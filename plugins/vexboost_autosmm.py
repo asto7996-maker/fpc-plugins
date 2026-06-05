@@ -2,7 +2,7 @@ from __future__ import annotations
 
 # === ОБЯЗАТЕЛЬНЫЕ ПОЛЯ FunPay Cardinal (НЕ УДАЛЯТЬ) ===
 NAME = "VexBoost AutoSMM"
-VERSION = "2.0.3"
+VERSION = "2.1.0"
 DESCRIPTION = "Автонакрутка через VexBoost (vexboost.ru)"
 CREDITS = "Cursor AI"
 UUID = "a3f8c2e1-7b4d-4a9f-9e2c-1d5b8f6a0c3e"
@@ -54,6 +54,10 @@ CASHLIST_FILE = f"{STORAGE_DIR}/cashlist.json"
 # ─────────────────────────────────────────────────────────────────────────────
 
 DEFAULT_SETTINGS: Dict[str, Any] = {
+    "auth_mode": "token",
+    "panel_url": "https://vexboost.ru",
+    "auth_token": "",
+    "cookie_name": "socpanel_session",
     "api_url": "https://vexboost.ru/api/v2",
     "api_key": "",
     "auto_refund_on_error": True,
@@ -232,6 +236,43 @@ def get_api_url() -> str:
 
 def get_api_key() -> str:
     return load_settings().get("api_key", "")
+
+
+def get_auth_mode() -> str:
+    mode = str(load_settings().get("auth_mode", "token")).strip().lower()
+    return mode if mode in ("token", "api_key") else "token"
+
+
+def get_panel_url() -> str:
+    settings = load_settings()
+    url = settings.get("panel_url") or settings.get("api_url", DEFAULT_SETTINGS["panel_url"])
+    url = str(url).rstrip("/")
+    if url.endswith("/api/v2"):
+        url = url[:-7]
+    return url.rstrip("/")
+
+
+def get_auth_token() -> str:
+    return str(load_settings().get("auth_token", "")).strip()
+
+
+def get_cookie_name() -> str:
+    return str(load_settings().get("cookie_name", "socpanel_session")).strip() or "socpanel_session"
+
+
+def is_api_configured() -> bool:
+    if get_auth_mode() == "token":
+        return bool(get_panel_url() and get_auth_token())
+    return bool(get_api_key())
+
+
+def _normalize_auth_token(raw: str) -> str:
+    token = (raw or "").strip()
+    if not token:
+        return ""
+    if "=" in token and token.lower().startswith(("socpanel_session=", "authtoken=")):
+        token = token.split("=", 1)[1].strip()
+    return token.strip('"').strip("'")
 
 
 def load_payorders() -> List[Dict[str, Any]]:
@@ -575,21 +616,37 @@ class OrderHistory:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class VexBoostAPI:
-    """Клиент API VexBoost (стандарт SMM API v2)."""
+    """Клиент VexBoost: AuthToken (cookie) или стандартный API KEY."""
 
     HEADERS = {
-        "User-Agent": "Mozilla/5.0 (compatible; VexBoostAutoSMM/2.0)",
+        "User-Agent": "Mozilla/5.0 (compatible; VexBoostAutoSMM/2.1)",
         "Accept": "application/json",
     }
 
     ERROR_MESSAGES = {
-        "user_inactive": "API-ключ неактивен. Проверьте аккаунт на vexboost.ru",
+        "user_inactive": "API-ключ неактивен. Используйте AuthToken или активируйте API на vexboost.ru",
         "incorrect api key": "Неверный API KEY. Обновите в /vexboost",
         "invalid api key": "Неверный API KEY. Обновите в /vexboost",
+        "unauthorized": "AuthToken недействителен или истёк. Скопируйте новый socpanel_session из Cookie-Editor",
         "not enough funds": "Недостаточно средств на балансе VexBoost",
         "incorrect service id": "Неверный ID услуги (ID: в лоте)",
         "invalid link": "Некорректная ссылка для этой услуги",
         "quantity out of range": "Количество вне допустимого диапазона услуги",
+    }
+
+    STATUS_MAP = {
+        "pending": "Pending",
+        "in progress": "In progress",
+        "in_progress": "In progress",
+        "processing": "In progress",
+        "progress": "In progress",
+        "completed": "Completed",
+        "done": "Completed",
+        "success": "Completed",
+        "partial": "Partial",
+        "canceled": "Canceled",
+        "cancelled": "Canceled",
+        "cancel": "Canceled",
     }
 
     @staticmethod
@@ -625,13 +682,23 @@ class VexBoostAPI:
         return {"error": "Некорректный ответ API"}
 
     @classmethod
-    def _request(cls, params: Dict[str, Any]) -> Dict[str, Any]:
+    def _normalize_status(cls, status: Any) -> str:
+        text = str(status or "Unknown").strip()
+        mapped = cls.STATUS_MAP.get(text.lower())
+        if mapped:
+            return mapped
+        if text.lower() in ("pending", "completed", "canceled", "partial"):
+            return text.capitalize() if text.lower() != "partial" else "Partial"
+        return text or "Unknown"
+
+    @classmethod
+    def _request_key(cls, params: Dict[str, Any]) -> Dict[str, Any]:
         from urllib.parse import urlencode
 
         api_url = get_api_url()
         api_key = get_api_key()
         if not api_key:
-            return {"error": "API ключ не задан. Используйте /vexboost"}
+            return {"error": "API KEY не задан. /vexboost → API KEY"}
         payload = {"key": api_key, **params}
         retries, delay = cls._get_retry_settings()
         query = urlencode(payload)
@@ -661,6 +728,196 @@ class VexBoostAPI:
                 time.sleep(delay * attempt)
 
         return {"error": f"Не удалось связаться с VexBoost: {last_error}"}
+
+    @classmethod
+    def _panel_host(cls) -> str:
+        from urllib.parse import urlparse
+        return urlparse(get_panel_url()).netloc
+
+    @classmethod
+    def _make_session(cls) -> Tuple[Optional[requests.Session], str]:
+        from urllib.parse import unquote
+
+        token = _normalize_auth_token(get_auth_token())
+        if not token:
+            return None, "AuthToken не задан. /vexboost → AuthToken"
+
+        session = requests.Session()
+        session.headers.update({
+            **cls.HEADERS,
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "X-Site-Host": cls._panel_host(),
+        })
+        session.cookies.set(get_cookie_name(), unquote(token), domain=cls._panel_host())
+
+        try:
+            session.get(f"{get_panel_url()}/api/csrf-cookie", timeout=45)
+        except requests.RequestException as exc:
+            return None, f"Ошибка сети (CSRF): {exc}"
+
+        xsrf = session.cookies.get("XSRF-TOKEN")
+        if xsrf:
+            session.headers["X-XSRF-TOKEN"] = unquote(xsrf)
+
+        return session, ""
+
+    @classmethod
+    def _request_token(
+        cls,
+        method: str,
+        path: str,
+        *,
+        json_body: Optional[Dict[str, Any]] = None,
+        params: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        retries, delay = cls._get_retry_settings()
+        last_error = "Нет ответа от сервера"
+        api_path = path.lstrip("/")
+        if not api_path.startswith("api/"):
+            api_path = f"api/{api_path}"
+
+        for attempt in range(1, retries + 1):
+            session, err = cls._make_session()
+            if not session:
+                return {"error": err}
+
+            url = f"{get_panel_url()}/{api_path}"
+            try:
+                response = session.request(
+                    method.upper(), url,
+                    json=json_body, params=params, timeout=45,
+                )
+            except requests.RequestException as exc:
+                last_error = str(exc)
+                if attempt < retries:
+                    time.sleep(delay * attempt)
+                continue
+
+            if response.status_code == 419 and attempt < retries:
+                time.sleep(delay)
+                continue
+
+            data = cls._parse_response(response)
+            if data is None:
+                last_error = f"HTTP {response.status_code}: {response.text[:120]}"
+                if attempt < retries:
+                    time.sleep(delay * attempt)
+                continue
+
+            if "error" in data:
+                data["error"] = cls.format_error(data["error"])
+            return data
+
+        return {"error": f"Не удалось связаться с VexBoost: {last_error}"}
+
+    @classmethod
+    def _request(cls, params: Dict[str, Any]) -> Dict[str, Any]:
+        if get_auth_mode() == "token":
+            return cls._request_token_mode(params)
+        return cls._request_key(params)
+
+    @classmethod
+    def _request_token_mode(cls, params: Dict[str, Any]) -> Dict[str, Any]:
+        action = params.get("action", "")
+        if action == "balance":
+            return cls._token_balance()
+        if action == "services":
+            data = cls._request_token("GET", "services")
+            if isinstance(data.get("services"), list):
+                return data
+            if isinstance(data, list):
+                return {"services": data}
+            return data
+        if action == "add":
+            return cls._token_create_order(
+                int(params["service"]), str(params["link"]), int(params["quantity"]),
+            )
+        if action == "status":
+            return cls._token_order_status(int(params["order"]))
+        if action == "refill":
+            return cls._token_refill(int(params["order"]))
+        if action == "cancel":
+            return cls._token_cancel(int(params["order"]))
+        return {"error": f"Неизвестное действие: {action}"}
+
+    @classmethod
+    def _token_balance(cls) -> Dict[str, Any]:
+        data = cls._request_token("GET", "user")
+        if "error" in data:
+            return data
+        for key in ("balance", "wallet", "funds", "amount"):
+            if key in data and data[key] is not None:
+                return {
+                    "balance": data[key],
+                    "currency": data.get("currency") or data.get("currency_code") or "RUB",
+                }
+        user = data.get("user")
+        if isinstance(user, dict):
+            for key in ("balance", "wallet", "funds"):
+                if key in user and user[key] is not None:
+                    return {
+                        "balance": user[key],
+                        "currency": user.get("currency") or "RUB",
+                    }
+        return {"error": "Не удалось получить баланс из /api/user"}
+
+    @classmethod
+    def _token_create_order(cls, service_id: int, link: str, quantity: int) -> Dict[str, Any]:
+        payloads = (
+            {"service_id": service_id, "link": link, "quantity": quantity},
+            {"serviceId": service_id, "link": link, "quantity": quantity},
+            {"service": service_id, "link": link, "quantity": quantity},
+        )
+        last_error = "Не удалось создать заказ"
+        for body in payloads:
+            data = cls._request_token("POST", "orders", json_body=body)
+            if "error" in data:
+                last_error = str(data["error"])
+                if "service" not in last_error.lower():
+                    continue
+                continue
+            order_id = data.get("id")
+            if order_id is None and isinstance(data.get("order"), dict):
+                order_id = data["order"].get("id")
+            if order_id is None and isinstance(data.get("order"), (int, str)):
+                order_id = data["order"]
+            if order_id is not None:
+                return {"order": int(order_id)}
+            return data
+        return {"error": last_error}
+
+    @classmethod
+    def _token_order_status(cls, order_id: int) -> Dict[str, Any]:
+        data = cls._request_token("GET", f"orders/{order_id}")
+        if "error" in data:
+            return data
+        order = data.get("order") if isinstance(data.get("order"), dict) else data
+        status = cls._normalize_status(order.get("status"))
+        remains = order.get("remains", order.get("remainder", order.get("rest", 0)))
+        charge = order.get("charge", order.get("cost", order.get("price", 0)))
+        currency = order.get("currency", order.get("currency_code", "RUB"))
+        return {
+            "status": status,
+            "remains": remains,
+            "charge": charge,
+            "currency": currency,
+        }
+
+    @classmethod
+    def _token_refill(cls, order_id: int) -> Dict[str, Any]:
+        data = cls._request_token("POST", f"orders/{order_id}/refill")
+        if "error" in data:
+            return data
+        refill_id = data.get("refill") or data.get("id")
+        return {"refill": refill_id or True}
+
+    @classmethod
+    def _token_cancel(cls, order_id: int) -> Dict[str, Any]:
+        data = cls._request_token("DELETE", f"orders/{order_id}")
+        if "error" in data:
+            return data
+        return {"cancel": data.get("cancel", True)}
 
     @classmethod
     def _do_post(cls, api_url: str, payload: Dict[str, Any]) -> Optional[requests.Response]:
@@ -934,8 +1191,8 @@ def _is_private_telegram_link(link: str) -> bool:
 
 def bind_to_new_order(c: "Cardinal", e: NewOrderEvent) -> None:
     try:
-        if not get_api_key():
-            logger.warning("%s: API ключ не задан", LOGGER_PREFIX)
+        if not is_api_configured():
+            logger.warning("%s: VexBoost не настроен (URL/AuthToken или API KEY)", LOGGER_PREFIX)
             return
 
         order_id = e.order.id
@@ -1293,15 +1550,15 @@ def _status_checker_loop(c: "Cardinal") -> None:
 
 
 def _check_all_active_orders(c: "Cardinal") -> None:
-    if not get_api_key():
+    if not is_api_configured():
         return
     active = load_active_orders()
     if not active:
         return
 
     settings = load_settings()
-    api_url = get_api_url()
-    api_key = get_api_key()
+    api_url = get_panel_url() if get_auth_mode() == "token" else get_api_url()
+    api_key = get_auth_token() if get_auth_mode() == "token" else get_api_key()
     updated: Dict[str, Any] = {}
     to_notify_complete: List[str] = []
     to_notify_cancel: List[str] = []
@@ -1466,10 +1723,22 @@ def _handle_partial_order(
 
 def _main_keyboard() -> InlineKeyboardMarkup:
     kb = InlineKeyboardMarkup(row_width=2)
-    kb.row(
-        InlineKeyboardButton("🔗 API URL", callback_data="vb_set_url"),
-        InlineKeyboardButton("🔐 API KEY", callback_data="vb_set_key"),
-    )
+    if get_auth_mode() == "token":
+        kb.row(
+            InlineKeyboardButton("🔗 URL", callback_data="vb_set_panel_url"),
+            InlineKeyboardButton("🔑 AuthToken", callback_data="vb_set_token"),
+        )
+        kb.row(
+            InlineKeyboardButton("🔐 Режим: AuthToken ✓", callback_data="vb_auth_mode_key"),
+        )
+    else:
+        kb.row(
+            InlineKeyboardButton("🔗 API URL", callback_data="vb_set_url"),
+            InlineKeyboardButton("🔐 API KEY", callback_data="vb_set_key"),
+        )
+        kb.row(
+            InlineKeyboardButton("🍪 Режим: API KEY ✓", callback_data="vb_auth_mode_token"),
+        )
     kb.row(
         InlineKeyboardButton("📊 Статистика", callback_data="vb_stats_menu"),
         InlineKeyboardButton("💰 Баланс", callback_data="vb_balance_btn"),
@@ -1535,14 +1804,28 @@ def _settings_keyboard(settings: Dict[str, Any]) -> InlineKeyboardMarkup:
 
 
 def _settings_summary(settings: Dict[str, Any]) -> str:
-    key = get_api_key()
-    key_display = ("***" + key[-4:]) if len(key) > 4 else "не задан"
     refund_err = "🟢" if settings.get("auto_refund_on_error") else "🔴"
     refund_cancel = "🟢" if settings.get("auto_refund_on_cancel") else "🔴"
+    if get_auth_mode() == "token":
+        token = get_auth_token()
+        token_display = ("***" + token[-6:]) if len(token) > 6 else "не задан"
+        auth_block = (
+            f"🍪 Режим: <b>AuthToken</b> (cookie)\n"
+            f"🔗 URL: <code>{get_panel_url()}</code>\n"
+            f"🔑 AuthToken: <code>{token_display}</code>\n"
+            f"🍪 Cookie: <code>{get_cookie_name()}</code>\n"
+        )
+    else:
+        key = get_api_key()
+        key_display = ("***" + key[-4:]) if len(key) > 4 else "не задан"
+        auth_block = (
+            f"🔐 Режим: <b>API KEY</b>\n"
+            f"🔗 API: <code>{get_api_url()}</code>\n"
+            f"🔐 KEY: <code>{key_display}</code>\n"
+        )
     return (
         f"⚙️ <b>{NAME} v{VERSION}</b>\n\n"
-        f"🔗 API: <code>{get_api_url()}</code>\n"
-        f"🔐 KEY: <code>{key_display}</code>\n"
+        f"{auth_block}"
         f"🔄 Автовозврат (ошибка): {refund_err}\n"
         f"🔄 Автовозврат (отмена): {refund_cancel}\n"
         f"⏱ Интервал проверки: <b>{settings.get('status_check_interval', 60)}</b> сек.\n"
@@ -1556,6 +1839,12 @@ def _settings_summary(settings: Dict[str, Any]) -> str:
 def _help_text() -> str:
     return (
         f"ℹ️ <b>Справка {NAME}</b>\n\n"
+        f"<b>AuthToken (рекомендуется):</b>\n"
+        f"1. Войдите на vexboost.ru в браузере\n"
+        f"2. Откройте расширение Cookie-Editor\n"
+        f"3. Найдите cookie <code>socpanel_session</code>\n"
+        f"4. Скопируйте <b>Value</b> → /vexboost → AuthToken\n"
+        f"5. URL: <code>https://vexboost.ru</code>\n\n"
         f"<b>Настройка лотов:</b>\n"
         f"В описании лота укажите ID услуги с vexboost.ru:\n"
         f"<code>ID: 1634</code>\n"
@@ -1620,6 +1909,45 @@ def init_commands(cardinal: "Cardinal", *args) -> None:
                     _settings_summary(settings), chat_id, msg_id,
                     reply_markup=_main_keyboard(), parse_mode="HTML",
                 )
+
+            elif call.data == "vb_set_panel_url":
+                result = bot.send_message(
+                    chat_id,
+                    "Введите URL панели VexBoost:\n(например https://vexboost.ru)",
+                )
+                tg.set_state(chat_id=chat_id, message_id=result.id,
+                             user_id=call.from_user.id, state="vb_panel_url")
+                bot.answer_callback_query(call.id)
+
+            elif call.data == "vb_set_token":
+                result = bot.send_message(
+                    chat_id,
+                    "Введите AuthToken из Cookie-Editor:\n"
+                    "cookie <code>socpanel_session</code> → поле Value\n\n"
+                    "Можно вставить целиком: socpanel_session=ЗНАЧЕНИЕ",
+                    parse_mode="HTML",
+                )
+                tg.set_state(chat_id=chat_id, message_id=result.id,
+                             user_id=call.from_user.id, state="vb_auth_token")
+                bot.answer_callback_query(call.id)
+
+            elif call.data == "vb_auth_mode_token":
+                settings["auth_mode"] = "token"
+                save_settings(settings)
+                bot.edit_message_text(
+                    _settings_summary(settings), chat_id, msg_id,
+                    reply_markup=_main_keyboard(), parse_mode="HTML",
+                )
+                bot.answer_callback_query(call.id, "Режим AuthToken")
+
+            elif call.data == "vb_auth_mode_key":
+                settings["auth_mode"] = "api_key"
+                save_settings(settings)
+                bot.edit_message_text(
+                    _settings_summary(settings), chat_id, msg_id,
+                    reply_markup=_main_keyboard(), parse_mode="HTML",
+                )
+                bot.answer_callback_query(call.id, "Режим API KEY")
 
             elif call.data == "vb_set_url":
                 result = bot.send_message(
@@ -1764,12 +2092,24 @@ def init_commands(cardinal: "Cardinal", *args) -> None:
         state = state_data["state"]
         settings = load_settings()
 
-        if state == "vb_api_url":
+        if state == "vb_panel_url":
+            settings["panel_url"] = message.text.strip().rstrip("/")
+            save_settings(settings)
+            bot.reply_to(
+                message, f"✅ URL: <code>{settings['panel_url']}</code>", parse_mode="HTML",
+            )
+        elif state == "vb_auth_token":
+            settings["auth_token"] = _normalize_auth_token(message.text)
+            settings["auth_mode"] = "token"
+            save_settings(settings)
+            bot.reply_to(message, "✅ AuthToken сохранён. Проверьте: /vb_balance")
+        elif state == "vb_api_url":
             settings["api_url"] = message.text.strip().rstrip("/")
             save_settings(settings)
             bot.reply_to(message, f"✅ API URL: <code>{settings['api_url']}</code>", parse_mode="HTML")
         elif state == "vb_api_key":
             settings["api_key"] = message.text.strip()
+            settings["auth_mode"] = "api_key"
             save_settings(settings)
             bot.reply_to(message, "✅ API KEY сохранён.")
         tg.clear_state(message.chat.id, message.from_user.id)
@@ -1778,7 +2118,9 @@ def init_commands(cardinal: "Cardinal", *args) -> None:
     tg.msg_handler(
         handle_text_input,
         func=lambda m: (
-            tg.check_state(m.chat.id, m.from_user.id, "vb_api_url")
+            tg.check_state(m.chat.id, m.from_user.id, "vb_panel_url")
+            or tg.check_state(m.chat.id, m.from_user.id, "vb_auth_token")
+            or tg.check_state(m.chat.id, m.from_user.id, "vb_api_url")
             or tg.check_state(m.chat.id, m.from_user.id, "vb_api_key")
         ),
     )
@@ -1961,23 +2303,29 @@ class PluginHealthCheck:
 
     @staticmethod
     def check_api() -> Tuple[bool, str]:
-        key = get_api_key()
-        if not key:
-            return False, "API ключ не задан (/vexboost)"
+        if not is_api_configured():
+            if get_auth_mode() == "token":
+                return False, "Задайте URL и AuthToken (/vexboost)"
+            return False, "API KEY не задан (/vexboost)"
         balance = VexBoostAPI.get_balance()
         if balance:
-            return True, f"API работает, баланс: {balance[0]:.2f} {balance[1]}"
+            mode = "AuthToken" if get_auth_mode() == "token" else "API KEY"
+            return True, f"{mode} OK, баланс: {balance[0]:.2f} {balance[1]}"
         err = VexBoostAPI.get_balance_error()
         return False, err or "API не отвечает"
 
     @staticmethod
     def check_settings() -> Tuple[bool, str]:
         settings = load_settings()
-        required = ["api_url", "api_key", "status_check_interval"]
-        missing = [k for k in required if k not in settings]
-        if missing:
-            return False, f"Отсутствуют настройки: {missing}"
-        return True, "Настройки корректны"
+        if get_auth_mode() == "token":
+            if not get_panel_url():
+                return False, "Не задан panel_url"
+            if not get_auth_token():
+                return False, "Не задан auth_token"
+            return True, "AuthToken-режим настроен"
+        if not get_api_key():
+            return False, "Не задан api_key"
+        return True, "API KEY-режим настроен"
 
     @classmethod
     def run_all(cls) -> str:
