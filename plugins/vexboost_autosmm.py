@@ -1,11 +1,20 @@
+# VexBoost AutoSMM v1.0.2 — обязательные поля FunPay Cardinal (должны быть до импортов)
+from __future__ import annotations
+
+NAME = "VexBoost AutoSMM"
+VERSION = "1.0.2"
+DESCRIPTION = "Автонакрутка через сервис VexBoost (vexboost.ru)"
+CREDITS = "Cursor AI"
+UUID = "a3f8c2e1-7b4d-4a9f-9e2c-1d5b8f6a0c3e"
+SETTINGS_PAGE = False
+BIND_TO_DELETE = None
+
 """
 Плагин автонакрутки через VexBoost для FunPay Cardinal.
 
 Настройка: команда /vexboost в Telegram-боте Cardinal.
 В описании лота укажите: ID: <service_id>  и опционально #Quan: <множитель>
 """
-
-from __future__ import annotations
 
 import json
 import logging
@@ -26,13 +35,6 @@ if TYPE_CHECKING:
     from cardinal import Cardinal
 
 logger = logging.getLogger("FPC.VexBoost")
-
-NAME = "VexBoost AutoSMM"
-VERSION = "1.0.1"
-DESCRIPTION = "Автонакрутка через сервис VexBoost (vexboost.ru)"
-CREDITS = "Cursor AI"
-UUID = "a3f8c2e1-7b4d-4a9f-9e2c-1d5b8f6a0c3e"
-SETTINGS_PAGE = False
 
 STORAGE_DIR = f"storage/plugins/{UUID}"
 SETTINGS_FILE = f"{STORAGE_DIR}/settings.json"
@@ -563,4 +565,3 @@ BIND_TO_PRE_INIT = [init_commands]
 BIND_TO_POST_INIT = [start_status_checker]
 BIND_TO_NEW_ORDER = [bind_to_new_order]
 BIND_TO_NEW_MESSAGE = [msg_hook]
-BIND_TO_DELETE = None
