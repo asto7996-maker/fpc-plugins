@@ -2,7 +2,7 @@ from __future__ import annotations
 
 # === ОБЯЗАТЕЛЬНЫЕ ПОЛЯ FunPay Cardinal (НЕ УДАЛЯТЬ) ===
 NAME = "VexBoost AutoSMM"
-VERSION = "2.0.2"
+VERSION = "2.0.3"
 DESCRIPTION = "Автонакрутка через VexBoost (vexboost.ru)"
 CREDITS = "Cursor AI"
 UUID = "a3f8c2e1-7b4d-4a9f-9e2c-1d5b8f6a0c3e"
@@ -577,6 +577,21 @@ class OrderHistory:
 class VexBoostAPI:
     """Клиент API VexBoost (стандарт SMM API v2)."""
 
+    HEADERS = {
+        "User-Agent": "Mozilla/5.0 (compatible; VexBoostAutoSMM/2.0)",
+        "Accept": "application/json",
+    }
+
+    ERROR_MESSAGES = {
+        "user_inactive": "API-ключ неактивен. Проверьте аккаунт на vexboost.ru",
+        "incorrect api key": "Неверный API KEY. Обновите в /vexboost",
+        "invalid api key": "Неверный API KEY. Обновите в /vexboost",
+        "not enough funds": "Недостаточно средств на балансе VexBoost",
+        "incorrect service id": "Неверный ID услуги (ID: в лоте)",
+        "invalid link": "Некорректная ссылка для этой услуги",
+        "quantity out of range": "Количество вне допустимого диапазона услуги",
+    }
+
     @staticmethod
     def _get_retry_settings() -> Tuple[int, int]:
         s = load_settings()
@@ -584,6 +599,30 @@ class VexBoostAPI:
             int(s.get("api_retry_count", 3)),
             int(s.get("api_retry_delay", 2)),
         )
+
+    @classmethod
+    def format_error(cls, error: Any) -> str:
+        if not error:
+            return "Неизвестная ошибка API"
+        text = str(error).strip()
+        return cls.ERROR_MESSAGES.get(text.lower(), text)
+
+    @classmethod
+    def _parse_response(cls, response: requests.Response) -> Optional[Dict[str, Any]]:
+        """VexBoost возвращает JSON и при ошибках с HTTP 400 — это НЕ сбой сети."""
+        try:
+            data = response.json()
+        except ValueError:
+            logger.warning(
+                "%s: не-JSON ответ HTTP %s: %s",
+                LOGGER_PREFIX, response.status_code, response.text[:200],
+            )
+            return None
+        if isinstance(data, list):
+            return {"services": data}
+        if isinstance(data, dict):
+            return data
+        return {"error": "Некорректный ответ API"}
 
     @classmethod
     def _request(cls, params: Dict[str, Any]) -> Dict[str, Any]:
@@ -598,47 +637,78 @@ class VexBoostAPI:
         query = urlencode(payload)
         get_url = f"{api_url}?{query}"
 
+        last_error = "Нет ответа от сервера"
+
         for attempt in range(1, retries + 1):
-            # Сначала GET (как AutoSmm) — VexBoost так работает стабильнее
-            for request_fn, label in (
-                (lambda: requests.get(get_url, timeout=45), "GET"),
-                (lambda: requests.get(api_url, params=payload, timeout=45), "GET-params"),
-                (lambda: requests.post(api_url, data=payload, timeout=45), "POST"),
+            for label, response in (
+                ("POST", cls._do_post(api_url, payload)),
+                ("GET", cls._do_get(get_url)),
+                ("GET-params", cls._do_get_params(api_url, payload)),
             ):
-                try:
-                    response = request_fn()
-                    response.raise_for_status()
-                    data = response.json()
-                    if isinstance(data, dict):
-                        return data
-                    if isinstance(data, list):
-                        return {"services": data}
-                    return {"error": "Некорректный ответ API"}
-                except requests.Timeout:
-                    logger.warning(
-                        "%s: таймаут %s (попытка %d/%d)",
-                        LOGGER_PREFIX, label, attempt, retries,
+                if response is None:
+                    continue
+                data = cls._parse_response(response)
+                if data is not None:
+                    if "error" in data:
+                        data["error"] = cls.format_error(data["error"])
+                    logger.debug(
+                        "%s: API %s HTTP %s → %s",
+                        LOGGER_PREFIX, label, response.status_code, data,
                     )
-                except requests.RequestException as exc:
-                    logger.warning(
-                        "%s: ошибка %s (попытка %d/%d): %s",
-                        LOGGER_PREFIX, label, attempt, retries, exc,
-                    )
-                except ValueError:
-                    logger.warning("%s: не-JSON ответ от %s", LOGGER_PREFIX, label)
+                    return data
+                last_error = f"HTTP {response.status_code}: {response.text[:120]}"
             if attempt < retries:
                 time.sleep(delay * attempt)
-        return {"error": "Не удалось связаться с VexBoost. Проверьте API KEY и баланс на vexboost.ru"}
+
+        return {"error": f"Не удалось связаться с VexBoost: {last_error}"}
+
+    @classmethod
+    def _do_post(cls, api_url: str, payload: Dict[str, Any]) -> Optional[requests.Response]:
+        try:
+            return requests.post(
+                api_url, data=payload, timeout=45, headers=cls.HEADERS,
+            )
+        except requests.RequestException as exc:
+            logger.warning("%s: POST ошибка сети: %s", LOGGER_PREFIX, exc)
+            return None
+
+    @classmethod
+    def _do_get(cls, url: str) -> Optional[requests.Response]:
+        try:
+            return requests.get(url, timeout=45, headers=cls.HEADERS)
+        except requests.RequestException as exc:
+            logger.warning("%s: GET ошибка сети: %s", LOGGER_PREFIX, exc)
+            return None
+
+    @classmethod
+    def _do_get_params(cls, api_url: str, payload: Dict[str, Any]) -> Optional[requests.Response]:
+        try:
+            return requests.get(
+                api_url, params=payload, timeout=45, headers=cls.HEADERS,
+            )
+        except requests.RequestException as exc:
+            logger.warning("%s: GET-params ошибка сети: %s", LOGGER_PREFIX, exc)
+            return None
 
     @classmethod
     def get_balance(cls) -> Optional[Tuple[float, str]]:
         data = cls._request({"action": "balance"})
+        if "error" in data:
+            logger.warning("%s: баланс — %s", LOGGER_PREFIX, data["error"])
+            return None
         if "balance" not in data:
             return None
         match = re.search(r"[\d.]+", str(data["balance"]))
         if not match:
             return None
         return float(match.group()), data.get("currency", "RUB")
+
+    @classmethod
+    def get_balance_error(cls) -> str:
+        data = cls._request({"action": "balance"})
+        if "balance" in data:
+            return ""
+        return data.get("error", "Не удалось получить баланс")
 
     @classmethod
     def get_services(cls) -> Optional[List[Dict[str, Any]]]:
@@ -1530,7 +1600,8 @@ def init_commands(cardinal: "Cardinal", *args) -> None:
         if balance:
             text = f"💰 <b>Баланс VexBoost:</b> {balance[0]:.2f} {balance[1]}"
         else:
-            text = "🔴 Не удалось получить баланс. Проверьте API KEY."
+            err = VexBoostAPI.get_balance_error()
+            text = f"🔴 <b>VexBoost:</b> {err or 'Проверьте API KEY в /vexboost'}"
         try:
             fp = cardinal.get_balance()
             text += f"\n💰 <b>FunPay:</b> {fp.total_rub}₽, {fp.available_usd}$, {fp.total_eur}€"
@@ -1571,7 +1642,8 @@ def init_commands(cardinal: "Cardinal", *args) -> None:
                         call.id, f"Баланс: {balance[0]:.2f} {balance[1]}", show_alert=True,
                     )
                 else:
-                    bot.answer_callback_query(call.id, "Ошибка получения баланса", show_alert=True)
+                    err = VexBoostAPI.get_balance_error() or "Ошибка API"
+                    bot.answer_callback_query(call.id, err[:200], show_alert=True)
 
             elif call.data == "vb_stats_menu":
                 bot.edit_message_text(
@@ -1895,7 +1967,8 @@ class PluginHealthCheck:
         balance = VexBoostAPI.get_balance()
         if balance:
             return True, f"API работает, баланс: {balance[0]:.2f} {balance[1]}"
-        return False, "API не отвечает или неверный ключ"
+        err = VexBoostAPI.get_balance_error()
+        return False, err or "API не отвечает"
 
     @staticmethod
     def check_settings() -> Tuple[bool, str]:
