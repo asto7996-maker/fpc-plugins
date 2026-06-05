@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 NAME = "VexBoost AutoSMM"
-VERSION = "2.0.0"
+VERSION = "2.0.1"
 DESCRIPTION = "Полная автонакрутка через VexBoost: статистика, прибыль, стабильная обработка заказов"
 CREDITS = "Cursor AI"
 UUID = "a3f8c2e1-7b4d-4a9f-9e2c-1d5b8f6a0c3e"
@@ -40,7 +40,7 @@ import requests
 from telebot.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from FunPayAPI.types import MessageTypes
-from FunPayAPI.updater.events import NewMessageEvent, NewOrderEvent
+from FunPayAPI.updater.events import LastChatMessageChangedEvent, NewMessageEvent, NewOrderEvent
 
 if TYPE_CHECKING:
     from cardinal import Cardinal
@@ -103,7 +103,8 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
 # Глобальные переменные состояния
 # ─────────────────────────────────────────────────────────────────────────────
 
-pending_confirmations: Dict[Any, Dict[str, Any]] = {}
+pending_confirmations: Dict[int, Dict[str, Any]] = {}
+pending_by_buyer: Dict[str, Dict[str, Any]] = {}
 _file_lock = threading.RLock()
 _status_thread_started = False
 
@@ -112,8 +113,74 @@ URL_PATTERN = re.compile(
 )
 SERVICE_ID_PATTERN = re.compile(r"ID:\s*(\d+)", re.IGNORECASE)
 QUANTITY_MULT_PATTERN = re.compile(r"#Quan:\s*(\d+)", re.IGNORECASE)
+HTML_TAG_PATTERN = re.compile(r"<[^>]+>")
 
 FUNPAY_ORDER_URL = "https://funpay.com/orders/{order_id}/"
+CONFIRM_MESSAGES = {"+", "-", "➕", "➖", "✅", "❌", "yes", "да", "ok"}
+
+
+def _normalize_chat_id(chat_id: Any) -> int:
+    try:
+        return int(chat_id)
+    except (TypeError, ValueError):
+        return chat_id  # type: ignore[return-value]
+
+
+def _strip_html(text: str) -> str:
+    return HTML_TAG_PATTERN.sub("", text).replace("&nbsp;", " ").strip()
+
+
+def send_fp(c: "Cardinal", chat_id: Any, text: str) -> None:
+    """Отправка сообщения покупателю в FunPay (без HTML-разметки)."""
+    if not chat_id:
+        logger.warning("%s: попытка отправить сообщение без chat_id", LOGGER_PREFIX)
+        return
+    c.send_message(_normalize_chat_id(chat_id), _strip_html(text))
+
+
+def _get_message_text(msg: Any) -> str:
+    raw = msg.text if getattr(msg, "text", None) else str(msg)
+    return (raw or "").strip()
+
+
+def _is_confirm_message(text: str) -> Optional[str]:
+    cleaned = text.strip().strip("\ufeff").lower()
+    if cleaned in ("+", "➕", "✅", "yes", "да", "ok", "подтверждаю"):
+        return "+"
+    if cleaned in ("-", "➖", "❌", "no", "нет", "отмена"):
+        return "-"
+    return None
+
+
+def set_pending(order: Dict[str, Any]) -> None:
+    chat_id = _normalize_chat_id(order.get("chat_id"))
+    order["chat_id"] = chat_id
+    pending_confirmations[chat_id] = order
+    if order.get("buyer"):
+        pending_by_buyer[order["buyer"]] = order
+
+
+def get_pending(chat_id: Any, buyer: str = "") -> Optional[Dict[str, Any]]:
+    cid = _normalize_chat_id(chat_id)
+    if cid in pending_confirmations:
+        return pending_confirmations[cid]
+    if buyer and buyer in pending_by_buyer:
+        return pending_by_buyer[buyer]
+    return None
+
+
+def pop_pending(chat_id: Any, buyer: str = "") -> Optional[Dict[str, Any]]:
+    order = get_pending(chat_id, buyer)
+    if not order:
+        return None
+    cid = _normalize_chat_id(order.get("chat_id"))
+    pending_confirmations.pop(cid, None)
+    pending_by_buyer.pop(order.get("buyer", ""), None)
+    return order
+
+
+def clear_pending(chat_id: Any, buyer: str = "") -> None:
+    pop_pending(chat_id, buyer)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Утилиты хранения (потокобезопасные)
@@ -543,19 +610,29 @@ class VexBoostAPI:
         retries, delay = cls._get_retry_settings()
 
         for attempt in range(1, retries + 1):
-            try:
-                response = requests.post(api_url, data=payload, timeout=30)
-                response.raise_for_status()
-                data = response.json()
-                if isinstance(data, dict):
-                    return data
-                return {"error": "Некорректный ответ API"}
-            except requests.Timeout:
-                logger.warning("%s: таймаут API (попытка %d/%d)", LOGGER_PREFIX, attempt, retries)
-            except requests.RequestException as exc:
-                logger.warning("%s: ошибка API (попытка %d/%d): %s", LOGGER_PREFIX, attempt, retries, exc)
-            except ValueError:
-                return {"error": "Некорректный JSON ответ"}
+            for method in ("get", "post"):
+                try:
+                    if method == "get":
+                        response = requests.get(api_url, params=payload, timeout=30)
+                    else:
+                        response = requests.post(api_url, data=payload, timeout=30)
+                    response.raise_for_status()
+                    data = response.json()
+                    if isinstance(data, dict):
+                        return data
+                    return {"error": "Некорректный ответ API"}
+                except requests.Timeout:
+                    logger.warning(
+                        "%s: таймаут API %s (попытка %d/%d)",
+                        LOGGER_PREFIX, method.upper(), attempt, retries,
+                    )
+                except requests.RequestException as exc:
+                    logger.warning(
+                        "%s: ошибка API %s (попытка %d/%d): %s",
+                        LOGGER_PREFIX, method.upper(), attempt, retries, exc,
+                    )
+                except ValueError:
+                    return {"error": "Некорректный JSON ответ"}
             if attempt < retries:
                 time.sleep(delay * attempt)
         return {"error": "Не удалось связаться с VexBoost после нескольких попыток"}
@@ -842,7 +919,7 @@ def bind_to_new_order(c: "Cardinal", e: NewOrderEvent) -> None:
 
         if chat_id:
             welcome = settings.get("welcome_message", DEFAULT_SETTINGS["welcome_message"])
-            c.send_message(chat_id, welcome)
+            send_fp(c, chat_id, welcome)
 
         logger.info(
             "%s: новый заказ FP#%s service=%s qty=%s buyer=%s",
@@ -861,8 +938,8 @@ def request_confirmation(c: "Cardinal", order: Dict[str, Any], link: str) -> Non
     settings = load_settings()
     allow_private = settings.get("set_tg_private") or settings.get("allow_private_telegram")
     if not allow_private and _is_private_telegram_link(link):
-        c.send_message(
-            order["chat_id"],
+        send_fp(
+            c, order["chat_id"],
             "❌ Закрытые Telegram-каналы/группы не поддерживаются.\n"
             "Используйте публичную ссылку: https://t.me/your_channel",
         )
@@ -870,30 +947,39 @@ def request_confirmation(c: "Cardinal", order: Dict[str, Any], link: str) -> Non
 
     order["url"] = link
     display_link = link.replace("https://", "").replace("http://", "")
-    c.send_message(
-        order["chat_id"],
-        f"📋 <b>Проверьте детали заказа:</b>\n\n"
+    send_fp(
+        c, order["chat_id"],
+        f"📋 Проверьте детали заказа:\n\n"
         f"🛒 Лот: {order['Order']}\n"
-        f"🔢 Количество: <b>{order['Amount']}</b> шт.\n"
+        f"🔢 Количество: {order['Amount']} шт.\n"
         f"🔗 Ссылка: {display_link}\n\n"
-        f"✅ Отправьте <b>+</b> для подтверждения\n"
-        f"❌ Отправьте <b>-</b> для отмены и возврата\n"
+        f"✅ Отправьте + для подтверждения\n"
+        f"❌ Отправьте - для отмены и возврата\n"
         f"🔄 Или отправьте новую ссылку",
     )
-    pending_confirmations[order["chat_id"]] = order
+    set_pending(order)
     _update_pay_order(order)
+    logger.info(
+        "%s: ожидание подтверждения FP#%s chat=%s buyer=%s",
+        LOGGER_PREFIX, order.get("OrderID"), order.get("chat_id"), order.get("buyer"),
+    )
 
 
-def confirm_order(c: "Cardinal", chat_id: Any, text: str) -> None:
-    settings = load_settings()
-    order = pending_confirmations.pop(chat_id, None)
+def confirm_order(c: "Cardinal", chat_id: Any, text: str, buyer: str = "") -> None:
+    order = pop_pending(chat_id, buyer)
     if not order:
+        logger.warning(
+            "%s: подтверждение без заказа chat=%s buyer=%s text=%r",
+            LOGGER_PREFIX, chat_id, buyer, text,
+        )
         return
 
-    if text.strip() == "+":
+    action = _is_confirm_message(text) or text.strip()
+    if action == "+":
+        send_fp(c, order["chat_id"], "⏳ Создаю заказ, подождите...")
         _create_vexboost_order(c, order)
-    elif text.strip() == "-":
-        c.send_message(chat_id, "❌ Заказ отменён. Средства будут возвращены.")
+    elif action == "-":
+        send_fp(c, chat_id, "❌ Заказ отменён. Средства будут возвращены.")
         _remove_pay_order(order["buyer"])
         _refund_order(c, order["OrderID"])
 
@@ -929,10 +1015,10 @@ def _create_vexboost_order(c: "Cardinal", order: Dict[str, Any]) -> None:
 
         send_order_created_notification(c, order, smm_id, cost, smm_cur)
 
-        c.send_message(
-            order["chat_id"],
-            f"📊 <b>Заказ создан и отправлен в VexBoost!</b>\n"
-            f"🆔 ID заказа: <code>{smm_id}</code>\n\n"
+        send_fp(
+            c, order["chat_id"],
+            f"📊 Заказ создан и отправлен в VexBoost!\n"
+            f"🆔 ID заказа: {smm_id}\n\n"
             f"📋 Команды:\n"
             f"⠀∟ #статус {smm_id}\n"
             f"⠀∟ #рефилл {smm_id}\n\n"
@@ -941,7 +1027,7 @@ def _create_vexboost_order(c: "Cardinal", order: Dict[str, Any]) -> None:
         logger.info("%s: VB#%s создан для FP#%s", LOGGER_PREFIX, smm_id, order["OrderID"])
     else:
         error_text = str(result)
-        c.send_message(order["chat_id"], f"❌ Ошибка при создании заказа:\n<code>{error_text}</code>")
+        send_fp(c, order["chat_id"], f"❌ Ошибка при создании заказа:\n{error_text}")
         StatisticsManager.record_failed()
         send_order_error_notification(c, error_text, order)
         OrderHistory.add_entry({
@@ -960,81 +1046,141 @@ def _create_vexboost_order(c: "Cardinal", order: Dict[str, Any]) -> None:
 # Обработчик сообщений FunPay
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _process_buyer_message(
+    c: "Cardinal",
+    message_text: str,
+    chat_id: Any,
+    chat_name: str,
+    author_id: Any,
+    msg_type: Any,
+) -> None:
+    msgname = chat_name
+    cid = _normalize_chat_id(chat_id)
+
+    if "вернул деньги покупателю" in message_text.lower():
+        _remove_pay_order(msgname)
+        clear_pending(cid, msgname)
+        return
+
+    if msg_type != MessageTypes.NON_SYSTEM:
+        return
+
+    if author_id == c.account.id:
+        return
+
+    confirm_action = _is_confirm_message(message_text)
+    pending = get_pending(cid, msgname)
+
+    if confirm_action:
+        logger.info(
+            "%s: получено подтверждение %r от %s chat=%s pending=%s",
+            LOGGER_PREFIX, message_text, msgname, cid, pending is not None,
+        )
+        if pending:
+            confirm_order(c, cid, confirm_action, msgname)
+            return
+        pay_orders = load_payorders()
+        order = find_order_by_buyer(pay_orders, msgname)
+        if order and order.get("url"):
+            order["chat_id"] = cid
+            set_pending(order)
+            confirm_order(c, cid, confirm_action, msgname)
+            return
+        send_fp(c, cid, "⚪️ Сначала отправьте ссылку для накрутки.")
+        return
+
+    if pending:
+        _handle_pending_message(c, cid, message_text, msgname)
+        return
+
+    if message_text.startswith("#статус"):
+        _cmd_status(c, cid, message_text)
+        return
+
+    if message_text.startswith("#рефилл"):
+        _cmd_refill(c, cid, message_text)
+        return
+
+    pay_orders = load_payorders()
+    order = find_order_by_buyer(pay_orders, msgname)
+    if order:
+        links = extract_links(message_text)
+        if links:
+            order["chat_id"] = cid
+            request_confirmation(c, order, links[0])
+
+
 def msg_hook(c: "Cardinal", e: NewMessageEvent) -> None:
     try:
         msg = e.message
-        message_text = (msg.text or "").strip()
-        msgname = msg.chat_name
-
-        if "вернул деньги покупателю" in message_text.lower():
-            _remove_pay_order(msgname)
-            pending_confirmations.pop(msg.chat_id, None)
-            return
-
-        if msg.type != MessageTypes.NON_SYSTEM:
-            return
-
-        if msg.author_id == c.account.id:
-            return
-
-        if msg.chat_id in pending_confirmations:
-            _handle_pending_message(c, msg.chat_id, message_text)
-            return
-
-        if message_text.startswith("#статус"):
-            _cmd_status(c, msg.chat_id, message_text)
-            return
-
-        if message_text.startswith("#рефилл"):
-            _cmd_refill(c, msg.chat_id, message_text)
-            return
-
-        pay_orders = load_payorders()
-        order = find_order_by_buyer(pay_orders, msgname)
-        if order:
-            links = extract_links(message_text)
-            if links:
-                order["chat_id"] = msg.chat_id
-                request_confirmation(c, order, links[0])
+        _process_buyer_message(
+            c,
+            _get_message_text(msg),
+            msg.chat_id,
+            msg.chat_name,
+            msg.author_id,
+            msg.type,
+        )
     except Exception as exc:
         logger.error("%s: ошибка msg_hook: %s", LOGGER_PREFIX, exc)
         logger.debug(traceback.format_exc())
 
 
-def _handle_pending_message(c: "Cardinal", chat_id: Any, message_text: str) -> None:
-    if message_text in ("+", "-"):
-        confirm_order(c, chat_id, message_text)
-        return
+def last_chat_msg_hook(c: "Cardinal", e: Any) -> None:
+    """Обработчик для old_mode_enabled (LAST_CHAT_MESSAGE_CHANGED)."""
+    try:
+        if not getattr(c, "old_mode_enabled", False):
+            return
+        chat = e.chat
+        if not chat.unread:
+            return
+        message_text = str(chat).strip()
+        _process_buyer_message(
+            c,
+            message_text,
+            chat.id,
+            chat.name,
+            None,
+            MessageTypes.NON_SYSTEM,
+        )
+    except Exception as exc:
+        logger.error("%s: ошибка last_chat_msg_hook: %s", LOGGER_PREFIX, exc)
+        logger.debug(traceback.format_exc())
+
+
+def _handle_pending_message(
+    c: "Cardinal", chat_id: Any, message_text: str, buyer: str = "",
+) -> None:
     if "http" in message_text:
-        order = pending_confirmations.get(chat_id)
+        order = get_pending(chat_id, buyer)
         if order:
-            order["chat_id"] = chat_id
+            order["chat_id"] = _normalize_chat_id(chat_id)
             links = extract_links(message_text)
             if links:
                 request_confirmation(c, order, links[0])
         return
-    c.send_message(
-        chat_id,
-        "⚪️ Отправьте <b>+</b> для подтверждения, <b>-</b> для отмены или новую ссылку.",
+    send_fp(
+        c, chat_id,
+        "⚪️ Отправьте + для подтверждения, - для отмены или новую ссылку.",
     )
 
 
 def _cmd_status(c: "Cardinal", chat_id: Any, message_text: str) -> None:
     parts = message_text.split()
     if len(parts) < 2 or not parts[1].isdigit():
-        c.send_message(chat_id, "Использование: <code>#статус ID</code>")
+        send_fp(c, chat_id, "Использование: #статус ID")
         return
     smm_id = int(parts[1])
     status = VexBoostAPI.get_order_status(smm_id)
     if not status:
-        c.send_message(chat_id, "🔴 Не удалось получить статус заказа.")
+        send_fp(c, chat_id, "🔴 Не удалось получить статус заказа.")
         return
     start_count = status.get("start_count", 0)
     display_start = "*" if start_count == 0 else str(start_count)
-    c.send_message(
-        chat_id,
-        f"📈 <b>Статус заказа {smm_id}</b>\n"
-        f"⠀∟ 📊 Статус: <b>{status.get('status', '—')}</b>\n"
+    send_fp(
+        c, chat_id,
+        f"📈 Статус заказа {smm_id}\n"
+        f"⠀∟ 📊 Статус: {status.get('status', '—')}\n"
         f"⠀∟ 🔢 Было: {display_start}\n"
         f"⠀∟ 👀 Остаток: {status.get('remains', '—')}\n"
         f"⠀∟ 💳 Стоимость: {status.get('charge', '—')} {status.get('currency', '')}",
@@ -1044,14 +1190,14 @@ def _cmd_status(c: "Cardinal", chat_id: Any, message_text: str) -> None:
 def _cmd_refill(c: "Cardinal", chat_id: Any, message_text: str) -> None:
     parts = message_text.split()
     if len(parts) < 2 or not parts[1].isdigit():
-        c.send_message(chat_id, "Использование: <code>#рефилл ID</code>")
+        send_fp(c, chat_id, "Использование: #рефилл ID")
         return
     result = VexBoostAPI.refill_order(int(parts[1]))
     if result is not None:
-        c.send_message(chat_id, "✅ Запрос на рефилл отправлен!")
+        send_fp(c, chat_id, "✅ Запрос на рефилл отправлен!")
     else:
-        c.send_message(
-            chat_id,
+        send_fp(
+            c, chat_id,
             "🔴 Ошибка рефилла. Возможно, рефилл ещё недоступен для этой услуги.",
         )
 
@@ -1163,7 +1309,7 @@ def _handle_completed_order(c: "Cardinal", smm_id: str, info: Dict[str, Any]) ->
 
     if chat_id:
         completion_msg = _build_completion_message(funpay_id)
-        c.send_message(chat_id, completion_msg)
+        send_fp(c, chat_id, completion_msg)
 
     send_order_complete_notification(c, {
         "order_id": funpay_id,
@@ -1189,9 +1335,9 @@ def _handle_canceled_order(c: "Cardinal", smm_id: str, info: Dict[str, Any]) -> 
     })
 
     if chat_id:
-        c.send_message(
-            chat_id,
-            f"❌ Заказ <code>#{funpay_id}</code> отменён на стороне VexBoost.\n"
+        send_fp(
+            c, chat_id,
+            f"❌ Заказ #{funpay_id} отменён на стороне VexBoost.\n"
             f"Средства будут возвращены.",
         )
 
@@ -1212,9 +1358,9 @@ def _handle_partial_order(
 
     if not settings.get("set_recreated_order"):
         if chat_id:
-            c.send_message(
-                chat_id,
-                f"⚠️ Заказ <code>#{funpay_id}</code> приостановлен (Partial).\n"
+            send_fp(
+                c, chat_id,
+                f"⚠️ Заказ #{funpay_id} приостановлен (Partial).\n"
                 f"Остаток: {partial_amount} ед.\n"
                 f"Обратитесь к продавцу.",
             )
@@ -1241,10 +1387,10 @@ def _handle_partial_order(
             }
             save_cashlist(cashlist)
             if chat_id:
-                c.send_message(
-                    chat_id,
-                    f"📈 Заказ <code>#{funpay_id}</code> пересоздан!\n"
-                    f"🆔 Новый ID: <code>{new_id}</code>\n"
+                send_fp(
+                    c, chat_id,
+                    f"📈 Заказ #{funpay_id} пересоздан!\n"
+                    f"🆔 Новый ID: {new_id}\n"
                     f"⏳ Остаток: {partial_amount}",
                 )
     except Exception as exc:
@@ -1692,7 +1838,7 @@ def request_confirmation(c: "Cardinal", order: Dict[str, Any], link: str) -> Non
     order["url"] = link
     valid, err = OrderValidator.validate_order(order)
     if not valid:
-        c.send_message(order["chat_id"], f"❌ {err}\nОтправьте корректную ссылку.")
+        send_fp(c, order["chat_id"], f"❌ {err}\nОтправьте корректную ссылку.")
         return
     _original_request_confirmation(c, order, link)
 
@@ -1917,6 +2063,7 @@ def safe_handler(func: Callable) -> Callable:
 # Обёртки обработчиков с защитой от падений
 _safe_bind_to_new_order = safe_handler(bind_to_new_order)
 _safe_msg_hook = safe_handler(msg_hook)
+_safe_last_chat_hook = safe_handler(last_chat_msg_hook)
 _safe_init_commands = safe_handler(init_commands)
 _safe_start_status_checker = safe_handler(start_status_checker)
 
@@ -1925,6 +2072,7 @@ BIND_TO_PRE_INIT = [_safe_init_commands]
 BIND_TO_POST_INIT = [_safe_start_status_checker]
 BIND_TO_NEW_ORDER = [_safe_bind_to_new_order]
 BIND_TO_NEW_MESSAGE = [_safe_msg_hook]
+BIND_TO_LAST_CHAT_MESSAGE_CHANGED = [_safe_last_chat_hook]
 
 logger.info("$MAGENTA%s v%s загружен.$RESET", LOGGER_PREFIX, VERSION)
 
