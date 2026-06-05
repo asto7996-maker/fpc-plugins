@@ -2,7 +2,7 @@ from __future__ import annotations
 
 # === ОБЯЗАТЕЛЬНЫЕ ПОЛЯ FunPay Cardinal (НЕ УДАЛЯТЬ) ===
 NAME = "VexBoost AutoSMM"
-VERSION = "2.1.0"
+VERSION = "2.2.0"
 DESCRIPTION = "Автонакрутка через VexBoost (vexboost.ru)"
 CREDITS = "Cursor AI"
 UUID = "a3f8c2e1-7b4d-4a9f-9e2c-1d5b8f6a0c3e"
@@ -54,10 +54,13 @@ CASHLIST_FILE = f"{STORAGE_DIR}/cashlist.json"
 # ─────────────────────────────────────────────────────────────────────────────
 
 DEFAULT_SETTINGS: Dict[str, Any] = {
-    "auth_mode": "token",
+    "auth_mode": "login",
     "panel_url": "https://vexboost.ru",
+    "vexboost_login": "",
+    "vexboost_password": "",
     "auth_token": "",
     "cookie_name": "socpanel_session",
+    "session_ttl": 5400,
     "api_url": "https://vexboost.ru/api/v2",
     "api_key": "",
     "auto_refund_on_error": True,
@@ -95,6 +98,8 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
 pending_confirmations: Dict[int, Dict[str, Any]] = {}
 pending_by_buyer: Dict[str, Dict[str, Any]] = {}
 _file_lock = threading.RLock()
+_session_cache_lock = threading.RLock()
+_vexboost_session_cache: Dict[str, Any] = {"session": None, "expires_at": 0.0}
 _status_thread_started = False
 
 URL_PATTERN = re.compile(
@@ -239,8 +244,18 @@ def get_api_key() -> str:
 
 
 def get_auth_mode() -> str:
-    mode = str(load_settings().get("auth_mode", "token")).strip().lower()
-    return mode if mode in ("token", "api_key") else "token"
+    mode = str(load_settings().get("auth_mode", "login")).strip().lower()
+    if mode in ("token", "api_key", "login"):
+        return mode
+    return "login"
+
+
+def get_vexboost_login() -> str:
+    return str(load_settings().get("vexboost_login", "")).strip()
+
+
+def get_vexboost_password() -> str:
+    return str(load_settings().get("vexboost_password", ""))
 
 
 def get_panel_url() -> str:
@@ -261,9 +276,18 @@ def get_cookie_name() -> str:
 
 
 def is_api_configured() -> bool:
-    if get_auth_mode() == "token":
+    mode = get_auth_mode()
+    if mode == "login":
+        return bool(get_panel_url() and get_vexboost_login() and get_vexboost_password())
+    if mode == "token":
         return bool(get_panel_url() and get_auth_token())
     return bool(get_api_key())
+
+
+def _invalidate_vexboost_session() -> None:
+    with _session_cache_lock:
+        _vexboost_session_cache["session"] = None
+        _vexboost_session_cache["expires_at"] = 0.0
 
 
 def _normalize_auth_token(raw: str) -> str:
@@ -627,7 +651,8 @@ class VexBoostAPI:
         "user_inactive": "API-ключ неактивен. Используйте AuthToken или активируйте API на vexboost.ru",
         "incorrect api key": "Неверный API KEY. Обновите в /vexboost",
         "invalid api key": "Неверный API KEY. Обновите в /vexboost",
-        "unauthorized": "AuthToken недействителен или истёк. Скопируйте новый socpanel_session из Cookie-Editor",
+        "unauthorized": "Сессия истекла. Плагин попробует войти снова автоматически",
+        "invalid_credentials": "Неверный логин или пароль VexBoost",
         "not enough funds": "Недостаточно средств на балансе VexBoost",
         "incorrect service id": "Неверный ID услуги (ID: в лоте)",
         "invalid link": "Некорректная ссылка для этой услуги",
@@ -735,13 +760,16 @@ class VexBoostAPI:
         return urlparse(get_panel_url()).netloc
 
     @classmethod
-    def _make_session(cls) -> Tuple[Optional[requests.Session], str]:
+    def _apply_csrf(cls, session: requests.Session) -> None:
         from urllib.parse import unquote
 
-        token = _normalize_auth_token(get_auth_token())
-        if not token:
-            return None, "AuthToken не задан. /vexboost → AuthToken"
+        session.get(f"{get_panel_url()}/api/csrf-cookie", timeout=45)
+        xsrf = session.cookies.get("XSRF-TOKEN")
+        if xsrf:
+            session.headers["X-XSRF-TOKEN"] = unquote(xsrf)
 
+    @classmethod
+    def _new_http_session(cls) -> requests.Session:
         session = requests.Session()
         session.headers.update({
             **cls.HEADERS,
@@ -749,18 +777,76 @@ class VexBoostAPI:
             "Content-Type": "application/json",
             "X-Site-Host": cls._panel_host(),
         })
-        session.cookies.set(get_cookie_name(), unquote(token), domain=cls._panel_host())
+        return session
 
+    @classmethod
+    def _session_from_login(cls, force: bool = False) -> Tuple[Optional[requests.Session], str]:
+        login = get_vexboost_login()
+        password = get_vexboost_password()
+        if not login or not password:
+            return None, "Логин/пароль не заданы. /vexboost → Логин и Пароль"
+
+        now = time.time()
+        ttl = int(load_settings().get("session_ttl", 5400))
+        if not force:
+            with _session_cache_lock:
+                cached = _vexboost_session_cache.get("session")
+                if cached is not None and _vexboost_session_cache.get("expires_at", 0) > now:
+                    return cached, ""
+
+        session = cls._new_http_session()
         try:
-            session.get(f"{get_panel_url()}/api/csrf-cookie", timeout=45)
+            cls._apply_csrf(session)
+            response = session.post(
+                f"{get_panel_url()}/api/login",
+                json={"login": login, "password": password},
+                timeout=45,
+            )
+        except requests.RequestException as exc:
+            return None, f"Ошибка входа: {exc}"
+
+        data = cls._parse_response(response) or {}
+        if response.status_code >= 400 or data.get("error"):
+            err = cls.format_error(data.get("error", f"HTTP {response.status_code}"))
+            _invalidate_vexboost_session()
+            return None, err
+
+        cookie_val = session.cookies.get(get_cookie_name())
+        if not cookie_val:
+            return None, "Вход выполнен, но cookie сессии не получена"
+
+        settings = load_settings()
+        settings["auth_token"] = cookie_val
+        save_settings(settings)
+
+        with _session_cache_lock:
+            _vexboost_session_cache["session"] = session
+            _vexboost_session_cache["expires_at"] = now + max(600, ttl)
+
+        logger.info("%s: автовход VexBoost выполнен для %s", LOGGER_PREFIX, login)
+        return session, ""
+
+    @classmethod
+    def _session_from_token(cls) -> Tuple[Optional[requests.Session], str]:
+        from urllib.parse import unquote
+
+        token = _normalize_auth_token(get_auth_token())
+        if not token:
+            return None, "AuthToken не задан. /vexboost → AuthToken"
+
+        session = cls._new_http_session()
+        session.cookies.set(get_cookie_name(), unquote(token), domain=cls._panel_host())
+        try:
+            cls._apply_csrf(session)
         except requests.RequestException as exc:
             return None, f"Ошибка сети (CSRF): {exc}"
-
-        xsrf = session.cookies.get("XSRF-TOKEN")
-        if xsrf:
-            session.headers["X-XSRF-TOKEN"] = unquote(xsrf)
-
         return session, ""
+
+    @classmethod
+    def _make_session(cls, force_login: bool = False) -> Tuple[Optional[requests.Session], str]:
+        if get_auth_mode() == "login":
+            return cls._session_from_login(force=force_login)
+        return cls._session_from_token()
 
     @classmethod
     def _request_token(
@@ -777,8 +863,9 @@ class VexBoostAPI:
         if not api_path.startswith("api/"):
             api_path = f"api/{api_path}"
 
+        force_login = False
         for attempt in range(1, retries + 1):
-            session, err = cls._make_session()
+            session, err = cls._make_session(force_login=force_login)
             if not session:
                 return {"error": err}
 
@@ -794,7 +881,9 @@ class VexBoostAPI:
                     time.sleep(delay * attempt)
                 continue
 
-            if response.status_code == 419 and attempt < retries:
+            if response.status_code in (401, 419) and attempt < retries:
+                _invalidate_vexboost_session()
+                force_login = get_auth_mode() == "login"
                 time.sleep(delay)
                 continue
 
@@ -805,6 +894,12 @@ class VexBoostAPI:
                     time.sleep(delay * attempt)
                 continue
 
+            if data.get("error") == "unauthorized" and attempt < retries:
+                _invalidate_vexboost_session()
+                force_login = get_auth_mode() == "login"
+                time.sleep(delay)
+                continue
+
             if "error" in data:
                 data["error"] = cls.format_error(data["error"])
             return data
@@ -813,7 +908,7 @@ class VexBoostAPI:
 
     @classmethod
     def _request(cls, params: Dict[str, Any]) -> Dict[str, Any]:
-        if get_auth_mode() == "token":
+        if get_auth_mode() in ("token", "login"):
             return cls._request_token_mode(params)
         return cls._request_key(params)
 
@@ -1557,8 +1652,9 @@ def _check_all_active_orders(c: "Cardinal") -> None:
         return
 
     settings = load_settings()
-    api_url = get_panel_url() if get_auth_mode() == "token" else get_api_url()
-    api_key = get_auth_token() if get_auth_mode() == "token" else get_api_key()
+    mode = get_auth_mode()
+    api_url = get_panel_url() if mode in ("token", "login") else get_api_url()
+    api_key = get_auth_token() if mode in ("token", "login") else get_api_key()
     updated: Dict[str, Any] = {}
     to_notify_complete: List[str] = []
     to_notify_cancel: List[str] = []
@@ -1723,13 +1819,23 @@ def _handle_partial_order(
 
 def _main_keyboard() -> InlineKeyboardMarkup:
     kb = InlineKeyboardMarkup(row_width=2)
-    if get_auth_mode() == "token":
+    mode = get_auth_mode()
+    if mode == "login":
+        kb.row(
+            InlineKeyboardButton("🔗 URL", callback_data="vb_set_panel_url"),
+            InlineKeyboardButton("👤 Логин", callback_data="vb_set_login"),
+        )
+        kb.row(
+            InlineKeyboardButton("🔒 Пароль", callback_data="vb_set_password"),
+            InlineKeyboardButton("✅ Режим: Логин", callback_data="vb_auth_mode_menu"),
+        )
+    elif mode == "token":
         kb.row(
             InlineKeyboardButton("🔗 URL", callback_data="vb_set_panel_url"),
             InlineKeyboardButton("🔑 AuthToken", callback_data="vb_set_token"),
         )
         kb.row(
-            InlineKeyboardButton("🔐 Режим: AuthToken ✓", callback_data="vb_auth_mode_key"),
+            InlineKeyboardButton("🍪 Режим: AuthToken", callback_data="vb_auth_mode_menu"),
         )
     else:
         kb.row(
@@ -1737,7 +1843,7 @@ def _main_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton("🔐 API KEY", callback_data="vb_set_key"),
         )
         kb.row(
-            InlineKeyboardButton("🍪 Режим: API KEY ✓", callback_data="vb_auth_mode_token"),
+            InlineKeyboardButton("🔑 Режим: API KEY", callback_data="vb_auth_mode_menu"),
         )
     kb.row(
         InlineKeyboardButton("📊 Статистика", callback_data="vb_stats_menu"),
@@ -1806,7 +1912,18 @@ def _settings_keyboard(settings: Dict[str, Any]) -> InlineKeyboardMarkup:
 def _settings_summary(settings: Dict[str, Any]) -> str:
     refund_err = "🟢" if settings.get("auto_refund_on_error") else "🔴"
     refund_cancel = "🟢" if settings.get("auto_refund_on_cancel") else "🔴"
-    if get_auth_mode() == "token":
+    mode = get_auth_mode()
+    if mode == "login":
+        login = get_vexboost_login()
+        login_display = login if len(login) < 24 else login[:20] + "..."
+        pwd_set = "задан" if get_vexboost_password() else "не задан"
+        auth_block = (
+            f"👤 Режим: <b>Логин + пароль</b> (автовход)\n"
+            f"🔗 URL: <code>{get_panel_url()}</code>\n"
+            f"👤 Логин: <code>{login_display or 'не задан'}</code>\n"
+            f"🔒 Пароль: <code>{pwd_set}</code>\n"
+        )
+    elif mode == "token":
         token = get_auth_token()
         token_display = ("***" + token[-6:]) if len(token) > 6 else "не задан"
         auth_block = (
@@ -1839,12 +1956,13 @@ def _settings_summary(settings: Dict[str, Any]) -> str:
 def _help_text() -> str:
     return (
         f"ℹ️ <b>Справка {NAME}</b>\n\n"
-        f"<b>AuthToken (рекомендуется):</b>\n"
-        f"1. Войдите на vexboost.ru в браузере\n"
-        f"2. Откройте расширение Cookie-Editor\n"
-        f"3. Найдите cookie <code>socpanel_session</code>\n"
-        f"4. Скопируйте <b>Value</b> → /vexboost → AuthToken\n"
-        f"5. URL: <code>https://vexboost.ru</code>\n\n"
+        f"<b>Логин + пароль (рекомендуется, 24/7):</b>\n"
+        f"1. /vexboost → URL: <code>https://vexboost.ru</code>\n"
+        f"2. Логин — email или логин с vexboost.ru\n"
+        f"3. Пароль — от аккаунта VexBoost\n"
+        f"4. /vb_balance — проверка\n\n"
+        f"<b>AuthToken (временно, ~2 ч):</b>\n"
+        f"Cookie-Editor → <code>socpanel_session</code> → Value\n\n"
         f"<b>Настройка лотов:</b>\n"
         f"В описании лота укажите ID услуги с vexboost.ru:\n"
         f"<code>ID: 1634</code>\n"
@@ -1931,23 +2049,64 @@ def init_commands(cardinal: "Cardinal", *args) -> None:
                              user_id=call.from_user.id, state="vb_auth_token")
                 bot.answer_callback_query(call.id)
 
-            elif call.data == "vb_auth_mode_token":
-                settings["auth_mode"] = "token"
+            elif call.data == "vb_auth_mode_menu":
+                mode_kb = InlineKeyboardMarkup(row_width=1)
+                mode_kb.add(
+                    InlineKeyboardButton("👤 Логин + пароль", callback_data="vb_auth_mode_login"),
+                    InlineKeyboardButton("🍪 AuthToken (cookie)", callback_data="vb_auth_mode_token"),
+                    InlineKeyboardButton("🔑 API KEY", callback_data="vb_auth_mode_key"),
+                    InlineKeyboardButton("⬅️ Назад", callback_data="vb_back_main"),
+                )
+                bot.edit_message_text(
+                    "Выберите способ авторизации VexBoost:",
+                    chat_id, msg_id, reply_markup=mode_kb,
+                )
+                bot.answer_callback_query(call.id)
+
+            elif call.data == "vb_auth_mode_login":
+                settings["auth_mode"] = "login"
+                _invalidate_vexboost_session()
                 save_settings(settings)
                 bot.edit_message_text(
                     _settings_summary(settings), chat_id, msg_id,
                     reply_markup=_main_keyboard(), parse_mode="HTML",
                 )
-                bot.answer_callback_query(call.id, "Режим AuthToken")
+                bot.answer_callback_query(call.id, "Режим: Логин + пароль")
+
+            elif call.data == "vb_auth_mode_token":
+                settings["auth_mode"] = "token"
+                _invalidate_vexboost_session()
+                save_settings(settings)
+                bot.edit_message_text(
+                    _settings_summary(settings), chat_id, msg_id,
+                    reply_markup=_main_keyboard(), parse_mode="HTML",
+                )
+                bot.answer_callback_query(call.id, "Режим: AuthToken")
 
             elif call.data == "vb_auth_mode_key":
                 settings["auth_mode"] = "api_key"
+                _invalidate_vexboost_session()
                 save_settings(settings)
                 bot.edit_message_text(
                     _settings_summary(settings), chat_id, msg_id,
                     reply_markup=_main_keyboard(), parse_mode="HTML",
                 )
-                bot.answer_callback_query(call.id, "Режим API KEY")
+                bot.answer_callback_query(call.id, "Режим: API KEY")
+
+            elif call.data == "vb_set_login":
+                result = bot.send_message(
+                    chat_id,
+                    "Введите логин VexBoost (email или логин с сайта):",
+                )
+                tg.set_state(chat_id=chat_id, message_id=result.id,
+                             user_id=call.from_user.id, state="vb_panel_login")
+                bot.answer_callback_query(call.id)
+
+            elif call.data == "vb_set_password":
+                result = bot.send_message(chat_id, "Введите пароль от аккаунта VexBoost:")
+                tg.set_state(chat_id=chat_id, message_id=result.id,
+                             user_id=call.from_user.id, state="vb_panel_password")
+                bot.answer_callback_query(call.id)
 
             elif call.data == "vb_set_url":
                 result = bot.send_message(
@@ -2098,9 +2257,26 @@ def init_commands(cardinal: "Cardinal", *args) -> None:
             bot.reply_to(
                 message, f"✅ URL: <code>{settings['panel_url']}</code>", parse_mode="HTML",
             )
+        elif state == "vb_panel_login":
+            settings["vexboost_login"] = message.text.strip()
+            settings["auth_mode"] = "login"
+            _invalidate_vexboost_session()
+            save_settings(settings)
+            bot.reply_to(message, f"✅ Логин сохранён: <code>{settings['vexboost_login']}</code>", parse_mode="HTML")
+        elif state == "vb_panel_password":
+            settings["vexboost_password"] = message.text
+            settings["auth_mode"] = "login"
+            _invalidate_vexboost_session()
+            save_settings(settings)
+            try:
+                bot.delete_message(message.chat.id, message.message_id)
+            except Exception:
+                pass
+            bot.reply_to(message, "✅ Пароль сохранён. Проверьте: /vb_balance")
         elif state == "vb_auth_token":
             settings["auth_token"] = _normalize_auth_token(message.text)
             settings["auth_mode"] = "token"
+            _invalidate_vexboost_session()
             save_settings(settings)
             bot.reply_to(message, "✅ AuthToken сохранён. Проверьте: /vb_balance")
         elif state == "vb_api_url":
@@ -2110,6 +2286,7 @@ def init_commands(cardinal: "Cardinal", *args) -> None:
         elif state == "vb_api_key":
             settings["api_key"] = message.text.strip()
             settings["auth_mode"] = "api_key"
+            _invalidate_vexboost_session()
             save_settings(settings)
             bot.reply_to(message, "✅ API KEY сохранён.")
         tg.clear_state(message.chat.id, message.from_user.id)
@@ -2119,6 +2296,8 @@ def init_commands(cardinal: "Cardinal", *args) -> None:
         handle_text_input,
         func=lambda m: (
             tg.check_state(m.chat.id, m.from_user.id, "vb_panel_url")
+            or tg.check_state(m.chat.id, m.from_user.id, "vb_panel_login")
+            or tg.check_state(m.chat.id, m.from_user.id, "vb_panel_password")
             or tg.check_state(m.chat.id, m.from_user.id, "vb_auth_token")
             or tg.check_state(m.chat.id, m.from_user.id, "vb_api_url")
             or tg.check_state(m.chat.id, m.from_user.id, "vb_api_key")
@@ -2304,27 +2483,39 @@ class PluginHealthCheck:
     @staticmethod
     def check_api() -> Tuple[bool, str]:
         if not is_api_configured():
-            if get_auth_mode() == "token":
+            mode = get_auth_mode()
+            if mode == "login":
+                return False, "Задайте URL, логин и пароль (/vexboost)"
+            if mode == "token":
                 return False, "Задайте URL и AuthToken (/vexboost)"
             return False, "API KEY не задан (/vexboost)"
         balance = VexBoostAPI.get_balance()
         if balance:
-            mode = "AuthToken" if get_auth_mode() == "token" else "API KEY"
-            return True, f"{mode} OK, баланс: {balance[0]:.2f} {balance[1]}"
+            labels = {"login": "Логин", "token": "AuthToken", "api_key": "API KEY"}
+            return True, f"{labels.get(get_auth_mode(), 'API')} OK, баланс: {balance[0]:.2f} {balance[1]}"
         err = VexBoostAPI.get_balance_error()
         return False, err or "API не отвечает"
 
     @staticmethod
     def check_settings() -> Tuple[bool, str]:
         settings = load_settings()
-        if get_auth_mode() == "token":
+        mode = get_auth_mode()
+        if mode == "login":
             if not get_panel_url():
-                return False, "Не задан panel_url"
+                return False, "Не задан URL"
+            if not get_vexboost_login():
+                return False, "Не задан логин"
+            if not get_vexboost_password():
+                return False, "Не задан пароль"
+            return True, "Логин-режим настроен"
+        if mode == "token":
+            if not get_panel_url():
+                return False, "Не задан URL"
             if not get_auth_token():
-                return False, "Не задан auth_token"
+                return False, "Не задан AuthToken"
             return True, "AuthToken-режим настроен"
         if not get_api_key():
-            return False, "Не задан api_key"
+            return False, "Не задан API KEY"
         return True, "API KEY-режим настроен"
 
     @classmethod
