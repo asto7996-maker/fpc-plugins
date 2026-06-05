@@ -1,29 +1,14 @@
-# VexBoost AutoSMM v2.0.0 — плагин автонакрутки для FunPay Cardinal
 from __future__ import annotations
 
+# === ОБЯЗАТЕЛЬНЫЕ ПОЛЯ FunPay Cardinal (НЕ УДАЛЯТЬ) ===
 NAME = "VexBoost AutoSMM"
-VERSION = "2.0.1"
-DESCRIPTION = "Полная автонакрутка через VexBoost: статистика, прибыль, стабильная обработка заказов"
+VERSION = "2.0.2"
+DESCRIPTION = "Автонакрутка через VexBoost (vexboost.ru)"
 CREDITS = "Cursor AI"
 UUID = "a3f8c2e1-7b4d-4a9f-9e2c-1d5b8f6a0c3e"
 SETTINGS_PAGE = False
 BIND_TO_DELETE = None
-
-"""
-╔══════════════════════════════════════════════════════════════════╗
-║  VexBoost AutoSMM v2.0.0 — FunPay Cardinal Plugin               ║
-╠══════════════════════════════════════════════════════════════════╣
-║  Настройка:  /vexboost  в Telegram-боте Cardinal                ║
-║  Статистика: /vb_stats                                           ║
-║  Баланс:     /vb_balance                                         ║
-║                                                                  ║
-║  В описании лота:                                                ║
-║    ID: 1634          — ID услуги на vexboost.ru                  ║
-║    #Quan: 10         — множитель количества (опционально)        ║
-║                                                                  ║
-║  Команды покупателя: #статус <id>  |  #рефилл <id>              ║
-╚══════════════════════════════════════════════════════════════════╝
-"""
+# === КОНЕЦ ОБЯЗАТЕЛЬНЫХ ПОЛЕЙ ===
 
 import json
 import logging
@@ -602,40 +587,48 @@ class VexBoostAPI:
 
     @classmethod
     def _request(cls, params: Dict[str, Any]) -> Dict[str, Any]:
+        from urllib.parse import urlencode
+
         api_url = get_api_url()
         api_key = get_api_key()
         if not api_key:
             return {"error": "API ключ не задан. Используйте /vexboost"}
         payload = {"key": api_key, **params}
         retries, delay = cls._get_retry_settings()
+        query = urlencode(payload)
+        get_url = f"{api_url}?{query}"
 
         for attempt in range(1, retries + 1):
-            for method in ("get", "post"):
+            # Сначала GET (как AutoSmm) — VexBoost так работает стабильнее
+            for request_fn, label in (
+                (lambda: requests.get(get_url, timeout=45), "GET"),
+                (lambda: requests.get(api_url, params=payload, timeout=45), "GET-params"),
+                (lambda: requests.post(api_url, data=payload, timeout=45), "POST"),
+            ):
                 try:
-                    if method == "get":
-                        response = requests.get(api_url, params=payload, timeout=30)
-                    else:
-                        response = requests.post(api_url, data=payload, timeout=30)
+                    response = request_fn()
                     response.raise_for_status()
                     data = response.json()
                     if isinstance(data, dict):
                         return data
+                    if isinstance(data, list):
+                        return {"services": data}
                     return {"error": "Некорректный ответ API"}
                 except requests.Timeout:
                     logger.warning(
-                        "%s: таймаут API %s (попытка %d/%d)",
-                        LOGGER_PREFIX, method.upper(), attempt, retries,
+                        "%s: таймаут %s (попытка %d/%d)",
+                        LOGGER_PREFIX, label, attempt, retries,
                     )
                 except requests.RequestException as exc:
                     logger.warning(
-                        "%s: ошибка API %s (попытка %d/%d): %s",
-                        LOGGER_PREFIX, method.upper(), attempt, retries, exc,
+                        "%s: ошибка %s (попытка %d/%d): %s",
+                        LOGGER_PREFIX, label, attempt, retries, exc,
                     )
                 except ValueError:
-                    return {"error": "Некорректный JSON ответ"}
+                    logger.warning("%s: не-JSON ответ от %s", LOGGER_PREFIX, label)
             if attempt < retries:
                 time.sleep(delay * attempt)
-        return {"error": "Не удалось связаться с VexBoost после нескольких попыток"}
+        return {"error": "Не удалось связаться с VexBoost. Проверьте API KEY и баланс на vexboost.ru"}
 
     @classmethod
     def get_balance(cls) -> Optional[Tuple[float, str]]:
