@@ -56,7 +56,7 @@ nano .env
 BOT_TOKEN=123456789:replace_me
 ADMIN_IDS=123456789
 TARGET_CHANNEL_ID=@your_public_channel
-AD_SIGNATURE=Подписывайтесь: https://t.me/your_public_channel
+AD_SIGNATURE="Подписывайтесь: https://t.me/your_public_channel"
 ```
 
 Проверка:

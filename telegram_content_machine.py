@@ -197,6 +197,22 @@ def infer_media_type(url: str, mime_type: str = "") -> str:
     return "text"
 
 
+def message_has_media(message: Dict[str, Any]) -> bool:
+    return any(
+        key in message
+        for key in (
+            "photo",
+            "video",
+            "document",
+            "audio",
+            "animation",
+            "voice",
+            "video_note",
+            "sticker",
+        )
+    )
+
+
 @dataclasses.dataclass(frozen=True)
 class Config:
     bot_token: str
@@ -1415,6 +1431,7 @@ class ContentBot:
     def handle_channel_post(self, message: Dict[str, Any]) -> None:
         chat = message.get("chat") or {}
         chat_id = int(chat.get("id") or 0)
+        message_id = int(message.get("message_id") or 0)
         if chat_id not in self.config.allowed_channel_ids:
             LOGGER.info("Ignoring channel post from non-allowed channel %s", chat_id)
             return
@@ -1422,13 +1439,16 @@ class ContentBot:
         title = str(chat.get("title") or chat.get("username") or chat_id)
         media_url = ""
         media_type = "text"
-        link = self.message_public_link(chat, int(message.get("message_id") or 0))
+        if message_has_media(message) and message_id:
+            media_type = "telegram_copy"
+            media_url = f"{chat_id}:{message_id}"
+        link = self.message_public_link(chat, message_id)
         status = "pending" if self.config.review_required else "approved"
         post_id = self.storage.create_post(
             source_type="telegram_channel",
             source_id=str(chat_id),
             source_name=title,
-            external_id=str(message.get("message_id") or ""),
+            external_id=str(message_id),
             title=truncate(compact_whitespace(text), 120),
             text=text,
             link=link,
@@ -1498,7 +1518,15 @@ class ContentBot:
     def publish_post(self, post: Post) -> None:
         caption = self.compose_post_text(post)
         try:
-            if post.media_url and post.media_type == "photo":
+            if post.media_url and post.media_type == "telegram_copy":
+                from_chat_id, message_id = self.parse_copy_source(post.media_url)
+                self.api.copy_message(
+                    self.config.target_channel_id,
+                    from_chat_id,
+                    message_id,
+                    caption=caption,
+                )
+            elif post.media_url and post.media_type == "photo":
                 self.api.send_photo(self.config.target_channel_id, post.media_url, caption)
             elif post.media_url and post.media_type == "video":
                 self.api.send_video(self.config.target_channel_id, post.media_url, caption)
@@ -1525,6 +1553,14 @@ class ContentBot:
             )
             self.notify_admins(f"⚠️ Не удалось опубликовать пост #{post.id}: {exc}")
             raise
+
+    @staticmethod
+    def parse_copy_source(value: str) -> Tuple[str, int]:
+        chat_id, _, raw_message_id = value.partition(":")
+        message_id = parse_int(raw_message_id, 0)
+        if not chat_id or not message_id:
+            raise ValueError("invalid telegram copy source")
+        return chat_id, message_id
 
     def compose_post_text(self, post: Post) -> str:
         pieces: List[str] = []
