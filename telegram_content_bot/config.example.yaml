@@ -1,0 +1,121 @@
+# ============================================================
+# Content Bot — Конфигурация
+# ============================================================
+# Скопируйте этот файл как config.yaml и заполните данные.
+# ============================================================
+
+# --- Telegram API ---
+# Получите api_id и api_hash на https://my.telegram.org/apps
+# Бот-токен получите у @BotFather
+telegram:
+  api_id: 12345
+  api_hash: "your_api_hash_here"
+  bot_token: "123456:ABC-your-bot-token"
+  session_name: "content_bot_session"
+  phone: "+79001234567"  # Номер телефона для userbot-авторизации
+
+# --- Администраторы ---
+# Telegram user IDs, которые имеют доступ к командам бота
+admin:
+  user_ids:
+    - 123456789
+  chat_ids: []
+
+# --- Каналы-доноры ---
+# Список каналов для мониторинга (username или ID)
+donors:
+  - "@example_channel_1"
+  - "@example_channel_2"
+  - "@example_channel_3"
+
+# --- Целевой канал ---
+# Канал, в который будут публиковаться посты
+target:
+  channel_id: 0  # Числовой ID канала (приоритетнее username)
+  channel_username: "@your_target_channel"
+
+# --- Настройки публикации ---
+posting:
+  min_delay_seconds: 300      # Минимальная задержка между постами (5 мин)
+  max_delay_seconds: 900      # Максимальная задержка (15 мин)
+  caption_template: ""         # Шаблон: {caption}, {donor}, {link}, {newline}
+  append_link: ""              # Ссылка, добавляемая к каждому посту
+  remove_original_caption: false
+  remove_original_links: false
+  add_signature: false
+  signature_text: ""
+  post_immediately: false      # Публиковать сразу без задержки
+  max_queue_size: 500          # Максимальный размер очереди
+  schedule_hours:
+    start: 8                   # Начало публикации (час)
+    end: 23                    # Конец публикации (час)
+  shuffle_queue: false
+
+# --- Мониторинг ---
+monitoring:
+  enabled: true
+  check_interval_seconds: 30   # Интервал проверки пропущенных постов
+  max_post_age_hours: 24       # Максимальный возраст поста для обработки
+  skip_forwards: false         # Пропускать пересланные посты
+  skip_edits: true             # Пропускать отредактированные посты
+  download_timeout_seconds: 120
+
+# --- Фильтры ---
+filters:
+  min_text_length: 0           # 0 = без ограничения
+  max_text_length: 0           # 0 = без ограничения
+  min_views: 0                 # 0 = без ограничения
+  required_media_types: []     # ["photo", "video"] — только эти типы
+  blocked_media_types: []      # ["sticker", "voice"] — блокировать эти типы
+  keyword_whitelist: []        # Пост должен содержать хотя бы одно слово
+  keyword_blacklist: []        # Пост НЕ должен содержать эти слова
+  regex_whitelist: []
+  regex_blacklist: []
+  skip_ads: true               # Пропускать посты с рекламой
+  ad_keywords:
+    - "реклама"
+    - "партнёр"
+    - "промокод"
+    - "#реклама"
+    - "#ad"
+    - "sponsor"
+  duplicate_check: true
+  duplicate_similarity_threshold: 0.85
+
+# --- Медиа ---
+media:
+  download_dir: "downloads"
+  max_file_size_mb: 50
+  strip_metadata: true         # Очищать метаданные (EXIF, etc.)
+  reencode_video: false        # Перекодировать видео (медленно)
+  video_codec: "libx264"
+  video_bitrate: "2M"
+  add_watermark: false
+  watermark_text: ""
+  watermark_position: "bottom_right"  # top_left, top_right, bottom_left, bottom_right, center
+  watermark_opacity: 0.5
+  cleanup_after_post: true     # Удалять файлы после публикации
+  compress_images: false
+  image_quality: 85
+
+# --- База данных ---
+database:
+  path: "bot_database.db"
+  cleanup_days: 30             # Удалять записи старше N дней
+
+# --- Логирование ---
+logging:
+  level: "INFO"                # DEBUG, INFO, WARNING, ERROR
+  file: "bot.log"
+  max_bytes: 10000000          # 10 MB
+  backup_count: 5
+  console_output: true
+
+# --- Прокси ---
+proxy:
+  enabled: false
+  type: "socks5"               # socks5, socks4, http
+  host: "127.0.0.1"
+  port: 9050
+  username: ""
+  password: ""

@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.env
+config.yaml
+*.session
+*.session-journal
+bot_database.db
+bot.log
+bot.log.*
+downloads/
