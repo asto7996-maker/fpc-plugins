@@ -1,0 +1,33 @@
+# Environment & secrets
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+venv/
+*.egg-info/
+
+# Session files (contain auth tokens)
+sessions/*.session
+sessions/*.session-journal
+
+# Runtime data
+data/*.db
+data/*.db-wal
+data/*.db-shm
+
+# Temp media
+media/*
+!media/.gitkeep
+
+# Logs
+logs/*.log
+logs/*.log.*
+
+# Editor
+.vscode/
+.idea/
+*.swp

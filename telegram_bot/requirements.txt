@@ -1,0 +1,19 @@
+# Core async Telegram libraries
+python-telegram-bot[job-queue]==21.6
+Telethon==1.36.0
+
+# Async SQLite
+aiosqlite==0.20.0
+
+# Media metadata stripping
+mutagen==1.47.0
+Pillow==10.4.0
+
+# Proxy support for Telethon
+PySocks==1.7.1
+
+# Env vars from .env file
+python-dotenv==1.0.1
+
+# Optional: faster event loop (Linux/macOS)
+uvloop==0.21.0; sys_platform != "win32"
