@@ -5,7 +5,7 @@
 set -e
 
 FPC_DIR="${1:-/home/fpc/FunPayCardinal}"
-PLUGIN_URL="https://raw.githubusercontent.com/asto7996-maker/fpc-plugins/cursor/vexboost-autosmm-plugin-00fa/plugins/vexboost_autosmm.py"
+PLUGIN_URL="https://raw.githubusercontent.com/asto7996-maker/fpc-plugins/main/plugins/vexboost_autosmm.py"
 PLUGIN_FILE="$FPC_DIR/plugins/vexboost_autosmm.py"
 
 echo "=== Установка VexBoost AutoSMM ==="

@@ -25,18 +25,34 @@ pip install requests pyTelegramBotAPI
 
 ## 3. Установка плагина
 
+> **Важно:** репозиторий приватный — `curl` с raw.githubusercontent.com вернёт **404**.
+> Используйте `git clone` (см. ниже).
+
+### Способ A — через git clone (рекомендуется)
+
 ```bash
-# Скачать плагин (или скопировать вручную)
-cd /home/fpc/FunPayCardinal/plugins
+cd /tmp
+git clone https://github.com/asto7996-maker/fpc-plugins.git
+cp fpc-plugins/plugins/vexboost_autosmm.py /home/fpc/FunPayCardinal/plugins/
+rm -rf /home/fpc/FunPayCardinal/plugins/__pycache__
+grep -E "^(VERSION|SETTINGS_PAGE)" /home/fpc/FunPayCardinal/plugins/vexboost_autosmm.py
+```
 
-# Удалить старую версию и кэш
-rm -f vexboost_autosmm.py
-rm -rf __pycache__
+Должно быть:
+```
+VERSION = "2.0.2"
+SETTINGS_PAGE = False
+```
 
-# Скопировать новый файл vexboost_autosmm.py в эту папку
-# Проверить версию в файле:
-grep 'VERSION = ' vexboost_autosmm.py
-# Должно быть: VERSION = "2.0.0"
+Если `git clone` просит авторизацию — используйте Personal Access Token:
+```bash
+git clone https://<ВАШ_TOKEN>@github.com/asto7996-maker/fpc-plugins.git
+```
+
+### Способ B — скрипт установки (только для публичного репо)
+
+```bash
+bash install_vexboost.sh /home/fpc/FunPayCardinal
 ```
 
 ## 4. Перезапуск бота
