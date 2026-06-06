@@ -1,837 +1,661 @@
 from __future__ import annotations
 
-# === ОБЯЗАТЕЛЬНЫЕ ПОЛЯ FunPay Cardinal (НЕ УДАЛЯТЬ) ===
-NAME = "Gemini Review Reply"
-VERSION = "1.0.0"
-DESCRIPTION = "ИИ-ответы на отзывы покупателей через Google Gemini"
-CREDITS = "Cursor AI"
-UUID = "c4e8b2f1-9a3d-4e7b-8c6f-2d1a5e9b0c3f"
-SETTINGS_PAGE = False
-BIND_TO_DELETE = None
-# === КОНЕЦ ОБЯЗАТЕЛЬНЫХ ПОЛЕЙ ===
+# ──────────────────────────────────────────────────────────────────────────────
+#  Gemini Review Reply v2.0 — FunPay Cardinal plugin
+#  Автоматически отвечает на отзывы покупателей через Google Gemini AI
+# ──────────────────────────────────────────────────────────────────────────────
 
 import hashlib
 import json
 import logging
 import os
+import random
 import re
-import threading
 import time
-import traceback
 from datetime import datetime
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
+from typing import Final
 
-import requests
-from telebot.types import InlineKeyboardButton, InlineKeyboardMarkup
+from FunPayAPI.common.utils import RegularExpressions
+from FunPayAPI.types import MessageTypes
+from FunPayAPI.updater.events import NewMessageEvent
+from cardinal import Cardinal
+from tg_bot import CBT
+from telebot.types import InlineKeyboardMarkup as IKM, InlineKeyboardButton as IKB
+import telebot
 
-from FunPayAPI.common.enums import OrderStatuses
-from FunPayAPI.types import MessageTypes, Order
-from FunPayAPI.updater.events import LastChatMessageChangedEvent, NewMessageEvent
 
-if TYPE_CHECKING:
-    from cardinal import Cardinal
+def _pip(pkg: str) -> None:
+    from pip._internal.cli.main import main as _m
+    _m(["install", "-U", "-q", pkg])
 
-logger = logging.getLogger("FPC.GeminiReview")
-LOGGER_PREFIX = "GeminiReview"
 
-STORAGE_DIR = f"storage/plugins/{UUID}"
-SETTINGS_FILE = f"{STORAGE_DIR}/settings.json"
-HISTORY_FILE = f"{STORAGE_DIR}/history.json"
+try:
+    from requests import get as http_get, post as http_post
+except ImportError:
+    _pip("requests")
+    from requests import get as http_get, post as http_post
 
-DEFAULT_SYSTEM_PROMPT = """Ты — дружелюбный и внимательный продавец на маркетплейсе FunPay.
-Твоя задача — написать ответ продавца на отзыв покупателя.
 
-СТРОГИЕ ПРАВИЛА:
-1. НИКОГДА не упоминай имя, ник или любые обращения к покупателю по имени.
-2. ОБЯЗАТЕЛЬНО упомяни купленный товар: {product_name}.
-3. ОБЯЗАТЕЛЬНО укажи дату и время выполнения заказа: {order_datetime}.
-4. Пиши тёпло, позитивно, красочно. Можно умеренно использовать эмодзи.
-5. Вырази радость за отзыв, искреннюю благодарность, тёплые пожелания.
-6. Обязательно напиши, что ждём покупателя снова.
-7. Добавь короткий уместный анекдот или лёгкую шутку, связанную с отзывом или товаром.
-8. Отталкивайся от текста отзыва покупателя — ответь на его слова и настроение.
-9. Каждый ответ должен быть уникальным. Не повторяй формулировки из списка предыдущих ответов.
-10. Пиши только на русском языке.
-11. Не используй шаблонные фразы вроде «дорогой друг» с именем.
-12. Максимум 900 символов и не более 8 строк.
+# ── Метаданные ────────────────────────────────────────────────────────────────
+NAME          = "Gemini Review Reply"
+VERSION       = "2.0.0"
+DESCRIPTION   = "ИИ красочно и позитивно отвечает на отзывы через Gemini 🌈"
+CREDITS       = "Cursor AI"
+UUID          = "c4e8b2f1-9a3d-4e7b-8c6f-2d1a5e9b0c3f"
+SETTINGS_PAGE = True
+BIND_TO_DELETE = None
 
-ОСОБОЕ ПРАВИЛО ДЛЯ 1 ЗВЕЗДЫ:
-Если оценка 1 звезда — обязательно включи мысль о том, что данный отзыв не соответствует действительности,
-оставлен с целью ухудшения рейтинга и в скором времени будет удалён. Сохраняй вежливый, но твёрдый тон."""
+# ── Константы ─────────────────────────────────────────────────────────────────
+MIN_STARS:        Final[int]  = 1
+MAX_REVIEW_LEN:   Final[int]  = 999
+MAX_CHAT_LEN:     Final[int]  = 240
+SEND_IN_CHAT:     Final[bool] = True
+ONLY_NEW:         Final[bool] = True
+CHAT_HISTORY_MAX: Final[int]  = 20
+SETTINGS_FILE     = "storage/plugins/gemini_reviews.json"
+CHINESE_RE        = re.compile(r"[\u4e00-\u9fff]")
 
-DEFAULT_SETTINGS: Dict[str, Any] = {
-    "enabled": True,
-    "gemini_api_key": "AIzaSyA5c7Jm7DZhQ3O0A7Ld_Mh4HLq1eJpvoA0",
-    "gemini_model": "gemini-2.0-flash",
-    "proxy": "http://wgmGhd:FFhgh5@77.83.186.237:8000",
-    "system_prompt": DEFAULT_SYSTEM_PROMPT,
-    "send_chat_message": True,
-    "chat_message": (
-        "Спасибо за отзыв! 🙏\n"
-        "Нам очень приятно получать обратную связь.\n"
-        "Будем рады видеть вас снова! ✨"
-    ),
-    "reply_on_changed": True,
-    "skip_hidden_reviews": False,
-    "temperature": 0.95,
-    "max_history": 200,
-}
-
-_file_lock = threading.RLock()
-_processing_lock = threading.Lock()
-_processing_orders: set[str] = set()
+GEMINI_MODELS = [
+    "gemini-2.0-flash",
+    "gemini-1.5-flash",
+    "gemini-1.5-pro",
+]
 
 MONTHS_RU = [
     "января", "февраля", "марта", "апреля", "мая", "июня",
     "июля", "августа", "сентября", "октября", "ноября", "декабря",
 ]
 
+# ── Настройки ─────────────────────────────────────────────────────────────────
+DEFAULT_SETTINGS: dict = {
+    "gemini_api_key": "AIzaSyA5c7Jm7DZhQ3O0A7Ld_Mh4HLq1eJpvoA0",
+    "http_proxy":     "http://wgmGhd:FFhgh5@77.83.186.237:8000",
 
-def _ensure_storage() -> None:
-    os.makedirs(STORAGE_DIR, exist_ok=True)
+    "review_system": (
+        "Ты — харизматичный, живой и невероятно тёплый менеджер крутого магазина на FunPay. "
+        "Ты пишешь сплошным живым текстом — без разделителей, символов и заголовков. "
+        "Эмодзи вплетаешь прямо в текст между словами и в конце предложений. "
+        "Стиль — как сообщение от лучшего друга, который реально рад.\n"
+        "ЖЕЛЕЗНЫЕ правила — нарушать нельзя:\n"
+        "— Пиши ТОЛЬКО на русском языке\n"
+        "— НИКОГДА не упоминай имя покупателя\n"
+        "— Никаких обращений типа Дорогой/Уважаемый/Привет + имя\n"
+        "— Никаких ссылок, сайтов, политики, мата\n"
+        "— Никаких заголовков и символов-разделителей\n"
+        "— Сразу живой текст с места в карьер"
+    ),
+
+    "review_prompt": (
+        "Покупатель оставил отзыв. Напиши ответ от лица продавца.\n\n"
+        "ДАННЫЕ ЗАКАЗА:\n"
+        "Товар: {item}\n"
+        "Сумма: {cost} {currency}\n"
+        "Дата выполнения заказа: {order_datetime}\n"
+        "Оценка: {rating} из 5\n"
+        "Текст отзыва: {text}\n\n"
+        "ИСТОРИЯ ЧАТА (для анализа стиля общения):\n"
+        "{chat_history}\n\n"
+        "ИНСТРУКЦИЯ:\n\n"
+        "Шаг 1 — изучи историю чата и подстрой стиль ответа под покупателя.\n\n"
+        "Шаг 2а — если оценка 4–5 звёзд:\n"
+        "1) Радостная реакция на {rating}⭐\n"
+        "2) Отреагируй на текст отзыва — покажи, что прочитал\n"
+        "3) Обязательно упомяни товар {item} и дату выполнения {order_datetime}\n"
+        "4) Тёплое пожелание по теме товара\n"
+        "5) Приглашение вернуться + лёгкая шутка или анекдот в финале\n\n"
+        "Шаг 2б — если оценка 2–3 звезды:\n"
+        "1) Искреннее сожаление без оправданий\n"
+        "2) Попроси дождаться продавца — он уже в курсе\n"
+        "3) Заверь, что всё решится 🤝\n\n"
+        "Шаг 2в — если оценка 1 звезда:\n"
+        "1) Вежливо, но твёрдо укажи: данный отзыв не соответствует действительности, "
+        "оставлен с целью ухудшения рейтинга и в скором времени будет удалён\n"
+        "2) Упомяни товар {item} и дату выполнения {order_datetime}\n"
+        "3) Сохрани спокойный профессиональный тон\n\n"
+        "СТРОГИЕ ТРЕБОВАНИЯ:\n"
+        "— ЗАПРЕЩЕНО упоминать имя покупателя\n"
+        "— Сплошной живой текст\n"
+        "— 6–10 эмодзи органично в тексте\n"
+        "— Объём: 300–700 символов\n"
+        "— Каждый ответ уникален, не повторяй предыдущие\n\n"
+        "Отвечай ТОЛЬКО готовым текстом ответа."
+    ),
+
+    "chat_system": (
+        "Ты — дружелюбный менеджер магазина на FunPay. "
+        "Пишешь короткое личное сообщение покупателю после его отзыва. "
+        "Стиль: живой, тёплый, немного неформальный. Только на русском."
+    ),
+    "chat_prompt": (
+        "Покупатель оставил отзыв {rating}⭐ на товар {item}.\n\n"
+        "История общения с покупателем в чате:\n"
+        "{chat_history}\n\n"
+        "Напиши короткое живое сообщение в личный чат:\n"
+        "— Подстройся под стиль из истории чата\n"
+        "— Поблагодари за покупку и отзыв\n"
+        "— Пожелай удачи с товаром\n"
+        "— 2–3 эмодзи\n"
+        "— Не более 180 символов\n"
+        "— Без имени покупателя\n\n"
+        "Отвечай ТОЛЬКО текстом сообщения."
+    ),
+
+    "recent_replies": [],
+}
+
+SETTINGS: dict = dict(DEFAULT_SETTINGS)
+
+logger = logging.getLogger("FPC.GeminiReviews")
+_P = "[GeminiReviews]"
+logger.info(f"{_P} Плагин загружен v{VERSION}")
 
 
-def _load_json(path: str, default: Any) -> Any:
-    with _file_lock:
-        if not os.path.exists(path):
-            return default
-        try:
-            with open(path, "r", encoding="utf-8") as fh:
-                return json.load(fh)
-        except (json.JSONDecodeError, OSError) as exc:
-            logger.error("%s: ошибка чтения %s — %s", LOGGER_PREFIX, path, exc)
-            return default
+# ═════════════════════════════════════════════════════════════════════════════
+#  Утилиты
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _log(msg: str)  -> None: logger.info(f"{_P} {msg}")
+def _err(msg: str)  -> None: logger.error(f"{_P} {msg}")
 
 
-def _save_json(path: str, data: Any) -> None:
-    with _file_lock:
-        _ensure_storage()
-        tmp = f"{path}.tmp"
-        try:
-            with open(tmp, "w", encoding="utf-8") as fh:
-                json.dump(data, fh, indent=4, ensure_ascii=False)
-            os.replace(tmp, path)
-        except OSError as exc:
-            logger.error("%s: ошибка записи %s — %s", LOGGER_PREFIX, path, exc)
-            if os.path.exists(tmp):
-                try:
-                    os.remove(tmp)
-                except OSError:
-                    pass
+def _tg(cardinal: Cardinal, text: str) -> None:
+    try:
+        for uid in cardinal.telegram.authorized_users:
+            cardinal.telegram.bot.send_message(uid, text, parse_mode="HTML")
+    except Exception as e:
+        _err(f"tg_notify: {e}")
 
 
-def load_settings() -> Dict[str, Any]:
-    if not os.path.exists(SETTINGS_FILE):
-        settings = DEFAULT_SETTINGS.copy()
-        _save_json(SETTINGS_FILE, settings)
-        return settings
-    data = _load_json(SETTINGS_FILE, {})
-    merged = DEFAULT_SETTINGS.copy()
-    merged.update(data)
-    return merged
+def _save() -> None:
+    try:
+        os.makedirs(os.path.dirname(SETTINGS_FILE), exist_ok=True)
+        with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+            json.dump(SETTINGS, f, indent=4, ensure_ascii=False)
+    except Exception as e:
+        _err(f"save_settings: {e}")
 
 
-def save_settings(settings: Dict[str, Any]) -> None:
-    _save_json(SETTINGS_FILE, settings)
-
-
-def load_history() -> List[Dict[str, Any]]:
-    history = _load_json(HISTORY_FILE, [])
-    return history if isinstance(history, list) else []
-
-
-def save_history(history: List[Dict[str, Any]]) -> None:
-    settings = load_settings()
-    max_items = int(settings.get("max_history", 200))
-    _save_json(HISTORY_FILE, history[-max_items:])
-
-
-def _proxy_dict(proxy_url: str) -> Dict[str, str]:
-    proxy_url = (proxy_url or "").strip()
-    if not proxy_url:
-        return {}
-    return {"http": proxy_url, "https": proxy_url}
+def _load() -> dict:
+    try:
+        with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+            loaded = json.load(f)
+            for k, v in DEFAULT_SETTINGS.items():
+                loaded.setdefault(k, v)
+            if not isinstance(loaded.get("recent_replies"), list):
+                loaded["recent_replies"] = []
+            return loaded
+    except FileNotFoundError:
+        _save()
+        return dict(DEFAULT_SETTINGS)
+    except Exception as e:
+        _err(f"load_settings: {e}")
+        return dict(DEFAULT_SETTINGS)
 
 
 def _format_datetime(dt: datetime) -> str:
-    month = MONTHS_RU[dt.month - 1]
-    return f"{dt.day} {month} {dt.year} года, {dt.strftime('%H:%M')}"
+    return f"{dt.day} {MONTHS_RU[dt.month - 1]} {dt.year} года, {dt.strftime('%H:%M')}"
 
 
-def _get_order_datetime(c: "Cardinal", order: Order) -> str:
+def _get_order_datetime(cardinal: Cardinal, order) -> str:
     try:
-        _, sales, _, _ = c.account.get_sales(id=order.id, include_closed=True, include_paid=True)
+        _, sales, _, _ = cardinal.account.get_sales(id=order.id, include_closed=True, include_paid=True)
         if sales and sales[0].date:
             return _format_datetime(sales[0].date)
     except Exception:
-        logger.debug("%s: не удалось получить дату заказа #%s", LOGGER_PREFIX, order.id, exc_info=True)
-
-    if order.status == OrderStatuses.CLOSED:
-        return _format_datetime(datetime.now())
-
-    return "дата уточняется"
+        pass
+    return datetime.now().strftime("%d.%m.%Y %H:%M")
 
 
-def _get_product_name(order: Order) -> str:
-    parts: List[str] = []
-    if order.short_description:
-        parts.append(order.short_description.strip())
-    if order.lot_params_text:
-        parts.append(order.lot_params_text.strip())
-    if order.subcategory:
-        parts.append(order.subcategory.fullname.strip())
-    if not parts and order.full_description:
-        parts.append(order.full_description.strip()[:120])
-    if not parts:
-        return "приобретённый товар"
-    return ", ".join(dict.fromkeys(parts))
+def _fill(template: str, order, chat_history: str = "", order_datetime: str = "") -> str:
+    review = getattr(order, "review", None)
+    item = str(getattr(order, "title", None) or getattr(order, "short_description", None) or "товар")
+    subs = {
+        "{name}":          str(getattr(order, "buyer_username", "Покупатель")),
+        "{item}":          item,
+        "{cost}":          str(getattr(order, "sum", "")),
+        "{currency}":      str(getattr(order, "currency", "₽")),
+        "{seller}":        str(getattr(order, "seller_username", "")),
+        "{rating}":        str(getattr(review, "stars", "5")),
+        "{text}":          str(getattr(review, "text", "") or "без текста"),
+        "{chat_history}":  chat_history or "История чата недоступна.",
+        "{order_datetime}": order_datetime or "не указана",
+    }
+    for k, v in subs.items():
+        template = template.replace(k, v)
+    return template
 
 
-def _format_review_text(text: str) -> str:
-    max_l = 999
-    text = (text or "").strip()
-    if len(text) <= max_l:
+def _get_chat_history(cardinal: Cardinal, chat_id, buyer: str) -> str:
+    try:
+        chat = cardinal.account.get_chat(chat_id)
+        messages = getattr(chat, "messages", []) or []
+        messages = messages[-CHAT_HISTORY_MAX:]
+        if not messages:
+            return "История чата пуста."
+
+        lines = []
+        for msg in messages:
+            author = getattr(msg, "author", "")
+            text = str(getattr(msg, "text", "") or "").strip()
+            if not text:
+                continue
+            if str(author).lower() == str(buyer).lower():
+                role = "👤 Покупатель"
+            else:
+                role = "🏪 Продавец"
+            lines.append(f"{role}: {text}")
+
+        return "\n".join(lines) if lines else "История чата пуста."
+    except Exception as e:
+        _err(f"_get_chat_history: {e}")
+        return "История чата недоступна."
+
+
+def _strip_name(text: str, buyer: str) -> str:
+    if not buyer or not text:
         return text
-
-    text_ = text[: max_l + 1]
-    indexes: List[int] = []
-    for char in (".", "!", "\n"):
-        index1 = text_.rfind(char)
-        indexes.extend([index1, text_[:index1].rfind(char)])
-    cut = max(indexes, key=lambda x: (x < len(text_) - 1, x))
-    text_ = text_[:cut].strip()
-    if text_.count("\n") > 9:
-        while text_.count("\n\n") > 1 and text_.count("\n") > 9:
-            text_ = text_[::-1].replace("\n\n", "\n", 1)[::-1]
-        if text_.count("\n") > 9:
-            text_ = text_[::-1].replace("\n", " ", text_.count("\n") - 9)[::-1]
-    return text_
+    patterns = [
+        rf"(?i)(дорогой|уважаемый|привет|здравствуй|хей|эй)[,!\s]+{re.escape(buyer)}[,!\s]*",
+        rf"(?i){re.escape(buyer)}[,!\s]+",
+        rf"(?i)\b{re.escape(buyer)}\b",
+    ]
+    for p in patterns:
+        text = re.sub(p, "", text)
+    text = re.sub(r" {2,}", " ", text)
+    text = re.sub(r"^\s+", "", text, flags=re.MULTILINE)
+    return text.strip()
 
 
-def _reply_hash(text: str) -> str:
-    normalized = re.sub(r"\s+", " ", (text or "").strip().lower())
-    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
+def _trim(text: str, max_len: int) -> str:
+    text = text.strip()
+    if len(text) <= max_len:
+        return text
+    cut = text[:max_len]
+    last = max(cut.rfind("."), cut.rfind("!"), cut.rfind("?"), cut.rfind("\n"))
+    if last > max_len // 2:
+        return cut[:last + 1].strip()
+    return cut.rsplit(" ", 1)[0].strip() + "…"
 
 
-def _recent_replies(limit: int = 15) -> List[str]:
-    history = load_history()
-    replies = []
-    for item in reversed(history):
-        reply = item.get("reply", "")
-        if reply:
-            replies.append(reply[:180])
-        if len(replies) >= limit:
-            break
-    return replies
-
-
-def _add_history_entry(order: Order, reply: str, stars: int, source: str = "gemini") -> None:
-    history = load_history()
-    history.append({
-        "order_id": order.id,
-        "stars": stars,
-        "product": _get_product_name(order),
-        "review_text": (order.review.text or "")[:300] if order.review else "",
-        "reply": reply,
-        "reply_hash": _reply_hash(reply),
-        "source": source,
-        "datetime": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-    })
-    save_history(history)
-
-
-def _is_duplicate_reply(reply: str) -> bool:
-    reply_hash = _reply_hash(reply)
-    for item in load_history():
-        if item.get("reply_hash") == reply_hash:
+def _is_bad(text: str) -> bool:
+    if not text or len(text.strip()) < 15:
+        return True
+    if CHINESE_RE.search(text):
+        return True
+    for bad in [
+        "Unable to decode JSON", "Request ended with status code",
+        "quota", "RESOURCE_EXHAUSTED", "Model not found",
+    ]:
+        if bad.lower() in text.lower():
             return True
     return False
 
 
-class GeminiClient:
-    @staticmethod
-    def generate(
-        system_prompt: str,
-        user_prompt: str,
-        api_key: str,
-        model: str,
-        proxy_url: str,
-        temperature: float = 0.95,
-    ) -> Optional[str]:
-        if not api_key:
-            logger.error("%s: не указан API-ключ Gemini", LOGGER_PREFIX)
-            return None
+def _reply_hash(text: str) -> str:
+    normalized = re.sub(r"\s+", " ", text.strip().lower())
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
 
+
+def _is_duplicate(text: str) -> bool:
+    h = _reply_hash(text)
+    return any(r.get("hash") == h for r in SETTINGS.get("recent_replies", []))
+
+
+def _remember_reply(text: str, order_id: str) -> None:
+    recent = SETTINGS.setdefault("recent_replies", [])
+    recent.append({
+        "hash": _reply_hash(text),
+        "order_id": order_id,
+        "text": text[:200],
+        "datetime": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    })
+    SETTINGS["recent_replies"] = recent[-50:]
+    _save()
+
+
+def _check_proxy(proxy: str) -> bool:
+    try:
+        r = http_get("https://api.ipify.org",
+                     proxies={"http": proxy, "https": proxy}, timeout=8)
+        return r.status_code == 200
+    except Exception:
+        return False
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  Генерация через Gemini — прямой HTTP
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _gemini(system: str, prompt: str) -> str | None:
+    api_key = SETTINGS.get("gemini_api_key", "").strip()
+    proxy   = SETTINGS.get("http_proxy", "").strip()
+
+    if not api_key:
+        _err("Gemini API key не задан!")
+        return None
+
+    proxies = {"http": proxy, "https": proxy} if proxy else None
+    models = GEMINI_MODELS[:]
+    random.shuffle(models)
+
+    for model in models:
         url = (
             f"https://generativelanguage.googleapis.com/v1beta/models/"
             f"{model}:generateContent?key={api_key}"
         )
         payload = {
-            "systemInstruction": {
-                "parts": [{"text": system_prompt}],
-            },
-            "contents": [
-                {
-                    "role": "user",
-                    "parts": [{"text": user_prompt}],
-                }
-            ],
+            "systemInstruction": {"parts": [{"text": system}]},
+            "contents": [{"role": "user", "parts": [{"text": prompt}]}],
             "generationConfig": {
-                "temperature": temperature,
-                "maxOutputTokens": 1024,
+                "temperature": 0.95,
+                "maxOutputTokens": 800,
             },
         }
         try:
-            response = requests.post(
-                url,
-                json=payload,
-                proxies=_proxy_dict(proxy_url),
-                timeout=60,
-            )
-            if response.status_code != 200:
-                logger.error(
-                    "%s: Gemini API ошибка %s — %s",
-                    LOGGER_PREFIX,
-                    response.status_code,
-                    response.text[:500],
-                )
-                return None
-            data = response.json()
+            _log(f"Gemini запрос → {model}")
+            resp = http_post(url, json=payload, proxies=proxies, timeout=40)
+
+            if resp.status_code == 429:
+                _log("Gemini rate limit, жду 3 сек…")
+                time.sleep(3)
+                continue
+
+            if resp.status_code != 200:
+                err = resp.text[:200]
+                _err(f"Gemini HTTP {resp.status_code}: {err}")
+                if "quota" in err.lower() or "RESOURCE_EXHAUSTED" in err:
+                    break
+                continue
+
+            data = resp.json()
             candidates = data.get("candidates") or []
             if not candidates:
-                return None
+                continue
             parts = candidates[0].get("content", {}).get("parts", [])
-            texts = [p.get("text", "") for p in parts if p.get("text")]
-            result = "\n".join(texts).strip()
-            return result or None
-        except Exception as exc:
-            logger.error("%s: ошибка запроса к Gemini — %s", LOGGER_PREFIX, exc)
-            logger.debug(traceback.format_exc())
-            return None
+            content = "\n".join(p.get("text", "") for p in parts if p.get("text")).strip()
+
+            if _is_bad(content):
+                _err(f"Gemini мусорный ответ от {model}: {content[:60]}…")
+                continue
+
+            _log(f"Gemini успешно ✅ модель={model} длина={len(content)}")
+            return content
+
+        except Exception as e:
+            _err(f"Gemini {model} исключение: {e}")
+
+    _err("Все модели Gemini исчерпаны.")
+    return None
 
 
-def _build_user_prompt(order: Order, order_datetime: str, product_name: str) -> str:
-    review = order.review
-    stars = review.stars if review else 0
-    review_text = (review.text or "без текста").strip()
-    recent = _recent_replies()
+def _generate(cardinal: Cardinal, system_key: str, prompt_key: str, order, chat_history: str) -> str | None:
+    order_datetime = _get_order_datetime(cardinal, order)
+    system = _fill(SETTINGS.get(system_key, ""), order, chat_history, order_datetime)
+    prompt = _fill(SETTINGS.get(prompt_key, ""), order, chat_history, order_datetime)
 
-    prompt = (
-        f"Оценка: {stars} из 5 звёзд\n"
-        f"Товар: {product_name}\n"
-        f"Дата выполнения заказа: {order_datetime}\n"
-        f"Текст отзыва покупателя: {review_text}\n\n"
-        "Напиши готовый ответ продавца на этот отзыв. Только текст ответа, без пояснений."
-    )
+    recent = SETTINGS.get("recent_replies", [])[-10:]
     if recent:
-        prompt += "\n\nНе повторяй и не копируй эти предыдущие ответы:\n"
-        for idx, old in enumerate(recent, 1):
-            prompt += f"{idx}. {old}\n"
-    return prompt
+        prompt += "\n\nНе повторяй эти предыдущие ответы:\n"
+        for i, r in enumerate(recent, 1):
+            prompt += f"{i}. {r.get('text', '')[:120]}\n"
+
+    return _gemini(system, prompt)
 
 
-def _generate_review_reply(c: "Cardinal", order: Order) -> Optional[str]:
-    settings = load_settings()
-    review = order.review
-    if not review or not review.stars:
-        return None
-
-    product_name = _get_product_name(order)
-    order_datetime = _get_order_datetime(c, order)
-    system_prompt = settings.get("system_prompt", DEFAULT_SYSTEM_PROMPT)
-    system_prompt = system_prompt.format(
-        product_name=product_name,
-        order_datetime=order_datetime,
-    )
-
-    user_prompt = _build_user_prompt(order, order_datetime, product_name)
-    reply = GeminiClient.generate(
-        system_prompt=system_prompt,
-        user_prompt=user_prompt,
-        api_key=settings.get("gemini_api_key", ""),
-        model=settings.get("gemini_model", "gemini-2.0-flash"),
-        proxy_url=settings.get("proxy", ""),
-        temperature=float(settings.get("temperature", 0.95)),
-    )
-
-    if not reply:
-        return _fallback_reply(order, product_name, order_datetime)
-
-    reply = _format_review_text(reply)
-
-    attempts = 0
-    while _is_duplicate_reply(reply) and attempts < 3:
-        attempts += 1
-        extra_prompt = user_prompt + (
-            f"\n\nПредыдущий вариант слишком похож на старые ответы. "
-            f"Напиши совершенно другой ответ, попытка {attempts + 1}."
-        )
-        reply = GeminiClient.generate(
-            system_prompt=system_prompt,
-            user_prompt=extra_prompt,
-            api_key=settings.get("gemini_api_key", ""),
-            model=settings.get("gemini_model", "gemini-2.0-flash"),
-            proxy_url=settings.get("proxy", ""),
-            temperature=min(1.2, float(settings.get("temperature", 0.95)) + 0.1 * attempts),
-        )
-        if reply:
-            reply = _format_review_text(reply)
-        else:
-            break
-
-    if not reply or _is_duplicate_reply(reply):
-        reply = _fallback_reply(order, product_name, order_datetime)
-
-    if order.buyer_username:
-        reply = re.sub(re.escape(order.buyer_username), "", reply, flags=re.IGNORECASE)
-        reply = re.sub(r"\s{2,}", " ", reply).strip()
-
-    return reply
-
-
-def _fallback_reply(order: Order, product_name: str, order_datetime: str) -> str:
-    review = order.review
-    stars = review.stars if review else 5
-    review_text = (review.text or "").strip().lower()
-    unique_tag = hashlib.md5(f"{order.id}{time.time()}".encode()).hexdigest()[:6]
+def _fallback_review(order, order_datetime: str) -> str:
+    review = getattr(order, "review", None)
+    stars = int(getattr(review, "stars", 5) or 5)
+    item = str(getattr(order, "title", None) or getattr(order, "short_description", None) or "товар")
+    text = str(getattr(review, "text", "") or "").lower()
 
     if stars == 1:
-        return _format_review_text(
-            f"Благодарим за обратную связь по заказу с товаром «{product_name}» "
-            f"(выполнен {order_datetime}). "
-            f"Сожалеем, что впечатление оказалось негативным. "
+        return _trim(
+            f"Благодарим за обратную связь по товару «{item}» (выполнен {order_datetime}). "
             f"Вынуждены отметить: данный отзыв не соответствует действительности, "
             f"оставлен с целью ухудшения рейтинга и в скором времени будет удалён. "
-            f"Мы всегда открыты к диалогу и готовы помочь! 🌟"
+            f"Мы всегда открыты к диалогу! 🌟",
+            MAX_REVIEW_LEN,
         )
 
-    beer_note = ""
-    if "пив" in review_text:
-        beer_note = " Желаем отличного вечера и приятного отдыха! 🍺"
-
+    beer = " Желаем отличного отдыха! 🍺" if "пив" in text else ""
     jokes = [
-        "Анекдот дня: покупатель спросил продавца — а скидка будет? Продавец ответил: скидка уже в вашей улыбке! 😄",
-        "Знаете, хороший отзыв — как кофе утром: сразу поднимает настроение! ☕",
-        "Говорят, довольный покупатель — лучшая реклама. Спасибо, что вы с нами! 🎉",
-        "Лёгкая шутка: наш товар настолько хорош, что даже кнопка «купить» устала ждать! 😊",
+        "Анекдот: покупатель спросил про скидку — а она уже в вашей улыбке! 😄",
+        "Хороший отзыв — как кофе утром: сразу поднимает настроение! ☕",
+        "Довольный покупатель — лучшая реклама. Спасибо, что вы с нами! 🎉",
     ]
-    joke = jokes[int(unique_tag, 16) % len(jokes)]
-
-    return _format_review_text(
-        f"Огромное спасибо за тёплый отзыв! ⭐\n"
-        f"Очень рады, что покупка «{product_name}» (заказ выполнен {order_datetime}) "
-        f"принесла вам положительные эмоции.{beer_note}\n"
-        f"{joke}\n"
-        f"Будем искренне рады видеть вас снова! До новых встреч! 💫"
+    joke = random.choice(jokes)
+    return _trim(
+        f"Огромное спасибо за тёплый отзыв! ⭐ "
+        f"Очень рады, что «{item}» (заказ выполнен {order_datetime}) вам понравился.{beer} "
+        f"{joke} Будем рады видеть вас снова! 💫",
+        MAX_REVIEW_LEN,
     )
 
 
-def _send_chat_thanks(c: "Cardinal", order: Order, chat_id: Any) -> None:
-    settings = load_settings()
-    if not settings.get("send_chat_message", True):
-        return
-    text = settings.get("chat_message", DEFAULT_SETTINGS["chat_message"])
-    if order.buyer_username:
-        text = text.replace("$username", "").replace("$buyer", "").strip()
-    try:
-        c.send_message(chat_id, text, order.buyer_username)
-        logger.info("%s: благодарность в чат отправлена (заказ #%s)", LOGGER_PREFIX, order.id)
-    except Exception:
-        logger.error("%s: не удалось отправить сообщение в чат #%s", LOGGER_PREFIX, order.id)
-        logger.debug(traceback.format_exc())
+# ═════════════════════════════════════════════════════════════════════════════
+#  Telegram — страница настроек Cardinal
+# ═════════════════════════════════════════════════════════════════════════════
 
+def init(cardinal: Cardinal) -> None:
+    global SETTINGS
+    SETTINGS = _load()
 
-def _should_process_review(order: Order, message_type: MessageTypes, settings: Dict[str, Any]) -> bool:
-    review = order.review
-    if not review or not review.stars:
-        return False
-    if settings.get("skip_hidden_reviews") and review.hidden:
-        return False
-    if message_type == MessageTypes.FEEDBACK_CHANGED and not settings.get("reply_on_changed", True):
-        return False
-    if review.answer and message_type == MessageTypes.NEW_FEEDBACK:
-        return False
-    return True
-
-
-def _process_review_event(c: "Cardinal", obj: Any, message_type: MessageTypes, chat_id: Any) -> None:
-    settings = load_settings()
-    if not settings.get("enabled", True):
-        return
-
-    try:
-        order = c.get_order_from_object(obj)
-        if order is None:
-            order_id_match = re.search(r"#([A-Z0-9]+)", str(obj))
-            if not order_id_match:
-                return
-            order = c.account.get_order(order_id_match.group(1))
-    except Exception:
-        logger.error("%s: не удалось получить заказ для отзыва", LOGGER_PREFIX)
-        logger.debug(traceback.format_exc())
-        return
-
-    if not _should_process_review(order, message_type, settings):
-        return
-
-    with _processing_lock:
-        if order.id in _processing_orders:
-            return
-        _processing_orders.add(order.id)
-
-    try:
-        logger.info(
-            "%s: новый отзыв на заказ #%s (%s зв.)",
-            LOGGER_PREFIX, order.id, order.review.stars,
-        )
-        reply = _generate_review_reply(c, order)
-        if not reply:
-            logger.warning("%s: не удалось сгенерировать ответ для #%s", LOGGER_PREFIX, order.id)
-            return
-
-        c.account.send_review(order.id, reply)
-        _add_history_entry(order, reply, order.review.stars)
-        logger.info("%s: ответ на отзыв #%s отправлен", LOGGER_PREFIX, order.id)
-
-        _send_chat_thanks(c, order, chat_id)
-    except Exception:
-        logger.error("%s: ошибка при ответе на отзыв #%s", LOGGER_PREFIX, order.id)
-        logger.debug(traceback.format_exc())
-    finally:
-        with _processing_lock:
-            _processing_orders.discard(order.id)
-
-
-def review_message_handler(c: "Cardinal", e: NewMessageEvent) -> None:
-    obj = e.message
-    message_type = obj.type
-    if message_type not in (MessageTypes.NEW_FEEDBACK, MessageTypes.FEEDBACK_CHANGED):
-        return
-    if obj.i_am_buyer:
-        return
-
-    def worker():
-        _process_review_event(c, obj, message_type, obj.chat_id)
-
-    threading.Thread(target=worker, daemon=True).start()
-
-
-def review_last_chat_handler(c: "Cardinal", e: LastChatMessageChangedEvent) -> None:
-    if not c.old_mode_enabled:
-        return
-    obj = e.chat
-    message_type = obj.last_message_type
-    if message_type not in (MessageTypes.NEW_FEEDBACK, MessageTypes.FEEDBACK_CHANGED):
-        return
-    if f" {c.account.username} " in str(obj):
-        return
-
-    def worker():
-        _process_review_event(c, obj, message_type, obj.id)
-
-    threading.Thread(target=worker, daemon=True).start()
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Telegram-панель
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _mask_secret(value: str, visible: int = 4) -> str:
-    value = value or ""
-    if len(value) <= visible:
-        return "*" * len(value)
-    return value[:visible] + "*" * (len(value) - visible)
-
-
-def _settings_summary(settings: Dict[str, Any]) -> str:
-    history = load_history()
-    last = history[-1] if history else None
-    last_text = (
-        f"\n📝 Последний ответ: <code>#{last.get('order_id')}</code> "
-        f"({last.get('datetime', '—')})"
-        if last else "\n📝 История ответов пуста"
-    )
-    return (
-        f"🤖 <b>{NAME}</b> v{VERSION}\n\n"
-        f"⚙️ Статус: <b>{'✅ Включён' if settings.get('enabled') else '❌ Выключен'}</b>\n"
-        f"🧠 Модель: <code>{settings.get('gemini_model')}</code>\n"
-        f"🔑 API-ключ: <code>{_mask_secret(settings.get('gemini_api_key', ''))}</code>\n"
-        f"🌐 Прокси: <code>{_mask_secret(settings.get('proxy', ''), 8)}</code>\n"
-        f"💬 Сообщение в чат: <b>{'да' if settings.get('send_chat_message') else 'нет'}</b>\n"
-        f"📊 Ответов в истории: <b>{len(history)}</b>"
-        f"{last_text}"
-    )
-
-
-def _main_keyboard(settings: Dict[str, Any]) -> InlineKeyboardMarkup:
-    kb = InlineKeyboardMarkup(row_width=2)
-    kb.add(
-        InlineKeyboardButton(
-            "✅ Вкл" if settings.get("enabled") else "❌ Выкл",
-            callback_data="grr_toggle_enabled",
-        ),
-        InlineKeyboardButton("📝 Промпт", callback_data="grr_prompt_menu"),
-    )
-    kb.add(
-        InlineKeyboardButton("🔑 API-ключ", callback_data="grr_set_api_key"),
-        InlineKeyboardButton("🌐 Прокси", callback_data="grr_set_proxy"),
-    )
-    kb.add(
-        InlineKeyboardButton("🧠 Модель", callback_data="grr_set_model"),
-        InlineKeyboardButton("💬 Чат-сообщение", callback_data="grr_chat_menu"),
-    )
-    kb.add(
-        InlineKeyboardButton("📜 История", callback_data="grr_history"),
-        InlineKeyboardButton("🧪 Тест Gemini", callback_data="grr_test"),
-    )
-    kb.add(
-        InlineKeyboardButton(
-            f"{'✅' if settings.get('reply_on_changed') else '❌'} Ответ при изменении",
-            callback_data="grr_toggle_changed",
-        ),
-        InlineKeyboardButton(
-            f"{'✅' if settings.get('skip_hidden_reviews') else '❌'} Пропуск скрытых",
-            callback_data="grr_toggle_hidden",
-        ),
-    )
-    return kb
-
-
-def _prompt_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(row_width=1).add(
-        InlineKeyboardButton("✏️ Изменить промпт", callback_data="grr_set_prompt"),
-        InlineKeyboardButton("♻️ Сбросить промпт", callback_data="grr_reset_prompt"),
-        InlineKeyboardButton("⬅️ Назад", callback_data="grr_back_main"),
-    )
-
-
-def _chat_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(row_width=1).add(
-        InlineKeyboardButton("✏️ Изменить текст", callback_data="grr_set_chat_msg"),
-        InlineKeyboardButton(
-            "🔁 Переключить отправку",
-            callback_data="grr_toggle_chat",
-        ),
-        InlineKeyboardButton("⬅️ Назад", callback_data="grr_back_main"),
-    )
-
-
-def _format_history_text(limit: int = 10) -> str:
-    history = load_history()
-    if not history:
-        return "📜 <b>История ответов пуста</b>"
-    lines = [f"📜 <b>Последние {min(limit, len(history))} ответов</b>\n"]
-    for item in reversed(history[-limit:]):
-        lines.append(
-            f"🆔 <code>#{item.get('order_id')}</code> | "
-            f"{'⭐' * int(item.get('stars', 0))}\n"
-            f"🛒 {item.get('product', '—')[:60]}\n"
-            f"🕐 {item.get('datetime', '—')}\n"
-            f"💬 {item.get('reply', '')[:120]}...\n"
-        )
-    return "\n".join(lines)
-
-
-def init_commands(cardinal: "Cardinal") -> None:
-    if not cardinal.telegram:
-        return
-
-    tg = cardinal.telegram
+    tg  = cardinal.telegram
     bot = tg.bot
 
-    def send_panel(message):
-        settings = load_settings()
-        bot.send_message(
-            message.chat.id,
-            _settings_summary(settings),
-            reply_markup=_main_keyboard(settings),
-            parse_mode="HTML",
+    if not SETTINGS.get("gemini_api_key"):
+        _tg(cardinal,
+            f"⚠️ <b>{NAME}</b>: Gemini API ключ не задан!\n"
+            f'<a href="https://aistudio.google.com/apikey">Получить ключ</a>')
+
+    CB_KEY    = f"gmr_{UUID}_key"
+    CB_PROXY  = f"gmr_{UUID}_proxy"
+    CB_TEST   = f"gmr_{UUID}_test"
+    CB_BACK   = f"gmr_{UUID}_back"
+
+    def page_main(call: telebot.types.CallbackQuery) -> None:
+        key   = SETTINGS.get("gemini_api_key", "")
+        proxy = SETTINGS.get("http_proxy", "")
+        k_show = (key[:18] + "…") if len(key) > 18 else (key or "🛑 не задан")
+        p_show = proxy or "🛑 не задан"
+        recent = len(SETTINGS.get("recent_replies", []))
+        kb = IKM()
+        kb.add(IKB("🔑 Изменить Gemini API ключ", callback_data=CB_KEY))
+        kb.add(IKB("🌐 Изменить прокси",           callback_data=CB_PROXY))
+        kb.add(IKB("🧪 Тест Gemini",                callback_data=CB_TEST))
+        kb.row(IKB("◀️ Назад", callback_data=f"{CBT.EDIT_PLUGIN}:{UUID}:0"))
+        text = (
+            f"⚙️ <b>{NAME} v{VERSION}</b>\n\n"
+            f"🔑 Gemini API: <code>{k_show}</code>\n"
+            f"🌐 Прокси:     <code>{p_show}</code>\n"
+            f"📊 Ответов в истории: <b>{recent}</b>\n\n"
+            f"Плагин отвечает на отзывы ≥ {MIN_STARS}⭐ красочно и позитивно 🌈\n"
+            f"Модели: {', '.join(GEMINI_MODELS)}"
         )
-
-    def handle_callback(call):
-        chat_id = call.message.chat.id
-        msg_id = call.message.message_id
-        settings = load_settings()
-
         try:
-            if call.data == "grr_back_main":
-                bot.edit_message_text(
-                    _settings_summary(settings), chat_id, msg_id,
-                    reply_markup=_main_keyboard(settings), parse_mode="HTML",
-                )
-            elif call.data == "grr_toggle_enabled":
-                settings["enabled"] = not settings.get("enabled", True)
-                save_settings(settings)
-                bot.edit_message_text(
-                    _settings_summary(settings), chat_id, msg_id,
-                    reply_markup=_main_keyboard(settings), parse_mode="HTML",
-                )
-            elif call.data == "grr_toggle_changed":
-                settings["reply_on_changed"] = not settings.get("reply_on_changed", True)
-                save_settings(settings)
-                bot.edit_message_reply_markup(chat_id, msg_id, reply_markup=_main_keyboard(settings))
-            elif call.data == "grr_toggle_hidden":
-                settings["skip_hidden_reviews"] = not settings.get("skip_hidden_reviews", False)
-                save_settings(settings)
-                bot.edit_message_reply_markup(chat_id, msg_id, reply_markup=_main_keyboard(settings))
-            elif call.data == "grr_prompt_menu":
-                prompt_preview = settings.get("system_prompt", "")[:600]
-                bot.edit_message_text(
-                    f"📝 <b>Системный промпт</b>\n\n<code>{prompt_preview}</code>",
-                    chat_id, msg_id,
-                    reply_markup=_prompt_keyboard(), parse_mode="HTML",
-                )
-            elif call.data == "grr_reset_prompt":
-                settings["system_prompt"] = DEFAULT_SYSTEM_PROMPT
-                save_settings(settings)
-                bot.answer_callback_query(call.id, "Промпт сброшен")
-                bot.edit_message_text(
-                    _settings_summary(settings), chat_id, msg_id,
-                    reply_markup=_main_keyboard(settings), parse_mode="HTML",
-                )
-            elif call.data == "grr_chat_menu":
-                chat_text = settings.get("chat_message", "")
-                bot.edit_message_text(
-                    f"💬 <b>Сообщение в чат</b>\n"
-                    f"Отправка: <b>{'вкл' if settings.get('send_chat_message') else 'выкл'}</b>\n\n"
-                    f"<code>{chat_text}</code>",
-                    chat_id, msg_id,
-                    reply_markup=_chat_keyboard(), parse_mode="HTML",
-                )
-            elif call.data == "grr_toggle_chat":
-                settings["send_chat_message"] = not settings.get("send_chat_message", True)
-                save_settings(settings)
-                bot.edit_message_text(
-                    f"💬 <b>Сообщение в чат</b>\n"
-                    f"Отправка: <b>{'вкл' if settings.get('send_chat_message') else 'выкл'}</b>\n\n"
-                    f"<code>{settings.get('chat_message', '')}</code>",
-                    chat_id, msg_id,
-                    reply_markup=_chat_keyboard(), parse_mode="HTML",
-                )
-            elif call.data == "grr_set_api_key":
-                result = bot.send_message(chat_id, "Введите API-ключ Google Gemini:")
-                tg.set_state(chat_id, result.id, call.from_user.id, state="grr_api_key")
-            elif call.data == "grr_set_proxy":
-                result = bot.send_message(
-                    chat_id,
-                    "Введите прокси в формате:\n"
-                    "<code>http://login:password@host:port</code>",
-                    parse_mode="HTML",
-                )
-                tg.set_state(chat_id, result.id, call.from_user.id, state="grr_proxy")
-            elif call.data == "grr_set_model":
-                result = bot.send_message(
-                    chat_id,
-                    "Введите название модели Gemini\n(например: gemini-2.0-flash):",
-                )
-                tg.set_state(chat_id, result.id, call.from_user.id, state="grr_model")
-            elif call.data == "grr_set_prompt":
-                result = bot.send_message(
-                    chat_id,
-                    "Отправьте новый системный промпт.\n"
-                    "Можно использовать переменные: {product_name}, {order_datetime}",
-                )
-                tg.set_state(chat_id, result.id, call.from_user.id, state="grr_prompt")
-            elif call.data == "grr_set_chat_msg":
-                result = bot.send_message(chat_id, "Введите текст благодарности для чата:")
-                tg.set_state(chat_id, result.id, call.from_user.id, state="grr_chat_msg")
-            elif call.data == "grr_history":
-                bot.edit_message_text(
-                    _format_history_text(10), chat_id, msg_id,
-                    reply_markup=InlineKeyboardMarkup().add(
-                        InlineKeyboardButton("⬅️ Назад", callback_data="grr_back_main"),
-                    ),
-                    parse_mode="HTML",
-                )
-            elif call.data == "grr_test":
-                bot.answer_callback_query(call.id, "Тестирую Gemini...")
-                test_reply = GeminiClient.generate(
-                    system_prompt="Ты помощник. Отвечай кратко на русском.",
-                    user_prompt="Напиши одно предложение: плагин Gemini Review Reply работает.",
-                    api_key=settings.get("gemini_api_key", ""),
-                    model=settings.get("gemini_model", "gemini-2.0-flash"),
-                    proxy_url=settings.get("proxy", ""),
-                )
-                if test_reply:
-                    bot.send_message(
-                        chat_id,
-                        f"✅ <b>Gemini отвечает:</b>\n\n{test_reply}",
-                        parse_mode="HTML",
-                    )
-                else:
-                    bot.send_message(chat_id, "❌ Ошибка подключения к Gemini. Проверьте ключ и прокси.")
-            bot.answer_callback_query(call.id)
-        except Exception as exc:
-            logger.error("%s: ошибка callback %s — %s", LOGGER_PREFIX, call.data, exc)
-            try:
-                bot.answer_callback_query(call.id, "Ошибка")
-            except Exception:
-                pass
+            bot.edit_message_text(text, call.message.chat.id, call.message.id,
+                                  reply_markup=kb, parse_mode="HTML",
+                                  disable_web_page_preview=True)
+        except Exception:
+            bot.send_message(call.message.chat.id, text, reply_markup=kb,
+                             parse_mode="HTML", disable_web_page_preview=True)
+        bot.answer_callback_query(call.id)
 
-    def handle_text_input(message):
-        state_data = tg.get_state(message.chat.id, message.from_user.id)
-        if not state_data or "state" not in state_data:
+    def ask_key(call: telebot.types.CallbackQuery) -> None:
+        bot.answer_callback_query(call.id)
+        kb = IKM(); kb.add(IKB("◀️ Отмена", callback_data=CB_BACK))
+        cur = SETTINGS.get("gemini_api_key", "нет")
+        msg = bot.send_message(
+            call.message.chat.id,
+            f"🔑 Текущий ключ: <code>{cur[:18]}…</code>\n\n"
+            f'Введите новый Gemini API ключ (<a href="https://aistudio.google.com/apikey">получить</a>):',
+            reply_markup=kb, parse_mode="HTML", disable_web_page_preview=True,
+        )
+        bot.register_next_step_handler(msg, _save_key)
+
+    def _save_key(message: telebot.types.Message) -> None:
+        if not message.text or message.text.startswith("/"):
             return
-        state = state_data["state"]
-        settings = load_settings()
-        text = (message.text or "").strip()
+        SETTINGS["gemini_api_key"] = message.text.strip()
+        _save()
+        tg.clear_state(message.chat.id, message.from_user.id, True)
+        kb = IKM(); kb.add(IKB("◀️ В настройки", callback_data=f"{CBT.PLUGIN_SETTINGS}:{UUID}:0"))
+        bot.reply_to(message,
+                     f"✅ Gemini API ключ обновлён: <code>{SETTINGS['gemini_api_key'][:18]}…</code>",
+                     reply_markup=kb, parse_mode="HTML")
 
-        if state == "grr_api_key":
-            settings["gemini_api_key"] = text
-            save_settings(settings)
-            bot.reply_to(message, "✅ API-ключ Gemini сохранён.")
-        elif state == "grr_proxy":
-            settings["proxy"] = text
-            save_settings(settings)
-            bot.reply_to(message, "✅ Прокси сохранён.")
-        elif state == "grr_model":
-            settings["gemini_model"] = text
-            save_settings(settings)
-            bot.reply_to(message, f"✅ Модель: <code>{text}</code>", parse_mode="HTML")
-        elif state == "grr_prompt":
-            settings["system_prompt"] = text
-            save_settings(settings)
-            bot.reply_to(message, "✅ Системный промпт обновлён.")
-        elif state == "grr_chat_msg":
-            settings["chat_message"] = text
-            save_settings(settings)
-            bot.reply_to(message, "✅ Текст сообщения в чат сохранён.")
+    def ask_proxy(call: telebot.types.CallbackQuery) -> None:
+        bot.answer_callback_query(call.id)
+        kb = IKM(); kb.add(IKB("◀️ Отмена", callback_data=CB_BACK))
+        cur = SETTINGS.get("http_proxy", "нет")
+        msg = bot.send_message(
+            call.message.chat.id,
+            f"🌐 Текущий прокси: <code>{cur}</code>\n\n"
+            "Введите новый прокси:\n<code>http://user:pass@ip:port</code>",
+            reply_markup=kb, parse_mode="HTML",
+        )
+        bot.register_next_step_handler(msg, _save_proxy)
 
-        tg.clear_state(message.chat.id, message.from_user.id)
+    def _save_proxy(message: telebot.types.Message) -> None:
+        if not message.text or message.text.startswith("/"):
+            return
+        proxy = message.text.strip()
+        if proxy and not proxy.startswith("http"):
+            proxy = f"http://{proxy}"
+        bot.send_message(message.chat.id, "⏳ Проверяю прокси…")
+        if not _check_proxy(proxy):
+            kb = IKM(); kb.add(IKB("Ввести другой", callback_data=CB_PROXY))
+            bot.reply_to(message, "❌ Прокси не отвечает. Проверьте данные.",
+                         reply_markup=kb)
+            return
+        SETTINGS["http_proxy"] = proxy
+        _save()
+        tg.clear_state(message.chat.id, message.from_user.id, True)
+        kb = IKM(); kb.add(IKB("◀️ В настройки", callback_data=f"{CBT.PLUGIN_SETTINGS}:{UUID}:0"))
+        bot.reply_to(message, f"✅ Прокси установлен:\n<code>{proxy}</code>",
+                     reply_markup=kb, parse_mode="HTML")
 
-    tg.cbq_handler(handle_callback, lambda c: c.data.startswith("grr_"))
-    tg.msg_handler(
-        handle_text_input,
-        func=lambda m: any(
-            tg.check_state(m.chat.id, m.from_user.id, s)
-            for s in ("grr_api_key", "grr_proxy", "grr_model", "grr_prompt", "grr_chat_msg")
-        ),
-    )
-    tg.msg_handler(send_panel, commands=["review_ai", "grr"])
+    def test_api(call: telebot.types.CallbackQuery) -> None:
+        bot.answer_callback_query(call.id, "Тестирую Gemini…")
+        result = _gemini(
+            "Ты помощник. Отвечай кратко на русском.",
+            "Напиши одно предложение: плагин Gemini Review Reply работает.",
+        )
+        if result:
+            bot.send_message(call.message.chat.id,
+                             f"✅ <b>Gemini отвечает:</b>\n\n{result}",
+                             parse_mode="HTML")
+        else:
+            bot.send_message(call.message.chat.id,
+                             "❌ Ошибка Gemini. Проверьте ключ, прокси и квоту API.")
 
-    cardinal.add_telegram_commands(UUID, [
-        ("review_ai", f"панель {NAME}", True),
-        ("grr", f"настройки {NAME}", True),
-    ])
+    def back_handler(call: telebot.types.CallbackQuery) -> None:
+        tg.clear_state(call.message.chat.id, call.from_user.id, True)
+        page_main(call)
+
+    tg.cbq_handler(page_main,    lambda c: f"{CBT.PLUGIN_SETTINGS}:{UUID}" in c.data)
+    tg.cbq_handler(ask_key,      lambda c: c.data == CB_KEY)
+    tg.cbq_handler(ask_proxy,    lambda c: c.data == CB_PROXY)
+    tg.cbq_handler(test_api,     lambda c: c.data == CB_TEST)
+    tg.cbq_handler(back_handler, lambda c: c.data == CB_BACK)
+
+    _log("init() завершён ✅")
 
 
-def safe_handler(func: Callable) -> Callable:
-    def wrapper(*args, **kwargs):
+# ═════════════════════════════════════════════════════════════════════════════
+#  Обработчик отзывов
+# ═════════════════════════════════════════════════════════════════════════════
+
+def message_handler(cardinal: Cardinal, event: NewMessageEvent) -> None:
+    try:
+        msg_type = event.message.type
+
+        if ONLY_NEW:
+            if msg_type != MessageTypes.NEW_FEEDBACK:
+                return
+        else:
+            if msg_type not in (MessageTypes.NEW_FEEDBACK, MessageTypes.FEEDBACK_CHANGED):
+                return
+
+        if event.message.i_am_buyer:
+            return
+
         try:
-            return func(*args, **kwargs)
-        except Exception as exc:
-            logger.error("%s: ошибка в %s — %s", LOGGER_PREFIX, func.__name__, exc)
-            logger.debug(traceback.format_exc())
-    wrapper.__name__ = func.__name__
-    return wrapper
+            order = cardinal.get_order_from_object(event.message)
+            if order is None:
+                match = RegularExpressions().ORDER_ID.findall(str(event.message))
+                if not match:
+                    return
+                order_id = match[0][1:] if match[0].startswith("#") else match[0]
+                order = cardinal.account.get_order(order_id)
+        except Exception as e:
+            _err(f"get_order: {e}")
+            return
+
+        review = getattr(order, "review", None)
+        if not review or not getattr(review, "stars", None):
+            return
+
+        stars = int(review.stars)
+        if stars < MIN_STARS:
+            return
+
+        if review.answer and ONLY_NEW:
+            _log(f"Заказ #{order.id}: ответ уже есть, пропуск")
+            return
+
+        buyer = str(getattr(order, "buyer_username", "") or event.message.chat_name or "")
+        chat_id = event.message.chat_id
+        chat_history = _get_chat_history(cardinal, chat_id, buyer)
+        order_datetime = _get_order_datetime(cardinal, order)
+
+        _log(f"Отзыв #{order.id} | {stars}⭐ | {getattr(order, 'title', 'товар')}")
+
+        reply = _generate(cardinal, "review_system", "review_prompt", order, chat_history)
+        if not reply:
+            reply = _fallback_review(order, order_datetime)
+        else:
+            reply = _strip_name(reply, buyer)
+            reply = _trim(reply, MAX_REVIEW_LEN)
+
+        attempts = 0
+        while _is_duplicate(reply) and attempts < 2:
+            attempts += 1
+            extra = _generate(cardinal, "review_system", "review_prompt", order, chat_history)
+            if extra:
+                reply = _trim(_strip_name(extra, buyer), MAX_REVIEW_LEN)
+            else:
+                break
+
+        if _is_duplicate(reply):
+            reply = _fallback_review(order, order_datetime)
+
+        cardinal.account.send_review(order.id, reply)
+        _remember_reply(reply, order.id)
+        _log(f"Ответ на отзыв #{order.id} отправлен ✅ ({len(reply)} симв.)")
+
+        if SEND_IN_CHAT:
+            chat_msg = _generate(cardinal, "chat_system", "chat_prompt", order, chat_history)
+            if not chat_msg:
+                chat_msg = (
+                    "Спасибо за отзыв! 🙏 Очень приятно получить обратную связь. "
+                    "Будем рады видеть вас снова! ✨"
+                )
+            else:
+                chat_msg = _strip_name(_trim(chat_msg, MAX_CHAT_LEN), buyer)
+            try:
+                cardinal.send_message(chat_id, chat_msg, buyer)
+                _log(f"Сообщение в чат #{chat_id} отправлено ✅")
+            except Exception as e:
+                _err(f"send_message: {e}")
+
+    except Exception as e:
+        _err(f"message_handler: {e}")
 
 
-_safe_review_msg = safe_handler(review_message_handler)
-_safe_review_last_chat = safe_handler(review_last_chat_handler)
-_safe_init_commands = safe_handler(init_commands)
+# ═════════════════════════════════════════════════════════════════════════════
+#  Привязка к Cardinal
+# ═════════════════════════════════════════════════════════════════════════════
 
-BIND_TO_PRE_INIT = [_safe_init_commands]
-BIND_TO_NEW_MESSAGE = [_safe_review_msg]
-BIND_TO_LAST_CHAT_MESSAGE_CHANGED = [_safe_review_last_chat]
-
-logger.info("$MAGENTA%s v%s загружен.$RESET", LOGGER_PREFIX, VERSION)
+BIND_TO_PRE_INIT    = [init]
+BIND_TO_NEW_MESSAGE = [message_handler]
