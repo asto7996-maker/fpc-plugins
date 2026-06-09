@@ -2,7 +2,7 @@ from __future__ import annotations
 
 # === ОБЯЗАТЕЛЬНЫЕ ПОЛЯ FunPay Cardinal (НЕ УДАЛЯТЬ) ===
 NAME = "VexBoost AutoSMM"
-VERSION = "2.4.0"
+VERSION = "2.4.1"
 DESCRIPTION = "Автонакрутка SMM-услуг для FunPay Cardinal"
 CREDITS = "@xei1y"
 UUID = "a3f8c2e1-7b4d-4a9f-9e2c-1d5b8f6a0c3e"
@@ -81,8 +81,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "commission_percent": 6.0,
     "welcome_message": (
         "👋 Спасибо за заказ!\n"
-        "Отправьте ссылку на аккаунт или пост для накрутки.\n"
-        "Пример: https://t.me/your_channel"
+        "Отправьте ссылку на аккаунт или пост для накрутки."
     ),
     "confirmation_message": (
         "📋 Проверьте детали заказа:\n\n"
