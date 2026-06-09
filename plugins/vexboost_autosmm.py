@@ -2,7 +2,7 @@ from __future__ import annotations
 
 # === ОБЯЗАТЕЛЬНЫЕ ПОЛЯ FunPay Cardinal (НЕ УДАЛЯТЬ) ===
 NAME = "VexBoost AutoSMM"
-VERSION = "2.3.0"
+VERSION = "2.4.0"
 DESCRIPTION = "Автонакрутка SMM-услуг для FunPay Cardinal"
 CREDITS = "@xei1y"
 UUID = "a3f8c2e1-7b4d-4a9f-9e2c-1d5b8f6a0c3e"
@@ -10,6 +10,7 @@ SETTINGS_PAGE = False
 BIND_TO_DELETE = None
 # === КОНЕЦ ОБЯЗАТЕЛЬНЫХ ПОЛЕЙ ===
 
+import html
 import json
 import logging
 import os
@@ -83,13 +84,142 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
         "Отправьте ссылку на аккаунт или пост для накрутки.\n"
         "Пример: https://t.me/your_channel"
     ),
+    "confirmation_message": (
+        "📋 Проверьте детали заказа:\n\n"
+        "🛒 Лот: {lot}\n"
+        "🔢 Количество: {amount} шт.\n"
+        "🔗 Ссылка: {link}\n\n"
+        "✅ Отправьте + для подтверждения\n"
+        "❌ Отправьте - для отмены и возврата\n"
+        "🔄 Или отправьте новую ссылку"
+    ),
+    "creating_order_message": "⏳ Создаю заказ, подождите...",
+    "order_created_message": (
+        "📊 Заказ создан и отправлен SMM–сервису!\n"
+        "🆔 ID заказа: {smm_id}\n\n"
+        "📋 Команды:\n"
+        "⠀∟ #статус {smm_id}\n"
+        "⠀∟ #рефилл {smm_id}\n\n"
+        "⌛ Время выполнения: от нескольких минут до 48 часов."
+    ),
+    "order_cancelled_message": "❌ Заказ отменён. Средства будут возвращены.",
+    "order_canceled_message": (
+        "❌ Заказ #{funpay_id} отменён.\n"
+        "Средства будут возвращены."
+    ),
     "completion_message": (
         "✅ Заказ #{order_id} выполнен!\n\n"
         "Пожалуйста, перейдите по ссылке и нажмите «Подтвердить выполнение заказа»:\n"
         "🔗 https://funpay.com/orders/{order_id}/\n\n"
         "Спасибо за покупку! 🙏"
     ),
+    "pending_hint_message": (
+        "⚪️ Отправьте + для подтверждения, - для отмены или новую ссылку."
+    ),
+    "send_link_first_message": "⚪️ Сначала отправьте ссылку для накрутки.",
+    "private_telegram_message": (
+        "❌ Закрытые Telegram-каналы/группы не поддерживаются.\n"
+        "Используйте публичную ссылку: https://t.me/your_channel"
+    ),
+    "invalid_link_message": "❌ {error}\nОтправьте корректную ссылку.",
+    "error_message": "❌ {error}",
+    "status_usage_message": "Использование: #статус ID",
+    "status_error_message": "🔴 Не удалось получить статус заказа.",
+    "status_message": (
+        "📈 Статус заказа {smm_id}\n"
+        "⠀∟ 📊 Статус: {status}\n"
+        "⠀∟ 🔢 Было: {start_count}\n"
+        "⠀∟ 👀 Остаток: {remains}"
+    ),
+    "refill_usage_message": "Использование: #рефилл ID",
+    "refill_success_message": "✅ Запрос на рефилл отправлен!",
+    "refill_error_message": (
+        "🔴 Ошибка рефилла. Возможно, рефилл ещё недоступен для этой услуги."
+    ),
+    "partial_paused_message": (
+        "⚠️ Заказ #{funpay_id} приостановлен.\n"
+        "Остаток: {remains} ед.\n"
+        "Обратитесь к продавцу."
+    ),
+    "partial_continued_message": (
+        "📈 Заказ #{funpay_id} продолжен.\n"
+        "⏳ Остаток к выполнению: {partial_amount} ед."
+    ),
 }
+
+MESSAGE_TEMPLATE_LABELS: Dict[str, Tuple[str, str]] = {
+    "welcome_message": ("👋 Приветствие", "—"),
+    "confirmation_message": ("📋 Подтверждение ссылки", "{lot}, {amount}, {link}"),
+    "creating_order_message": ("⏳ Создание заказа", "—"),
+    "order_created_message": ("📊 Заказ создан", "{smm_id}, {funpay_id}"),
+    "order_cancelled_message": ("❌ Отмена покупателем", "—"),
+    "order_canceled_message": ("❌ Отмена SMM", "{funpay_id}"),
+    "completion_message": ("✅ Выполнение", "{order_id}"),
+    "pending_hint_message": ("💬 Ожидание +/-", "—"),
+    "send_link_first_message": ("🔗 Нужна ссылка", "—"),
+    "private_telegram_message": ("🔒 Закрытый TG", "—"),
+    "invalid_link_message": ("⚠️ Неверная ссылка", "{error}"),
+    "error_message": ("⚠️ Ошибка заказа", "{error}"),
+    "status_usage_message": ("#статус — справка", "—"),
+    "status_error_message": ("#статус — ошибка", "—"),
+    "status_message": ("#статус — ответ", "{smm_id}, {status}, {start_count}, {remains}"),
+    "refill_usage_message": ("#рефилл — справка", "—"),
+    "refill_success_message": ("#рефилл — успех", "—"),
+    "refill_error_message": ("#рефилл — ошибка", "—"),
+    "partial_paused_message": ("⏸ Partial пауза", "{funpay_id}, {remains}"),
+    "partial_continued_message": ("▶️ Partial продолжение", "{funpay_id}, {partial_amount}"),
+}
+
+
+def _format_buyer_template(template_key: str, **kwargs: Any) -> str:
+    settings = load_settings()
+    template = settings.get(template_key, DEFAULT_SETTINGS.get(template_key, ""))
+    if not template:
+        template = DEFAULT_SETTINGS.get(template_key, "")
+    try:
+        return template.format(**kwargs)
+    except (KeyError, ValueError):
+        result = str(template)
+        for key, value in kwargs.items():
+            result = result.replace("{" + key + "}", str(value))
+        return result
+
+
+def _template_menu_text() -> str:
+    return (
+        "📝 <b>Шаблоны сообщений покупателю</b>\n\n"
+        "Выберите шаблон для редактирования.\n"
+        "Переменные в фигурных скобках подставляются автоматически "
+        "(например <code>{smm_id}</code>, <code>{order_id}</code>)."
+    )
+
+
+def _template_edit_prompt(template_key: str) -> str:
+    label, placeholders = MESSAGE_TEMPLATE_LABELS[template_key]
+    current = load_settings().get(template_key, DEFAULT_SETTINGS.get(template_key, ""))
+    return (
+        f"✏️ <b>{label}</b>\n\n"
+        f"Переменные: <code>{html.escape(placeholders)}</code>\n\n"
+        f"<b>Текущий шаблон:</b>\n<pre>{html.escape(str(current))}</pre>\n\n"
+        f"Отправьте новый текст сообщения.\n"
+        f"Для сброса: <code>/default</code>"
+    )
+
+
+def _templates_keyboard() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup(row_width=1)
+    for key, (label, _) in MESSAGE_TEMPLATE_LABELS.items():
+        kb.add(InlineKeyboardButton(label, callback_data=f"vb_tpl_edit_{key}"))
+    kb.add(InlineKeyboardButton("⬅️ Назад", callback_data="vb_back_main"))
+    return kb
+
+
+def _template_edit_keyboard(template_key: str) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(InlineKeyboardButton("🔄 Сбросить по умолчанию", callback_data=f"vb_tpl_reset_{template_key}"))
+    kb.add(InlineKeyboardButton("⬅️ К списку шаблонов", callback_data="vb_templates_menu"))
+    return kb
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Глобальные переменные состояния
@@ -1309,9 +1439,7 @@ def _update_pay_order(order: Dict[str, Any]) -> None:
 
 
 def _build_completion_message(funpay_order_id: str) -> str:
-    settings = load_settings()
-    template = settings.get("completion_message", DEFAULT_SETTINGS["completion_message"])
-    return template.format(order_id=funpay_order_id)
+    return _format_buyer_template("completion_message", order_id=funpay_order_id)
 
 
 def _is_private_telegram_link(link: str) -> bool:
@@ -1371,8 +1499,7 @@ def bind_to_new_order(c: "Cardinal", e: NewOrderEvent) -> None:
             send_balance_notification(c)
 
         if chat_id:
-            welcome = settings.get("welcome_message", DEFAULT_SETTINGS["welcome_message"])
-            send_fp(c, chat_id, welcome)
+            send_fp(c, chat_id, _format_buyer_template("welcome_message", order_id=order_id))
 
         logger.info(
             "%s: новый заказ FP#%s service=%s qty=%s buyer=%s",
@@ -1391,24 +1518,19 @@ def request_confirmation(c: "Cardinal", order: Dict[str, Any], link: str) -> Non
     settings = load_settings()
     allow_private = settings.get("set_tg_private") or settings.get("allow_private_telegram")
     if not allow_private and _is_private_telegram_link(link):
-        send_fp(
-            c, order["chat_id"],
-            "❌ Закрытые Telegram-каналы/группы не поддерживаются.\n"
-            "Используйте публичную ссылку: https://t.me/your_channel",
-        )
+        send_fp(c, order["chat_id"], _format_buyer_template("private_telegram_message"))
         return
 
     order["url"] = link
     display_link = link.replace("https://", "").replace("http://", "")
     send_fp(
         c, order["chat_id"],
-        f"📋 Проверьте детали заказа:\n\n"
-        f"🛒 Лот: {order['Order']}\n"
-        f"🔢 Количество: {order['Amount']} шт.\n"
-        f"🔗 Ссылка: {display_link}\n\n"
-        f"✅ Отправьте + для подтверждения\n"
-        f"❌ Отправьте - для отмены и возврата\n"
-        f"🔄 Или отправьте новую ссылку",
+        _format_buyer_template(
+            "confirmation_message",
+            lot=order["Order"],
+            amount=order["Amount"],
+            link=display_link,
+        ),
     )
     set_pending(order)
     _update_pay_order(order)
@@ -1429,10 +1551,10 @@ def confirm_order(c: "Cardinal", chat_id: Any, text: str, buyer: str = "") -> No
 
     action = _is_confirm_message(text) or text.strip()
     if action == "+":
-        send_fp(c, order["chat_id"], "⏳ Создаю заказ, подождите...")
+        send_fp(c, order["chat_id"], _format_buyer_template("creating_order_message"))
         _create_vexboost_order(c, order)
     elif action == "-":
-        send_fp(c, chat_id, "❌ Заказ отменён. Средства будут возвращены.")
+        send_fp(c, chat_id, _format_buyer_template("order_cancelled_message"))
         _remove_pay_order(order["buyer"])
         _refund_order(c, order["OrderID"])
 
@@ -1470,16 +1592,19 @@ def _create_vexboost_order(c: "Cardinal", order: Dict[str, Any]) -> None:
 
         send_fp(
             c, order["chat_id"],
-            f"✅ Заказ #{order['OrderID']} принят в работу!\n\n"
-            f"📋 Команды:\n"
-            f"⠀∟ #статус {smm_id}\n"
-            f"⠀∟ #рефилл {smm_id}\n\n"
-            f"⌛ Время выполнения: от нескольких минут до 48 часов.",
+            _format_buyer_template(
+                "order_created_message",
+                smm_id=smm_id,
+                funpay_id=order["OrderID"],
+            ),
         )
         logger.info("%s: VB#%s создан для FP#%s", LOGGER_PREFIX, smm_id, order["OrderID"])
     else:
         error_text = str(result)
-        send_fp(c, order["chat_id"], f"❌ {_buyer_error_message(error_text)}")
+        send_fp(
+            c, order["chat_id"],
+            _format_buyer_template("error_message", error=_buyer_error_message(error_text)),
+        )
         StatisticsManager.record_failed()
         send_order_error_notification(c, error_text, order)
         OrderHistory.add_entry({
@@ -1538,7 +1663,7 @@ def _process_buyer_message(
             set_pending(order)
             confirm_order(c, cid, confirm_action, msgname)
             return
-        send_fp(c, cid, "⚪️ Сначала отправьте ссылку для накрутки.")
+        send_fp(c, cid, _format_buyer_template("send_link_first_message"))
         return
 
     if pending:
@@ -1611,46 +1736,43 @@ def _handle_pending_message(
             if links:
                 request_confirmation(c, order, links[0])
         return
-    send_fp(
-        c, chat_id,
-        "⚪️ Отправьте + для подтверждения, - для отмены или новую ссылку.",
-    )
+    send_fp(c, chat_id, _format_buyer_template("pending_hint_message"))
 
 
 def _cmd_status(c: "Cardinal", chat_id: Any, message_text: str) -> None:
     parts = message_text.split()
     if len(parts) < 2 or not parts[1].isdigit():
-        send_fp(c, chat_id, "Использование: #статус ID")
+        send_fp(c, chat_id, _format_buyer_template("status_usage_message"))
         return
     smm_id = int(parts[1])
     status = VexBoostAPI.get_order_status(smm_id)
     if not status:
-        send_fp(c, chat_id, "🔴 Не удалось получить статус заказа.")
+        send_fp(c, chat_id, _format_buyer_template("status_error_message"))
         return
     start_count = status.get("start_count", 0)
     display_start = "*" if start_count == 0 else str(start_count)
     send_fp(
         c, chat_id,
-        f"📈 Статус заказа {smm_id}\n"
-        f"⠀∟ 📊 Статус: {_buyer_status_label(status.get('status'))}\n"
-        f"⠀∟ 🔢 Было: {display_start}\n"
-        f"⠀∟ 👀 Остаток: {status.get('remains', '—')}",
+        _format_buyer_template(
+            "status_message",
+            smm_id=smm_id,
+            status=_buyer_status_label(status.get("status")),
+            start_count=display_start,
+            remains=status.get("remains", "—"),
+        ),
     )
 
 
 def _cmd_refill(c: "Cardinal", chat_id: Any, message_text: str) -> None:
     parts = message_text.split()
     if len(parts) < 2 or not parts[1].isdigit():
-        send_fp(c, chat_id, "Использование: #рефилл ID")
+        send_fp(c, chat_id, _format_buyer_template("refill_usage_message"))
         return
     result = VexBoostAPI.refill_order(int(parts[1]))
     if result is not None:
-        send_fp(c, chat_id, "✅ Запрос на рефилл отправлен!")
+        send_fp(c, chat_id, _format_buyer_template("refill_success_message"))
     else:
-        send_fp(
-            c, chat_id,
-            "🔴 Ошибка рефилла. Возможно, рефилл ещё недоступен для этой услуги.",
-        )
+        send_fp(c, chat_id, _format_buyer_template("refill_error_message"))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1789,8 +1911,7 @@ def _handle_canceled_order(c: "Cardinal", smm_id: str, info: Dict[str, Any]) -> 
     if chat_id:
         send_fp(
             c, chat_id,
-            f"❌ Заказ #{funpay_id} отменён.\n"
-            f"Средства будут возвращены.",
+            _format_buyer_template("order_canceled_message", funpay_id=funpay_id),
         )
 
     if settings.get("auto_refund_on_cancel", True):
@@ -1812,9 +1933,11 @@ def _handle_partial_order(
         if chat_id:
             send_fp(
                 c, chat_id,
-                f"⚠️ Заказ #{funpay_id} приостановлен.\n"
-                f"Остаток: {partial_amount} ед.\n"
-                f"Обратитесь к продавцу.",
+                _format_buyer_template(
+                    "partial_paused_message",
+                    funpay_id=funpay_id,
+                    remains=partial_amount,
+                ),
             )
         return
 
@@ -1841,8 +1964,11 @@ def _handle_partial_order(
             if chat_id:
                 send_fp(
                     c, chat_id,
-                    f"📈 Заказ #{funpay_id} продолжен.\n"
-                    f"⏳ Остаток к выполнению: {partial_amount} ед.",
+                    _format_buyer_template(
+                        "partial_continued_message",
+                        funpay_id=funpay_id,
+                        partial_amount=partial_amount,
+                    ),
                 )
     except Exception as exc:
         logger.error("%s: ошибка пересоздания partial: %s", LOGGER_PREFIX, exc)
@@ -1901,7 +2027,10 @@ def _main_keyboard() -> InlineKeyboardMarkup:
         InlineKeyboardButton("📊 Детально", callback_data="vb_extended_stats"),
     )
     kb.row(
+        InlineKeyboardButton("📝 Шаблоны", callback_data="vb_templates_menu"),
         InlineKeyboardButton("🛠 Настройки", callback_data="vb_settings_menu"),
+    )
+    kb.row(
         InlineKeyboardButton("ℹ️ Помощь", callback_data="vb_help"),
     )
     return kb
@@ -2012,7 +2141,9 @@ def _help_text() -> str:
         f"<b>Команды администратора:</b>\n"
         f"/vexboost — панель управления\n"
         f"/vb_stats — статистика\n"
-        f"/vb_balance — баланс VexBoost"
+        f"/vb_balance — баланс VexBoost\n\n"
+        f"<b>Шаблоны сообщений:</b>\n"
+        f"/vexboost → 📝 Шаблоны — редактирование текстов для покупателей"
     )
 
 
@@ -2245,6 +2376,46 @@ def init_commands(cardinal: "Cardinal", *args) -> None:
                     reply_markup=_settings_keyboard(settings), parse_mode="HTML",
                 )
 
+            elif call.data == "vb_templates_menu":
+                bot.edit_message_text(
+                    _template_menu_text(), chat_id, msg_id,
+                    reply_markup=_templates_keyboard(), parse_mode="HTML",
+                )
+                bot.answer_callback_query(call.id)
+
+            elif call.data.startswith("vb_tpl_edit_"):
+                template_key = call.data.replace("vb_tpl_edit_", "")
+                if template_key in MESSAGE_TEMPLATE_LABELS:
+                    result = bot.send_message(
+                        chat_id,
+                        _template_edit_prompt(template_key),
+                        parse_mode="HTML",
+                        reply_markup=_template_edit_keyboard(template_key),
+                    )
+                    tg.set_state(
+                        chat_id=chat_id, message_id=result.id,
+                        user_id=call.from_user.id, state=f"vb_tpl_{template_key}",
+                    )
+                bot.answer_callback_query(call.id)
+
+            elif call.data.startswith("vb_tpl_reset_"):
+                template_key = call.data.replace("vb_tpl_reset_", "")
+                if template_key in MESSAGE_TEMPLATE_LABELS:
+                    settings[template_key] = DEFAULT_SETTINGS[template_key]
+                    save_settings(settings)
+                    label = MESSAGE_TEMPLATE_LABELS[template_key][0]
+                    bot.answer_callback_query(call.id, f"{label}: сброшено")
+                    try:
+                        bot.edit_message_text(
+                            _template_edit_prompt(template_key), chat_id, msg_id,
+                            parse_mode="HTML",
+                            reply_markup=_template_edit_keyboard(template_key),
+                        )
+                    except Exception:
+                        pass
+                else:
+                    bot.answer_callback_query(call.id)
+
             elif call.data in VB_EXTRA_CALLBACKS:
                 VB_EXTRA_CALLBACKS[call.data](cardinal, bot, chat_id, msg_id)
 
@@ -2323,20 +2494,39 @@ def init_commands(cardinal: "Cardinal", *args) -> None:
             _invalidate_vexboost_session()
             save_settings(settings)
             bot.reply_to(message, "✅ API KEY сохранён.")
+        elif state.startswith("vb_tpl_"):
+            template_key = state.replace("vb_tpl_", "")
+            if template_key in MESSAGE_TEMPLATE_LABELS:
+                label = MESSAGE_TEMPLATE_LABELS[template_key][0]
+                if message.text.strip() == "/default":
+                    settings[template_key] = DEFAULT_SETTINGS[template_key]
+                    bot.reply_to(message, f"✅ Шаблон «{label}» сброшен по умолчанию.")
+                else:
+                    settings[template_key] = message.text
+                    bot.reply_to(
+                        message,
+                        f"✅ Шаблон «{label}» сохранён.\n\n"
+                        f"<pre>{html.escape(message.text)}</pre>",
+                        parse_mode="HTML",
+                    )
+                save_settings(settings)
         tg.clear_state(message.chat.id, message.from_user.id)
 
+    def _has_text_input_state(message):
+        base_states = (
+            "vb_panel_url", "vb_panel_login", "vb_panel_password",
+            "vb_auth_token", "vb_api_url", "vb_api_key",
+        )
+        if any(tg.check_state(message.chat.id, message.from_user.id, s) for s in base_states):
+            return True
+        state_data = tg.get_state(message.chat.id, message.from_user.id)
+        state = (state_data or {}).get("state", "")
+        if state.startswith("vb_tpl_"):
+            return state.replace("vb_tpl_", "") in MESSAGE_TEMPLATE_LABELS
+        return False
+
     tg.cbq_handler(handle_callback, lambda c: c.data.startswith("vb_"))
-    tg.msg_handler(
-        handle_text_input,
-        func=lambda m: (
-            tg.check_state(m.chat.id, m.from_user.id, "vb_panel_url")
-            or tg.check_state(m.chat.id, m.from_user.id, "vb_panel_login")
-            or tg.check_state(m.chat.id, m.from_user.id, "vb_panel_password")
-            or tg.check_state(m.chat.id, m.from_user.id, "vb_auth_token")
-            or tg.check_state(m.chat.id, m.from_user.id, "vb_api_url")
-            or tg.check_state(m.chat.id, m.from_user.id, "vb_api_key")
-        ),
-    )
+    tg.msg_handler(handle_text_input, func=_has_text_input_state)
     tg.msg_handler(send_main_panel, commands=["vexboost"])
     tg.msg_handler(send_stats_cmd, commands=["vb_stats"])
     tg.msg_handler(send_balance_cmd, commands=["vb_balance"])
@@ -2458,7 +2648,7 @@ def request_confirmation(c: "Cardinal", order: Dict[str, Any], link: str) -> Non
     order["url"] = link
     valid, err = OrderValidator.validate_order(order)
     if not valid:
-        send_fp(c, order["chat_id"], f"❌ {err}\nОтправьте корректную ссылку.")
+        send_fp(c, order["chat_id"], _format_buyer_template("invalid_link_message", error=err))
         return
     _original_request_confirmation(c, order, link)
 
