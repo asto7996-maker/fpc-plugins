@@ -1,12 +1,19 @@
 #!/bin/bash
 # Установка/обновление VexBoost AutoSMM для FunPay Cardinal
-# Использование: bash install_vexboost.sh /home/fpc/FunPayCardinal
+# Автор плагина: @xei1y
+# Использование: bash install_vexboost.sh /path/to/FunPayCardinal [URL_плагина]
 
 set -e
 
-FPC_DIR="${1:-/home/fpc/FunPayCardinal}"
-PLUGIN_URL="https://raw.githubusercontent.com/asto7996-maker/fpc-plugins/main/plugins/vexboost_autosmm.py"
+FPC_DIR="${1:?Укажите путь к FunPayCardinal}"
+PLUGIN_URL="${2:-}"
 PLUGIN_FILE="$FPC_DIR/plugins/vexboost_autosmm.py"
+
+if [ -z "$PLUGIN_URL" ]; then
+    echo "Укажите URL raw-файла плагина вторым аргументом."
+    echo "Пример: bash install_vexboost.sh /opt/FunPayCardinal https://example.com/vexboost_autosmm.py"
+    exit 1
+fi
 
 echo "=== Установка VexBoost AutoSMM ==="
 echo "Папка Cardinal: $FPC_DIR"
@@ -16,34 +23,26 @@ if [ ! -d "$FPC_DIR/plugins" ]; then
     exit 1
 fi
 
-# Резервная копия
 if [ -f "$PLUGIN_FILE" ]; then
     cp "$PLUGIN_FILE" "$PLUGIN_FILE.bak.$(date +%Y%m%d_%H%M%S)"
-    echo "Старая версия сохранена в .bak"
+    echo "Резервная копия сохранена (.bak)"
 fi
 
-# Скачивание
 echo "Скачиваю плагин..."
 curl -fsSL "$PLUGIN_URL" -o "$PLUGIN_FILE"
 
-# Проверка обязательных полей
-echo "Проверка файла..."
-for field in SETTINGS_PAGE BIND_TO_DELETE VERSION UUID; do
-    if ! grep -q "^${field} " "$PLUGIN_FILE" && ! grep -q "^${field}=" "$PLUGIN_FILE"; then
+for field in SETTINGS_PAGE BIND_TO_DELETE VERSION UUID CREDITS; do
+    if ! grep -qE "^${field} " "$PLUGIN_FILE" && ! grep -qE "^${field}=" "$PLUGIN_FILE"; then
         echo "ОШИБКА: поле $field не найдено в файле!"
         exit 1
     fi
 done
 
-VERSION=$(grep '^VERSION = ' "$PLUGIN_FILE" | head -1)
-echo "Установлено: $VERSION"
+grep -E '^(VERSION|CREDITS) ' "$PLUGIN_FILE" | head -2
 
-# Удаление кэша
 rm -rf "$FPC_DIR/plugins/__pycache__"
 find "$FPC_DIR/plugins" -name "vexboost_autosmm*.pyc" -delete 2>/dev/null || true
 
 echo ""
-echo "=== Готово! ==="
-echo "1. Перезапустите бота: /restart в Telegram"
-echo "2. Настройте API: /vexboost → API KEY"
-echo "3. Проверьте: grep SETTINGS_PAGE $PLUGIN_FILE"
+echo "Готово. Перезапустите бота: /restart"
+echo "Настройка: /vexboost"

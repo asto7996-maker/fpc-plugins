@@ -1,122 +1,53 @@
-# Установка VexBoost AutoSMM на Ubuntu 24.04
+# VexBoost AutoSMM — установка
 
-## 1. Системные зависимости
+**Автор плагина:** @xei1y
 
-```bash
-sudo apt update && sudo apt upgrade -y
-sudo apt install -y python3 python3-pip python3-venv git curl
-```
-
-## 2. Python-библиотеки для плагина
-
-FunPay Cardinal уже включает большинство зависимостей. Для плагина дополнительно нужны:
+## 1. Зависимости
 
 ```bash
-pip3 install requests pyTelegramBotAPI
-```
-
-Если Cardinal установлен в виртуальном окружении — активируйте его и установите там:
-
-```bash
-cd /home/fpc/FunPayCardinal
-source venv/bin/activate   # или: source .venv/bin/activate
 pip install requests pyTelegramBotAPI
 ```
 
-## 3. Установка плагина
+Если Cardinal в venv — установите пакеты внутри venv.
 
-> **Важно:** репозиторий приватный — `curl` с raw.githubusercontent.com вернёт **404**.
-> Используйте `git clone` (см. ниже).
+## 2. Установка плагина
 
-### Способ A — через git clone (рекомендуется)
+Скопируйте `plugins/vexboost_autosmm.py` в папку `plugins` вашего FunPay Cardinal.
 
-```bash
-cd /tmp
-git clone https://github.com/asto7996-maker/fpc-plugins.git
-cp fpc-plugins/plugins/vexboost_autosmm.py /home/fpc/FunPayCardinal/plugins/
-rm -rf /home/fpc/FunPayCardinal/plugins/__pycache__
-grep -E "^(VERSION|SETTINGS_PAGE)" /home/fpc/FunPayCardinal/plugins/vexboost_autosmm.py
-```
-
-Должно быть:
-```
-VERSION = "2.0.2"
-SETTINGS_PAGE = False
-```
-
-Если `git clone` просит авторизацию — используйте Personal Access Token:
-```bash
-git clone https://<ВАШ_TOKEN>@github.com/asto7996-maker/fpc-plugins.git
-```
-
-### Способ B — скрипт установки (только для публичного репо)
+Или через curl (подставьте свой URL файла):
 
 ```bash
-bash install_vexboost.sh /home/fpc/FunPayCardinal
+curl -fsSL -o /path/to/FunPayCardinal/plugins/vexboost_autosmm.py "URL_ФАЙЛА"
+rm -rf /path/to/FunPayCardinal/plugins/__pycache__
 ```
 
-## 4. Перезапуск бота
+## 3. Перезапуск
 
 В Telegram-боте Cardinal:
+
 ```
 /restart
 ```
 
-Или через консоль:
-```bash
-cd /home/fpc/FunPayCardinal
-python3 main.py
-```
-
-## 5. Настройка
-
-1. В Telegram-боте Cardinal: `/vexboost`
-2. Нажмите **API KEY** → вставьте ключ из [vexboost.ru](https://vexboost.ru/)
-3. API URL по умолчанию: `https://vexboost.ru/api/v2`
-
-## 6. Настройка лотов FunPay
-
-В описании каждого лота добавьте:
+## 4. Настройка
 
 ```
-ID: 1634
-#Quan: 10
+/vexboost
 ```
 
-- `ID:` — ID услуги на VexBoost (обязательно)
-- `#Quan:` — множитель количества (опционально)
+- **URL** — адрес SMM-панели (например `https://vexboost.ru`)
+- **Логин + пароль** — данные аккаунта панели (рекомендуется)
+- Либо **AuthToken** / **API KEY** — альтернативные режимы
 
-## 7. Команды
+Проверка: `/vb_balance`
 
-| Команда | Описание |
-|---------|----------|
-| `/vexboost` | Панель управления |
-| `/vb_stats` | Статистика и прибыль |
-| `/vb_balance` | Баланс VexBoost и FunPay |
+## 5. Лот FunPay
 
-Покупатель в чате FunPay:
-- `#статус 12345` — статус заказа VexBoost
-- `#рефилл 12345` — запрос рефилла
+В описании лота:
 
-## 8. Проверка работы
-
-```bash
-# В логах Cardinal должно появиться:
-# VexBoost AutoSMM v2.0.0 загружен.
-
-# В Telegram: /vexboost → Диагностика — все пункты ✅
+```
+ID: 1000
+#Quan: 1
 ```
 
-## 9. Устранение неполадок
-
-```bash
-# Ошибка загрузки плагина
-rm -rf /home/fpc/FunPayCardinal/plugins/__pycache__
-grep SETTINGS_PAGE /home/fpc/FunPayCardinal/plugins/vexboost_autosmm.py
-
-# Ошибка API
-# Проверьте ключ и баланс на vexboost.ru
-
-# Данные плагина
-ls storage/plugins/a3f8c2e1-7b4d-4a9f-9e2c-1d5b8f6a0c3e/
-```
+`ID` — ID услуги в SMM-панели. `#Quan` — множитель количества (опционально).
