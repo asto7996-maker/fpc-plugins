@@ -2,7 +2,7 @@ from __future__ import annotations
 
 # === ОБЯЗАТЕЛЬНЫЕ ПОЛЯ FunPay Cardinal (НЕ УДАЛЯТЬ) ===
 NAME = "VexBoost AutoSMM"
-VERSION = "2.4.1"
+VERSION = "2.4.2"
 DESCRIPTION = "Автонакрутка SMM-услуг для FunPay Cardinal"
 CREDITS = "@xei1y"
 UUID = "a3f8c2e1-7b4d-4a9f-9e2c-1d5b8f6a0c3e"
@@ -20,7 +20,7 @@ import time
 import traceback
 from collections import defaultdict
 from datetime import datetime, timedelta
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tuple, Union
 
 import requests
 from telebot.types import InlineKeyboardButton, InlineKeyboardMarkup
@@ -230,6 +230,11 @@ _file_lock = threading.RLock()
 _session_cache_lock = threading.RLock()
 _vexboost_session_cache: Dict[str, Any] = {"session": None, "expires_at": 0.0}
 _status_thread_started = False
+_fp_order_lock = threading.RLock()
+_fp_orders_in_flight: Set[str] = set()
+_message_dedup_lock = threading.RLock()
+_recent_message_keys: Dict[str, float] = {}
+_MESSAGE_DEDUP_TTL = 5.0
 
 URL_PATTERN = re.compile(
     r"https?://(?:[a-zA-Z0-9]|[$-_@.&+]|(?:%[0-9a-fA-F][0-9a-fA-F]))+"
@@ -541,6 +546,44 @@ def find_order_by_buyer(orders: List[Dict[str, Any]], buyer: str) -> Optional[Di
         if order.get("buyer") == buyer:
             return order
     return None
+
+
+def _fp_order_exists_in_active(fp_id: str) -> bool:
+    active = load_active_orders()
+    return any(str(info.get("order_id")) == fp_id for info in active.values())
+
+
+def _try_lock_fp_order(fp_id: str) -> bool:
+    with _fp_order_lock:
+        if fp_id in _fp_orders_in_flight or _fp_order_exists_in_active(fp_id):
+            return False
+        _fp_orders_in_flight.add(fp_id)
+        return True
+
+
+def _unlock_fp_order(fp_id: str) -> None:
+    with _fp_order_lock:
+        _fp_orders_in_flight.discard(fp_id)
+
+
+def _is_fp_order_busy(fp_id: str) -> bool:
+    with _fp_order_lock:
+        if fp_id in _fp_orders_in_flight:
+            return True
+    return _fp_order_exists_in_active(fp_id)
+
+
+def _should_process_message(chat_id: Any, text: str, message_id: Any = None) -> bool:
+    key = f"{chat_id}:{message_id}" if message_id is not None else f"{chat_id}:{hash(text.strip())}"
+    now = time.time()
+    with _message_dedup_lock:
+        stale = [k for k, ts in _recent_message_keys.items() if now - ts > _MESSAGE_DEDUP_TTL]
+        for stale_key in stale:
+            _recent_message_keys.pop(stale_key, None)
+        if key in _recent_message_keys:
+            return False
+        _recent_message_keys[key] = now
+    return True
 
 
 def today_key() -> str:
@@ -1487,7 +1530,15 @@ def bind_to_new_order(c: "Cardinal", e: NewOrderEvent) -> None:
             "OrderDateTime": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         }
 
+        fp_id = str(order_id)
+        if _fp_order_exists_in_active(fp_id):
+            logger.info("%s: заказ FP#%s уже отправлен в SMM", LOGGER_PREFIX, order_id)
+            return
+
         pay_orders = load_payorders()
+        if any(str(o.get("OrderID")) == fp_id for o in pay_orders):
+            logger.info("%s: заказ FP#%s уже ожидает ссылку", LOGGER_PREFIX, order_id)
+            return
         pay_orders.append(order_entry)
         save_payorders(pay_orders)
 
@@ -1550,8 +1601,19 @@ def confirm_order(c: "Cardinal", chat_id: Any, text: str, buyer: str = "") -> No
 
     action = _is_confirm_message(text) or text.strip()
     if action == "+":
+        fp_id = str(order.get("OrderID", ""))
+        if not _try_lock_fp_order(fp_id):
+            logger.warning(
+                "%s: дубликат подтверждения заблокирован FP#%s buyer=%s",
+                LOGGER_PREFIX, fp_id, buyer,
+            )
+            return
         send_fp(c, order["chat_id"], _format_buyer_template("creating_order_message"))
-        _create_vexboost_order(c, order)
+        try:
+            _create_vexboost_order(c, order)
+        except Exception:
+            _unlock_fp_order(fp_id)
+            raise
     elif action == "-":
         send_fp(c, chat_id, _format_buyer_template("order_cancelled_message"))
         _remove_pay_order(order["buyer"])
@@ -1560,6 +1622,12 @@ def confirm_order(c: "Cardinal", chat_id: Any, text: str, buyer: str = "") -> No
 
 def _create_vexboost_order(c: "Cardinal", order: Dict[str, Any]) -> None:
     settings = load_settings()
+    fp_id = str(order.get("OrderID", ""))
+    if _fp_order_exists_in_active(fp_id):
+        logger.warning("%s: заказ FP#%s уже создан в SMM", LOGGER_PREFIX, fp_id)
+        _unlock_fp_order(fp_id)
+        return
+
     result = VexBoostAPI.create_order(
         order["service_id"], order["url"], order["Amount"],
     )
@@ -1582,6 +1650,7 @@ def _create_vexboost_order(c: "Cardinal", order: Dict[str, Any]) -> None:
         }
         save_active_orders(active)
         _remove_pay_order(order["buyer"])
+        _unlock_fp_order(fp_id)
 
         status_data = VexBoostAPI.get_order_status(smm_id)
         cost = safe_float(status_data.get("charge", 0)) if status_data else 0.0
@@ -1600,6 +1669,7 @@ def _create_vexboost_order(c: "Cardinal", order: Dict[str, Any]) -> None:
         logger.info("%s: VB#%s создан для FP#%s", LOGGER_PREFIX, smm_id, order["OrderID"])
     else:
         error_text = str(result)
+        _unlock_fp_order(fp_id)
         send_fp(
             c, order["chat_id"],
             _format_buyer_template("error_message", error=_buyer_error_message(error_text)),
@@ -1658,6 +1728,13 @@ def _process_buyer_message(
         pay_orders = load_payorders()
         order = find_order_by_buyer(pay_orders, msgname)
         if order and order.get("url"):
+            fp_id = str(order.get("OrderID", ""))
+            if _is_fp_order_busy(fp_id):
+                logger.info(
+                    "%s: повторное подтверждение пропущено FP#%s buyer=%s",
+                    LOGGER_PREFIX, fp_id, msgname,
+                )
+                return
             order["chat_id"] = cid
             set_pending(order)
             confirm_order(c, cid, confirm_action, msgname)
@@ -1688,10 +1765,15 @@ def _process_buyer_message(
 
 def msg_hook(c: "Cardinal", e: NewMessageEvent) -> None:
     try:
+        if getattr(c, "old_mode_enabled", False):
+            return
         msg = e.message
+        text = _get_message_text(msg)
+        if not _should_process_message(msg.chat_id, text, getattr(msg, "id", None)):
+            return
         _process_buyer_message(
             c,
-            _get_message_text(msg),
+            text,
             msg.chat_id,
             msg.chat_name,
             msg.author_id,
@@ -1711,6 +1793,8 @@ def last_chat_msg_hook(c: "Cardinal", e: Any) -> None:
         if not chat.unread:
             return
         message_text = str(chat).strip()
+        if not _should_process_message(chat.id, message_text):
+            return
         _process_buyer_message(
             c,
             message_text,
