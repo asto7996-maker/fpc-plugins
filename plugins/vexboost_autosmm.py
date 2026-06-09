@@ -2,7 +2,7 @@ from __future__ import annotations
 
 # === ОБЯЗАТЕЛЬНЫЕ ПОЛЯ FunPay Cardinal (НЕ УДАЛЯТЬ) ===
 NAME = "VexBoost AutoSMM"
-VERSION = "2.4.2"
+VERSION = "2.4.3"
 DESCRIPTION = "Автонакрутка SMM-услуг для FunPay Cardinal"
 CREDITS = "@xei1y"
 UUID = "a3f8c2e1-7b4d-4a9f-9e2c-1d5b8f6a0c3e"
@@ -49,6 +49,7 @@ ACTIVE_ORDERS_FILE = f"{STORAGE_DIR}/active_orders.json"
 HISTORY_FILE = f"{STORAGE_DIR}/history.json"
 STATS_FILE = f"{STORAGE_DIR}/stats.json"
 CASHLIST_FILE = f"{STORAGE_DIR}/cashlist.json"
+SUBMITTED_ORDERS_FILE = f"{STORAGE_DIR}/submitted_orders.json"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Настройки по умолчанию
@@ -508,6 +509,34 @@ def save_cashlist(data: Dict[str, Any]) -> None:
     _save_json(CASHLIST_FILE, data)
 
 
+def load_submitted_orders() -> Dict[str, Any]:
+    return _load_json(SUBMITTED_ORDERS_FILE, {})
+
+
+def save_submitted_orders(data: Dict[str, Any]) -> None:
+    _save_json(SUBMITTED_ORDERS_FILE, data)
+
+
+def get_submitted_smm_id(fp_id: str) -> Optional[int]:
+    value = load_submitted_orders().get(str(fp_id))
+    if value is not None and str(value).isdigit():
+        return int(value)
+    return None
+
+
+def mark_submitted_order(fp_id: str, smm_id: int) -> None:
+    with _file_lock:
+        data = load_submitted_orders()
+        data[str(fp_id)] = int(smm_id)
+        save_submitted_orders(data)
+
+
+def _fp_order_already_submitted(fp_id: str) -> bool:
+    if get_submitted_smm_id(fp_id) is not None:
+        return True
+    return _fp_order_exists_in_active(fp_id)
+
+
 def _default_stats() -> Dict[str, Any]:
     return {
         "total": {
@@ -555,7 +584,7 @@ def _fp_order_exists_in_active(fp_id: str) -> bool:
 
 def _try_lock_fp_order(fp_id: str) -> bool:
     with _fp_order_lock:
-        if fp_id in _fp_orders_in_flight or _fp_order_exists_in_active(fp_id):
+        if fp_id in _fp_orders_in_flight or _fp_order_already_submitted(fp_id):
             return False
         _fp_orders_in_flight.add(fp_id)
         return True
@@ -570,7 +599,7 @@ def _is_fp_order_busy(fp_id: str) -> bool:
     with _fp_order_lock:
         if fp_id in _fp_orders_in_flight:
             return True
-    return _fp_order_exists_in_active(fp_id)
+    return _fp_order_already_submitted(fp_id)
 
 
 def _should_process_message(chat_id: Any, text: str, message_id: Any = None) -> bool:
@@ -938,10 +967,23 @@ class VexBoostAPI:
         if not api_key:
             return {"error": "API KEY не задан. /vexboost → API KEY"}
         payload = {"key": api_key, **params}
+        action = params.get("action", "")
+
+        # Создание/изменение заказа — только один POST, иначе каждый метод создаёт заказ.
+        if action in ("add", "refill", "cancel"):
+            response = cls._do_post(api_url, payload)
+            if response is None:
+                return {"error": "Не удалось связаться с VexBoost: нет ответа"}
+            data = cls._parse_response(response)
+            if data is None:
+                return {"error": f"HTTP {response.status_code}: {response.text[:120]}"}
+            if "error" in data:
+                data["error"] = cls.format_error(data["error"])
+            return data
+
         retries, delay = cls._get_retry_settings()
         query = urlencode(payload)
         get_url = f"{api_url}?{query}"
-
         last_error = "Нет ответа от сервера"
 
         for attempt in range(1, retries + 1):
@@ -1059,6 +1101,16 @@ class VexBoostAPI:
         return cls._session_from_token()
 
     @classmethod
+    def _is_mutating_token_request(cls, method: str, path: str) -> bool:
+        upper = method.upper()
+        normalized = path.lstrip("/").lower()
+        if upper not in ("POST", "PUT", "PATCH", "DELETE"):
+            return False
+        if normalized in ("orders", "api/orders"):
+            return True
+        return "/orders/" in normalized
+
+    @classmethod
     def _request_token(
         cls,
         method: str,
@@ -1068,6 +1120,8 @@ class VexBoostAPI:
         params: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         retries, delay = cls._get_retry_settings()
+        if cls._is_mutating_token_request(method, path):
+            retries = 1
         last_error = "Нет ответа от сервера"
         api_path = path.lstrip("/")
         if not api_path.startswith("api/"):
@@ -1168,29 +1222,39 @@ class VexBoostAPI:
         return {"error": "Не удалось получить баланс из /api/user"}
 
     @classmethod
+    def _extract_created_order_id(cls, data: Dict[str, Any]) -> Optional[int]:
+        if not isinstance(data, dict):
+            return None
+        for key in ("id", "order_id", "orderId"):
+            value = data.get(key)
+            if value is not None and str(value).isdigit():
+                return int(value)
+        order = data.get("order")
+        if isinstance(order, dict):
+            nested = cls._extract_created_order_id(order)
+            if nested is not None:
+                return nested
+        if isinstance(order, (int, str)) and str(order).isdigit():
+            return int(order)
+        nested_data = data.get("data")
+        if isinstance(nested_data, dict):
+            return cls._extract_created_order_id(nested_data)
+        return None
+
+    @classmethod
     def _token_create_order(cls, service_id: int, link: str, quantity: int) -> Dict[str, Any]:
-        payloads = (
-            {"service_id": service_id, "link": link, "quantity": quantity},
-            {"serviceId": service_id, "link": link, "quantity": quantity},
-            {"service": service_id, "link": link, "quantity": quantity},
-        )
-        last_error = "Не удалось создать заказ"
-        for body in payloads:
-            data = cls._request_token("POST", "orders", json_body=body)
-            if "error" in data:
-                last_error = str(data["error"])
-                if "service" not in last_error.lower():
-                    continue
-                continue
-            order_id = data.get("id")
-            if order_id is None and isinstance(data.get("order"), dict):
-                order_id = data["order"].get("id")
-            if order_id is None and isinstance(data.get("order"), (int, str)):
-                order_id = data["order"]
-            if order_id is not None:
-                return {"order": int(order_id)}
+        body = {"service_id": service_id, "link": link, "quantity": quantity}
+        data = cls._request_token("POST", "orders", json_body=body)
+        if data.get("error"):
             return data
-        return {"error": last_error}
+        order_id = cls._extract_created_order_id(data)
+        if order_id is not None:
+            logger.info(
+                "%s: SMM-заказ создан одним запросом id=%s service=%s qty=%s",
+                LOGGER_PREFIX, order_id, service_id, quantity,
+            )
+            return {"order": order_id}
+        return {"error": "Заказ не создан: ID не найден в ответе API"}
 
     @classmethod
     def _token_order_status(cls, order_id: int) -> Dict[str, Any]:
@@ -1531,7 +1595,7 @@ def bind_to_new_order(c: "Cardinal", e: NewOrderEvent) -> None:
         }
 
         fp_id = str(order_id)
-        if _fp_order_exists_in_active(fp_id):
+        if _fp_order_already_submitted(fp_id):
             logger.info("%s: заказ FP#%s уже отправлен в SMM", LOGGER_PREFIX, order_id)
             return
 
@@ -1623,8 +1687,16 @@ def confirm_order(c: "Cardinal", chat_id: Any, text: str, buyer: str = "") -> No
 def _create_vexboost_order(c: "Cardinal", order: Dict[str, Any]) -> None:
     settings = load_settings()
     fp_id = str(order.get("OrderID", ""))
+    existing_smm_id = get_submitted_smm_id(fp_id)
+    if existing_smm_id is not None:
+        logger.warning(
+            "%s: заказ FP#%s уже создан в SMM как #%s",
+            LOGGER_PREFIX, fp_id, existing_smm_id,
+        )
+        _unlock_fp_order(fp_id)
+        return
     if _fp_order_exists_in_active(fp_id):
-        logger.warning("%s: заказ FP#%s уже создан в SMM", LOGGER_PREFIX, fp_id)
+        logger.warning("%s: заказ FP#%s уже в активных", LOGGER_PREFIX, fp_id)
         _unlock_fp_order(fp_id)
         return
 
@@ -1649,6 +1721,7 @@ def _create_vexboost_order(c: "Cardinal", order: Dict[str, Any]) -> None:
             "status": "Pending",
         }
         save_active_orders(active)
+        mark_submitted_order(fp_id, smm_id)
         _remove_pay_order(order["buyer"])
         _unlock_fp_order(fp_id)
 
@@ -1723,20 +1796,6 @@ def _process_buyer_message(
             LOGGER_PREFIX, message_text, msgname, cid, pending is not None,
         )
         if pending:
-            confirm_order(c, cid, confirm_action, msgname)
-            return
-        pay_orders = load_payorders()
-        order = find_order_by_buyer(pay_orders, msgname)
-        if order and order.get("url"):
-            fp_id = str(order.get("OrderID", ""))
-            if _is_fp_order_busy(fp_id):
-                logger.info(
-                    "%s: повторное подтверждение пропущено FP#%s buyer=%s",
-                    LOGGER_PREFIX, fp_id, msgname,
-                )
-                return
-            order["chat_id"] = cid
-            set_pending(order)
             confirm_order(c, cid, confirm_action, msgname)
             return
         send_fp(c, cid, _format_buyer_template("send_link_first_message"))
