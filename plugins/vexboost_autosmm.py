@@ -2,9 +2,9 @@ from __future__ import annotations
 
 # === ОБЯЗАТЕЛЬНЫЕ ПОЛЯ FunPay Cardinal (НЕ УДАЛЯТЬ) ===
 NAME = "VexBoost AutoSMM"
-VERSION = "2.2.1"
+VERSION = "2.2.2"
 DESCRIPTION = "Автонакрутка через VexBoost (vexboost.ru)"
-CREDITS = "Cursor AI"
+CREDITS = "@xei1y"
 UUID = "a3f8c2e1-7b4d-4a9f-9e2c-1d5b8f6a0c3e"
 SETTINGS_PAGE = False
 BIND_TO_DELETE = None
