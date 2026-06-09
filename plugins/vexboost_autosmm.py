@@ -2,7 +2,7 @@ from __future__ import annotations
 
 # === ОБЯЗАТЕЛЬНЫЕ ПОЛЯ FunPay Cardinal (НЕ УДАЛЯТЬ) ===
 NAME = "VexBoost AutoSMM"
-VERSION = "2.2.0"
+VERSION = "2.2.1"
 DESCRIPTION = "Автонакрутка через VexBoost (vexboost.ru)"
 CREDITS = "Cursor AI"
 UUID = "a3f8c2e1-7b4d-4a9f-9e2c-1d5b8f6a0c3e"
@@ -124,12 +124,44 @@ def _strip_html(text: str) -> str:
     return HTML_TAG_PATTERN.sub("", text).replace("&nbsp;", " ").strip()
 
 
+def _buyer_error_message(error: Any) -> str:
+    """Сообщение об ошибке для покупателя без названия сервиса и тех. деталей."""
+    text = str(error or "").strip().lower()
+    if "invalid link" in text or "ссылк" in text:
+        return "Некорректная ссылка. Проверьте и отправьте снова."
+    if "quantity" in text or "количеств" in text:
+        return "Некорректное количество для этой услуги. Обратитесь к продавцу."
+    if "service" in text or "услуг" in text:
+        return "Ошибка параметров заказа. Обратитесь к продавцу."
+    if "fund" in text or "средств" in text or "баланс" in text:
+        return "Заказ временно не может быть выполнен. Обратитесь к продавцу."
+    return "Не удалось выполнить заказ. Продавец уведомлён — напишите в чат."
+
+
+def _buyer_status_label(status: Any) -> str:
+    mapping = {
+        "pending": "В очереди",
+        "in progress": "Выполняется",
+        "in_progress": "Выполняется",
+        "processing": "Выполняется",
+        "completed": "Выполнен",
+        "partial": "Частично выполнен",
+        "canceled": "Отменён",
+        "cancelled": "Отменён",
+    }
+    raw = str(status or "—").strip()
+    return mapping.get(raw.lower(), raw)
+
+
 def send_fp(c: "Cardinal", chat_id: Any, text: str) -> None:
     """Отправка сообщения покупателю в FunPay (без HTML-разметки)."""
     if not chat_id:
         logger.warning("%s: попытка отправить сообщение без chat_id", LOGGER_PREFIX)
         return
-    c.send_message(_normalize_chat_id(chat_id), _strip_html(text))
+    cleaned = _strip_html(text)
+    for token in ("vexboost", "VexBoost", "VEXBOOST", "socpanel"):
+        cleaned = cleaned.replace(token, "")
+    c.send_message(_normalize_chat_id(chat_id), cleaned)
 
 
 def _get_message_text(msg: Any) -> str:
@@ -1432,8 +1464,7 @@ def _create_vexboost_order(c: "Cardinal", order: Dict[str, Any]) -> None:
 
         send_fp(
             c, order["chat_id"],
-            f"📊 Заказ создан и отправлен в VexBoost!\n"
-            f"🆔 ID заказа: {smm_id}\n\n"
+            f"✅ Заказ #{order['OrderID']} принят в работу!\n\n"
             f"📋 Команды:\n"
             f"⠀∟ #статус {smm_id}\n"
             f"⠀∟ #рефилл {smm_id}\n\n"
@@ -1442,7 +1473,7 @@ def _create_vexboost_order(c: "Cardinal", order: Dict[str, Any]) -> None:
         logger.info("%s: VB#%s создан для FP#%s", LOGGER_PREFIX, smm_id, order["OrderID"])
     else:
         error_text = str(result)
-        send_fp(c, order["chat_id"], f"❌ Ошибка при создании заказа:\n{error_text}")
+        send_fp(c, order["chat_id"], f"❌ {_buyer_error_message(error_text)}")
         StatisticsManager.record_failed()
         send_order_error_notification(c, error_text, order)
         OrderHistory.add_entry({
@@ -1595,10 +1626,9 @@ def _cmd_status(c: "Cardinal", chat_id: Any, message_text: str) -> None:
     send_fp(
         c, chat_id,
         f"📈 Статус заказа {smm_id}\n"
-        f"⠀∟ 📊 Статус: {status.get('status', '—')}\n"
+        f"⠀∟ 📊 Статус: {_buyer_status_label(status.get('status'))}\n"
         f"⠀∟ 🔢 Было: {display_start}\n"
-        f"⠀∟ 👀 Остаток: {status.get('remains', '—')}\n"
-        f"⠀∟ 💳 Стоимость: {status.get('charge', '—')} {status.get('currency', '')}",
+        f"⠀∟ 👀 Остаток: {status.get('remains', '—')}",
     )
 
 
@@ -1753,7 +1783,7 @@ def _handle_canceled_order(c: "Cardinal", smm_id: str, info: Dict[str, Any]) -> 
     if chat_id:
         send_fp(
             c, chat_id,
-            f"❌ Заказ #{funpay_id} отменён на стороне VexBoost.\n"
+            f"❌ Заказ #{funpay_id} отменён.\n"
             f"Средства будут возвращены.",
         )
 
@@ -1805,9 +1835,8 @@ def _handle_partial_order(
             if chat_id:
                 send_fp(
                     c, chat_id,
-                    f"📈 Заказ #{funpay_id} пересоздан!\n"
-                    f"🆔 Новый ID: {new_id}\n"
-                    f"⏳ Остаток: {partial_amount}",
+                    f"📈 Заказ #{funpay_id} продолжен.\n"
+                    f"⏳ Остаток к выполнению: {partial_amount} ед.",
                 )
     except Exception as exc:
         logger.error("%s: ошибка пересоздания partial: %s", LOGGER_PREFIX, exc)
