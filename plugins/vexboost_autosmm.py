@@ -1806,7 +1806,7 @@ def _handle_partial_order(
         if chat_id:
             send_fp(
                 c, chat_id,
-                f"⚠️ Заказ #{funpay_id} приостановлен (Partial).\n"
+                f"⚠️ Заказ #{funpay_id} приостановлен.\n"
                 f"Остаток: {partial_amount} ед.\n"
                 f"Обратитесь к продавцу.",
             )
