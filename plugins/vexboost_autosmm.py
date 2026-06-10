@@ -2249,12 +2249,26 @@ def _guide_section_text(section: str) -> str:
 
 def _guide_menu_keyboard() -> InlineKeyboardMarkup:
     kb = InlineKeyboardMarkup(row_width=2)
-    order = ("start", "auth", "lots", "flow", "panel", "templates", "settings", "fix")
-    for key in order:
-        title, _ = GUIDE_SECTIONS[key]
-        short = title.split(" ", 1)[-1][:14]
-        kb.add(InlineKeyboardButton(short, callback_data=f"vb_guide_{key}"))
-    kb.add(InlineKeyboardButton("⬅️ В меню", callback_data="vb_back_main"))
+    labels = (
+        ("🚀 Старт", "start"),
+        ("🔐 Вход", "auth"),
+        ("📦 Лоты", "lots"),
+        ("🔄 Заказ", "flow"),
+        ("🎛 Панель", "panel"),
+        ("📝 Шаблоны", "templates"),
+        ("⚙️ Настройки", "settings"),
+        ("🔧 Проблемы", "fix"),
+    )
+    for i in range(0, len(labels), 2):
+        left = InlineKeyboardButton(labels[i][0], callback_data=f"vb_guide_{labels[i][1]}")
+        if i + 1 < len(labels):
+            right = InlineKeyboardButton(
+                labels[i + 1][0], callback_data=f"vb_guide_{labels[i + 1][1]}",
+            )
+            kb.row(left, right)
+        else:
+            kb.row(left)
+    kb.row(InlineKeyboardButton("⬅️ В меню", callback_data="vb_back_main"))
     return kb
 
 
