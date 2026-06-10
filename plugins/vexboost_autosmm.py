@@ -2,7 +2,7 @@ from __future__ import annotations
 
 # === ОБЯЗАТЕЛЬНЫЕ ПОЛЯ FunPay Cardinal (НЕ УДАЛЯТЬ) ===
 NAME = "VexBoost AutoSMM"
-VERSION = "2.4.3"
+VERSION = "2.4.4"
 DESCRIPTION = "Автонакрутка SMM-услуг для FunPay Cardinal"
 CREDITS = "@xei1y"
 UUID = "a3f8c2e1-7b4d-4a9f-9e2c-1d5b8f6a0c3e"
@@ -2117,6 +2117,154 @@ def _handle_partial_order(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Встроенный гайд (/vexboost → 📖 Гайд)
+# ─────────────────────────────────────────────────────────────────────────────
+
+GUIDE_SECTIONS: Dict[str, Tuple[str, str]] = {
+    "start": (
+        "🚀 Быстрый старт",
+        (
+            "<b>1. Установка</b>\n"
+            "Скопируйте <code>vexboost_autosmm.py</code> в папку <code>plugins</code> "
+            "и перезапустите Cardinal.\n\n"
+            "<b>2. Настройка</b>\n"
+            "• /vexboost → URL + Логин + Пароль\n"
+            "• /vb_balance — проверка связи\n\n"
+            "<b>3. Лот FunPay</b>\n"
+            "В описании:\n"
+            "<code>ID: 1000</code>\n"
+            "<code>#Quan: 1</code> — по желанию\n\n"
+            "<b>4. Тест</b>\n"
+            "Оплата → ссылка → <b>+</b> → 1 заказ в панели.\n\n"
+            "✅ Чеклист: Cardinal работает · curl vexboost.ru OK · баланс виден"
+        ),
+    ),
+    "auth": (
+        "🔐 Авторизация",
+        (
+            "<b>Логин + пароль</b> — рекомендуется, 24/7\n"
+            "URL → Логин → Пароль → /vb_balance\n\n"
+            "<b>AuthToken</b> — временно (~2 ч)\n"
+            "Cookie-Editor → <code>socpanel_session</code> → Value\n\n"
+            "<b>API KEY</b>\n"
+            "API URL + KEY из кабинета панели\n\n"
+            "Смена режима: кнопка <b>Режим</b> в главном меню."
+        ),
+    ),
+    "lots": (
+        "📦 Лоты FunPay",
+        (
+            "В <b>описании лота</b> укажите ID услуги из SMM-панели:\n\n"
+            "<code>ID: 1000</code>\n\n"
+            "Множитель количества (опционально):\n"
+            "<code>#Quan: 1000</code>\n\n"
+            "Формула: <i>кол-во в панели = шт. лота × #Quan</i>\n"
+            "Без #Quan: кол-во = шт. лота.\n\n"
+            "Разные лоты — разные <code>ID:</code> в описании."
+        ),
+    ),
+    "flow": (
+        "🔄 Процесс заказа",
+        (
+            "<b>Покупатель:</b>\n"
+            "1️⃣ Оплата лота\n"
+            "2️⃣ Ссылка на канал/пост\n"
+            "3️⃣ Проверка деталей\n"
+            "4️⃣ <b>+</b> подтвердить / <b>-</b> отмена\n"
+            "5️⃣ Получает ID заказа SMM\n"
+            "6️⃣ После выполнения — ссылка на FunPay\n\n"
+            "<b>Команды в чате:</b>\n"
+            "<code>#статус ID</code> · <code>#рефилл ID</code>\n\n"
+            "Название панели покупателю <b>не показывается</b>."
+        ),
+    ),
+    "panel": (
+        "🎛 Кнопки панели",
+        (
+            "<b>Управление</b>\n"
+            "📊 Статистика · 💰 Баланс\n"
+            "📝 Ожидают ссылку · 📋 Активные\n"
+            "📜 История · 🏆 Топ услуг\n\n"
+            "<b>Аналитика</b>\n"
+            "💎 Прибыль · 📈 График · 📊 Детально\n\n"
+            "<b>Сервис</b>\n"
+            "🏥 Диагностика — проверка API\n"
+            "📝 Шаблоны — тексты для покупателей\n"
+            "🛠 Настройки — автовозврат, уведомления\n\n"
+            "<b>Команды:</b> /vexboost · /vb_stats · /vb_balance"
+        ),
+    ),
+    "templates": (
+        "📝 Шаблоны",
+        (
+            "📝 Шаблоны → выберите текст → отправьте новый.\n\n"
+            "<b>Переменные:</b>\n"
+            "<code>{smm_id}</code> — ID в панели\n"
+            "<code>{order_id}</code> / <code>{funpay_id}</code>\n"
+            "<code>{lot}</code> · <code>{amount}</code> · <code>{link}</code>\n"
+            "<code>{error}</code> · <code>{status}</code> · <code>{remains}</code>\n\n"
+            "Сброс: <code>/default</code> или кнопка «Сбросить»."
+        ),
+    ),
+    "settings": (
+        "⚙️ Настройки",
+        (
+            "<b>Автовозврат</b> — при ошибке / отмене в панели\n\n"
+            "<b>Уведомления TG</b> — новый заказ, ошибка, выполнение, баланс\n\n"
+            "<b>Partial</b> — автодозаказ остатка (выкл. по умолчанию)\n\n"
+            "<b>Закрытые TG</b> — разрешить t.me/+ и t.me/c/ ссылки\n\n"
+            "Переключатели: 🟢 вкл · 🔴 выкл"
+        ),
+    ),
+    "fix": (
+        "🔧 Решение проблем",
+        (
+            "<b>Нет баланса / API</b>\n"
+            "🏥 Диагностика → проверьте логин/пароль\n"
+            "<code>curl -I https://vexboost.ru</code> с сервера\n\n"
+            "<b>FunPay timeout</b>\n"
+            "Проблема сети VPS, не плагина. Нужен другой хостинг.\n\n"
+            "<b>Заказ не создаётся</b>\n"
+            "Баланс · ID в лоте · ссылка https:// · логи Cardinal\n\n"
+            "<b>Дубли заказов</b>\n"
+            "Обновите до v2.4.3+. Старые — отмените вручную в панели."
+        ),
+    ),
+}
+
+
+def _guide_menu_text() -> str:
+    return (
+        f"📖 <b>Гайд {NAME} v{VERSION}</b>\n\n"
+        f"Автор: {CREDITS}\n\n"
+        f"Автонакрутка SMM через FunPay Cardinal.\n"
+        f"Выберите раздел:"
+    )
+
+
+def _guide_section_text(section: str) -> str:
+    title, body = GUIDE_SECTIONS.get(section, ("", "Раздел не найден."))
+    return f"📖 <b>{title}</b>\n\n{body}"
+
+
+def _guide_menu_keyboard() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup(row_width=2)
+    order = ("start", "auth", "lots", "flow", "panel", "templates", "settings", "fix")
+    for key in order:
+        title, _ = GUIDE_SECTIONS[key]
+        short = title.split(" ", 1)[-1][:14]
+        kb.add(InlineKeyboardButton(short, callback_data=f"vb_guide_{key}"))
+    kb.add(InlineKeyboardButton("⬅️ В меню", callback_data="vb_back_main"))
+    return kb
+
+
+def _guide_section_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(row_width=1).add(
+        InlineKeyboardButton("⬅️ К разделам гайда", callback_data="vb_guide"),
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Telegram-панель управления (/vexboost)
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -2173,6 +2321,7 @@ def _main_keyboard() -> InlineKeyboardMarkup:
         InlineKeyboardButton("🛠 Настройки", callback_data="vb_settings_menu"),
     )
     kb.row(
+        InlineKeyboardButton("📖 Гайд", callback_data="vb_guide"),
         InlineKeyboardButton("ℹ️ Помощь", callback_data="vb_help"),
     )
     return kb
@@ -2284,8 +2433,8 @@ def _help_text() -> str:
         f"/vexboost — панель управления\n"
         f"/vb_stats — статистика\n"
         f"/vb_balance — баланс VexBoost\n\n"
-        f"<b>Шаблоны сообщений:</b>\n"
-        f"/vexboost → 📝 Шаблоны — редактирование текстов для покупателей"
+        f"<b>Подробная инструкция:</b>\n"
+        f"/vexboost → 📖 Гайд"
     )
 
 
@@ -2561,10 +2710,27 @@ def init_commands(cardinal: "Cardinal", *args) -> None:
             elif call.data in VB_EXTRA_CALLBACKS:
                 VB_EXTRA_CALLBACKS[call.data](cardinal, bot, chat_id, msg_id)
 
+            elif call.data == "vb_guide":
+                bot.edit_message_text(
+                    _guide_menu_text(), chat_id, msg_id,
+                    reply_markup=_guide_menu_keyboard(), parse_mode="HTML",
+                )
+                bot.answer_callback_query(call.id)
+
+            elif call.data.startswith("vb_guide_"):
+                section = call.data.replace("vb_guide_", "")
+                if section in GUIDE_SECTIONS:
+                    bot.edit_message_text(
+                        _guide_section_text(section), chat_id, msg_id,
+                        reply_markup=_guide_section_keyboard(), parse_mode="HTML",
+                    )
+                bot.answer_callback_query(call.id)
+
             elif call.data == "vb_help":
                 bot.edit_message_text(
                     _help_text(), chat_id, msg_id,
                     reply_markup=InlineKeyboardMarkup().add(
+                        InlineKeyboardButton("📖 Полный гайд", callback_data="vb_guide"),
                         InlineKeyboardButton("⬅️ Назад", callback_data="vb_back_main"),
                     ),
                     parse_mode="HTML",
