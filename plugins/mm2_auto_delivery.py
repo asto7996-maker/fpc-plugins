@@ -109,8 +109,20 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "roblox_http_retries": 3,
     "roblox_http_retry_delay_seconds": 2,
     "admin_funpay_chat_id": "",
+    "admin_notifications_to_telegram": True,
+    "admin_notifications_to_funpay": False,
+    "telegram_mirror_funpay_messages": True,
     "pause_on_auth_error": True,
     "auto_start_delivery_after_friend_request": True,
+    "buyer_server_join_enabled": True,
+    "buyer_join_keywords": [
+        "/joinme",
+        "/join",
+        "join me",
+        "зайди ко мне",
+        "иди ко мне",
+        "ко мне",
+    ],
     "lot_id_patterns": [
         r"(?:MM2|Murder\s*Mystery\s*2)?\s*(?:ID|Lot|Лот|Номер)\s*[:#№-]?\s*(\d{1,12})",
         r"#MM2-(\d{1,12})",
@@ -175,11 +187,26 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
         ),
         "waiting_join": (
             "Жду вас в игре для передачи предмета {item_name}. "
-            "Примите дружбу и зайдите на VIP-сервер: {server_url}"
+            "Примите дружбу и зайдите на VIP-сервер: {server_url}\n"
+            "Если хотите, чтобы я зашёл на ваш сервер, напишите /joinme."
         ),
         "join_fallback": (
             "Я не смог передать вам предмет. Пожалуйста, нажмите кнопку 'Join' в моём профиле Roblox "
             "({profile_url}) или зайдите ко мне на VIP-сервер: {server_url}"
+        ),
+        "joinme_need_nick": "Сначала отправьте ваш точный ник Roblox, чтобы я понял, к кому присоединяться.",
+        "joinme_no_presence": "Я пока не вижу вас в MM2. Зайдите на сервер Murder Mystery 2 и напишите /joinme ещё раз.",
+        "joinme_private_unknown": (
+            "Вижу, что вы в MM2, но Roblox не отдал вместимость сервера. "
+            "Пробую присоединиться к вам. Если сервер полный, перейдите на другой сервер и напишите /joinme."
+        ),
+        "joinme_joining": (
+            "Вижу ваш сервер MM2 ({playing}/{max_players}). Пробую присоединиться к вам и передать {item_name}. "
+            "Пожалуйста, оставайтесь в игре и не уходите AFK."
+        ),
+        "joinme_server_full": (
+            "Ваш сервер заполнен ({playing}/{max_players}). Смените сервер и напишите /joinme ещё раз. "
+            "Если это ваш VIP-сервер, удалите/попросите выйти одного игрока, чтобы я смог зайти."
         ),
         "trade_started": "Вижу вас в игре. Начинаю трейд предмета {item_name}. Пожалуйста, не уходите AFK.",
         "trade_timeout": "Трейд не был принят за 60 секунд. Я попробую ещё раз, когда вы будете готовы.",
@@ -321,8 +348,13 @@ class PluginSettings:
     roblox_http_retries: int
     roblox_http_retry_delay_seconds: int
     admin_funpay_chat_id: str
+    admin_notifications_to_telegram: bool
+    admin_notifications_to_funpay: bool
+    telegram_mirror_funpay_messages: bool
     pause_on_auth_error: bool
     auto_start_delivery_after_friend_request: bool
+    buyer_server_join_enabled: bool
+    buyer_join_keywords: List[str]
     lot_id_patterns: List[str]
     delay_keywords: List[str]
     ready_keywords: List[str]
@@ -357,8 +389,13 @@ class PluginSettings:
             roblox_http_retries=max(1, int(data.get("roblox_http_retries") or 3)),
             roblox_http_retry_delay_seconds=max(1, int(data.get("roblox_http_retry_delay_seconds") or 2)),
             admin_funpay_chat_id=str(data.get("admin_funpay_chat_id", "")),
+            admin_notifications_to_telegram=bool(data.get("admin_notifications_to_telegram", True)),
+            admin_notifications_to_funpay=bool(data.get("admin_notifications_to_funpay", False)),
+            telegram_mirror_funpay_messages=bool(data.get("telegram_mirror_funpay_messages", True)),
             pause_on_auth_error=bool(data.get("pause_on_auth_error", True)),
             auto_start_delivery_after_friend_request=bool(data.get("auto_start_delivery_after_friend_request", True)),
+            buyer_server_join_enabled=bool(data.get("buyer_server_join_enabled", True)),
+            buyer_join_keywords=[str(x).lower() for x in data.get("buyer_join_keywords", [])],
             lot_id_patterns=[str(x) for x in data.get("lot_id_patterns", [])],
             delay_keywords=[str(x).lower() for x in data.get("delay_keywords", [])],
             ready_keywords=[str(x).lower() for x in data.get("ready_keywords", [])],
@@ -466,6 +503,26 @@ class RobloxPresence:
     @property
     def in_game(self) -> bool:
         return self.presence_type == 2
+
+
+@dataclasses.dataclass
+class RobloxServerCapacity:
+    game_id: str
+    playing: int = 0
+    max_players: int = 0
+    source: str = "unknown"
+
+    @property
+    def known(self) -> bool:
+        return bool(self.game_id and self.max_players > 0)
+
+    @property
+    def is_full(self) -> bool:
+        return self.known and self.playing >= self.max_players
+
+    @property
+    def has_space(self) -> bool:
+        return self.known and self.playing < self.max_players
 
 
 @dataclasses.dataclass
@@ -974,17 +1031,28 @@ class FunPayAdapter:
         try:
             self.cardinal.send_message(chat, cleaned)
             logger.info("%s: FunPay -> chat=%s: %s", LOGGER_PREFIX, chat, cleaned.replace("\n", " ")[:180])
+            if self.settings.telegram_mirror_funpay_messages and not scope.startswith("admin:"):
+                self.notify_admin(
+                    f"FunPay chat {chat}\n"
+                    f"Scope: {scope or '-'}\n"
+                    f"Message:\n{cleaned}",
+                    force_telegram=True,
+                    allow_funpay=False,
+                )
         except Exception as exc:
             logger.error("%s: ошибка отправки FunPay-сообщения chat=%s: %s", LOGGER_PREFIX, chat, exc)
 
-    def notify_admin(self, text: str) -> None:
+    def notify_admin(self, text: str, force_telegram: bool = False, allow_funpay: Optional[bool] = None) -> None:
+        allow_funpay = self.settings.admin_notifications_to_funpay if allow_funpay is None else allow_funpay
         admin_chat = self.settings.admin_funpay_chat_id
-        if admin_chat:
+        if admin_chat and allow_funpay:
             self.send_message(admin_chat, f"[MM2 AutoDelivery]\n{text}", scope=f"admin:{hash(text)}")
+        if self.settings.admin_notifications_to_telegram or force_telegram:
+            _tg_send_to_admins(self.cardinal, f"🔪 <b>MM2 AutoDelivery</b>\n\n<pre>{_html(text)}</pre>")
         telegram = getattr(self.cardinal, "telegram", None)
         bot = getattr(telegram, "bot", None)
         tg_id = getattr(telegram, "admin_chat_id", None) or getattr(telegram, "chat_id", None)
-        if bot and tg_id:
+        if bot and tg_id and (self.settings.admin_notifications_to_telegram or force_telegram):
             with contextlib.suppress(Exception):
                 bot.send_message(tg_id, f"MM2 AutoDelivery\n{text}")
 
@@ -1116,6 +1184,36 @@ class RobloxApiClient:
             game_id=str(item.get("gameId") or ""),
         )
 
+    async def get_public_server_capacity(self, place_id: int, game_id: str) -> Optional[RobloxServerCapacity]:
+        if not place_id or not game_id:
+            return None
+        cursor = ""
+        for _page in range(5):
+            params = {
+                "sortOrder": "Asc",
+                "limit": "100",
+            }
+            if cursor:
+                params["cursor"] = cursor
+            url = f"https://games.roblox.com/v1/games/{int(place_id)}/servers/Public?{urllib.parse.urlencode(params)}"
+            result = await self.request("GET", url, auth=False, allow_statuses=(400, 401, 403, 404))
+            if not result.ok:
+                logger.info("%s: capacity сервера %s недоступна: HTTP %s", LOGGER_PREFIX, game_id, result.status)
+                return None
+            payload = result.json_data or {}
+            for server in payload.get("data") or []:
+                if str(server.get("id") or "") == str(game_id):
+                    return RobloxServerCapacity(
+                        game_id=str(game_id),
+                        playing=int(server.get("playing") or 0),
+                        max_players=int(server.get("maxPlayers") or 0),
+                        source="public_servers",
+                    )
+            cursor = str(payload.get("nextPageCursor") or "")
+            if not cursor:
+                break
+        return None
+
     async def request(
         self,
         method: str,
@@ -1240,7 +1338,8 @@ class BrowserTradeAutomator:
         headless = bool(self.settings.browser.get("headless", False))
         slow_mo = int(self.settings.browser.get("slow_mo_ms") or 0)
         launch_timeout = int(self.settings.browser.get("launch_timeout_ms") or 120000)
-        server_url = self.settings.roblox_vip_server_url or self.settings.roblox_profile_url
+        server_url = str(order.metadata.get("preferred_join_url") or "").strip()
+        server_url = server_url or self.settings.roblox_vip_server_url or self.settings.roblox_profile_url
         if not server_url:
             return TradeResult(DeliveryOutcome.BUYER_NOT_IN_SERVER, "Не указан VIP-сервер или профиль Roblox")
 
@@ -1432,6 +1531,13 @@ def is_ready_request(text: str, settings: PluginSettings) -> bool:
     return any(keyword and keyword in lowered for keyword in settings.ready_keywords)
 
 
+def is_buyer_join_request(text: str, settings: PluginSettings) -> bool:
+    if not settings.buyer_server_join_enabled:
+        return False
+    lowered = (text or "").lower().strip()
+    return any(keyword and keyword in lowered for keyword in settings.buyer_join_keywords)
+
+
 def normalize_nickname(text: str) -> str:
     text = (text or "").strip()
     text = text.removeprefix("@").strip()
@@ -1498,6 +1604,7 @@ ADMIN_GUIDE_SECTIONS: Dict[str, Tuple[str, str]] = {
             "Покупателю доступны простые текстовые команды в его заказе:\n"
             "- /delay, 'позже', 'отложи', 'завтра' - поставить передачу на паузу.\n"
             "- /ready, 'готов', 'можно' - возобновить доставку.\n"
+            "- /joinme, 'зайди ко мне' - попросить бота присоединиться к текущему серверу покупателя.\n"
             "Если покупатель отправляет новый валидный ник в состоянии ожидания, "
             "плагин перепроверит аккаунт и повторит friend request."
         ),
@@ -1566,6 +1673,8 @@ ADMIN_RUNBOOKS: Dict[str, Tuple[str, List[str]]] = {
         [
             "Проверьте roblox_vip_server_url и права доступа к VIP-серверу.",
             "Если используется публичный сервер, включите use_public_server_if_no_vip.",
+            "Если покупатель хочет доставку на своём сервере, он должен зайти в MM2 и написать /joinme.",
+            "При /joinme плагин проверит Public server capacity; если сервер полный, покупатель получит инструкцию сменить сервер.",
             "Presence API видит игру, но не всегда раскрывает private server instance.",
             "Если задан expected_game_instance_id, проверьте актуальность ID.",
             "Покупателю можно отправить ссылку из сообщения join_fallback.",
@@ -2692,10 +2801,21 @@ class DeliveryCoordinator:
         key = f"{chat_id}:{message_id or abs(hash(text))}"
         if self.store.was_message_seen(key, chat_id, text):
             return
+        if self.settings.telegram_mirror_funpay_messages:
+            self.funpay.notify_admin(
+                f"FunPay chat {chat_id}\n"
+                f"Buyer: {buyer or '-'}\n"
+                f"Incoming:\n{text}",
+                force_telegram=True,
+                allow_funpay=False,
+            )
         if await self.admin_commands.handle(chat_id, text):
             return
         order = self.store.get_active_order_by_chat(chat_id, buyer)
         if not order:
+            return
+        if is_buyer_join_request(text, self.settings):
+            await self.request_join_buyer_server(order)
             return
         if is_delay_request(text, self.settings):
             await self.delay_order(order)
@@ -2711,6 +2831,80 @@ class DeliveryCoordinator:
                 await self.handle_nickname(order, text)
             else:
                 self.funpay.send_message(order.chat_id, self.settings.message("waiting_join", item_name=order.item_name, server_url=self.settings.roblox_vip_server_url), scope=f"wait_join:{order.order_id}")
+
+    async def request_join_buyer_server(self, order: DeliveryOrder) -> None:
+        if not order.roblox_user_id:
+            self.funpay.send_message(order.chat_id, self.settings.message("joinme_need_nick"), scope=f"joinme_need_nick:{order.order_id}")
+            return
+        if self._paused_by_auth:
+            self.funpay.send_message(order.chat_id, self.settings.message("auth_paused"), scope=f"joinme_auth:{order.order_id}")
+            return
+        try:
+            presence = await self.roblox.get_presence(order.roblox_user_id)
+        except RobloxAuthError as exc:
+            await self._pause_for_auth_error(f"Roblox auth error during /joinme: {exc}")
+            self.funpay.send_message(order.chat_id, self.settings.message("auth_paused"), scope=f"joinme_auth:{order.order_id}")
+            return
+        except Exception as exc:
+            order.last_error = f"/joinme presence error: {exc}"
+            self.store.update_order(order, event_type="joinme_presence_error", message=order.last_error)
+            self.funpay.send_message(order.chat_id, "Roblox временно не отвечает. Попробуйте /joinme ещё раз через минуту.", scope=f"joinme_presence:{order.order_id}")
+            return
+
+        if not presence or not presence.in_game or not presence.game_id:
+            self.funpay.send_message(order.chat_id, self.settings.message("joinme_no_presence"), scope=f"joinme_no_presence:{order.order_id}")
+            return
+        if not self._presence_is_mm2(presence):
+            self.funpay.send_message(order.chat_id, self.settings.message("joinme_no_presence"), scope=f"joinme_wrong_game:{order.order_id}")
+            return
+
+        place_id = presence.place_id or presence.root_place_id or self.settings.roblox_place_id
+        capacity = await self.roblox.get_public_server_capacity(place_id, presence.game_id)
+        order.metadata["preferred_join_game_id"] = presence.game_id
+        order.metadata["preferred_join_place_id"] = place_id
+        order.metadata["preferred_join_url"] = self._build_public_join_url(place_id, presence.game_id)
+        order.metadata["preferred_join_requested_at"] = utc_now()
+
+        if capacity and capacity.is_full:
+            order.last_error = f"buyer_server_full {capacity.playing}/{capacity.max_players}"
+            self.store.update_order(order, event_type="joinme_server_full", message=order.last_error)
+            self.funpay.send_message(
+                order.chat_id,
+                self.settings.message("joinme_server_full", playing=capacity.playing, max_players=capacity.max_players),
+                scope=f"joinme_full:{order.order_id}:{presence.game_id}",
+            )
+            self.funpay.notify_admin(
+                f"Заказ #{order.order_id}: покупатель {order.roblox_username} попросил /joinme, "
+                f"но сервер полный {capacity.playing}/{capacity.max_players}."
+            )
+            return
+
+        if capacity and capacity.known:
+            message = self.settings.message(
+                "joinme_joining",
+                playing=capacity.playing,
+                max_players=capacity.max_players,
+                item_name=order.item_name,
+            )
+            event_message = f"/joinme server {presence.game_id} capacity {capacity.playing}/{capacity.max_players}"
+        else:
+            message = self.settings.message("joinme_private_unknown")
+            event_message = f"/joinme server {presence.game_id} capacity unknown"
+
+        self.state_machine.transition(order, OrderState.WAITING_JOIN, "joinme_requested", event_message)
+        self.funpay.send_message(order.chat_id, message, scope=f"joinme_joining:{order.order_id}:{presence.game_id}")
+        self.funpay.notify_admin(
+            f"Заказ #{order.order_id}: запускаю доставку на сервер покупателя.\n"
+            f"Buyer: {order.roblox_username} ({order.roblox_user_id})\n"
+            f"Item: {order.item_name}\n"
+            f"GameId: {presence.game_id}\n"
+            f"Join URL: {order.metadata.get('preferred_join_url')}"
+        )
+        self.submit(self.delivery_loop, order.order_id)
+
+    def _build_public_join_url(self, place_id: int, game_id: str) -> str:
+        params = urllib.parse.urlencode({"placeId": int(place_id or self.settings.roblox_place_id), "gameInstanceId": str(game_id)})
+        return f"https://www.roblox.com/games/start?{params}"
 
     async def delay_order(self, order: DeliveryOrder) -> None:
         if order.state in TERMINAL_STATES:
@@ -2840,7 +3034,7 @@ class DeliveryCoordinator:
                 await asyncio.sleep(self.settings.presence_poll_seconds)
                 continue
 
-            if presence and self._presence_matches_delivery_server(presence):
+            if presence and self._presence_matches_order_target(order, presence):
                 await self._attempt_trade(order)
                 return
 
@@ -2879,6 +3073,21 @@ class DeliveryCoordinator:
         if expected_instance:
             return presence.game_id == expected_instance
         return True
+
+    def _presence_matches_order_target(self, order: DeliveryOrder, presence: RobloxPresence) -> bool:
+        preferred_game_id = str(order.metadata.get("preferred_join_game_id") or "")
+        if preferred_game_id:
+            return self._presence_is_mm2(presence) and presence.game_id == preferred_game_id
+        return self._presence_matches_delivery_server(presence)
+
+    def _presence_is_mm2(self, presence: RobloxPresence) -> bool:
+        expected_place = int(self.settings.roblox_place_id or 0)
+        if not expected_place:
+            return presence.in_game
+        return presence.in_game and (
+            presence.place_id in (expected_place, 0)
+            or presence.root_place_id in (expected_place, 0)
+        )
 
     async def _attempt_trade(self, order: DeliveryOrder) -> None:
         order.trade_attempts += 1
@@ -3016,6 +3225,10 @@ def _tg_settings_keyboard(settings: Dict[str, Any]) -> Any:
     kb.add(
         InlineKeyboardButton(f"{_bool_icon(settings.get('enabled'))} Плагин включён", callback_data="mm2_toggle_enabled"),
         InlineKeyboardButton(f"{_bool_icon(get_setting_path(settings, 'browser.enabled'))} Playwright трейд", callback_data="mm2_toggle_browser"),
+        InlineKeyboardButton(f"{_bool_icon(settings.get('buyer_server_join_enabled'))} Покупатель /joinme", callback_data="mm2_toggle_joinme"),
+        InlineKeyboardButton(f"{_bool_icon(settings.get('telegram_mirror_funpay_messages'))} Копии FP в Telegram", callback_data="mm2_toggle_tg_mirror"),
+        InlineKeyboardButton(f"{_bool_icon(settings.get('admin_notifications_to_telegram'))} Админ -> Telegram", callback_data="mm2_toggle_admin_tg"),
+        InlineKeyboardButton(f"{_bool_icon(settings.get('admin_notifications_to_funpay'))} Админ -> FunPay", callback_data="mm2_toggle_admin_fp"),
         InlineKeyboardButton(f"{_bool_icon(settings.get('pause_on_auth_error'))} Пауза при auth error", callback_data="mm2_toggle_pause_auth"),
         InlineKeyboardButton(f"{_bool_icon(settings.get('auto_start_delivery_after_friend_request'))} Автостарт после friend request", callback_data="mm2_toggle_auto_start"),
     )
@@ -3176,6 +3389,10 @@ def _tg_settings_text(settings: Dict[str, Any]) -> str:
         f"🎮 Place ID: <code>{_html(settings.get('roblox_place_id') or '-')}</code>\n"
         f"🧩 Instance: <code>{_html(settings.get('expected_game_instance_id') or '-')}</code>\n"
         f"💬 Admin chat: <code>{_html(settings.get('admin_funpay_chat_id') or '-')}</code>\n\n"
+        f"{_bool_icon(settings.get('buyer_server_join_enabled'))} /joinme покупателя\n"
+        f"{_bool_icon(settings.get('telegram_mirror_funpay_messages'))} копии FunPay-сообщений в Telegram\n"
+        f"{_bool_icon(settings.get('admin_notifications_to_telegram'))} админ-уведомления в Telegram\n"
+        f"{_bool_icon(settings.get('admin_notifications_to_funpay'))} админ-уведомления в FunPay\n\n"
         "Используйте кнопки для изменения параметров."
     )
 
@@ -3503,6 +3720,26 @@ def init_telegram_panel(cardinal: Any, *args: Any) -> None:
                 _tg_answer(bot, call, "Сохранено")
             elif data == "mm2_toggle_browser":
                 settings = toggle_setting_path("browser.enabled")
+                coord.reload_settings()
+                _tg_edit(bot, chat_id, msg_id, _tg_settings_text(settings), _tg_settings_keyboard(settings))
+                _tg_answer(bot, call, "Сохранено")
+            elif data == "mm2_toggle_joinme":
+                settings = toggle_setting_path("buyer_server_join_enabled")
+                coord.reload_settings()
+                _tg_edit(bot, chat_id, msg_id, _tg_settings_text(settings), _tg_settings_keyboard(settings))
+                _tg_answer(bot, call, "Сохранено")
+            elif data == "mm2_toggle_tg_mirror":
+                settings = toggle_setting_path("telegram_mirror_funpay_messages")
+                coord.reload_settings()
+                _tg_edit(bot, chat_id, msg_id, _tg_settings_text(settings), _tg_settings_keyboard(settings))
+                _tg_answer(bot, call, "Сохранено")
+            elif data == "mm2_toggle_admin_tg":
+                settings = toggle_setting_path("admin_notifications_to_telegram")
+                coord.reload_settings()
+                _tg_edit(bot, chat_id, msg_id, _tg_settings_text(settings), _tg_settings_keyboard(settings))
+                _tg_answer(bot, call, "Сохранено")
+            elif data == "mm2_toggle_admin_fp":
+                settings = toggle_setting_path("admin_notifications_to_funpay")
                 coord.reload_settings()
                 _tg_edit(bot, chat_id, msg_id, _tg_settings_text(settings), _tg_settings_keyboard(settings))
                 _tg_answer(bot, call, "Сохранено")
