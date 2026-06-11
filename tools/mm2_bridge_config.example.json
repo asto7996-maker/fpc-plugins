@@ -1,0 +1,35 @@
+{
+  "host": "0.0.0.0",
+  "port": 8765,
+  "api_key": "",
+  "log_file": "mm2_bridge.log",
+  "join": {
+    "open_mode": "web",
+    "wait_after_open_seconds": 35,
+    "focus_roblox_window": true,
+    "roblox_window_title_keywords": ["Roblox"]
+  },
+  "trade": {
+    "enabled": false,
+    "timeout_seconds": 180,
+    "step_delay_seconds": 0.35,
+    "macro": [
+      {
+        "action": "comment",
+        "text": "Включите trade.enabled=true и настройте шаги под ваш экран MM2."
+      },
+      {
+        "action": "comment",
+        "text": "Доступные placeholders: {roblox_username}, {roblox_user_id}, {item_name}, {lot_id}, {place_id}, {game_id}."
+      },
+      {
+        "action": "comment",
+        "text": "Пример: click координаты кнопки Trade, paste username, image_click игрока, paste item_name, image_click предмета, click accept."
+      }
+    ],
+    "success_images": [],
+    "privacy_error_images": [],
+    "declined_images": [],
+    "item_missing_images": []
+  }
+}
