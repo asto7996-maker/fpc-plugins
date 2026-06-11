@@ -125,6 +125,23 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "pause_on_auth_error": True,
     "auto_start_delivery_after_friend_request": True,
     "delivery_queue_workers": 1,
+    "inventory_sync": {
+        "enabled": True,
+        "auto_create_lot_mapping": True,
+        "lot_id_start": 1001,
+        "source_order": ["browser", "roblox_collectibles"],
+        "manual_import_separator": "\n",
+        "browser_scan_url": "",
+        "browser_scan_wait_seconds": 15,
+        "selectors": {
+            "inventory_open_button": "",
+            "inventory_items": "[data-mm2='inventory-item']",
+            "inventory_item_name": "[data-mm2='inventory-item-name']",
+            "inventory_item_quantity": "[data-mm2='inventory-item-quantity']",
+            "inventory_next_page": "",
+        },
+        "roblox_collectibles_enabled": True,
+    },
     "buyer_server_join_enabled": True,
     "buyer_join_keywords": [
         "/joinme",
@@ -407,6 +424,7 @@ class PluginSettings:
     pause_on_auth_error: bool
     auto_start_delivery_after_friend_request: bool
     delivery_queue_workers: int
+    inventory_sync: Dict[str, Any]
     buyer_server_join_enabled: bool
     buyer_join_keywords: List[str]
     lot_id_patterns: List[str]
@@ -455,6 +473,7 @@ class PluginSettings:
             pause_on_auth_error=bool(data.get("pause_on_auth_error", True)),
             auto_start_delivery_after_friend_request=bool(data.get("auto_start_delivery_after_friend_request", True)),
             delivery_queue_workers=max(1, int(data.get("delivery_queue_workers") or 1)),
+            inventory_sync=dict(data.get("inventory_sync", {})),
             buyer_server_join_enabled=bool(data.get("buyer_server_join_enabled", True)),
             buyer_join_keywords=[str(x).lower() for x in data.get("buyer_join_keywords", [])],
             lot_id_patterns=[str(x) for x in data.get("lot_id_patterns", [])],
@@ -526,6 +545,47 @@ class ItemMapping:
     stock: int = 0
     enabled: bool = True
     notes: str = ""
+
+
+@dataclasses.dataclass
+class InventoryItem:
+    item_name: str
+    quantity: int = 1
+    category: str = ""
+    source: str = "unknown"
+    external_id: str = ""
+    lot_id: str = ""
+    raw: Dict[str, Any] = dataclasses.field(default_factory=dict)
+
+
+@dataclasses.dataclass
+class InventorySyncResult:
+    ok: bool
+    source: str
+    items: List[InventoryItem] = dataclasses.field(default_factory=list)
+    created_mappings: int = 0
+    updated_inventory: int = 0
+    errors: List[str] = dataclasses.field(default_factory=list)
+    hints: List[str] = dataclasses.field(default_factory=list)
+
+    def summary_text(self) -> str:
+        lines = [
+            "Синхронизация инвентаря MM2",
+            f"Статус: {'OK' if self.ok else 'ERROR'}",
+            f"Источник: {self.source}",
+            f"Найдено предметов: {len(self.items)}",
+            f"Создано/обновлено ID лотов: {self.created_mappings}",
+            f"Обновлено строк инвентаря: {self.updated_inventory}",
+        ]
+        if self.errors:
+            lines.append("")
+            lines.append("Проблемы:")
+            lines.extend(f"- {err}" for err in self.errors[:8])
+        if self.hints:
+            lines.append("")
+            lines.append("Как исправить:")
+            lines.extend(f"- {hint}" for hint in self.hints[:8])
+        return "\n".join(lines)
 
 
 @dataclasses.dataclass
@@ -612,6 +672,53 @@ class TradeResult:
     message: str = ""
 
 
+def normalize_item_name(value: str) -> str:
+    return re.sub(r"\s+", " ", str(value or "").strip()).casefold()
+
+
+def clean_inventory_item_name(value: str) -> str:
+    value = re.sub(r"\s+", " ", str(value or "").strip())
+    value = re.sub(r"^\[[^\]]+\]\s*", "", value)
+    value = re.sub(r"\s+x\d+$", "", value, flags=re.I)
+    return value.strip()
+
+
+def parse_inventory_card_text(text: str) -> Tuple[str, int]:
+    lines = [line.strip() for line in str(text or "").splitlines() if line.strip()]
+    if not lines:
+        return "", 1
+    joined = " ".join(lines)
+    qty = 1
+    for candidate in reversed(lines + [joined]):
+        match = re.search(r"(?:x|×)\s*(\d+)|(\d+)\s*(?:шт|pcs|pc)", candidate, flags=re.I)
+        if match:
+            qty = max(1, int(match.group(1) or match.group(2)))
+            break
+    name = lines[0]
+    if len(lines) > 1 and re.fullmatch(r"(?:x|×)?\s*\d+\s*(?:шт|pcs|pc)?", name, flags=re.I):
+        name = lines[1]
+    return clean_inventory_item_name(name), qty
+
+
+def dedupe_inventory_items(items: Sequence[InventoryItem]) -> List[InventoryItem]:
+    merged: Dict[str, InventoryItem] = {}
+    for item in items:
+        name = clean_inventory_item_name(item.item_name)
+        if not name:
+            continue
+        key = normalize_item_name(name)
+        existing = merged.get(key)
+        if existing:
+            existing.quantity += max(0, int(item.quantity or 0))
+            if not existing.external_id and item.external_id:
+                existing.external_id = item.external_id
+            continue
+        item.item_name = name
+        item.quantity = max(1, int(item.quantity or 1))
+        merged[key] = item
+    return list(merged.values())
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # SQLite: таблица лотов, заказы, события, дедупликация сообщений
 # ─────────────────────────────────────────────────────────────────────────────
@@ -644,6 +751,20 @@ class SQLiteStore:
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS inventory_items (
+                    item_name TEXT PRIMARY KEY,
+                    lot_id TEXT NOT NULL DEFAULT '',
+                    quantity INTEGER NOT NULL DEFAULT 1,
+                    category TEXT NOT NULL DEFAULT '',
+                    source TEXT NOT NULL DEFAULT '',
+                    external_id TEXT NOT NULL DEFAULT '',
+                    raw TEXT NOT NULL DEFAULT '{}',
+                    last_seen_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_inventory_lot_id ON inventory_items(lot_id);
 
                 CREATE TABLE IF NOT EXISTS orders (
                     order_id TEXT PRIMARY KEY,
@@ -749,6 +870,34 @@ class SQLiteStore:
                 (item.lot_id, item.item_name, item.category, item.stock, int(item.enabled), item.notes, now, now),
             )
 
+    def get_mapping_by_item_name(self, item_name: str) -> Optional[ItemMapping]:
+        normalized = normalize_item_name(item_name)
+        with self._lock, self._connect() as conn:
+            rows = conn.execute("SELECT * FROM item_mapping").fetchall()
+        for row in rows:
+            if normalize_item_name(str(row["item_name"])) == normalized:
+                return ItemMapping(
+                    lot_id=str(row["lot_id"]),
+                    item_name=str(row["item_name"]),
+                    category=str(row["category"] or ""),
+                    stock=int(row["stock"] or 0),
+                    enabled=bool(row["enabled"]),
+                    notes=str(row["notes"] or ""),
+                )
+        return None
+
+    def next_lot_id(self, start: int = 1001) -> str:
+        with self._lock, self._connect() as conn:
+            rows = conn.execute("SELECT lot_id FROM item_mapping").fetchall()
+        used: Set[int] = set()
+        for row in rows:
+            with contextlib.suppress(Exception):
+                used.add(int(str(row["lot_id"])))
+        candidate = max(1, int(start))
+        while candidate in used:
+            candidate += 1
+        return str(candidate)
+
     def list_mappings(self) -> List[ItemMapping]:
         with self._lock, self._connect() as conn:
             rows = conn.execute("SELECT * FROM item_mapping ORDER BY CAST(lot_id AS INTEGER), lot_id").fetchall()
@@ -780,6 +929,103 @@ class SQLiteStore:
                 """,
                 (int(delta), int(delta), utc_now(), str(lot_id)),
             )
+
+    def upsert_inventory_item(self, item: InventoryItem, auto_mapping: bool = True, lot_id_start: int = 1001) -> InventoryItem:
+        existing_mapping = self.get_mapping_by_item_name(item.item_name)
+        if existing_mapping:
+            item.lot_id = existing_mapping.lot_id
+            self.upsert_mapping(
+                ItemMapping(
+                    lot_id=existing_mapping.lot_id,
+                    item_name=existing_mapping.item_name,
+                    category=existing_mapping.category or item.category or ItemNameHelper().suggest_category(item.item_name),
+                    stock=max(0, int(item.quantity or 0)),
+                    enabled=existing_mapping.enabled,
+                    notes=existing_mapping.notes or f"Обновлено из инвентаря ({item.source})",
+                )
+            )
+        elif auto_mapping:
+            item.lot_id = item.lot_id or self.next_lot_id(lot_id_start)
+            self.upsert_mapping(
+                ItemMapping(
+                    lot_id=item.lot_id,
+                    item_name=item.item_name,
+                    category=item.category or ItemNameHelper().suggest_category(item.item_name),
+                    stock=max(0, int(item.quantity or 0)),
+                    enabled=True,
+                    notes=f"Авто из инвентаря ({item.source})",
+                )
+            )
+        now = utc_now()
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO inventory_items(item_name, lot_id, quantity, category, source, external_id, raw, last_seen_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(item_name) DO UPDATE SET
+                    lot_id = excluded.lot_id,
+                    quantity = excluded.quantity,
+                    category = excluded.category,
+                    source = excluded.source,
+                    external_id = excluded.external_id,
+                    raw = excluded.raw,
+                    last_seen_at = excluded.last_seen_at,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    item.item_name,
+                    item.lot_id,
+                    max(0, int(item.quantity or 0)),
+                    item.category,
+                    item.source,
+                    item.external_id,
+                    json.dumps(item.raw or {}, ensure_ascii=False),
+                    now,
+                    now,
+                ),
+            )
+        return item
+
+    def upsert_inventory_items(self, items: Sequence[InventoryItem], auto_mapping: bool = True, lot_id_start: int = 1001) -> Tuple[int, int]:
+        updated = 0
+        created_mappings = 0
+        for item in dedupe_inventory_items(items):
+            had_mapping = self.get_mapping_by_item_name(item.item_name) is not None
+            stored = self.upsert_inventory_item(item, auto_mapping=auto_mapping, lot_id_start=lot_id_start)
+            updated += 1
+            if stored.lot_id and not had_mapping:
+                created_mappings += 1
+        return updated, created_mappings
+
+    def list_inventory_items(self, limit: int = 200) -> List[InventoryItem]:
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT item_name, lot_id, quantity, category, source, external_id, raw
+                FROM inventory_items
+                ORDER BY CAST(NULLIF(lot_id, '') AS INTEGER), item_name
+                LIMIT ?
+                """,
+                (int(limit),),
+            ).fetchall()
+        result: List[InventoryItem] = []
+        for row in rows:
+            try:
+                raw = json.loads(row["raw"] or "{}")
+            except Exception:
+                raw = {}
+            result.append(
+                InventoryItem(
+                    item_name=str(row["item_name"]),
+                    lot_id=str(row["lot_id"] or ""),
+                    quantity=int(row["quantity"] or 0),
+                    category=str(row["category"] or ""),
+                    source=str(row["source"] or ""),
+                    external_id=str(row["external_id"] or ""),
+                    raw=raw if isinstance(raw, dict) else {},
+                )
+            )
+        return result
 
     def get_recent_events(self, order_id: str, limit: int = 10) -> List[Dict[str, Any]]:
         with self._lock, self._connect() as conn:
@@ -1277,6 +1523,45 @@ class RobloxApiClient:
                 break
         return None
 
+    async def get_collectibles_inventory(self, user_id: int) -> List[InventoryItem]:
+        if not user_id:
+            user = await self.validate_session()
+            user_id = user.user_id
+        cursor = ""
+        items: List[InventoryItem] = []
+        for _page in range(10):
+            params = {
+                "sortOrder": "Asc",
+                "limit": "100",
+            }
+            if cursor:
+                params["cursor"] = cursor
+            url = f"https://inventory.roblox.com/v1/users/{int(user_id)}/assets/collectibles?{urllib.parse.urlencode(params)}"
+            result = await self.request("GET", url, auth=True, allow_statuses=(400, 401, 403, 404))
+            if result.status in (401, 403):
+                raise RobloxAuthError(result.body)
+            if not result.ok:
+                raise RobloxHttpError(result.status, result.body, result.json_data)
+            payload = result.json_data or {}
+            for asset in payload.get("data") or []:
+                name = str(asset.get("name") or asset.get("assetName") or "").strip()
+                if not name:
+                    continue
+                items.append(
+                    InventoryItem(
+                        item_name=name,
+                        quantity=1,
+                        category="roblox_collectible",
+                        source="roblox_collectibles",
+                        external_id=str(asset.get("assetId") or asset.get("id") or ""),
+                        raw=asset if isinstance(asset, dict) else {},
+                    )
+                )
+            cursor = str(payload.get("nextPageCursor") or "")
+            if not cursor:
+                break
+        return dedupe_inventory_items(items)
+
     async def request(
         self,
         method: str,
@@ -1388,6 +1673,113 @@ class BrowserTradeAutomator:
     def enabled(self) -> bool:
         return bool(self.settings.browser.get("enabled", False))
 
+    async def scan_inventory(self) -> InventorySyncResult:
+        inventory_settings = dict(self.settings.inventory_sync or {})
+        if not self.enabled:
+            return InventorySyncResult(
+                ok=False,
+                source="browser",
+                errors=["Playwright-автоматизация выключена: browser.enabled=false."],
+                hints=[
+                    "Откройте /mm2 -> Настройки и включите Playwright трейд.",
+                    "Установите playwright и браузер на сервере: python3 -m playwright install chromium.",
+                    "Заполните inventory_sync.browser_scan_url и selectors под страницу/панель, где виден MM2-инвентарь.",
+                ],
+            )
+        try:
+            from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+            from playwright.async_api import async_playwright
+        except Exception as exc:
+            return InventorySyncResult(
+                ok=False,
+                source="browser",
+                errors=[f"Playwright недоступен: {exc}"],
+                hints=[
+                    "Установите зависимость playwright в окружение Cardinal.",
+                    "После установки выполните: python3 -m playwright install chromium.",
+                ],
+            )
+
+        scan_url = str(inventory_settings.get("browser_scan_url") or "").strip()
+        scan_url = scan_url or self.settings.roblox_vip_server_url or self.settings.roblox_profile_url
+        if not scan_url:
+            return InventorySyncResult(
+                ok=False,
+                source="browser",
+                errors=["Не указан URL для сканирования инвентаря."],
+                hints=[
+                    "Заполните inventory_sync.browser_scan_url в settings.json.",
+                    "Можно указать URL вашей web-панели/страницы, где отображается MM2-инвентарь аккаунта-бота.",
+                ],
+            )
+
+        selectors = dict(inventory_settings.get("selectors") or {})
+        item_selector = str(selectors.get("inventory_items") or "").strip()
+        if not item_selector:
+            return InventorySyncResult(
+                ok=False,
+                source="browser",
+                errors=["Не заполнен selector inventory_sync.selectors.inventory_items."],
+                hints=["Укажите CSS-селектор строки/карточки предмета в инвентаре MM2."],
+            )
+
+        headless = bool(self.settings.browser.get("headless", False))
+        slow_mo = int(self.settings.browser.get("slow_mo_ms") or 0)
+        launch_timeout = int(self.settings.browser.get("launch_timeout_ms") or 120000)
+        wait_seconds = max(1, int(inventory_settings.get("browser_scan_wait_seconds") or 15))
+        try:
+            async with async_playwright() as pw:
+                browser = await pw.chromium.launch(headless=headless, slow_mo=slow_mo, timeout=launch_timeout)
+                context = await browser.new_context()
+                await self._install_cookie(context)
+                page = await context.new_page()
+                await page.goto(scan_url, wait_until="domcontentloaded", timeout=launch_timeout)
+                open_button = str(selectors.get("inventory_open_button") or "").strip()
+                if open_button:
+                    with contextlib.suppress(Exception):
+                        await page.locator(open_button).first.click(timeout=10000)
+                await asyncio.sleep(wait_seconds)
+                items = await self._extract_inventory_items(page, selectors)
+                next_selector = str(selectors.get("inventory_next_page") or "").strip()
+                for _ in range(10):
+                    if not next_selector or not await self._is_visible(page, next_selector):
+                        break
+                    await page.locator(next_selector).first.click(timeout=5000)
+                    await asyncio.sleep(2)
+                    items.extend(await self._extract_inventory_items(page, selectors))
+                await context.close()
+                await browser.close()
+                items = dedupe_inventory_items(items)
+                if not items:
+                    return InventorySyncResult(
+                        ok=False,
+                        source="browser",
+                        errors=["Инвентарь открыт, но предметы по указанным селекторам не найдены."],
+                        hints=[
+                            "Проверьте inventory_sync.selectors.inventory_items и inventory_item_name.",
+                            "Убедитесь, что аккаунт-бот авторизован и инвентарь MM2 реально виден на странице.",
+                            "Roblox/MM2 может не отдавать внутриигровой инвентарь через сайт; тогда используйте ручной импорт списка.",
+                        ],
+                    )
+                return InventorySyncResult(ok=True, source="browser", items=items)
+        except PlaywrightTimeoutError as exc:
+            return InventorySyncResult(
+                ok=False,
+                source="browser",
+                errors=[f"Playwright timeout: {exc}"],
+                hints=["Проверьте доступность страницы, скорость сервера и корректность selector'ов."],
+            )
+        except Exception as exc:
+            return InventorySyncResult(
+                ok=False,
+                source="browser",
+                errors=[f"Ошибка браузерного сканирования: {exc}"],
+                hints=[
+                    "Проверьте .ROBLOSECURITY, browser_scan_url и selector'ы.",
+                    "Если MM2-инвентарь не отображается в браузере на сервере, используйте ручной импорт.",
+                ],
+            )
+
     async def deliver(self, order: DeliveryOrder) -> TradeResult:
         if not self.enabled:
             return TradeResult(DeliveryOutcome.AUTOMATION_UNAVAILABLE, "Playwright-автоматизация выключена")
@@ -1495,6 +1887,39 @@ class BrowserTradeAutomator:
         with contextlib.suppress(Exception):
             return await page.locator(selector).first.is_visible(timeout=500)
         return False
+
+    async def _extract_inventory_items(self, page: Any, selectors: Dict[str, str]) -> List[InventoryItem]:
+        item_selector = str(selectors.get("inventory_items") or "").strip()
+        name_selector = str(selectors.get("inventory_item_name") or "").strip()
+        qty_selector = str(selectors.get("inventory_item_quantity") or "").strip()
+        result: List[InventoryItem] = []
+        cards = page.locator(item_selector)
+        count = await cards.count()
+        for idx in range(count):
+            card = cards.nth(idx)
+            if name_selector:
+                with contextlib.suppress(Exception):
+                    name = (await card.locator(name_selector).first.inner_text(timeout=1000)).strip()
+                    if name:
+                        qty = await self._extract_quantity(card, qty_selector)
+                        result.append(InventoryItem(item_name=name, quantity=qty, source="browser"))
+                        continue
+            with contextlib.suppress(Exception):
+                text = (await card.inner_text(timeout=1000)).strip()
+                parsed_name, qty = parse_inventory_card_text(text)
+                if parsed_name:
+                    result.append(InventoryItem(item_name=parsed_name, quantity=qty, source="browser"))
+        return result
+
+    async def _extract_quantity(self, card: Any, qty_selector: str) -> int:
+        if not qty_selector:
+            return 1
+        with contextlib.suppress(Exception):
+            raw = await card.locator(qty_selector).first.inner_text(timeout=1000)
+            match = re.search(r"(\d+)", raw or "")
+            if match:
+                return max(1, int(match.group(1)))
+        return 1
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1735,7 +2160,7 @@ ADMIN_GUIDE_SECTIONS: Dict[str, Tuple[str, str]] = {
     "lots": (
         "Маппинг лотов",
         (
-            "Плагин ищет номер лота в полном описании заказа. Поддерживаются шаблоны:\n"
+            "Плагин ищет номер лота в полном подробном описании заказа. Поддерживаются шаблоны:\n"
             "- ID: 1001\n"
             "- Lot #1001\n"
             "- Лот №1001\n"
@@ -1743,6 +2168,18 @@ ADMIN_GUIDE_SECTIONS: Dict[str, Tuple[str, str]] = {
             "- [MM2:1001]\n\n"
             "Команда добавления: /mm2_map 1001 | Harvester | gun | 3\n"
             "Команда списка: /mm2_mappings"
+        ),
+    ),
+    "inventory": (
+        "Инвентарь и ID",
+        (
+            "Раздел /mm2 -> Инвентарь нужен, чтобы получить таблицу:\n"
+            "ID: 1001 — Harvester\n"
+            "ID: 1002 — Icebreaker\n\n"
+            "Этот ID вставляется в конец подробного описания лота FunPay:\n"
+            "ID: 1001\n\n"
+            "Автоскан пробует войти в Roblox по .ROBLOSECURITY и прочитать предметы. "
+            "Если MM2-инвентарь не доступен через сайт/API, бот покажет причину и предложит ручной импорт списка."
         ),
     ),
     "states": (
@@ -1858,6 +2295,17 @@ ADMIN_RUNBOOKS: Dict[str, Tuple[str, List[str]]] = {
             "Добавьте запись /mm2_map 1001 | Item Name | knife | 1.",
             "Если нужен новый формат номера, добавьте regex в lot_id_patterns.",
             "Заказ без mapping попадает в MANUAL_REVIEW и не теряется.",
+        ],
+    ),
+    "inventory": (
+        "Инвентарь не сканируется",
+        [
+            "Проверьте .ROBLOSECURITY через /mm2 -> Roblox Auth -> Диагностика.",
+            "Помните: MM2-предметы внутриигровые, официальный Roblox inventory API обычно их не отдаёт.",
+            "Для автосканирования включите browser.enabled и настройте inventory_sync.browser_scan_url.",
+            "Заполните CSS-селекторы inventory_sync.selectors под страницу/панель, где виден инвентарь.",
+            "Если UI-скан невозможен, используйте /mm2 -> Инвентарь -> Ручной импорт.",
+            "После импорта бот сам присвоит ID и создаст mapping для лотов.",
         ],
     ),
     "storage": (
@@ -2450,6 +2898,215 @@ class HealthInspector:
             return 0.0
 
 
+class InventorySynchronizer:
+    """Синхронизация инвентаря аккаунта-бота с локальной таблицей ID лотов."""
+
+    def __init__(
+        self,
+        settings_getter: Callable[[], PluginSettings],
+        store: SQLiteStore,
+        roblox: RobloxApiClient,
+        automator: BrowserTradeAutomator,
+    ) -> None:
+        self._settings_getter = settings_getter
+        self.store = store
+        self.roblox = roblox
+        self.automator = automator
+
+    @property
+    def settings(self) -> PluginSettings:
+        return self._settings_getter()
+
+    async def sync(self) -> InventorySyncResult:
+        settings = self.settings
+        inv_settings = dict(settings.inventory_sync or {})
+        if not inv_settings.get("enabled", True):
+            return InventorySyncResult(
+                ok=False,
+                source="disabled",
+                errors=["Синхронизация инвентаря выключена: inventory_sync.enabled=false."],
+                hints=["Включите inventory_sync.enabled через settings.json."],
+            )
+        if not settings.roblox_security_cookie:
+            return InventorySyncResult(
+                ok=False,
+                source="auth",
+                errors=["Не заполнен roblox_security_cookie (.ROBLOSECURITY)."],
+                hints=[
+                    "В Telegram откройте /mm2 -> Настройки -> Cookie и вставьте актуальный .ROBLOSECURITY.",
+                    "После сохранения нажмите Roblox Auth / Диагностика.",
+                ],
+            )
+        try:
+            user = await self.roblox.validate_session()
+            if settings.roblox_bot_user_id and user.user_id != settings.roblox_bot_user_id:
+                return InventorySyncResult(
+                    ok=False,
+                    source="auth",
+                    errors=[f"Cookie принадлежит аккаунту {user.username} ({user.user_id}), а в настройках bot_user_id={settings.roblox_bot_user_id}."],
+                    hints=["Обновите roblox_bot_user_id или вставьте cookie нужного аккаунта-бота."],
+                )
+        except RobloxAuthError as exc:
+            return InventorySyncResult(
+                ok=False,
+                source="auth",
+                errors=[f"Roblox отклонил cookie: {exc}"],
+                hints=[
+                    "Cookie устарел или скопирован не полностью.",
+                    "Войдите в Roblox под аккаунтом-ботом и заново скопируйте .ROBLOSECURITY.",
+                ],
+            )
+        except Exception as exc:
+            return InventorySyncResult(
+                ok=False,
+                source="auth",
+                errors=[f"Не удалось проверить Roblox-сессию: {exc}"],
+                hints=["Проверьте сеть сервера и доступ к users.roblox.com."],
+            )
+
+        source_order = [str(x) for x in inv_settings.get("source_order") or ["browser", "roblox_collectibles"]]
+        attempted: List[InventorySyncResult] = []
+        for source in source_order:
+            if source == "browser":
+                result = await self.automator.scan_inventory()
+            elif source == "roblox_collectibles":
+                result = await self._sync_collectibles_source()
+            else:
+                result = InventorySyncResult(ok=False, source=source, errors=[f"Неизвестный источник inventory_sync: {source}"])
+            attempted.append(result)
+            if result.ok and result.items:
+                return self._persist_result(result)
+
+        errors: List[str] = []
+        hints: List[str] = [
+            "MM2-инвентарь является внутриигровым и обычно не доступен через официальный Roblox inventory API.",
+            "Для автоматического чтения настройте browser.enabled=true, inventory_sync.browser_scan_url и CSS-селекторы inventory_sync.selectors.",
+            "Если UI-скан невозможен, используйте кнопку ручного импорта инвентаря и вставьте названия предметов списком.",
+        ]
+        for result in attempted:
+            errors.extend([f"{result.source}: {err}" for err in result.errors])
+            hints.extend(result.hints)
+        return InventorySyncResult(ok=False, source="auto", errors=dedupe_strings(errors), hints=dedupe_strings(hints))
+
+    async def _sync_collectibles_source(self) -> InventorySyncResult:
+        if not bool((self.settings.inventory_sync or {}).get("roblox_collectibles_enabled", True)):
+            return InventorySyncResult(ok=False, source="roblox_collectibles", errors=["Источник roblox_collectibles выключен."])
+        try:
+            user_id = int(self.settings.roblox_bot_user_id or 0)
+            items = await self.roblox.get_collectibles_inventory(user_id)
+            mm2_items = self._filter_mm2_like_items(items)
+            if not mm2_items:
+                return InventorySyncResult(
+                    ok=False,
+                    source="roblox_collectibles",
+                    errors=["Roblox collectibles API не вернул MM2-предметы."],
+                    hints=[
+                        "Это ожидаемо: ножи/пистолеты MM2 - внутриигровые предметы, а не Roblox collectible assets.",
+                        "Используйте browser scan или ручной импорт.",
+                    ],
+                )
+            return InventorySyncResult(ok=True, source="roblox_collectibles", items=mm2_items)
+        except RobloxAuthError as exc:
+            return InventorySyncResult(ok=False, source="roblox_collectibles", errors=[f"Auth error: {exc}"])
+        except Exception as exc:
+            return InventorySyncResult(ok=False, source="roblox_collectibles", errors=[str(exc)])
+
+    def manual_import(self, raw: str) -> InventorySyncResult:
+        items = parse_manual_inventory_items(raw)
+        if not items:
+            return InventorySyncResult(
+                ok=False,
+                source="manual",
+                errors=["Не найдено ни одного предмета в тексте."],
+                hints=["Вставьте список: Harvester, Icebreaker x2, Corrupt. Можно по одному предмету на строку."],
+            )
+        return self._persist_result(InventorySyncResult(ok=True, source="manual", items=items))
+
+    def _persist_result(self, result: InventorySyncResult) -> InventorySyncResult:
+        inv_settings = dict(self.settings.inventory_sync or {})
+        updated, created = self.store.upsert_inventory_items(
+            result.items,
+            auto_mapping=bool(inv_settings.get("auto_create_lot_mapping", True)),
+            lot_id_start=int(inv_settings.get("lot_id_start") or 1001),
+        )
+        result.updated_inventory = updated
+        result.created_mappings = created
+        result.items = self.store.list_inventory_items(limit=500)
+        return result
+
+    def _filter_mm2_like_items(self, items: Sequence[InventoryItem]) -> List[InventoryItem]:
+        helper = ItemNameHelper()
+        known = {normalize_item_name(name) for names in KNOWN_MM2_ITEMS.values() for name in names}
+        result: List[InventoryItem] = []
+        for item in items:
+            normalized = normalize_item_name(item.item_name)
+            lower_name = item.item_name.lower()
+            if normalized in known or "mm2" in lower_name or "murder mystery" in lower_name:
+                item.category = item.category or helper.suggest_category(item.item_name)
+                result.append(item)
+        return result
+
+    def format_inventory_ids(self, limit: int = 120) -> str:
+        items = self.store.list_inventory_items(limit=limit)
+        if not items:
+            return (
+                "Инвентарь пуст.\n"
+                "Нажмите «🔄 Сканировать инвентарь» или «✍️ Ручной импорт»."
+            )
+        lines = ["ID предметов для описаний FunPay:", ""]
+        for item in items:
+            stock = f" x{item.quantity}" if item.quantity else ""
+            lot = item.lot_id or "-"
+            lines.append(f"ID: {lot} — {item.item_name}{stock}")
+        lines.append("")
+        lines.append("В конец подробного описания лота вставляйте строку, например: ID: 1001")
+        return "\n".join(lines)
+
+    def format_funpay_description_hint(self, item_name: str = "") -> str:
+        item: Optional[InventoryItem] = None
+        if item_name:
+            normalized = normalize_item_name(item_name)
+            for current in self.store.list_inventory_items(limit=500):
+                if normalize_item_name(current.item_name) == normalized:
+                    item = current
+                    break
+        if not item:
+            items = self.store.list_inventory_items(limit=1)
+            item = items[0] if items else None
+        if not item:
+            return "Сначала синхронизируйте или импортируйте инвентарь."
+        return (
+            "Пример конца подробного описания лота:\n\n"
+            "▰▰▰▰▰▰▰▰▰▰▰\n"
+            f"ID: {item.lot_id}\n\n"
+            f"Этот ID соответствует предмету: {item.item_name}"
+        )
+
+
+def parse_manual_inventory_items(raw: str) -> List[InventoryItem]:
+    chunks = re.split(r"[\n;,]+", raw or "")
+    items: List[InventoryItem] = []
+    for chunk in chunks:
+        text = chunk.strip()
+        if not text:
+            continue
+        name, qty = parse_inventory_card_text(text)
+        if name:
+            items.append(InventoryItem(item_name=name, quantity=qty, source="manual", category=ItemNameHelper().suggest_category(name)))
+    return dedupe_inventory_items(items)
+
+
+def dedupe_strings(values: Sequence[str]) -> List[str]:
+    result: List[str] = []
+    seen: Set[str] = set()
+    for value in values:
+        clean = str(value or "").strip()
+        if clean and clean not in seen:
+            seen.add(clean)
+            result.append(clean)
+    return result
+
+
 class AdminCommandRouter:
     """Небольшая FunPay-панель управления без зависимости от Telegram-кнопок."""
 
@@ -2774,6 +3431,7 @@ class DeliveryCoordinator:
         self.funpay = FunPayAdapter(cardinal, self.settings, self.store)
         self.roblox = RobloxApiClient(self.settings)
         self.automator = BrowserTradeAutomator(self.settings)
+        self.inventory = InventorySynchronizer(lambda: self.settings, self.store, self.roblox, self.automator)
         self.admin_commands = AdminCommandRouter(
             settings_getter=lambda: self.settings,
             store=self.store,
@@ -3432,6 +4090,8 @@ TG_STATE_LABELS: Dict[str, str] = {
     "mm2_add_mapping": "lot mapping",
     "mm2_search_item": "item search",
     "mm2_import_maps": "mapping JSON import",
+    "mm2_manual_inventory": "manual inventory import",
+    "mm2_inventory_hint": "inventory item hint",
     "mm2_order_open": "FunPay order id",
     "mm2_order_retry": "FunPay order id",
     "mm2_order_delay": "FunPay order id",
@@ -3463,24 +4123,25 @@ def _tg_main_keyboard(settings: Dict[str, Any]) -> Any:
     kb = InlineKeyboardMarkup(row_width=2)
     kb.row(
         InlineKeyboardButton("⚙️ Настройки", callback_data="mm2_settings"),
-        InlineKeyboardButton("📦 Лоты", callback_data="mm2_mappings"),
+        InlineKeyboardButton("🎒 Инвентарь", callback_data="mm2_inventory"),
     )
     kb.row(
+        InlineKeyboardButton("📦 Лоты/ID", callback_data="mm2_mappings"),
         InlineKeyboardButton("📋 Заказы", callback_data="mm2_orders"),
+    )
+    kb.row(
         InlineKeyboardButton("🧾 Ручная проверка", callback_data="mm2_orders_manual"),
-    )
-    kb.row(
         InlineKeyboardButton("🏥 Диагностика", callback_data="mm2_diag"),
+    )
+    kb.row(
         InlineKeyboardButton("🔐 Roblox Auth", callback_data="mm2_auth"),
-    )
-    kb.row(
         InlineKeyboardButton("📖 Гайд", callback_data="mm2_guide"),
-        InlineKeyboardButton("🛟 Runbook", callback_data="mm2_runbooks"),
     )
     kb.row(
+        InlineKeyboardButton("🛟 Runbook", callback_data="mm2_runbooks"),
         InlineKeyboardButton("🔄 Reload", callback_data="mm2_reload"),
-        InlineKeyboardButton(f"{_bool_icon(settings.get('enabled'))} Вкл/выкл", callback_data="mm2_toggle_enabled"),
     )
+    kb.add(InlineKeyboardButton(f"{_bool_icon(settings.get('enabled'))} Вкл/выкл", callback_data="mm2_toggle_enabled"))
     return kb
 
 
@@ -3552,6 +4213,23 @@ def _tg_mappings_keyboard() -> Any:
     return kb
 
 
+def _tg_inventory_keyboard() -> Any:
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.row(
+        InlineKeyboardButton("🔄 Сканировать инвентарь", callback_data="mm2_inventory_sync"),
+        InlineKeyboardButton("📋 Список ID", callback_data="mm2_inventory_list"),
+    )
+    kb.row(
+        InlineKeyboardButton("✍️ Ручной импорт", callback_data="mm2_manual_inventory"),
+        InlineKeyboardButton("🧾 Пример описания", callback_data="mm2_inventory_hint"),
+    )
+    kb.row(
+        InlineKeyboardButton("📦 Лоты/ID", callback_data="mm2_mappings"),
+        InlineKeyboardButton("⬅️ Назад", callback_data="mm2_back_main"),
+    )
+    return kb
+
+
 def _tg_orders_keyboard() -> Any:
     kb = InlineKeyboardMarkup(row_width=2)
     kb.row(
@@ -3599,6 +4277,7 @@ def _tg_guide_keyboard() -> Any:
         ("🚀 Старт", "start"),
         ("🍪 Cookie", "cookies"),
         ("📦 Лоты", "lots"),
+        ("🎒 Инвентарь", "inventory"),
         ("🔄 Статусы", "states"),
         ("👤 Покупатель", "buyer"),
         ("🤝 Трейд", "trade"),
@@ -3618,6 +4297,7 @@ def _tg_runbook_keyboard() -> Any:
         ("🎮 Join", "join"),
         ("💱 Trade", "trade"),
         ("📦 Mapping", "mapping"),
+        ("🎒 Inventory", "inventory"),
         ("💾 Storage", "storage"),
     ):
         kb.add(InlineKeyboardButton(label, callback_data=f"mm2_runbook_{key}"))
@@ -3631,6 +4311,7 @@ def _tg_main_text(store: SQLiteStore, settings: Dict[str, Any]) -> str:
     manual_count = len(store.list_orders_by_states([OrderState.MANUAL_REVIEW], limit=1000))
     delayed_count = len(store.list_orders_by_states([OrderState.DELAYED], limit=1000))
     mapping_count = len(store.list_mappings())
+    inventory_count = len(store.list_inventory_items(limit=1000))
     return (
         f"🔪 <b>{_html(NAME)} v{_html(VERSION)}</b>\n\n"
         f"Автовыдача MM2-предметов после заказов FunPay.\n\n"
@@ -3638,6 +4319,7 @@ def _tg_main_text(store: SQLiteStore, settings: Dict[str, Any]) -> str:
         f"{_bool_icon(get_setting_path(settings, 'browser.enabled'))} <b>Playwright трейд:</b> {'включён' if get_setting_path(settings, 'browser.enabled') else 'выключен'}\n"
         f"🔐 <b>Auth pause:</b> <code>{_html(store.get_flag('paused_by_auth', '0'))}</code>\n"
         f"📦 <b>Лотов в таблице:</b> <code>{mapping_count}</code>\n"
+        f"🎒 <b>Предметов инвентаря:</b> <code>{inventory_count}</code>\n"
         f"📋 <b>Активные:</b> <code>{active_count}</code>\n"
         f"⏸ <b>Отложены:</b> <code>{delayed_count}</code>\n"
         f"🧾 <b>Ручная проверка:</b> <code>{manual_count}</code>\n\n"
@@ -3687,6 +4369,19 @@ def _tg_timeouts_text(settings: Dict[str, Any]) -> str:
 def _tg_mappings_text(store: SQLiteStore) -> str:
     text = OrderFormatter.mappings_table(store.list_mappings(), limit=30)
     return "📦 <b>Таблица лотов</b>\n\n" + _html(text)
+
+
+def _tg_inventory_text(coordinator: DeliveryCoordinator) -> str:
+    items = coordinator.store.list_inventory_items(limit=500)
+    inv_settings = coordinator.settings.inventory_sync or {}
+    return (
+        "🎒 <b>Инвентарь аккаунта-бота</b>\n\n"
+        f"Предметов в локальной базе: <code>{len(items)}</code>\n"
+        f"Авто-ID для лотов: <code>{'да' if inv_settings.get('auto_create_lot_mapping', True) else 'нет'}</code>\n"
+        f"Старт ID: <code>{_html(inv_settings.get('lot_id_start', 1001))}</code>\n\n"
+        "Нажмите «Сканировать», чтобы бот попробовал подключиться к Roblox-аккаунту и прочитать инвентарь.\n"
+        "Если MM2-инвентарь нельзя прочитать автоматически, используйте «Ручной импорт»."
+    )
 
 
 def _tg_orders_text(store: SQLiteStore) -> str:
@@ -3754,6 +4449,12 @@ def _tg_prompt_text(state: str) -> str:
         ),
         "mm2_search_item": "Отправьте часть названия предмета. Пример: <code>harv</code>",
         "mm2_import_maps": "Отправьте JSON экспорта с полем <code>items</code>.",
+        "mm2_manual_inventory": (
+            "Отправьте список предметов из инвентаря. Можно по строкам или через запятую:\n"
+            "<code>Harvester\nIcebreaker x2\nCorrupt</code>\n\n"
+            "Бот присвоит каждому предмету ID и создаст mapping для лотов."
+        ),
+        "mm2_inventory_hint": "Отправьте название предмета для примера ID или <code>-</code>, чтобы взять первый из списка.",
         "mm2_order_open": "Отправьте ID заказа FunPay для просмотра.",
         "mm2_order_retry": "Отправьте ID заказа FunPay для повтора доставки.",
         "mm2_order_delay": "Отправьте ID заказа FunPay, который нужно отложить.",
@@ -3884,6 +4585,11 @@ def _save_tg_state_value(state: str, text: str, coordinator: DeliveryCoordinator
             lines.append("Ошибки:")
             lines.extend(errors[:10])
         return "\n".join(lines)
+    if state == "mm2_manual_inventory":
+        result = coordinator.inventory.manual_import(raw)
+        return result.summary_text() + "\n\n" + coordinator.inventory.format_inventory_ids(limit=80)
+    if state == "mm2_inventory_hint":
+        return coordinator.inventory.format_funpay_description_hint("" if raw == "-" else raw)
     if state.startswith("mm2_order_"):
         return _apply_tg_order_action(state, raw, coordinator)
     if state == "mm2_buyer_message":
@@ -4044,6 +4750,24 @@ def init_telegram_panel(cardinal: Any, *args: Any) -> None:
             elif data == "mm2_mappings":
                 _tg_edit(bot, chat_id, msg_id, _tg_mappings_text(coord.store), _tg_mappings_keyboard())
                 _tg_answer(bot, call)
+            elif data == "mm2_inventory":
+                _tg_edit(bot, chat_id, msg_id, _tg_inventory_text(coord), _tg_inventory_keyboard())
+                _tg_answer(bot, call)
+            elif data == "mm2_inventory_sync":
+                _tg_answer(bot, call, "Сканирую инвентарь...", alert=False)
+                bot.send_message(chat_id, "🔄 Запускаю синхронизацию инвентаря. Это может занять до минуты...")
+                result = _run_async_sync(coord.inventory.sync())
+                text = result.summary_text()
+                if result.ok:
+                    text += "\n\n" + coord.inventory.format_inventory_ids(limit=80)
+                bot.send_message(chat_id, f"<pre>{_html(text)}</pre>", parse_mode="HTML", reply_markup=_tg_inventory_keyboard())
+            elif data == "mm2_inventory_list":
+                bot.send_message(chat_id, f"<pre>{_html(coord.inventory.format_inventory_ids(limit=120))}</pre>", parse_mode="HTML", reply_markup=_tg_inventory_keyboard())
+                _tg_answer(bot, call)
+            elif data == "mm2_inventory_hint":
+                _tg_send_prompt(tg, bot, call, "mm2_inventory_hint")
+            elif data == "mm2_manual_inventory":
+                _tg_send_prompt(tg, bot, call, "mm2_manual_inventory")
             elif data == "mm2_export_maps":
                 bot.send_message(chat_id, f"<pre>{_html(MappingCatalogIO(coord.store).export_lines_for_chat())}</pre>", parse_mode="HTML")
                 _tg_answer(bot, call, "Экспорт отправлен")
