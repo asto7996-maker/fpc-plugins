@@ -28,7 +28,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 try:
     from FunPayAPI.types import MessageTypes
@@ -112,8 +112,19 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "admin_notifications_to_telegram": True,
     "admin_notifications_to_funpay": False,
     "telegram_mirror_funpay_messages": True,
+    "seller_funpay_usernames": [],
+    "ignore_orders_where_buyer_is_me": True,
+    "require_mm2_category_match": True,
+    "mm2_category_keywords": [
+        "mm2",
+        "murder mystery",
+        "murder mystery 2",
+        "murder mystery x",
+        "roblox mm2",
+    ],
     "pause_on_auth_error": True,
     "auto_start_delivery_after_friend_request": True,
+    "delivery_queue_workers": 1,
     "buyer_server_join_enabled": True,
     "buyer_join_keywords": [
         "/joinme",
@@ -143,6 +154,18 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
         "можно",
         "я тут",
     ],
+    "buyer_menu_keywords": [
+        "/menu",
+        "/help",
+        "меню",
+        "помощь",
+        "команды",
+    ],
+    "buyer_back_keywords": [
+        "/back",
+        "назад",
+        "вернуться",
+    ],
     "nickname_min_len": 3,
     "nickname_max_len": 20,
     "browser": {
@@ -168,7 +191,10 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
         },
     },
     "messages": {
-        "welcome": "Спасибо за покупку! Пожалуйста, отправьте ваш точный никнейм в Roblox в ответ на это сообщение.",
+        "welcome": (
+            "Спасибо за покупку! Пожалуйста, отправьте ваш точный никнейм Roblox в ответ на это сообщение.\n"
+            "Если нужна подсказка по выдаче, напишите /menu."
+        ),
         "unknown_lot": (
             "Не удалось определить предмет по описанию лота. "
             "Администратор уже получил уведомление, заказ будет обработан вручную."
@@ -188,7 +214,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
         "waiting_join": (
             "Жду вас в игре для передачи предмета {item_name}. "
             "Примите дружбу и зайдите на VIP-сервер: {server_url}\n"
-            "Если хотите, чтобы я зашёл на ваш сервер, напишите /joinme."
+            "Если хотите, чтобы я зашёл на ваш сервер, напишите /joinme. Меню команд: /menu."
         ),
         "join_fallback": (
             "Я не смог передать вам предмет. Пожалуйста, нажмите кнопку 'Join' в моём профиле Roblox "
@@ -216,8 +242,31 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
         ),
         "trade_declined": "Трейд был отклонён. Если вы готовы принять предмет, напишите /ready.",
         "completed": (
-            "Готово! Предмет {item_name} передан. "
+            "Спасибо за заказ! Предмет {item_name} передан. "
             "Пожалуйста, подтвердите выполнение заказа на FunPay."
+        ),
+        "buyer_menu_main": (
+            "Меню выдачи MM2:\n"
+            "1. Отправить ник Roblox\n"
+            "2. Позвать бота на мой сервер (/joinme)\n"
+            "3. Отложить выдачу (/delay)\n"
+            "4. Я готов (/ready)\n"
+            "5. Статус заказа\n\n"
+            "Напишите цифру 1-5 или команду. Для возврата напишите /back."
+        ),
+        "buyer_menu_nick": (
+            "Отправьте ваш точный Roblox username одним сообщением. "
+            "Не display name, а именно username из профиля."
+        ),
+        "buyer_menu_joinme": (
+            "Чтобы бот зашёл к вам: зайдите в Murder Mystery 2 и напишите /joinme. "
+            "Если сервер полный, бот попросит сменить сервер или освободить слот."
+        ),
+        "buyer_status": (
+            "Статус заказа: {state}\n"
+            "Предмет: {item_name}\n"
+            "Roblox: {roblox_username}\n"
+            "Если нужна помощь, напишите /menu."
         ),
         "delayed": "Передача отложена. Как будете готовы, напишите '/ready'.",
         "ready": "Возобновляю передачу. Проверьте дружбу с ботом и зайдите в игру.",
@@ -351,13 +400,20 @@ class PluginSettings:
     admin_notifications_to_telegram: bool
     admin_notifications_to_funpay: bool
     telegram_mirror_funpay_messages: bool
+    seller_funpay_usernames: List[str]
+    ignore_orders_where_buyer_is_me: bool
+    require_mm2_category_match: bool
+    mm2_category_keywords: List[str]
     pause_on_auth_error: bool
     auto_start_delivery_after_friend_request: bool
+    delivery_queue_workers: int
     buyer_server_join_enabled: bool
     buyer_join_keywords: List[str]
     lot_id_patterns: List[str]
     delay_keywords: List[str]
     ready_keywords: List[str]
+    buyer_menu_keywords: List[str]
+    buyer_back_keywords: List[str]
     nickname_min_len: int
     nickname_max_len: int
     browser: Dict[str, Any]
@@ -392,13 +448,20 @@ class PluginSettings:
             admin_notifications_to_telegram=bool(data.get("admin_notifications_to_telegram", True)),
             admin_notifications_to_funpay=bool(data.get("admin_notifications_to_funpay", False)),
             telegram_mirror_funpay_messages=bool(data.get("telegram_mirror_funpay_messages", True)),
+            seller_funpay_usernames=[str(x).lower() for x in data.get("seller_funpay_usernames", [])],
+            ignore_orders_where_buyer_is_me=bool(data.get("ignore_orders_where_buyer_is_me", True)),
+            require_mm2_category_match=bool(data.get("require_mm2_category_match", True)),
+            mm2_category_keywords=[str(x).lower() for x in data.get("mm2_category_keywords", [])],
             pause_on_auth_error=bool(data.get("pause_on_auth_error", True)),
             auto_start_delivery_after_friend_request=bool(data.get("auto_start_delivery_after_friend_request", True)),
+            delivery_queue_workers=max(1, int(data.get("delivery_queue_workers") or 1)),
             buyer_server_join_enabled=bool(data.get("buyer_server_join_enabled", True)),
             buyer_join_keywords=[str(x).lower() for x in data.get("buyer_join_keywords", [])],
             lot_id_patterns=[str(x) for x in data.get("lot_id_patterns", [])],
             delay_keywords=[str(x).lower() for x in data.get("delay_keywords", [])],
             ready_keywords=[str(x).lower() for x in data.get("ready_keywords", [])],
+            buyer_menu_keywords=[str(x).lower() for x in data.get("buyer_menu_keywords", [])],
+            buyer_back_keywords=[str(x).lower() for x in data.get("buyer_back_keywords", [])],
             nickname_min_len=max(1, int(data.get("nickname_min_len") or 3)),
             nickname_max_len=max(3, int(data.get("nickname_max_len") or 20)),
             browser=dict(data.get("browser", {})),
@@ -1485,12 +1548,94 @@ def get_order_field(order: Any, *names: str, default: Any = "") -> Any:
     return default
 
 
+def normalize_funpay_username(value: Any) -> str:
+    return re.sub(r"\s+", "", str(value or "").strip().lower())
+
+
+def get_cardinal_funpay_username(cardinal: Any) -> str:
+    account = getattr(cardinal, "account", None)
+    candidates: List[Any] = [
+        getattr(account, "username", None),
+        getattr(account, "name", None),
+        getattr(account, "login", None),
+        getattr(account, "nickname", None),
+        getattr(cardinal, "username", None),
+        getattr(cardinal, "account_username", None),
+    ]
+    profile = getattr(account, "profile", None)
+    if profile is not None:
+        candidates.extend([
+            getattr(profile, "username", None),
+            getattr(profile, "name", None),
+        ])
+    user = getattr(account, "user", None)
+    if user is not None:
+        candidates.extend([
+            getattr(user, "username", None),
+            getattr(user, "name", None),
+        ])
+    for candidate in candidates:
+        normalized = normalize_funpay_username(candidate)
+        if normalized:
+            return normalized
+    return ""
+
+
+def get_seller_aliases(cardinal: Any, settings: PluginSettings) -> List[str]:
+    aliases = [normalize_funpay_username(x) for x in settings.seller_funpay_usernames]
+    own = get_cardinal_funpay_username(cardinal)
+    if own:
+        aliases.append(own)
+    return sorted({alias for alias in aliases if alias})
+
+
+def order_text_blob(payload: Dict[str, Any]) -> str:
+    parts = [
+        payload.get("description", ""),
+        payload.get("raw_title", ""),
+        payload.get("category", ""),
+        payload.get("subcategory", ""),
+        payload.get("game", ""),
+        payload.get("lot_title", ""),
+    ]
+    return "\n".join(str(part or "") for part in parts).lower()
+
+
+def is_mm2_order_payload(payload: Dict[str, Any], settings: PluginSettings, store: Optional[SQLiteStore] = None) -> bool:
+    if not settings.require_mm2_category_match:
+        return True
+    lot_id = str(payload.get("lot_id") or "")
+    if lot_id and store and store.get_mapping(lot_id):
+        return True
+    blob = order_text_blob(payload)
+    return any(keyword and keyword in blob for keyword in settings.mm2_category_keywords)
+
+
+def should_process_sale_payload(
+    payload: Dict[str, Any],
+    cardinal: Any,
+    settings: PluginSettings,
+    store: Optional[SQLiteStore] = None,
+) -> Tuple[bool, str]:
+    aliases = get_seller_aliases(cardinal, settings)
+    buyer = normalize_funpay_username(payload.get("buyer"))
+    seller = normalize_funpay_username(payload.get("seller"))
+    if settings.ignore_orders_where_buyer_is_me and buyer and buyer in aliases:
+        return False, "ignored_own_purchase_buyer_is_me"
+    if seller and aliases and seller not in aliases:
+        return False, "ignored_not_my_sale_seller_mismatch"
+    if not is_mm2_order_payload(payload, settings, store):
+        return False, "ignored_not_mm2_category"
+    return True, "ok"
+
+
 def extract_order_payload(cardinal: Any, event: Any, settings: PluginSettings, adapter: FunPayAdapter) -> Optional[Dict[str, Any]]:
     order = getattr(event, "order", event)
     order_id = get_order_field(order, "id", "order_id", "OrderID", default="")
     if not order_id:
         return None
     buyer = str(get_order_field(order, "buyer_username", "buyer", "buyer_name", default="") or "")
+    seller = str(get_order_field(order, "seller_username", "seller", "seller_name", "owner_username", default="") or "")
     chat_id = adapter.find_chat_id(buyer, get_order_field(order, "chat_id", "chat", default=""))
     fallback = str(order)
     description = adapter.get_full_order_description(order_id, fallback=fallback)
@@ -1498,12 +1643,17 @@ def extract_order_payload(cardinal: Any, event: Any, settings: PluginSettings, a
     return {
         "order_id": str(order_id),
         "buyer": buyer,
+        "seller": seller,
         "chat_id": chat_id,
         "description": description,
         "lot_id": lot_id,
         "amount": get_order_field(order, "amount", default=1),
         "price": get_order_field(order, "price", default=""),
         "currency": str(get_order_field(order, "currency", default="")),
+        "category": str(get_order_field(order, "category", "category_name", "lot_category", default="")),
+        "subcategory": str(get_order_field(order, "subcategory", "sub_category", "subcategory_name", default="")),
+        "game": str(get_order_field(order, "game", "game_name", "node", default="")),
+        "lot_title": str(get_order_field(order, "title", "short_description", "name", default="")),
         "raw_title": fallback,
     }
 
@@ -1536,6 +1686,16 @@ def is_buyer_join_request(text: str, settings: PluginSettings) -> bool:
         return False
     lowered = (text or "").lower().strip()
     return any(keyword and keyword in lowered for keyword in settings.buyer_join_keywords)
+
+
+def is_buyer_menu_request(text: str, settings: PluginSettings) -> bool:
+    lowered = (text or "").lower().strip()
+    return any(keyword and keyword == lowered for keyword in settings.buyer_menu_keywords)
+
+
+def is_buyer_back_request(text: str, settings: PluginSettings) -> bool:
+    lowered = (text or "").lower().strip()
+    return any(keyword and keyword == lowered for keyword in settings.buyer_back_keywords)
 
 
 def normalize_nickname(text: str) -> str:
@@ -2619,7 +2779,7 @@ class DeliveryCoordinator:
             store=self.store,
             funpay=self.funpay,
             roblox=self.roblox,
-            resume_callback=lambda order_id: self.submit(self.delivery_loop, order_id),
+            resume_callback=lambda order_id: self.enqueue_delivery(order_id, "admin_resume"),
             reload_callback=self.reload_settings,
             state_machine=self.state_machine,
         )
@@ -2627,6 +2787,11 @@ class DeliveryCoordinator:
         self._thread: Optional[threading.Thread] = None
         self._shutdown = threading.Event()
         self._tasks: "queue.Queue[Tuple[Callable[..., Any], Tuple[Any, ...], Dict[str, Any]]]" = queue.Queue()
+        self._delivery_queue: Optional[asyncio.Queue[str]] = None
+        self._delivery_queue_lock = threading.RLock()
+        self._queued_delivery_order_ids: Set[str] = set()
+        self._running_delivery_order_ids: Set[str] = set()
+        self._pending_delivery_order_ids: List[str] = []
         self._started = False
         self._paused_by_auth = self.store.get_flag("paused_by_auth", "0") == "1"
 
@@ -2664,9 +2829,32 @@ class DeliveryCoordinator:
         else:
             self._tasks.put((coro_func, args, kwargs))
 
+    def enqueue_delivery(self, order_id: str, reason: str = "") -> bool:
+        order_id = str(order_id or "").strip()
+        if not order_id or self._shutdown.is_set():
+            return False
+        with self._delivery_queue_lock:
+            if order_id in self._queued_delivery_order_ids or order_id in self._running_delivery_order_ids:
+                logger.info("%s: заказ %s уже в очереди/работе (%s)", LOGGER_PREFIX, order_id, reason)
+                return False
+            self._queued_delivery_order_ids.add(order_id)
+            if self._loop and self._loop.is_running() and self._delivery_queue is not None:
+                self._loop.call_soon_threadsafe(self._delivery_queue.put_nowait, order_id)
+            else:
+                self._pending_delivery_order_ids.append(order_id)
+        logger.info("%s: заказ %s добавлен в очередь доставки (%s)", LOGGER_PREFIX, order_id, reason or "manual")
+        return True
+
     def _run_loop_thread(self) -> None:
         self._loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self._loop)
+        self._delivery_queue = asyncio.Queue()
+        with self._delivery_queue_lock:
+            for order_id in self._pending_delivery_order_ids:
+                self._delivery_queue.put_nowait(order_id)
+            self._pending_delivery_order_ids.clear()
+        for worker_idx in range(max(1, self.settings.delivery_queue_workers)):
+            self._loop.create_task(self._delivery_worker(worker_idx + 1))
         while not self._tasks.empty():
             coro_func, args, kwargs = self._tasks.get()
             self._loop.create_task(self._safe_coro(coro_func, *args, **kwargs))
@@ -2680,6 +2868,26 @@ class DeliveryCoordinator:
             with contextlib.suppress(Exception):
                 self._loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
             self._loop.close()
+
+    async def _delivery_worker(self, worker_id: int) -> None:
+        while not self._shutdown.is_set():
+            if self._delivery_queue is None:
+                await asyncio.sleep(0.2)
+                continue
+            order_id = await self._delivery_queue.get()
+            with self._delivery_queue_lock:
+                self._queued_delivery_order_ids.discard(order_id)
+                self._running_delivery_order_ids.add(order_id)
+            try:
+                logger.info("%s: worker %s начал доставку заказа %s", LOGGER_PREFIX, worker_id, order_id)
+                await self.delivery_loop(order_id)
+            except Exception as exc:
+                logger.error("%s: worker %s ошибка доставки %s: %s", LOGGER_PREFIX, worker_id, order_id, exc)
+                logger.debug(traceback.format_exc())
+            finally:
+                with self._delivery_queue_lock:
+                    self._running_delivery_order_ids.discard(order_id)
+                self._delivery_queue.task_done()
 
     async def _safe_coro(self, coro_func: Callable[..., Any], *args: Any, **kwargs: Any) -> None:
         try:
@@ -2713,7 +2921,7 @@ class DeliveryCoordinator:
                 continue
             active = self.store.list_orders_by_states([OrderState.WAITING_FRIEND, OrderState.WAITING_JOIN, OrderState.TRADING], limit=25)
             for order in active:
-                self.submit(self.delivery_loop, order.order_id)
+                self.enqueue_delivery(order.order_id, "periodic_resume")
 
     def on_new_order(self, event: Any) -> None:
         if not self.settings.enabled:
@@ -2735,6 +2943,10 @@ class DeliveryCoordinator:
         if not payload:
             return
         order_id = payload["order_id"]
+        should_process, reason = should_process_sale_payload(payload, self.cardinal, self.settings, self.store)
+        if not should_process:
+            logger.info("%s: заказ %s пропущен: %s buyer=%s seller=%s", LOGGER_PREFIX, order_id, reason, payload.get("buyer"), payload.get("seller"))
+            return
         existing = self.store.get_order(order_id)
         if existing:
             logger.info("%s: заказ %s уже существует в MM2-хранилище", LOGGER_PREFIX, order_id)
@@ -2801,18 +3013,20 @@ class DeliveryCoordinator:
         key = f"{chat_id}:{message_id or abs(hash(text))}"
         if self.store.was_message_seen(key, chat_id, text):
             return
-        if self.settings.telegram_mirror_funpay_messages:
-            self.funpay.notify_admin(
-                f"FunPay chat {chat_id}\n"
-                f"Buyer: {buyer or '-'}\n"
-                f"Incoming:\n{text}",
-                force_telegram=True,
-                allow_funpay=False,
-            )
         if await self.admin_commands.handle(chat_id, text):
             return
         order = self.store.get_active_order_by_chat(chat_id, buyer)
         if not order:
+            return
+        if self.settings.telegram_mirror_funpay_messages:
+            self.funpay.notify_admin(
+                f"FunPay MM2 order #{order.order_id}\n"
+                f"Покупатель: {order.buyer or buyer or '-'}\n"
+                f"Incoming:\n{text}",
+                force_telegram=True,
+                allow_funpay=False,
+            )
+        if await self.handle_buyer_menu(order, text):
             return
         if is_buyer_join_request(text, self.settings):
             await self.request_join_buyer_server(order)
@@ -2831,6 +3045,54 @@ class DeliveryCoordinator:
                 await self.handle_nickname(order, text)
             else:
                 self.funpay.send_message(order.chat_id, self.settings.message("waiting_join", item_name=order.item_name, server_url=self.settings.roblox_vip_server_url), scope=f"wait_join:{order.order_id}")
+
+    async def handle_buyer_menu(self, order: DeliveryOrder, text: str) -> bool:
+        normalized = (text or "").strip().lower()
+        if is_buyer_menu_request(text, self.settings) or normalized in {"0", "меню"}:
+            self.show_buyer_menu(order, "main")
+            return True
+        if is_buyer_back_request(text, self.settings):
+            previous = str(order.metadata.get("buyer_menu_previous") or "main")
+            self.show_buyer_menu(order, previous if previous != "current" else "main")
+            return True
+        if normalized in {"1", "ник", "roblox", "роблокс"}:
+            self.show_buyer_menu(order, "nick")
+            return True
+        if normalized in {"2", "join", "joinme", "сервер"}:
+            self.show_buyer_menu(order, "joinme")
+            return True
+        if normalized in {"3", "отложить"}:
+            await self.delay_order(order)
+            return True
+        if normalized in {"4", "готов"}:
+            await self.ready_order(order)
+            return True
+        if normalized in {"5", "статус", "status"}:
+            self.funpay.send_message(
+                order.chat_id,
+                self.settings.message(
+                    "buyer_status",
+                    state=order.state.value,
+                    item_name=order.item_name,
+                    roblox_username=order.roblox_username or "ещё не указан",
+                ),
+                scope=f"buyer_status:{order.order_id}:{int(time.time())}",
+            )
+            return True
+        return False
+
+    def show_buyer_menu(self, order: DeliveryOrder, page: str = "main") -> None:
+        previous = str(order.metadata.get("buyer_menu_current") or "main")
+        order.metadata["buyer_menu_previous"] = previous
+        order.metadata["buyer_menu_current"] = page
+        self.store.update_order(order, event_type="buyer_menu", message=f"menu={page}")
+        if page == "nick":
+            text = self.settings.message("buyer_menu_nick")
+        elif page == "joinme":
+            text = self.settings.message("buyer_menu_joinme")
+        else:
+            text = self.settings.message("buyer_menu_main")
+        self.funpay.send_message(order.chat_id, text, scope=f"buyer_menu:{order.order_id}:{page}:{int(time.time())}")
 
     async def request_join_buyer_server(self, order: DeliveryOrder) -> None:
         if not order.roblox_user_id:
@@ -2900,7 +3162,7 @@ class DeliveryCoordinator:
             f"GameId: {presence.game_id}\n"
             f"Join URL: {order.metadata.get('preferred_join_url')}"
         )
-        self.submit(self.delivery_loop, order.order_id)
+        self.enqueue_delivery(order.order_id, "buyer_joinme")
 
     def _build_public_join_url(self, place_id: int, game_id: str) -> str:
         params = urllib.parse.urlencode({"placeId": int(place_id or self.settings.roblox_place_id), "gameInstanceId": str(game_id)})
@@ -2925,7 +3187,7 @@ class DeliveryCoordinator:
             self.state_machine.transition(order, target, "ready_by_buyer", "Покупатель готов")
         self.funpay.send_message(order.chat_id, self.settings.message("ready"), scope=f"ready:{order.order_id}")
         if order.roblox_user_id:
-            self.submit(self.delivery_loop, order.order_id)
+            self.enqueue_delivery(order.order_id, "buyer_ready")
 
     async def handle_nickname(self, order: DeliveryOrder, text: str) -> None:
         nickname = normalize_nickname(text)
@@ -2975,7 +3237,7 @@ class DeliveryCoordinator:
             order.last_error = f"Ошибка friend request: {exc}"
             self.store.update_order(order, event_type="friend_request_error", message=order.last_error)
             self.funpay.send_message(order.chat_id, "Не удалось отправить запрос в друзья из-за ошибки Roblox. Попробую позже.", scope=f"friend_err:{order.order_id}")
-            self.submit(self.delivery_loop, order.order_id)
+            self.enqueue_delivery(order.order_id, "friend_request_retry")
             return
 
         if result.outcome == FriendRequestOutcome.SENT:
@@ -3003,7 +3265,7 @@ class DeliveryCoordinator:
             self.store.update_order(order, event_type="friend_unknown_result", message=result.message)
 
         if self.settings.auto_start_delivery_after_friend_request:
-            self.submit(self.delivery_loop, order.order_id)
+            self.enqueue_delivery(order.order_id, "friend_request_done")
 
     async def delivery_loop(self, order_id: str) -> None:
         order = self.store.get_order(order_id)
@@ -3133,6 +3395,7 @@ class DeliveryCoordinator:
 
     async def _complete_order(self, order: DeliveryOrder) -> None:
         self.state_machine.transition(order, OrderState.COMPLETED, "completed", f"Предмет {order.item_name} передан")
+        self.store.adjust_stock(order.lot_id, -1)
         self.funpay.send_message(order.chat_id, self.settings.message("completed", item_name=order.item_name), scope=f"completed:{order.order_id}")
         logger.info("%s: заказ %s завершён, item=%s", LOGGER_PREFIX, order.order_id, order.item_name)
 
@@ -3161,6 +3424,7 @@ TG_STATE_LABELS: Dict[str, str] = {
     "mm2_set_place_id": "Roblox place id",
     "mm2_set_game_instance": "Game instance id",
     "mm2_set_admin_chat": "FunPay admin chat id",
+    "mm2_set_seller_names": "FunPay seller usernames",
     "mm2_set_delivery_timeout": "Delivery timeout minutes",
     "mm2_set_presence_poll": "Presence poll seconds",
     "mm2_set_trade_timeout": "Trade timeout seconds",
@@ -3229,6 +3493,7 @@ def _tg_settings_keyboard(settings: Dict[str, Any]) -> Any:
         InlineKeyboardButton(f"{_bool_icon(settings.get('telegram_mirror_funpay_messages'))} Копии FP в Telegram", callback_data="mm2_toggle_tg_mirror"),
         InlineKeyboardButton(f"{_bool_icon(settings.get('admin_notifications_to_telegram'))} Админ -> Telegram", callback_data="mm2_toggle_admin_tg"),
         InlineKeyboardButton(f"{_bool_icon(settings.get('admin_notifications_to_funpay'))} Админ -> FunPay", callback_data="mm2_toggle_admin_fp"),
+        InlineKeyboardButton(f"{_bool_icon(settings.get('require_mm2_category_match'))} Только MM2", callback_data="mm2_toggle_mm2_only"),
         InlineKeyboardButton(f"{_bool_icon(settings.get('pause_on_auth_error'))} Пауза при auth error", callback_data="mm2_toggle_pause_auth"),
         InlineKeyboardButton(f"{_bool_icon(settings.get('auto_start_delivery_after_friend_request'))} Автостарт после friend request", callback_data="mm2_toggle_auto_start"),
     )
@@ -3247,6 +3512,9 @@ def _tg_settings_keyboard(settings: Dict[str, Any]) -> Any:
     kb.row(
         InlineKeyboardButton("🧩 Instance ID", callback_data="mm2_set_game_instance"),
         InlineKeyboardButton("💬 Admin chat", callback_data="mm2_set_admin_chat"),
+    )
+    kb.row(
+        InlineKeyboardButton("🧑‍💼 FunPay продавец", callback_data="mm2_set_seller_names"),
     )
     kb.row(
         InlineKeyboardButton("⏱ Таймауты", callback_data="mm2_timeouts"),
@@ -3379,6 +3647,11 @@ def _tg_main_text(store: SQLiteStore, settings: Dict[str, Any]) -> str:
 
 def _tg_settings_text(settings: Dict[str, Any]) -> str:
     cookie = str(settings.get("roblox_security_cookie") or "")
+    seller_aliases_raw = settings.get("seller_funpay_usernames") or []
+    if isinstance(seller_aliases_raw, str):
+        seller_aliases = [seller_aliases_raw]
+    else:
+        seller_aliases = [str(alias) for alias in seller_aliases_raw]
     return (
         "⚙️ <b>Настройки MM2 Auto Delivery</b>\n\n"
         f"🍪 Cookie: <code>{_html(mask_secret(cookie))}</code>\n"
@@ -3389,6 +3662,8 @@ def _tg_settings_text(settings: Dict[str, Any]) -> str:
         f"🎮 Place ID: <code>{_html(settings.get('roblox_place_id') or '-')}</code>\n"
         f"🧩 Instance: <code>{_html(settings.get('expected_game_instance_id') or '-')}</code>\n"
         f"💬 Admin chat: <code>{_html(settings.get('admin_funpay_chat_id') or '-')}</code>\n\n"
+        f"🧑‍💼 Seller aliases: <code>{_html(', '.join(seller_aliases) or 'авто')}</code>\n"
+        f"{_bool_icon(settings.get('require_mm2_category_match'))} только MM2-заказы\n"
         f"{_bool_icon(settings.get('buyer_server_join_enabled'))} /joinme покупателя\n"
         f"{_bool_icon(settings.get('telegram_mirror_funpay_messages'))} копии FunPay-сообщений в Telegram\n"
         f"{_bool_icon(settings.get('admin_notifications_to_telegram'))} админ-уведомления в Telegram\n"
@@ -3466,6 +3741,7 @@ def _tg_prompt_text(state: str) -> str:
         "mm2_set_place_id": "Отправьте Roblox place id. Для MM2 обычно <code>142823291</code>.",
         "mm2_set_game_instance": "Отправьте game instance id или <code>-</code>, чтобы очистить.",
         "mm2_set_admin_chat": "Отправьте FunPay chat_id администратора или <code>-</code>, чтобы очистить.",
+        "mm2_set_seller_names": "Отправьте ваш FunPay-ник продавца. Можно несколько через запятую. Пример: <code>MyShop, MySecondShop</code>",
         "mm2_set_delivery_timeout": "Отправьте минуты ожидания покупателя на сервере. Пример: <code>12</code>",
         "mm2_set_presence_poll": "Отправьте интервал проверки presence в секундах. Пример: <code>15</code>",
         "mm2_set_trade_timeout": "Отправьте таймаут трейда в секундах. Пример: <code>60</code>",
@@ -3578,13 +3854,18 @@ def _save_tg_state_value(state: str, text: str, coordinator: DeliveryCoordinator
         if state == "mm2_set_cookie":
             return "✅ Cookie сохранён. Нажмите «Roblox Auth» → «Проверить Roblox-сессию»."
         return f"✅ Сохранено: {TG_STATE_LABELS.get(state)}"
+    if state == "mm2_set_seller_names":
+        aliases = [] if raw == "-" else [part.strip() for part in re.split(r"[,;\n]", raw) if part.strip()]
+        update_setting_path("seller_funpay_usernames", aliases)
+        coordinator.reload_settings()
+        return "✅ FunPay-продавцы сохранены: " + (", ".join(aliases) if aliases else "авто")
     if state == "mm2_add_mapping":
         item = AdminCommandRouter(
             settings_getter=lambda: coordinator.settings,
             store=coordinator.store,
             funpay=coordinator.funpay,
             roblox=coordinator.roblox,
-            resume_callback=lambda order_id: coordinator.submit(coordinator.delivery_loop, order_id),
+            resume_callback=lambda order_id: coordinator.enqueue_delivery(order_id, "tg_mapping_helper"),
             reload_callback=coordinator.reload_settings,
             state_machine=coordinator.state_machine,
         )._parse_mapping_args(raw)
@@ -3632,7 +3913,7 @@ def _apply_tg_order_action(state: str, order_id: str, coordinator: DeliveryCoord
         elif order.state == OrderState.DELAYED:
             coordinator.state_machine.transition(order, OrderState.WAITING_JOIN if order.roblox_user_id else OrderState.WAITING_NICK, "tg_ready_retry", "Возобновление через Telegram")
         if order.roblox_user_id:
-            coordinator.submit(coordinator.delivery_loop, order.order_id)
+            coordinator.enqueue_delivery(order.order_id, "tg_retry")
         return f"✅ Повтор доставки заказа #{order.order_id} запущен."
     if state == "mm2_order_delay":
         if order.state in TERMINAL_STATES:
@@ -3647,7 +3928,7 @@ def _apply_tg_order_action(state: str, order_id: str, coordinator: DeliveryCoord
             return "❌ Финальный заказ нельзя возобновить."
         coordinator.state_machine.transition(order, target, "tg_ready", "Возобновлено через Telegram")
         if order.roblox_user_id:
-            coordinator.submit(coordinator.delivery_loop, order.order_id)
+            coordinator.enqueue_delivery(order.order_id, "tg_ready")
         coordinator.funpay.send_message(order.chat_id, coordinator.settings.message("ready"), scope=f"tg_ready:{order.order_id}")
         return f"✅ Заказ #{order.order_id} переведён в {target.value}."
     if state == "mm2_order_manual":
@@ -3740,6 +4021,11 @@ def init_telegram_panel(cardinal: Any, *args: Any) -> None:
                 _tg_answer(bot, call, "Сохранено")
             elif data == "mm2_toggle_admin_fp":
                 settings = toggle_setting_path("admin_notifications_to_funpay")
+                coord.reload_settings()
+                _tg_edit(bot, chat_id, msg_id, _tg_settings_text(settings), _tg_settings_keyboard(settings))
+                _tg_answer(bot, call, "Сохранено")
+            elif data == "mm2_toggle_mm2_only":
+                settings = toggle_setting_path("require_mm2_category_match")
                 coord.reload_settings()
                 _tg_edit(bot, chat_id, msg_id, _tg_settings_text(settings), _tg_settings_keyboard(settings))
                 _tg_answer(bot, call, "Сохранено")
