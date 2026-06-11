@@ -3276,6 +3276,34 @@ def _tg_answer(bot: Any, call: Any, text: str = "", alert: bool = False) -> None
         bot.answer_callback_query(call.id, text[:190] if text else None, show_alert=alert)
 
 
+def _tg_authorized_users() -> List[int]:
+    try:
+        from tg_bot.utils import load_authorized_users
+
+        users = load_authorized_users() or []
+        return [int(user_id) for user_id in users]
+    except Exception:
+        return []
+
+
+def _tg_send_to_admins(cardinal: Any, text: str, keyboard: Any = None) -> None:
+    telegram = getattr(cardinal, "telegram", None)
+    bot = getattr(telegram, "bot", None)
+    if not bot:
+        return
+    for user_id in _tg_authorized_users():
+        try:
+            bot.send_message(
+                user_id,
+                text,
+                reply_markup=keyboard,
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
+        except Exception as exc:
+            logger.debug("%s: не удалось отправить TG user %s: %s", LOGGER_PREFIX, user_id, exc)
+
+
 def _tg_edit(bot: Any, chat_id: Any, msg_id: Any, text: str, keyboard: Any = None) -> None:
     bot.edit_message_text(text, chat_id, msg_id, reply_markup=keyboard, parse_mode="HTML", disable_web_page_preview=True)
 
@@ -3416,6 +3444,9 @@ def _apply_tg_order_action(state: str, order_id: str, coordinator: DeliveryCoord
 def init_telegram_panel(cardinal: Any, *args: Any) -> None:
     if not _tg_available() or not getattr(cardinal, "telegram", None):
         return
+    if getattr(cardinal, "_mm2_telegram_panel_registered", False):
+        return
+    setattr(cardinal, "_mm2_telegram_panel_registered", True)
 
     tg = cardinal.telegram
     bot = tg.bot
@@ -3433,6 +3464,12 @@ def init_telegram_panel(cardinal: Any, *args: Any) -> None:
             parse_mode="HTML",
             disable_web_page_preview=True,
         )
+
+    def send_main_panel_by_text(message: Any) -> None:
+        text = str(getattr(message, "text", "") or "").strip().lower().split("@")[0]
+        if text not in ("/mm2", "/mm2_menu"):
+            return
+        send_main_panel(message)
 
     def send_status(message: Any) -> None:
         coord = coordinator()
@@ -3560,10 +3597,23 @@ def init_telegram_panel(cardinal: Any, *args: Any) -> None:
     try:
         bot.message_handler(commands=["mm2", "mm2_menu"])(send_main_panel)
         bot.message_handler(commands=["mm2_status"])(send_status)
+        bot.message_handler(func=lambda message: str(getattr(message, "text", "") or "").strip().lower().split("@")[0] in ("/mm2", "/mm2_menu"))(send_main_panel_by_text)
         bot.callback_query_handler(func=lambda call: str(getattr(call, "data", "")).startswith("mm2_"))(handle_callback)
         bot.message_handler(content_types=["text"])(handle_text_state)
+        open_kb = InlineKeyboardMarkup(row_width=1)
+        open_kb.add(InlineKeyboardButton("🔪 Открыть панель MM2", callback_data="mm2_back_main"))
+        _tg_send_to_admins(
+            cardinal,
+            (
+                f"✅ <b>{_html(NAME)} v{_html(VERSION)}</b> запущен\n\n"
+                "Панель управления: <code>/mm2</code>\n"
+                "Если команда не отвечает, нажмите кнопку ниже."
+            ),
+            keyboard=open_kb,
+        )
         logger.info("%s: Telegram-панель /mm2 зарегистрирована", LOGGER_PREFIX)
     except Exception as exc:
+        setattr(cardinal, "_mm2_telegram_panel_registered", False)
         logger.error("%s: не удалось зарегистрировать Telegram-панель: %s", LOGGER_PREFIX, exc)
 
 
