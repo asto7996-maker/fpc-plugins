@@ -39,6 +39,12 @@ except Exception:  # pragma: no cover - Cardinal provides these at runtime.
     NewMessageEvent = Any  # type: ignore
     NewOrderEvent = Any  # type: ignore
 
+try:
+    from telebot.types import InlineKeyboardButton, InlineKeyboardMarkup
+except Exception:  # pragma: no cover - telebot is provided by Cardinal.
+    InlineKeyboardButton = None  # type: ignore
+    InlineKeyboardMarkup = None  # type: ignore
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Логирование и базовые пути
@@ -231,6 +237,58 @@ def load_settings_file() -> Dict[str, Any]:
             os.replace(SETTINGS_FILE, broken_name)
         save_json(SETTINGS_FILE, DEFAULT_SETTINGS)
         return dict(DEFAULT_SETTINGS)
+
+
+def save_settings_file(settings: Dict[str, Any]) -> None:
+    save_json(SETTINGS_FILE, deep_merge(DEFAULT_SETTINGS, settings))
+
+
+def update_setting_path(path: str, value: Any) -> Dict[str, Any]:
+    settings = load_settings_file()
+    cursor = settings
+    parts = path.split(".")
+    for part in parts[:-1]:
+        current = cursor.get(part)
+        if not isinstance(current, dict):
+            current = {}
+            cursor[part] = current
+        cursor = current
+    cursor[parts[-1]] = value
+    save_settings_file(settings)
+    return settings
+
+
+def toggle_setting_path(path: str) -> Dict[str, Any]:
+    settings = load_settings_file()
+    cursor = settings
+    parts = path.split(".")
+    for part in parts[:-1]:
+        current = cursor.get(part)
+        if not isinstance(current, dict):
+            current = {}
+            cursor[part] = current
+        cursor = current
+    cursor[parts[-1]] = not bool(cursor.get(parts[-1], False))
+    save_settings_file(settings)
+    return settings
+
+
+def get_setting_path(settings: Dict[str, Any], path: str, default: Any = None) -> Any:
+    cursor: Any = settings
+    for part in path.split("."):
+        if not isinstance(cursor, dict) or part not in cursor:
+            return default
+        cursor = cursor[part]
+    return cursor
+
+
+def mask_secret(value: str, visible: int = 4) -> str:
+    value = str(value or "")
+    if not value:
+        return "не задан"
+    if len(value) <= visible * 2:
+        return "*" * len(value)
+    return f"{value[:visible]}...{value[-visible:]}"
 
 
 def save_json(path: str, payload: Any) -> None:
@@ -2882,6 +2940,634 @@ class DeliveryCoordinator:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Telegram inline-панель Cardinal
+# ─────────────────────────────────────────────────────────────────────────────
+
+TG_STATE_LABELS: Dict[str, str] = {
+    "mm2_set_cookie": ".ROBLOSECURITY cookie",
+    "mm2_set_bot_id": "Roblox bot user id",
+    "mm2_set_bot_username": "Roblox bot username",
+    "mm2_set_profile_url": "Roblox profile URL",
+    "mm2_set_vip_url": "VIP server URL",
+    "mm2_set_place_id": "Roblox place id",
+    "mm2_set_game_instance": "Game instance id",
+    "mm2_set_admin_chat": "FunPay admin chat id",
+    "mm2_set_delivery_timeout": "Delivery timeout minutes",
+    "mm2_set_presence_poll": "Presence poll seconds",
+    "mm2_set_trade_timeout": "Trade timeout seconds",
+    "mm2_set_trade_retries": "Trade retry count",
+    "mm2_add_mapping": "lot mapping",
+    "mm2_search_item": "item search",
+    "mm2_import_maps": "mapping JSON import",
+    "mm2_order_open": "FunPay order id",
+    "mm2_order_retry": "FunPay order id",
+    "mm2_order_delay": "FunPay order id",
+    "mm2_order_ready": "FunPay order id",
+    "mm2_order_manual": "FunPay order id",
+    "mm2_buyer_message": "buyer message",
+}
+
+
+def _tg_available() -> bool:
+    return InlineKeyboardButton is not None and InlineKeyboardMarkup is not None
+
+
+def _html(value: Any) -> str:
+    return html.escape(str(value if value is not None else ""), quote=False)
+
+
+def _bool_icon(value: Any) -> str:
+    return "🟢" if bool(value) else "🔴"
+
+
+def _tg_back_main_keyboard() -> Any:
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(InlineKeyboardButton("⬅️ Главное меню", callback_data="mm2_back_main"))
+    return kb
+
+
+def _tg_main_keyboard(settings: Dict[str, Any]) -> Any:
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.row(
+        InlineKeyboardButton("⚙️ Настройки", callback_data="mm2_settings"),
+        InlineKeyboardButton("📦 Лоты", callback_data="mm2_mappings"),
+    )
+    kb.row(
+        InlineKeyboardButton("📋 Заказы", callback_data="mm2_orders"),
+        InlineKeyboardButton("🧾 Ручная проверка", callback_data="mm2_orders_manual"),
+    )
+    kb.row(
+        InlineKeyboardButton("🏥 Диагностика", callback_data="mm2_diag"),
+        InlineKeyboardButton("🔐 Roblox Auth", callback_data="mm2_auth"),
+    )
+    kb.row(
+        InlineKeyboardButton("📖 Гайд", callback_data="mm2_guide"),
+        InlineKeyboardButton("🛟 Runbook", callback_data="mm2_runbooks"),
+    )
+    kb.row(
+        InlineKeyboardButton("🔄 Reload", callback_data="mm2_reload"),
+        InlineKeyboardButton(f"{_bool_icon(settings.get('enabled'))} Вкл/выкл", callback_data="mm2_toggle_enabled"),
+    )
+    return kb
+
+
+def _tg_settings_keyboard(settings: Dict[str, Any]) -> Any:
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(
+        InlineKeyboardButton(f"{_bool_icon(settings.get('enabled'))} Плагин включён", callback_data="mm2_toggle_enabled"),
+        InlineKeyboardButton(f"{_bool_icon(get_setting_path(settings, 'browser.enabled'))} Playwright трейд", callback_data="mm2_toggle_browser"),
+        InlineKeyboardButton(f"{_bool_icon(settings.get('pause_on_auth_error'))} Пауза при auth error", callback_data="mm2_toggle_pause_auth"),
+        InlineKeyboardButton(f"{_bool_icon(settings.get('auto_start_delivery_after_friend_request'))} Автостарт после friend request", callback_data="mm2_toggle_auto_start"),
+    )
+    kb.row(
+        InlineKeyboardButton("🍪 Cookie", callback_data="mm2_set_cookie"),
+        InlineKeyboardButton("🤖 Bot ID", callback_data="mm2_set_bot_id"),
+    )
+    kb.row(
+        InlineKeyboardButton("👤 Username", callback_data="mm2_set_bot_username"),
+        InlineKeyboardButton("🔗 Профиль", callback_data="mm2_set_profile_url"),
+    )
+    kb.row(
+        InlineKeyboardButton("🏰 VIP-сервер", callback_data="mm2_set_vip_url"),
+        InlineKeyboardButton("🎮 Place ID", callback_data="mm2_set_place_id"),
+    )
+    kb.row(
+        InlineKeyboardButton("🧩 Instance ID", callback_data="mm2_set_game_instance"),
+        InlineKeyboardButton("💬 Admin chat", callback_data="mm2_set_admin_chat"),
+    )
+    kb.row(
+        InlineKeyboardButton("⏱ Таймауты", callback_data="mm2_timeouts"),
+        InlineKeyboardButton("⬅️ Назад", callback_data="mm2_back_main"),
+    )
+    return kb
+
+
+def _tg_timeouts_keyboard() -> Any:
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(
+        InlineKeyboardButton("⏳ Минуты ожидания доставки", callback_data="mm2_set_delivery_timeout"),
+        InlineKeyboardButton("📡 Интервал presence", callback_data="mm2_set_presence_poll"),
+        InlineKeyboardButton("🤝 Таймаут трейда", callback_data="mm2_set_trade_timeout"),
+        InlineKeyboardButton("🔁 Кол-во попыток трейда", callback_data="mm2_set_trade_retries"),
+        InlineKeyboardButton("⬅️ Настройки", callback_data="mm2_settings"),
+    )
+    return kb
+
+
+def _tg_mappings_keyboard() -> Any:
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.row(
+        InlineKeyboardButton("➕ Добавить", callback_data="mm2_add_mapping"),
+        InlineKeyboardButton("🔎 Найти предмет", callback_data="mm2_search_item"),
+    )
+    kb.row(
+        InlineKeyboardButton("📤 Экспорт", callback_data="mm2_export_maps"),
+        InlineKeyboardButton("📥 Импорт", callback_data="mm2_import_maps"),
+    )
+    kb.row(
+        InlineKeyboardButton("🔄 Обновить список", callback_data="mm2_mappings"),
+        InlineKeyboardButton("⬅️ Назад", callback_data="mm2_back_main"),
+    )
+    return kb
+
+
+def _tg_orders_keyboard() -> Any:
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.row(
+        InlineKeyboardButton("⏳ Ждут ник", callback_data="mm2_orders_WAITING_NICK"),
+        InlineKeyboardButton("🤝 Ждут дружбу", callback_data="mm2_orders_WAITING_FRIEND"),
+    )
+    kb.row(
+        InlineKeyboardButton("🎮 Ждут вход", callback_data="mm2_orders_WAITING_JOIN"),
+        InlineKeyboardButton("🔁 Трейдинг", callback_data="mm2_orders_TRADING"),
+    )
+    kb.row(
+        InlineKeyboardButton("⏸ Отложены", callback_data="mm2_orders_DELAYED"),
+        InlineKeyboardButton("🧾 Ручная", callback_data="mm2_orders_MANUAL_REVIEW"),
+    )
+    kb.row(
+        InlineKeyboardButton("🔍 Открыть заказ", callback_data="mm2_order_open"),
+        InlineKeyboardButton("🔁 Повторить", callback_data="mm2_order_retry"),
+    )
+    kb.row(
+        InlineKeyboardButton("⏸ Отложить", callback_data="mm2_order_delay"),
+        InlineKeyboardButton("▶️ Возобновить", callback_data="mm2_order_ready"),
+    )
+    kb.row(
+        InlineKeyboardButton("🧾 В ручную", callback_data="mm2_order_manual"),
+        InlineKeyboardButton("⬅️ Назад", callback_data="mm2_back_main"),
+    )
+    return kb
+
+
+def _tg_auth_keyboard() -> Any:
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(
+        InlineKeyboardButton("🏥 Проверить Roblox-сессию", callback_data="mm2_diag"),
+        InlineKeyboardButton("🍪 Обновить cookie", callback_data="mm2_set_cookie"),
+        InlineKeyboardButton("✅ Снять auth-паузу", callback_data="mm2_unpause_auth"),
+        InlineKeyboardButton("📖 Runbook auth", callback_data="mm2_runbook_auth"),
+        InlineKeyboardButton("⬅️ Назад", callback_data="mm2_back_main"),
+    )
+    return kb
+
+
+def _tg_guide_keyboard() -> Any:
+    kb = InlineKeyboardMarkup(row_width=2)
+    for label, key in (
+        ("🚀 Старт", "start"),
+        ("🍪 Cookie", "cookies"),
+        ("📦 Лоты", "lots"),
+        ("🔄 Статусы", "states"),
+        ("👤 Покупатель", "buyer"),
+        ("🤝 Трейд", "trade"),
+        ("🔐 Ошибки", "privacy"),
+    ):
+        kb.add(InlineKeyboardButton(label, callback_data=f"mm2_guide_{key}"))
+    kb.add(InlineKeyboardButton("⬅️ Назад", callback_data="mm2_back_main"))
+    return kb
+
+
+def _tg_runbook_keyboard() -> Any:
+    kb = InlineKeyboardMarkup(row_width=2)
+    for label, key in (
+        ("🔐 Auth", "auth"),
+        ("👤 Nick", "nickname"),
+        ("🤝 Friends", "friends"),
+        ("🎮 Join", "join"),
+        ("💱 Trade", "trade"),
+        ("📦 Mapping", "mapping"),
+        ("💾 Storage", "storage"),
+    ):
+        kb.add(InlineKeyboardButton(label, callback_data=f"mm2_runbook_{key}"))
+    kb.add(InlineKeyboardButton("⬅️ Назад", callback_data="mm2_back_main"))
+    return kb
+
+
+def _tg_main_text(store: SQLiteStore, settings: Dict[str, Any]) -> str:
+    active_states = [OrderState.WAITING_NICK, OrderState.WAITING_FRIEND, OrderState.WAITING_JOIN, OrderState.TRADING]
+    active_count = len(store.list_orders_by_states(active_states, limit=1000))
+    manual_count = len(store.list_orders_by_states([OrderState.MANUAL_REVIEW], limit=1000))
+    delayed_count = len(store.list_orders_by_states([OrderState.DELAYED], limit=1000))
+    mapping_count = len(store.list_mappings())
+    return (
+        f"🔪 <b>{_html(NAME)} v{_html(VERSION)}</b>\n\n"
+        f"Автовыдача MM2-предметов после заказов FunPay.\n\n"
+        f"{_bool_icon(settings.get('enabled'))} <b>Плагин:</b> {'включён' if settings.get('enabled') else 'выключен'}\n"
+        f"{_bool_icon(get_setting_path(settings, 'browser.enabled'))} <b>Playwright трейд:</b> {'включён' if get_setting_path(settings, 'browser.enabled') else 'выключен'}\n"
+        f"🔐 <b>Auth pause:</b> <code>{_html(store.get_flag('paused_by_auth', '0'))}</code>\n"
+        f"📦 <b>Лотов в таблице:</b> <code>{mapping_count}</code>\n"
+        f"📋 <b>Активные:</b> <code>{active_count}</code>\n"
+        f"⏸ <b>Отложены:</b> <code>{delayed_count}</code>\n"
+        f"🧾 <b>Ручная проверка:</b> <code>{manual_count}</code>\n\n"
+        f"Нажмите кнопку ниже для настройки и сопровождения."
+    )
+
+
+def _tg_settings_text(settings: Dict[str, Any]) -> str:
+    cookie = str(settings.get("roblox_security_cookie") or "")
+    return (
+        "⚙️ <b>Настройки MM2 Auto Delivery</b>\n\n"
+        f"🍪 Cookie: <code>{_html(mask_secret(cookie))}</code>\n"
+        f"🤖 Bot ID: <code>{_html(settings.get('roblox_bot_user_id') or 'не задан')}</code>\n"
+        f"👤 Username: <code>{_html(settings.get('roblox_bot_username') or 'не задан')}</code>\n"
+        f"🔗 Profile: <code>{_html('задан' if settings.get('roblox_profile_url') else 'не задан')}</code>\n"
+        f"🏰 VIP: <code>{_html('задан' if settings.get('roblox_vip_server_url') else 'не задан')}</code>\n"
+        f"🎮 Place ID: <code>{_html(settings.get('roblox_place_id') or '-')}</code>\n"
+        f"🧩 Instance: <code>{_html(settings.get('expected_game_instance_id') or '-')}</code>\n"
+        f"💬 Admin chat: <code>{_html(settings.get('admin_funpay_chat_id') or '-')}</code>\n\n"
+        "Используйте кнопки для изменения параметров."
+    )
+
+
+def _tg_timeouts_text(settings: Dict[str, Any]) -> str:
+    return (
+        "⏱ <b>Таймауты и повторы</b>\n\n"
+        f"Доставка: <code>{_html(settings.get('delivery_timeout_minutes'))}</code> мин.\n"
+        f"Presence poll: <code>{_html(settings.get('presence_poll_seconds'))}</code> сек.\n"
+        f"Friend accept: <code>{_html(settings.get('friend_accept_timeout_minutes'))}</code> мин.\n"
+        f"Trade timeout: <code>{_html(settings.get('trade_timeout_seconds'))}</code> сек.\n"
+        f"Trade retries: <code>{_html(settings.get('trade_retry_count'))}</code>\n"
+        f"Trade retry delay: <code>{_html(settings.get('trade_retry_delay_seconds'))}</code> сек."
+    )
+
+
+def _tg_mappings_text(store: SQLiteStore) -> str:
+    text = OrderFormatter.mappings_table(store.list_mappings(), limit=30)
+    return "📦 <b>Таблица лотов</b>\n\n" + _html(text)
+
+
+def _tg_orders_text(store: SQLiteStore) -> str:
+    states = [OrderState.WAITING_NICK, OrderState.WAITING_FRIEND, OrderState.WAITING_JOIN, OrderState.TRADING, OrderState.DELAYED, OrderState.MANUAL_REVIEW]
+    lines = ["📋 <b>Заказы MM2</b>\n"]
+    for state in states:
+        count = len(store.list_orders_by_states([state], limit=1000))
+        lines.append(f"<code>{state.value}</code>: <b>{count}</b>")
+    lines.append("\nВыберите список или действие кнопками.")
+    return "\n".join(lines)
+
+
+def _tg_orders_by_state_text(store: SQLiteStore, state: OrderState) -> str:
+    orders = store.list_orders_by_states([state], limit=30)
+    text = OrderFormatter.active_orders(f"Заказы {state.value}:", orders)
+    return _html(text)
+
+
+def _tg_order_detail_text(store: SQLiteStore, order_id: str) -> str:
+    order = store.get_order(order_id)
+    if not order:
+        return f"Заказ #{_html(order_id)} не найден."
+    return _html(OrderFormatter.detailed_order(order, store.get_recent_events(order_id, limit=8)))
+
+
+def _tg_guide_text(section: str = "") -> str:
+    if not section:
+        return "📖 <b>Гайд MM2 Auto Delivery</b>\n\nВыберите раздел."
+    title, body = ADMIN_GUIDE_SECTIONS.get(section, ADMIN_GUIDE_SECTIONS["start"])
+    return f"📖 <b>{_html(title)}</b>\n\n{_html(body)}"
+
+
+def _tg_runbook_text(section: str = "") -> str:
+    if not section:
+        return "🛟 <b>Runbook</b>\n\nВыберите тип проблемы."
+    title, steps = ADMIN_RUNBOOKS.get(section, ADMIN_RUNBOOKS["auth"])
+    lines = [f"🛟 <b>{_html(title)}</b>", ""]
+    lines.extend(f"{idx}. {_html(step)}" for idx, step in enumerate(steps, start=1))
+    return "\n".join(lines)
+
+
+def _tg_prompt_text(state: str) -> str:
+    prompts = {
+        "mm2_set_cookie": (
+            "Отправьте новое значение <code>.ROBLOSECURITY</code>.\n"
+            "Сообщение с cookie будет удалено, если Telegram позволит."
+        ),
+        "mm2_set_bot_id": "Отправьте Roblox user id аккаунта-бота. Пример: <code>123456789</code>",
+        "mm2_set_bot_username": "Отправьте username аккаунта-бота Roblox.",
+        "mm2_set_profile_url": "Отправьте ссылку на профиль бота Roblox.",
+        "mm2_set_vip_url": "Отправьте ссылку на VIP-сервер MM2.",
+        "mm2_set_place_id": "Отправьте Roblox place id. Для MM2 обычно <code>142823291</code>.",
+        "mm2_set_game_instance": "Отправьте game instance id или <code>-</code>, чтобы очистить.",
+        "mm2_set_admin_chat": "Отправьте FunPay chat_id администратора или <code>-</code>, чтобы очистить.",
+        "mm2_set_delivery_timeout": "Отправьте минуты ожидания покупателя на сервере. Пример: <code>12</code>",
+        "mm2_set_presence_poll": "Отправьте интервал проверки presence в секундах. Пример: <code>15</code>",
+        "mm2_set_trade_timeout": "Отправьте таймаут трейда в секундах. Пример: <code>60</code>",
+        "mm2_set_trade_retries": "Отправьте количество повторов трейда. Пример: <code>3</code>",
+        "mm2_add_mapping": (
+            "Отправьте лот в формате:\n"
+            "<code>1001 | Harvester | ancient | 1</code>\n\n"
+            "Категорию и остаток можно не указывать:\n"
+            "<code>1001 | Harvester</code>"
+        ),
+        "mm2_search_item": "Отправьте часть названия предмета. Пример: <code>harv</code>",
+        "mm2_import_maps": "Отправьте JSON экспорта с полем <code>items</code>.",
+        "mm2_order_open": "Отправьте ID заказа FunPay для просмотра.",
+        "mm2_order_retry": "Отправьте ID заказа FunPay для повтора доставки.",
+        "mm2_order_delay": "Отправьте ID заказа FunPay, который нужно отложить.",
+        "mm2_order_ready": "Отправьте ID заказа FunPay, который нужно возобновить.",
+        "mm2_order_manual": "Отправьте ID заказа FunPay для ручной проверки.",
+        "mm2_buyer_message": "Отправьте: <code>FP_ID | текст сообщения покупателю</code>",
+    }
+    return prompts.get(state, f"Отправьте значение для {_html(TG_STATE_LABELS.get(state, state))}.")
+
+
+def _tg_answer(bot: Any, call: Any, text: str = "", alert: bool = False) -> None:
+    with contextlib.suppress(Exception):
+        bot.answer_callback_query(call.id, text[:190] if text else None, show_alert=alert)
+
+
+def _tg_edit(bot: Any, chat_id: Any, msg_id: Any, text: str, keyboard: Any = None) -> None:
+    bot.edit_message_text(text, chat_id, msg_id, reply_markup=keyboard, parse_mode="HTML", disable_web_page_preview=True)
+
+
+def _tg_send_prompt(tg: Any, bot: Any, call: Any, state: str) -> None:
+    result = bot.send_message(call.message.chat.id, _tg_prompt_text(state), parse_mode="HTML", disable_web_page_preview=True)
+    tg.set_state(chat_id=call.message.chat.id, message_id=result.id, user_id=call.from_user.id, state=state)
+    _tg_answer(bot, call)
+
+
+def _run_async_sync(coro: Any) -> Any:
+    try:
+        return asyncio.run(coro)
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(coro)
+        finally:
+            loop.close()
+
+
+def _save_tg_state_value(state: str, text: str, coordinator: DeliveryCoordinator) -> str:
+    raw = (text or "").strip()
+    int_settings = {
+        "mm2_set_bot_id": ("roblox_bot_user_id", 0, 10**18),
+        "mm2_set_place_id": ("roblox_place_id", 1, 10**18),
+        "mm2_set_delivery_timeout": ("delivery_timeout_minutes", 1, 180),
+        "mm2_set_presence_poll": ("presence_poll_seconds", 5, 600),
+        "mm2_set_trade_timeout": ("trade_timeout_seconds", 20, 600),
+        "mm2_set_trade_retries": ("trade_retry_count", 1, 20),
+    }
+    str_settings = {
+        "mm2_set_cookie": "roblox_security_cookie",
+        "mm2_set_bot_username": "roblox_bot_username",
+        "mm2_set_profile_url": "roblox_profile_url",
+        "mm2_set_vip_url": "roblox_vip_server_url",
+        "mm2_set_game_instance": "expected_game_instance_id",
+        "mm2_set_admin_chat": "admin_funpay_chat_id",
+    }
+    if state in int_settings:
+        path, min_value, max_value = int_settings[state]
+        try:
+            value = int(raw)
+        except Exception:
+            return "❌ Нужно отправить число."
+        if value < min_value or value > max_value:
+            return f"❌ Число должно быть от {min_value} до {max_value}."
+        update_setting_path(path, value)
+        coordinator.reload_settings()
+        return f"✅ Сохранено: {TG_STATE_LABELS.get(state)} = {value}"
+    if state in str_settings:
+        value = "" if raw == "-" else raw
+        update_setting_path(str_settings[state], value)
+        coordinator.reload_settings()
+        if state == "mm2_set_cookie":
+            return "✅ Cookie сохранён. Нажмите «Roblox Auth» → «Проверить Roblox-сессию»."
+        return f"✅ Сохранено: {TG_STATE_LABELS.get(state)}"
+    if state == "mm2_add_mapping":
+        item = AdminCommandRouter(
+            settings_getter=lambda: coordinator.settings,
+            store=coordinator.store,
+            funpay=coordinator.funpay,
+            roblox=coordinator.roblox,
+            resume_callback=lambda order_id: coordinator.submit(coordinator.delivery_loop, order_id),
+            reload_callback=coordinator.reload_settings,
+            state_machine=coordinator.state_machine,
+        )._parse_mapping_args(raw)
+        if not item:
+            return "❌ Формат: 1001 | Harvester | ancient | 1"
+        if not item.category:
+            item.category = ItemNameHelper().suggest_category(item.item_name)
+        coordinator.store.upsert_mapping(item)
+        return f"✅ Лот {item.lot_id} -> {item.item_name} сохранён."
+    if state == "mm2_search_item":
+        return ItemNameHelper().format_search(raw)
+    if state == "mm2_import_maps":
+        imported, errors = MappingCatalogIO(coordinator.store).import_json(raw)
+        lines = [f"✅ Импортировано: {imported}"]
+        if errors:
+            lines.append("Ошибки:")
+            lines.extend(errors[:10])
+        return "\n".join(lines)
+    if state.startswith("mm2_order_"):
+        return _apply_tg_order_action(state, raw, coordinator)
+    if state == "mm2_buyer_message":
+        if "|" not in raw:
+            return "❌ Формат: FP_ID | текст сообщения"
+        order_id, message = [part.strip() for part in raw.split("|", 1)]
+        order = coordinator.store.get_order(order_id)
+        if not order:
+            return f"❌ Заказ #{order_id} не найден."
+        coordinator.funpay.send_message(order.chat_id, message, scope=f"tg_manual_msg:{order.order_id}:{int(time.time())}")
+        return f"✅ Сообщение отправлено покупателю заказа #{order.order_id}."
+    return "❌ Неизвестное состояние ввода."
+
+
+def _apply_tg_order_action(state: str, order_id: str, coordinator: DeliveryCoordinator) -> str:
+    order_id = (order_id or "").strip().split()[0] if order_id else ""
+    if not order_id:
+        return "❌ Укажите ID заказа FunPay."
+    order = coordinator.store.get_order(order_id)
+    if not order:
+        return f"❌ Заказ #{order_id} не найден."
+    if state == "mm2_order_open":
+        return OrderFormatter.detailed_order(order, coordinator.store.get_recent_events(order_id, limit=8))
+    if state == "mm2_order_retry":
+        if order.state == OrderState.MANUAL_REVIEW:
+            coordinator.state_machine.transition(order, OrderState.WAITING_JOIN if order.roblox_user_id else OrderState.WAITING_NICK, "tg_retry", "Повтор через Telegram")
+        elif order.state == OrderState.DELAYED:
+            coordinator.state_machine.transition(order, OrderState.WAITING_JOIN if order.roblox_user_id else OrderState.WAITING_NICK, "tg_ready_retry", "Возобновление через Telegram")
+        if order.roblox_user_id:
+            coordinator.submit(coordinator.delivery_loop, order.order_id)
+        return f"✅ Повтор доставки заказа #{order.order_id} запущен."
+    if state == "mm2_order_delay":
+        if order.state in TERMINAL_STATES:
+            return "❌ Финальный заказ нельзя отложить."
+        order.metadata["state_before_delay"] = order.state.value
+        coordinator.state_machine.transition(order, OrderState.DELAYED, "tg_delay", "Отложено через Telegram")
+        coordinator.funpay.send_message(order.chat_id, coordinator.settings.message("delayed"), scope=f"tg_delayed:{order.order_id}")
+        return f"✅ Заказ #{order.order_id} отложен."
+    if state == "mm2_order_ready":
+        target = OrderState.WAITING_JOIN if order.roblox_user_id else OrderState.WAITING_NICK
+        if order.state in TERMINAL_STATES and order.state != OrderState.MANUAL_REVIEW:
+            return "❌ Финальный заказ нельзя возобновить."
+        coordinator.state_machine.transition(order, target, "tg_ready", "Возобновлено через Telegram")
+        if order.roblox_user_id:
+            coordinator.submit(coordinator.delivery_loop, order.order_id)
+        coordinator.funpay.send_message(order.chat_id, coordinator.settings.message("ready"), scope=f"tg_ready:{order.order_id}")
+        return f"✅ Заказ #{order.order_id} переведён в {target.value}."
+    if state == "mm2_order_manual":
+        if order.state in TERMINAL_STATES and order.state != OrderState.FAILED:
+            return "❌ Заказ уже в финальном состоянии."
+        coordinator.state_machine.transition(order, OrderState.MANUAL_REVIEW, "tg_manual", "Ручная проверка через Telegram")
+        return f"✅ Заказ #{order.order_id} переведён в MANUAL_REVIEW."
+    return "❌ Неизвестное действие заказа."
+
+
+def init_telegram_panel(cardinal: Any, *args: Any) -> None:
+    if not _tg_available() or not getattr(cardinal, "telegram", None):
+        return
+
+    tg = cardinal.telegram
+    bot = tg.bot
+
+    def coordinator() -> DeliveryCoordinator:
+        return get_global_coordinator(cardinal)
+
+    def send_main_panel(message: Any) -> None:
+        coord = coordinator()
+        settings = load_settings_file()
+        bot.reply_to(
+            message,
+            _tg_main_text(coord.store, settings),
+            reply_markup=_tg_main_keyboard(settings),
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+
+    def send_status(message: Any) -> None:
+        coord = coordinator()
+        settings = load_settings_file()
+        bot.reply_to(message, _tg_main_text(coord.store, settings), reply_markup=_tg_main_keyboard(settings), parse_mode="HTML")
+
+    def handle_callback(call: Any) -> None:
+        if not str(getattr(call, "data", "")).startswith("mm2_"):
+            return
+        coord = coordinator()
+        chat_id = call.message.chat.id
+        msg_id = call.message.message_id
+        data = str(call.data)
+        try:
+            if data in ("mm2_back_main", "mm2_refresh"):
+                settings = load_settings_file()
+                _tg_edit(bot, chat_id, msg_id, _tg_main_text(coord.store, settings), _tg_main_keyboard(settings))
+                _tg_answer(bot, call)
+            elif data == "mm2_settings":
+                settings = load_settings_file()
+                _tg_edit(bot, chat_id, msg_id, _tg_settings_text(settings), _tg_settings_keyboard(settings))
+                _tg_answer(bot, call)
+            elif data == "mm2_timeouts":
+                settings = load_settings_file()
+                _tg_edit(bot, chat_id, msg_id, _tg_timeouts_text(settings), _tg_timeouts_keyboard())
+                _tg_answer(bot, call)
+            elif data == "mm2_toggle_enabled":
+                settings = toggle_setting_path("enabled")
+                coord.reload_settings()
+                _tg_edit(bot, chat_id, msg_id, _tg_main_text(coord.store, settings), _tg_main_keyboard(settings))
+                _tg_answer(bot, call, "Сохранено")
+            elif data == "mm2_toggle_browser":
+                settings = toggle_setting_path("browser.enabled")
+                coord.reload_settings()
+                _tg_edit(bot, chat_id, msg_id, _tg_settings_text(settings), _tg_settings_keyboard(settings))
+                _tg_answer(bot, call, "Сохранено")
+            elif data == "mm2_toggle_pause_auth":
+                settings = toggle_setting_path("pause_on_auth_error")
+                coord.reload_settings()
+                _tg_edit(bot, chat_id, msg_id, _tg_settings_text(settings), _tg_settings_keyboard(settings))
+                _tg_answer(bot, call, "Сохранено")
+            elif data == "mm2_toggle_auto_start":
+                settings = toggle_setting_path("auto_start_delivery_after_friend_request")
+                coord.reload_settings()
+                _tg_edit(bot, chat_id, msg_id, _tg_settings_text(settings), _tg_settings_keyboard(settings))
+                _tg_answer(bot, call, "Сохранено")
+            elif data in TG_STATE_LABELS:
+                _tg_send_prompt(tg, bot, call, data)
+            elif data == "mm2_mappings":
+                _tg_edit(bot, chat_id, msg_id, _tg_mappings_text(coord.store), _tg_mappings_keyboard())
+                _tg_answer(bot, call)
+            elif data == "mm2_export_maps":
+                bot.send_message(chat_id, f"<pre>{_html(MappingCatalogIO(coord.store).export_lines_for_chat())}</pre>", parse_mode="HTML")
+                _tg_answer(bot, call, "Экспорт отправлен")
+            elif data == "mm2_orders":
+                _tg_edit(bot, chat_id, msg_id, _tg_orders_text(coord.store), _tg_orders_keyboard())
+                _tg_answer(bot, call)
+            elif data == "mm2_orders_manual":
+                _tg_edit(bot, chat_id, msg_id, _tg_orders_by_state_text(coord.store, OrderState.MANUAL_REVIEW), _tg_orders_keyboard())
+                _tg_answer(bot, call)
+            elif data.startswith("mm2_orders_"):
+                state_name = data.replace("mm2_orders_", "")
+                state = OrderState(state_name)
+                _tg_edit(bot, chat_id, msg_id, _tg_orders_by_state_text(coord.store, state), _tg_orders_keyboard())
+                _tg_answer(bot, call)
+            elif data == "mm2_diag":
+                report = _run_async_sync(HealthInspector(lambda: coord.settings, coord.store, coord.roblox).build_report())
+                _tg_edit(bot, chat_id, msg_id, f"<pre>{_html(report)}</pre>", _tg_auth_keyboard())
+                _tg_answer(bot, call)
+            elif data == "mm2_auth":
+                _tg_edit(bot, chat_id, msg_id, _tg_settings_text(load_settings_file()), _tg_auth_keyboard())
+                _tg_answer(bot, call)
+            elif data == "mm2_unpause_auth":
+                coord.store.set_flag("paused_by_auth", "0")
+                coord.reload_settings()
+                _tg_answer(bot, call, "Auth-пауза снята", alert=True)
+                _tg_edit(bot, chat_id, msg_id, _tg_settings_text(load_settings_file()), _tg_auth_keyboard())
+            elif data == "mm2_reload":
+                coord.reload_settings()
+                settings = load_settings_file()
+                _tg_edit(bot, chat_id, msg_id, _tg_main_text(coord.store, settings), _tg_main_keyboard(settings))
+                _tg_answer(bot, call, "settings.json перечитан")
+            elif data == "mm2_guide":
+                _tg_edit(bot, chat_id, msg_id, _tg_guide_text(), _tg_guide_keyboard())
+                _tg_answer(bot, call)
+            elif data.startswith("mm2_guide_"):
+                section = data.replace("mm2_guide_", "")
+                _tg_edit(bot, chat_id, msg_id, _tg_guide_text(section), _tg_guide_keyboard())
+                _tg_answer(bot, call)
+            elif data == "mm2_runbooks":
+                _tg_edit(bot, chat_id, msg_id, _tg_runbook_text(), _tg_runbook_keyboard())
+                _tg_answer(bot, call)
+            elif data.startswith("mm2_runbook_"):
+                section = data.replace("mm2_runbook_", "")
+                _tg_edit(bot, chat_id, msg_id, _tg_runbook_text(section), _tg_runbook_keyboard())
+                _tg_answer(bot, call)
+            else:
+                _tg_answer(bot, call)
+        except Exception as exc:
+            logger.error("%s: ошибка Telegram callback %s: %s", LOGGER_PREFIX, data, exc)
+            logger.debug(traceback.format_exc())
+            _tg_answer(bot, call, "Ошибка обработки", alert=True)
+
+    def handle_text_state(message: Any) -> None:
+        state_data = tg.get_state(message.chat.id, message.from_user.id)
+        if not state_data or "state" not in state_data:
+            return
+        state = str(state_data["state"])
+        if not state.startswith("mm2_"):
+            return
+        coord = coordinator()
+        try:
+            result = _save_tg_state_value(state, getattr(message, "text", ""), coord)
+            if state == "mm2_set_cookie":
+                with contextlib.suppress(Exception):
+                    bot.delete_message(message.chat.id, message.message_id)
+            bot.reply_to(message, f"<pre>{_html(result)}</pre>", parse_mode="HTML", reply_markup=_tg_back_main_keyboard())
+        except Exception as exc:
+            logger.error("%s: ошибка обработки Telegram state %s: %s", LOGGER_PREFIX, state, exc)
+            bot.reply_to(message, f"❌ Ошибка: {_html(exc)}", parse_mode="HTML")
+        finally:
+            with contextlib.suppress(Exception):
+                tg.clear_state(message.chat.id, message.from_user.id)
+
+    try:
+        bot.message_handler(commands=["mm2", "mm2_menu"])(send_main_panel)
+        bot.message_handler(commands=["mm2_status"])(send_status)
+        bot.callback_query_handler(func=lambda call: str(getattr(call, "data", "")).startswith("mm2_"))(handle_callback)
+        bot.message_handler(content_types=["text"])(handle_text_state)
+        logger.info("%s: Telegram-панель /mm2 зарегистрирована", LOGGER_PREFIX)
+    except Exception as exc:
+        logger.error("%s: не удалось зарегистрировать Telegram-панель: %s", LOGGER_PREFIX, exc)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Singleton для BIND_TO_* хуков Cardinal
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -2948,11 +3634,17 @@ def bind_to_delete(c: Any, *args: Any) -> None:
     stop_global_coordinator(c)
 
 
+def bind_to_pre_init(c: Any, *args: Any) -> None:
+    init_telegram_panel(c, *args)
+
+
+_safe_bind_to_pre_init = safe_handler(bind_to_pre_init)
 _safe_bind_to_new_order = safe_handler(bind_to_new_order)
 _safe_bind_to_new_message = safe_handler(bind_to_new_message)
 _safe_bind_to_last_chat_message_changed = safe_handler(bind_to_last_chat_message_changed)
 _safe_bind_to_delete = safe_handler(bind_to_delete)
 
+BIND_TO_PRE_INIT = [_safe_bind_to_pre_init]
 BIND_TO_NEW_ORDER = [_safe_bind_to_new_order]
 BIND_TO_NEW_MESSAGE = [_safe_bind_to_new_message]
 BIND_TO_LAST_CHAT_MESSAGE_CHANGED = [_safe_bind_to_last_chat_message_changed]
