@@ -125,6 +125,21 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "pause_on_auth_error": True,
     "auto_start_delivery_after_friend_request": True,
     "delivery_queue_workers": 1,
+    "delivery_backend": "bridge",
+    "fallback_to_browser_automation": False,
+    "automation_bridge": {
+        "enabled": True,
+        "base_url": "http://127.0.0.1:8765",
+        "api_key": "",
+        "health_path": "/health",
+        "deliver_path": "/deliver",
+        "join_path": "/join",
+        "trade_path": "/trade",
+        "timeout_seconds": 180,
+        "join_timeout_seconds": 120,
+        "trade_timeout_seconds": 180,
+        "require_healthy": True,
+    },
     "inventory_sync": {
         "enabled": True,
         "auto_create_lot_mapping": True,
@@ -295,6 +310,10 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
             "Автоматическая выдача не завершилась. Администратор проверит заказ вручную. "
             "Ваш предмет: {item_name}."
         ),
+        "bridge_unavailable": (
+            "Сейчас не получается подключить Roblox-бота к игре. "
+            "Администратор уже получил диагностику и скоро поможет с выдачей."
+        ),
     },
 }
 
@@ -424,6 +443,9 @@ class PluginSettings:
     pause_on_auth_error: bool
     auto_start_delivery_after_friend_request: bool
     delivery_queue_workers: int
+    delivery_backend: str
+    fallback_to_browser_automation: bool
+    automation_bridge: Dict[str, Any]
     inventory_sync: Dict[str, Any]
     buyer_server_join_enabled: bool
     buyer_join_keywords: List[str]
@@ -473,6 +495,9 @@ class PluginSettings:
             pause_on_auth_error=bool(data.get("pause_on_auth_error", True)),
             auto_start_delivery_after_friend_request=bool(data.get("auto_start_delivery_after_friend_request", True)),
             delivery_queue_workers=max(1, int(data.get("delivery_queue_workers") or 1)),
+            delivery_backend=str(data.get("delivery_backend") or "bridge").lower(),
+            fallback_to_browser_automation=bool(data.get("fallback_to_browser_automation", False)),
+            automation_bridge=dict(data.get("automation_bridge", {})),
             inventory_sync=dict(data.get("inventory_sync", {})),
             buyer_server_join_enabled=bool(data.get("buyer_server_join_enabled", True)),
             buyer_join_keywords=[str(x).lower() for x in data.get("buyer_join_keywords", [])],
@@ -522,6 +547,9 @@ class DeliveryOutcome(str, enum.Enum):
     ITEM_NOT_FOUND = "ITEM_NOT_FOUND"
     AUTH_ERROR = "AUTH_ERROR"
     AUTOMATION_UNAVAILABLE = "AUTOMATION_UNAVAILABLE"
+    BRIDGE_UNAVAILABLE = "BRIDGE_UNAVAILABLE"
+    JOIN_FAILED = "JOIN_FAILED"
+    SERVER_FULL = "SERVER_FULL"
     UNKNOWN_ERROR = "UNKNOWN_ERROR"
 
 
@@ -1922,6 +1950,173 @@ class BrowserTradeAutomator:
         return 1
 
 
+class RobloxAutomationBridge:
+    """HTTP-мост к реальному Roblox-клиенту.
+
+    Cardinal работает на сервере и не может сам управлять окном Roblox/MM2.
+    Bridge запускается там, где открыт Roblox-клиент аккаунта-бота, и выполняет
+    действия: join server -> открыть трейд -> положить item -> accept/confirm.
+    """
+
+    def __init__(self, settings: PluginSettings) -> None:
+        self.settings = settings
+
+    @property
+    def config(self) -> Dict[str, Any]:
+        return dict(self.settings.automation_bridge or {})
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.config.get("enabled", True))
+
+    @property
+    def base_url(self) -> str:
+        return str(self.config.get("base_url") or "").strip().rstrip("/")
+
+    async def health(self) -> Tuple[bool, str, Dict[str, Any]]:
+        if not self.enabled:
+            return False, "automation_bridge.enabled=false", {}
+        if not self.base_url:
+            return False, "automation_bridge.base_url пустой", {}
+        path = str(self.config.get("health_path") or "/health")
+        try:
+            result = await self._request("GET", path, None, timeout=10)
+        except Exception as exc:
+            return False, f"bridge недоступен: {exc}", {}
+        ok = result.ok and bool((result.json_data or {}).get("ok", True))
+        message = str((result.json_data or {}).get("message") or result.body or ("OK" if ok else "health failed"))
+        return ok, message, result.json_data if isinstance(result.json_data, dict) else {}
+
+    async def deliver(self, order: DeliveryOrder, settings: PluginSettings) -> TradeResult:
+        if not self.enabled or not self.base_url:
+            return TradeResult(
+                DeliveryOutcome.BRIDGE_UNAVAILABLE,
+                "Automation bridge не настроен. Заполните automation_bridge.base_url и запустите bridge рядом с Roblox-клиентом.",
+            )
+        if bool(self.config.get("require_healthy", True)):
+            ok, message, _payload = await self.health()
+            if not ok:
+                return TradeResult(DeliveryOutcome.BRIDGE_UNAVAILABLE, message)
+
+        payload = self._build_delivery_payload(order, settings)
+        deliver_path = str(self.config.get("deliver_path") or "/deliver")
+        try:
+            result = await self._request("POST", deliver_path, payload, timeout=int(self.config.get("timeout_seconds") or 180), allow_statuses=(404,))
+            if result.status != 404:
+                return self._trade_result_from_http(result)
+            join_result = await self._request(
+                "POST",
+                str(self.config.get("join_path") or "/join"),
+                payload,
+                timeout=int(self.config.get("join_timeout_seconds") or 120),
+            )
+            join_trade = self._trade_result_from_http(join_result)
+            if join_trade.outcome != DeliveryOutcome.SUCCESS:
+                return join_trade
+            trade_result = await self._request(
+                "POST",
+                str(self.config.get("trade_path") or "/trade"),
+                payload,
+                timeout=int(self.config.get("trade_timeout_seconds") or 180),
+            )
+            return self._trade_result_from_http(trade_result)
+        except Exception as exc:
+            return TradeResult(DeliveryOutcome.BRIDGE_UNAVAILABLE, f"Bridge request failed: {exc}")
+
+    def _build_delivery_payload(self, order: DeliveryOrder, settings: PluginSettings) -> Dict[str, Any]:
+        place_id = int(order.metadata.get("preferred_join_place_id") or settings.roblox_place_id or 0)
+        game_id = str(order.metadata.get("preferred_join_game_id") or settings.expected_game_instance_id or "")
+        join_url = str(order.metadata.get("preferred_join_url") or settings.roblox_vip_server_url or settings.roblox_profile_url or "")
+        return {
+            "order_id": order.order_id,
+            "buyer": {
+                "funpay_username": order.buyer,
+                "roblox_username": order.roblox_username,
+                "roblox_user_id": order.roblox_user_id,
+            },
+            "item": {
+                "lot_id": order.lot_id,
+                "name": order.item_name,
+                "quantity": int(order.metadata.get("amount") or 1),
+            },
+            "server": {
+                "place_id": place_id,
+                "game_id": game_id,
+                "join_url": join_url,
+                "vip_server_url": settings.roblox_vip_server_url,
+            },
+            "timeouts": {
+                "join_seconds": int(self.config.get("join_timeout_seconds") or settings.delivery_timeout_minutes * 60),
+                "trade_seconds": int(self.config.get("trade_timeout_seconds") or settings.trade_timeout_seconds),
+            },
+        }
+
+    def _trade_result_from_http(self, result: HttpResult) -> TradeResult:
+        payload = result.json_data if isinstance(result.json_data, dict) else {}
+        status = str(payload.get("status") or payload.get("outcome") or "").upper()
+        ok = bool(payload.get("ok", result.ok))
+        message = str(payload.get("message") or result.body or "")
+        if result.ok and (ok or status in {"OK", "SUCCESS", "COMPLETED"}):
+            return TradeResult(DeliveryOutcome.SUCCESS, message)
+        mapping = {
+            "SERVER_FULL": DeliveryOutcome.SERVER_FULL,
+            "FULL": DeliveryOutcome.SERVER_FULL,
+            "JOIN_FAILED": DeliveryOutcome.JOIN_FAILED,
+            "BUYER_NOT_IN_SERVER": DeliveryOutcome.BUYER_NOT_IN_SERVER,
+            "TRADE_TIMEOUT": DeliveryOutcome.TRADE_TIMEOUT,
+            "TIMEOUT": DeliveryOutcome.TRADE_TIMEOUT,
+            "TRADE_PRIVACY_DISABLED": DeliveryOutcome.TRADE_PRIVACY_DISABLED,
+            "PRIVACY": DeliveryOutcome.TRADE_PRIVACY_DISABLED,
+            "TRADE_DECLINED": DeliveryOutcome.TRADE_DECLINED,
+            "DECLINED": DeliveryOutcome.TRADE_DECLINED,
+            "ITEM_NOT_FOUND": DeliveryOutcome.ITEM_NOT_FOUND,
+            "AUTH_ERROR": DeliveryOutcome.AUTH_ERROR,
+        }
+        return TradeResult(mapping.get(status, DeliveryOutcome.UNKNOWN_ERROR), message or f"Bridge HTTP {result.status}")
+
+    async def _request(
+        self,
+        method: str,
+        path: str,
+        payload: Optional[Dict[str, Any]],
+        timeout: int,
+        allow_statuses: Sequence[int] = tuple(),
+    ) -> HttpResult:
+        return await asyncio.to_thread(self._request_sync, method, path, payload, timeout, tuple(allow_statuses))
+
+    def _request_sync(
+        self,
+        method: str,
+        path: str,
+        payload: Optional[Dict[str, Any]],
+        timeout: int,
+        allow_statuses: Sequence[int],
+    ) -> HttpResult:
+        url = self.base_url + (path if path.startswith("/") else "/" + path)
+        data = json.dumps(payload or {}, ensure_ascii=False).encode("utf-8") if payload is not None else None
+        headers = {"Accept": "application/json", "Content-Type": "application/json"}
+        api_key = str(self.config.get("api_key") or "")
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        request = urllib.request.Request(url=url, data=data, headers=headers, method=method.upper())
+        try:
+            with urllib.request.urlopen(request, timeout=max(1, int(timeout))) as response:
+                body = response.read().decode("utf-8", errors="replace")
+                return self._build_result(response.status, dict(response.headers), body)
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            if exc.code in allow_statuses:
+                return self._build_result(exc.code, dict(exc.headers), body)
+            return self._build_result(exc.code, dict(exc.headers), body)
+
+    def _build_result(self, status: int, headers: Dict[str, str], body: str) -> HttpResult:
+        json_data: Any = None
+        if body:
+            with contextlib.suppress(Exception):
+                json_data = json.loads(body)
+        return HttpResult(status=status, headers=headers, body=body, json_data=json_data)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Извлечение данных из событий Cardinal
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2280,11 +2475,24 @@ ADMIN_RUNBOOKS: Dict[str, Tuple[str, List[str]]] = {
     "trade": (
         "Трейд не завершается",
         [
+            "Для реального входа в игру и трейда нужен automation bridge рядом с Roblox-клиентом.",
+            "Проверьте /mm2 -> Roblox Auth -> Bridge.",
             "Проверьте browser.enabled и установку Playwright, если нужна UI-автоматика.",
             "Проверьте селекторы browser.selectors под вашу страницу/панель.",
             "Если у покупателя отключены трейды, он должен изменить Privacy settings.",
             "Если покупатель AFK, дождитесь /ready и выполните /mm2_retry FP_ID.",
             "Если предмета нет в инвентаре бота, переведите заказ в ручную проверку.",
+        ],
+    ),
+    "bridge": (
+        "Roblox automation bridge",
+        [
+            "Cardinal на сервере не может сам кликать внутри Roblox-клиента.",
+            "Запустите bridge на машине, где открыт Roblox под аккаунтом-ботом.",
+            "Bridge должен отвечать на GET /health и POST /deliver или POST /join + POST /trade.",
+            "В /mm2 -> Настройки проверьте automation_bridge.base_url.",
+            "В /mm2 -> Roblox Auth нажмите Bridge для проверки связи.",
+            "Если bridge недоступен, бот не сможет гарантированно зайти на сервер и кинуть трейд.",
         ],
     ),
     "mapping": (
@@ -3431,6 +3639,7 @@ class DeliveryCoordinator:
         self.funpay = FunPayAdapter(cardinal, self.settings, self.store)
         self.roblox = RobloxApiClient(self.settings)
         self.automator = BrowserTradeAutomator(self.settings)
+        self.bridge = RobloxAutomationBridge(self.settings)
         self.inventory = InventorySynchronizer(lambda: self.settings, self.store, self.roblox, self.automator)
         self.admin_commands = AdminCommandRouter(
             settings_getter=lambda: self.settings,
@@ -3458,6 +3667,7 @@ class DeliveryCoordinator:
         self.funpay.settings = self.settings
         self.roblox.settings = self.settings
         self.automator.settings = self.settings
+        self.bridge.settings = self.settings
         self._paused_by_auth = self.store.get_flag("paused_by_auth", "0") == "1"
         logger.info("%s: settings.json перечитан", LOGGER_PREFIX)
 
@@ -4015,41 +4225,86 @@ class DeliveryCoordinator:
         self.funpay.send_message(order.chat_id, self.settings.message("trade_started", item_name=order.item_name), scope=f"trade_started:{order.order_id}:{order.trade_attempts}")
 
         for attempt in range(1, self.settings.trade_retry_count + 1):
-            result = await self.automator.deliver(order)
-            if result.outcome == DeliveryOutcome.SUCCESS:
-                await self._complete_order(order)
-                return
-            if result.outcome == DeliveryOutcome.TRADE_PRIVACY_DISABLED:
-                order.last_error = result.message or "trade_privacy_disabled"
-                self.state_machine.transition(order, OrderState.WAITING_JOIN, "trade_privacy", order.last_error)
-                self.funpay.send_message(order.chat_id, self.settings.message("trade_privacy"), scope=f"trade_privacy:{order.order_id}")
-                return
-            if result.outcome == DeliveryOutcome.TRADE_DECLINED:
-                order.last_error = result.message or "trade_declined"
-                self.state_machine.transition(order, OrderState.WAITING_JOIN, "trade_declined", order.last_error)
-                self.funpay.send_message(order.chat_id, self.settings.message("trade_declined"), scope=f"trade_declined:{order.order_id}")
-                return
-            if result.outcome == DeliveryOutcome.TRADE_TIMEOUT:
-                order.last_error = result.message or "trade_timeout"
-                self.store.update_order(order, event_type="trade_timeout", message=order.last_error)
-                self.funpay.send_message(order.chat_id, self.settings.message("trade_timeout"), scope=f"trade_timeout:{order.order_id}:{attempt}")
-                await asyncio.sleep(self.settings.trade_retry_delay_seconds)
-                continue
-            if result.outcome == DeliveryOutcome.AUTH_ERROR:
-                await self._pause_for_auth_error(result.message)
-                self.funpay.send_message(order.chat_id, self.settings.message("auth_paused"), scope=f"auth:{order.order_id}")
-                return
-
-            order.last_error = result.message or result.outcome.value
-            self.store.update_order(order, event_type="trade_error", message=order.last_error)
-            if result.outcome == DeliveryOutcome.AUTOMATION_UNAVAILABLE:
-                break
+            if self.settings.delivery_backend == "bridge":
+                result = await self.bridge.deliver(order, self.settings)
+                handled = await self._handle_trade_result(order, result, attempt, backend="bridge")
+                if handled:
+                    return
+                if result.outcome == DeliveryOutcome.BRIDGE_UNAVAILABLE and not self.settings.fallback_to_browser_automation:
+                    break
+                if result.outcome not in (DeliveryOutcome.TRADE_TIMEOUT, DeliveryOutcome.UNKNOWN_ERROR, DeliveryOutcome.BRIDGE_UNAVAILABLE):
+                    return
+                if self.settings.fallback_to_browser_automation:
+                    browser_result = await self.automator.deliver(order)
+                    handled = await self._handle_trade_result(order, browser_result, attempt, backend="browser")
+                    if handled:
+                        return
+                    result = browser_result
+            else:
+                result = await self.automator.deliver(order)
+                handled = await self._handle_trade_result(order, result, attempt, backend="browser")
+                if handled:
+                    return
+                if result.outcome == DeliveryOutcome.AUTOMATION_UNAVAILABLE:
+                    break
             await asyncio.sleep(self.settings.trade_retry_delay_seconds)
 
         order.retry_count += 1
         self.state_machine.transition(order, OrderState.MANUAL_REVIEW, "trade_failed_manual", order.last_error)
         self.funpay.send_message(order.chat_id, self.settings.message("manual_required", item_name=order.item_name), scope=f"manual:{order.order_id}")
         self.funpay.notify_admin(f"Заказ #{order.order_id}: автоматический трейд не завершён. Предмет: {order.item_name}. Ошибка: {order.last_error}")
+
+    async def _handle_trade_result(self, order: DeliveryOrder, result: TradeResult, attempt: int, backend: str) -> bool:
+        if result.outcome == DeliveryOutcome.SUCCESS:
+            await self._complete_order(order)
+            return True
+        if result.outcome == DeliveryOutcome.SERVER_FULL:
+            order.last_error = result.message or "server_full"
+            self.state_machine.transition(order, OrderState.WAITING_JOIN, f"{backend}_server_full", order.last_error)
+            self.funpay.send_message(
+                order.chat_id,
+                self.settings.message("joinme_server_full", playing="?", max_players="?"),
+                scope=f"server_full:{order.order_id}:{attempt}",
+            )
+            return True
+        if result.outcome == DeliveryOutcome.TRADE_PRIVACY_DISABLED:
+            order.last_error = result.message or "trade_privacy_disabled"
+            self.state_machine.transition(order, OrderState.WAITING_JOIN, f"{backend}_trade_privacy", order.last_error)
+            self.funpay.send_message(order.chat_id, self.settings.message("trade_privacy"), scope=f"trade_privacy:{order.order_id}")
+            return True
+        if result.outcome == DeliveryOutcome.TRADE_DECLINED:
+            order.last_error = result.message or "trade_declined"
+            self.state_machine.transition(order, OrderState.WAITING_JOIN, f"{backend}_trade_declined", order.last_error)
+            self.funpay.send_message(order.chat_id, self.settings.message("trade_declined"), scope=f"trade_declined:{order.order_id}")
+            return True
+        if result.outcome == DeliveryOutcome.ITEM_NOT_FOUND:
+            order.last_error = result.message or "item_not_found"
+            self.store.update_order(order, event_type=f"{backend}_item_not_found", message=order.last_error)
+            self.funpay.notify_admin(f"Заказ #{order.order_id}: bridge не нашёл предмет {order.item_name}. {order.last_error}")
+            return False
+        if result.outcome == DeliveryOutcome.TRADE_TIMEOUT:
+            order.last_error = result.message or "trade_timeout"
+            self.store.update_order(order, event_type=f"{backend}_trade_timeout", message=order.last_error)
+            self.funpay.send_message(order.chat_id, self.settings.message("trade_timeout"), scope=f"trade_timeout:{order.order_id}:{attempt}")
+            return False
+        if result.outcome == DeliveryOutcome.AUTH_ERROR:
+            await self._pause_for_auth_error(result.message)
+            self.funpay.send_message(order.chat_id, self.settings.message("auth_paused"), scope=f"auth:{order.order_id}")
+            return True
+        if result.outcome == DeliveryOutcome.BRIDGE_UNAVAILABLE:
+            order.last_error = result.message or "bridge_unavailable"
+            self.store.update_order(order, event_type="bridge_unavailable", message=order.last_error)
+            self.funpay.send_message(order.chat_id, self.settings.message("bridge_unavailable"), scope=f"bridge_unavailable:{order.order_id}")
+            self.funpay.notify_admin(
+                f"Bridge недоступен для заказа #{order.order_id}.\n"
+                f"Причина: {order.last_error}\n\n"
+                "Чтобы бот реально заходил в Roblox и кидал трейд, запустите automation bridge рядом с Roblox-клиентом "
+                "и проверьте /mm2 -> Roblox Auth -> Bridge."
+            )
+            return False
+        order.last_error = result.message or result.outcome.value
+        self.store.update_order(order, event_type=f"{backend}_trade_error", message=order.last_error)
+        return False
 
     async def _complete_order(self, order: DeliveryOrder) -> None:
         self.state_machine.transition(order, OrderState.COMPLETED, "completed", f"Предмет {order.item_name} передан")
@@ -4079,6 +4334,7 @@ TG_STATE_LABELS: Dict[str, str] = {
     "mm2_set_bot_username": "Roblox bot username",
     "mm2_set_profile_url": "Roblox profile URL",
     "mm2_set_vip_url": "VIP server URL",
+    "mm2_set_bridge_url": "Automation bridge URL",
     "mm2_set_place_id": "Roblox place id",
     "mm2_set_game_instance": "Game instance id",
     "mm2_set_admin_chat": "FunPay admin chat id",
@@ -4168,7 +4424,11 @@ def _tg_settings_keyboard(settings: Dict[str, Any]) -> Any:
     )
     kb.row(
         InlineKeyboardButton("🏰 VIP-сервер", callback_data="mm2_set_vip_url"),
+        InlineKeyboardButton("🌉 Bridge URL", callback_data="mm2_set_bridge_url"),
+    )
+    kb.row(
         InlineKeyboardButton("🎮 Place ID", callback_data="mm2_set_place_id"),
+        InlineKeyboardButton("🤖 Bridge diag", callback_data="mm2_bridge_diag"),
     )
     kb.row(
         InlineKeyboardButton("🧩 Instance ID", callback_data="mm2_set_game_instance"),
@@ -4263,6 +4523,7 @@ def _tg_auth_keyboard() -> Any:
     kb = InlineKeyboardMarkup(row_width=1)
     kb.add(
         InlineKeyboardButton("🏥 Проверить Roblox-сессию", callback_data="mm2_diag"),
+        InlineKeyboardButton("🤖 Проверить Bridge", callback_data="mm2_bridge_diag"),
         InlineKeyboardButton("🍪 Обновить cookie", callback_data="mm2_set_cookie"),
         InlineKeyboardButton("✅ Снять auth-паузу", callback_data="mm2_unpause_auth"),
         InlineKeyboardButton("📖 Runbook auth", callback_data="mm2_runbook_auth"),
@@ -4296,6 +4557,7 @@ def _tg_runbook_keyboard() -> Any:
         ("🤝 Friends", "friends"),
         ("🎮 Join", "join"),
         ("💱 Trade", "trade"),
+        ("🤖 Bridge", "bridge"),
         ("📦 Mapping", "mapping"),
         ("🎒 Inventory", "inventory"),
         ("💾 Storage", "storage"),
@@ -4337,6 +4599,8 @@ def _tg_settings_text(settings: Dict[str, Any]) -> str:
     return (
         "⚙️ <b>Настройки MM2 Auto Delivery</b>\n\n"
         f"🍪 Cookie: <code>{_html(mask_secret(cookie))}</code>\n"
+        f"🤖 Delivery backend: <code>{_html(settings.get('delivery_backend') or 'bridge')}</code>\n"
+        f"🌉 Bridge URL: <code>{_html((settings.get('automation_bridge') or {}).get('base_url') or '-')}</code>\n"
         f"🤖 Bot ID: <code>{_html(settings.get('roblox_bot_user_id') or 'не задан')}</code>\n"
         f"👤 Username: <code>{_html(settings.get('roblox_bot_username') or 'не задан')}</code>\n"
         f"🔗 Profile: <code>{_html('задан' if settings.get('roblox_profile_url') else 'не задан')}</code>\n"
@@ -4423,6 +4687,35 @@ def _tg_runbook_text(section: str = "") -> str:
     return "\n".join(lines)
 
 
+async def _tg_bridge_diag_text(coordinator: DeliveryCoordinator) -> str:
+    ok, message, payload = await coordinator.bridge.health()
+    cfg = coordinator.settings.automation_bridge or {}
+    lines = [
+        "Roblox Automation Bridge",
+        f"status: {'OK' if ok else 'ERROR'}",
+        f"base_url: {cfg.get('base_url') or '-'}",
+        f"delivery_backend: {coordinator.settings.delivery_backend}",
+        f"message: {message}",
+    ]
+    if payload:
+        lines.append("")
+        lines.append("payload:")
+        for key, value in payload.items():
+            lines.append(f"  {key}: {str(value)[:160]}")
+    if not ok:
+        lines.extend(
+            [
+                "",
+                "Как исправить:",
+                "- Запустите bridge на машине, где открыт Roblox-клиент аккаунта-бота.",
+                "- Проверьте, что bridge слушает automation_bridge.base_url.",
+                "- GET /health должен возвращать JSON вроде {\"ok\": true}.",
+                "- Для выдачи нужен POST /deliver или POST /join + POST /trade.",
+            ]
+        )
+    return "\n".join(lines)
+
+
 def _tg_prompt_text(state: str) -> str:
     prompts = {
         "mm2_set_cookie": (
@@ -4433,6 +4726,7 @@ def _tg_prompt_text(state: str) -> str:
         "mm2_set_bot_username": "Отправьте username аккаунта-бота Roblox.",
         "mm2_set_profile_url": "Отправьте ссылку на профиль бота Roblox.",
         "mm2_set_vip_url": "Отправьте ссылку на VIP-сервер MM2.",
+        "mm2_set_bridge_url": "Отправьте URL automation bridge. Пример: <code>http://127.0.0.1:8765</code>",
         "mm2_set_place_id": "Отправьте Roblox place id. Для MM2 обычно <code>142823291</code>.",
         "mm2_set_game_instance": "Отправьте game instance id или <code>-</code>, чтобы очистить.",
         "mm2_set_admin_chat": "Отправьте FunPay chat_id администратора или <code>-</code>, чтобы очистить.",
@@ -4534,6 +4828,7 @@ def _save_tg_state_value(state: str, text: str, coordinator: DeliveryCoordinator
         "mm2_set_bot_username": "roblox_bot_username",
         "mm2_set_profile_url": "roblox_profile_url",
         "mm2_set_vip_url": "roblox_vip_server_url",
+        "mm2_set_bridge_url": "automation_bridge.base_url",
         "mm2_set_game_instance": "expected_game_instance_id",
         "mm2_set_admin_chat": "admin_funpay_chat_id",
     }
@@ -4784,6 +5079,10 @@ def init_telegram_panel(cardinal: Any, *args: Any) -> None:
                 _tg_answer(bot, call)
             elif data == "mm2_diag":
                 report = _run_async_sync(HealthInspector(lambda: coord.settings, coord.store, coord.roblox).build_report())
+                _tg_edit(bot, chat_id, msg_id, f"<pre>{_html(report)}</pre>", _tg_auth_keyboard())
+                _tg_answer(bot, call)
+            elif data == "mm2_bridge_diag":
+                report = _run_async_sync(_tg_bridge_diag_text(coord))
                 _tg_edit(bot, chat_id, msg_id, f"<pre>{_html(report)}</pre>", _tg_auth_keyboard())
                 _tg_answer(bot, call)
             elif data == "mm2_auth":
