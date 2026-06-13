@@ -134,7 +134,7 @@ class BasePlugin(ABC):
                 rows.append([
                     InlineKeyboardButton(
                         text=f"▶️ {label}",
-                        callback_data=f"{CBT.PLUGIN_ACTION}{self.UUID}:{key}",
+                        callback_data=f"{CBT.PLUGIN_SCHEMA_ACT}{self.UUID}:{key}",
                     )
                 ])
             elif ftype == "select":
@@ -221,6 +221,10 @@ class BasePlugin(ABC):
         Верните (text, InlineKeyboardMarkup) или None.
         """
         return None
+
+    async def on_telegram_command(self, call, command: str) -> bool:
+        """Переопределите для обработки /команд плагина."""
+        return False
 
     async def on_panel_action(self, call: CallbackQuery, action: str) -> bool:
         """Обработка кнопок панели (callback sc:plugpact:uuid:action)."""

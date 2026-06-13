@@ -258,11 +258,11 @@ def create_plugin_settings_router(ctx: Any) -> Router:
             await inst.apply_setting(key, value)
             await _show_settings(call, pm, uuid, skip_loading=True)
 
-    @router.callback_query(F.data.startswith(CBT.PLUGIN_ACTION))
+    @router.callback_query(F.data.startswith(CBT.PLUGIN_SCHEMA_ACT))
     async def cb_plugin_action(call: CallbackQuery) -> None:
         if not await ctx._has_access(call.from_user.id):
             return
-        uuid, key = _parse_uuid_key(call.data, CBT.PLUGIN_ACTION)
+        uuid, key = _parse_uuid_key(call.data, CBT.PLUGIN_SCHEMA_ACT)
         inst = _get_plugin_instance(pm, uuid)
         if inst and hasattr(inst, "on_settings_action"):
             handled = await inst.on_settings_action(call, key)

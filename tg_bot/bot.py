@@ -89,8 +89,14 @@ class TelegramBot:
         self.bot = Bot(token=settings.bot_token)
         self.dp = Dispatcher()
         self.router = Router()
-        self.dp.include_router(self.router)
         self._register_handlers()
+        # Hub (плагины FPC) — регистрируем ПЕРВЫМ, чтобы перехватывал sc:plug*
+        try:
+            from handlers.tg.hub import create_hub_router
+            self.dp.include_router(create_hub_router(self))
+        except Exception as exc:
+            logger.warning("Premium UI hub: %s", exc)
+        self.dp.include_router(self.router)
 
     # ── Доступ (без пароля, как Cardinal у владельца) ─────────────────────
 
@@ -170,7 +176,7 @@ class TelegramBot:
         r.callback_query.register(self.cb_back, F.data == CB["back"])
         r.callback_query.register(self.cb_profile, F.data == CB["profile"])
         r.callback_query.register(self.cb_status, F.data == CB["status"])
-        r.callback_query.register(self.cb_plugins, F.data == CB["plugins"])
+        # sc:plugins — hub (premium router)
         r.callback_query.register(self.cb_settings, F.data == CB["settings"])
         r.callback_query.register(self.cb_adel, F.data == CB["adel"])
         r.callback_query.register(self.cb_gemini, F.data == CB["gemini"])
@@ -182,18 +188,11 @@ class TelegramBot:
         r.callback_query.register(self.cb_first_setup, F.data == CB["first_setup"])
         r.callback_query.register(self.cb_toggle, F.data.startswith(CB["toggle"]))
         r.callback_query.register(self.cb_notify, F.data.startswith(CB["notify"]))
-        r.callback_query.register(self.cb_plug_toggle, F.data.startswith(CB["plug"]))
+        # Плагины — только через hub (handlers/tg/plugins_panel.py), без legacy sc:plug:
         r.callback_query.register(self.cb_adel_add, F.data == CB["adel_add"])
         r.callback_query.register(self.cb_edit_welcome, F.data == CB["edit_welcome"])
         r.callback_query.register(self.cb_edit_bump, F.data == CB["edit_bump"])
         r.callback_query.register(self.cb_edit_delivery, F.data == CB["edit_delivery"])
-
-        # Premium UI hub (плагины, настройки, автоответчик, уведомления)
-        try:
-            from handlers.tg.hub import create_hub_router
-            self.dp.include_router(create_hub_router(self))
-        except Exception as exc:
-            logger.warning("Premium UI hub: %s", exc)
 
     # ── Клавиатуры ────────────────────────────────────────────────────────
 
@@ -266,7 +265,8 @@ class TelegramBot:
     async def cmd_plugins(self, message: Message) -> None:
         if not await self._has_access(message.from_user.id):
             return
-        text, kb = self._plugins_view()
+        from handlers.tg.plugins_panel import build_plugins_list
+        text, kb = await build_plugins_list(self.plugin_manager, self.db)
         await message.answer(text, parse_mode="HTML", reply_markup=kb)
 
     async def cmd_restart(self, message: Message) -> None:
@@ -488,38 +488,6 @@ class TelegramBot:
             [InlineKeyboardButton(text="◀️ Меню", callback_data=CB["main"])],
         ])
         await call.message.edit_reply_markup(reply_markup=kb)
-
-    def _plugins_view(self) -> tuple[str, InlineKeyboardMarkup]:
-        metas = self.plugin_manager.plugins.values() if self.plugin_manager.plugins else self.plugin_manager.load_all()
-        lines = ["🔌 <b>Плагины</b>\n"]
-        buttons: list[list[InlineKeyboardButton]] = []
-        for meta in metas:
-            st = "🟢" if meta.enabled else "🔴"
-            err = f"\n  ⚠️ {meta.load_error[:50]}" if meta.load_error else ""
-            lines.append(f"{st} <b>{meta.name}</b> v{meta.version}{err}")
-            buttons.append([InlineKeyboardButton(
-                text=f"{'Выкл' if meta.enabled else 'Вкл'} {meta.name}",
-                callback_data=f"{CB['plug']}{meta.uuid}",
-            )])
-        if not list(metas):
-            lines.append("<i>Нет плагинов в plugins/</i>")
-        buttons.append([InlineKeyboardButton(text="🔄 Обновить", callback_data=CB["plugins"])])
-        buttons.append([InlineKeyboardButton(text="◀️ Меню", callback_data=CB["main"])])
-        return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=buttons)
-
-    async def cb_plugins(self, call: CallbackQuery) -> None:
-        if not await self._has_access(call.from_user.id):
-            return
-        self.plugin_manager.load_all()
-        text, kb = self._plugins_view()
-        await call.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
-        await call.answer()
-
-    async def cb_plug_toggle(self, call: CallbackQuery) -> None:
-        uuid = call.data.replace(CB["plug"], "")
-        enabled = self.plugin_manager.toggle(uuid)
-        await call.answer("Включён" if enabled else "Выключен")
-        await self.cb_plugins(call)
 
     async def cb_adel(self, call: CallbackQuery) -> None:
         if not await self._has_access(call.from_user.id):

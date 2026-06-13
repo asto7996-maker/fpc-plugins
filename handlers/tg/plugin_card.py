@@ -29,14 +29,12 @@ def _rec(pm: Any, uuid: str) -> Any | None:
     return pm.plugins.get(uuid)
 
 
-def _plugin_capabilities(pm: Any, rec: Any) -> tuple[bool, bool, bool]:
-    """has_commands, has_panel, has_settings."""
-    inst = rec.instance if rec else None
+def _plugin_capabilities(pm: Any, rec: Any) -> tuple[bool, bool]:
+    """has_commands, has_settings."""
     commands = pm.get_plugin_commands(rec.uuid) if rec and hasattr(pm, "get_plugin_commands") else []
     has_commands = len(commands) > 0
-    has_panel = bool(inst and hasattr(inst, "has_plugin_panel") and inst.has_plugin_panel())
     has_settings = bool(rec and rec.has_settings_page)
-    return has_commands, has_panel, has_settings
+    return has_commands, has_settings
 
 
 async def render_plugin_card(call: CallbackQuery, pm: Any, uuid: str, db: Any = None, skip_loading: bool = False) -> None:
@@ -61,9 +59,9 @@ async def render_plugin_card(call: CallbackQuery, pm: Any, uuid: str, db: Any = 
         except Exception as exc:
             logger.warning("card extras %s: %s", uuid, exc)
 
-    has_commands, has_panel, has_settings = _plugin_capabilities(pm, rec)
+    has_commands, has_settings = _plugin_capabilities(pm, rec)
     text = plugin_card_text(rec, extra)
-    kb = plugin_card_keyboard(rec, has_commands=has_commands, has_panel=has_panel, has_settings=has_settings)
+    kb = plugin_card_keyboard(rec, has_commands=has_commands, has_settings=has_settings)
 
     async def _do() -> None:
         await call.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
@@ -109,8 +107,35 @@ def create_plugin_card_router(ctx: Any) -> Router:
             await call.message.edit_text(
                 plugin_commands_text(rec, commands),
                 parse_mode="HTML",
-                reply_markup=plugin_commands_keyboard(uuid),
+                reply_markup=plugin_commands_keyboard(uuid, commands),
             )
+
+    @router.callback_query(F.data.startswith(CBT.PLUGIN_CMD_RUN))
+    async def cb_plugin_cmd_run(call: CallbackQuery) -> None:
+        if not await ctx._has_access(call.from_user.id):
+            return
+        body = call.data.replace(CBT.PLUGIN_CMD_RUN, "", 1)
+        uuid, _, cmd = body.partition(":")
+        rec = _rec(pm, uuid)
+        if not rec or not rec.instance:
+            await call.answer("Плагин не загружен", show_alert=True)
+            return
+        inst = rec.instance
+        if hasattr(inst, "on_telegram_command"):
+            handled = await inst.on_telegram_command(call, cmd)
+            if handled:
+                return
+        if hasattr(inst, "has_plugin_panel") and inst.has_plugin_panel():
+            try:
+                result = await inst.render_plugin_panel()
+                if result:
+                    text, kb = result
+                    await call.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+                    await call.answer()
+                    return
+            except Exception as exc:
+                logger.exception("panel via cmd %s: %s", cmd, exc)
+        await call.answer("Команда не реализована", show_alert=True)
 
     @router.callback_query(F.data.startswith(CBT.PLUGIN_PANEL))
     async def cb_plugin_panel(call: CallbackQuery) -> None:

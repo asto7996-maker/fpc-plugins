@@ -42,7 +42,7 @@ def create_premium_router(bot_context: Any) -> Router:
         if not await bot_context._has_access(call.from_user.id):
             await bot_context._deny(call)
             return
-        await _render_plugins_page(call, pm, page=1)
+        await _render_plugins_page(call, pm, page=1, db=bot_context.db)
 
     @router.callback_query(F.data.startswith(CBT.PLUGIN_PAGE))
     async def cb_plugins_page(call: CallbackQuery) -> None:
@@ -86,15 +86,17 @@ def create_premium_router(bot_context: Any) -> Router:
     return router
 
 
+async def build_plugins_list(pm: Any, db: Any = None, page: int = 1) -> tuple[str, object]:
+    """Текст и клавиатура списка плагинов (FPC)."""
+    records = list(pm.plugins.values()) if pm.plugins else pm.load_all()
+    if hasattr(pm, "sort_records_pinned") and db:
+        records = await pm.sort_records_pinned(records)
+    total = max(1, (len(records) + PLUGINS_PER_PAGE - 1) // PLUGINS_PER_PAGE)
+    page = max(1, min(page, total))
+    return plugins_panel_text(records, page, total), plugins_panel_keyboard(records, page)
+
+
 async def _render_plugins_page(call: CallbackQuery, pm: Any, page: int, db: Any = None) -> None:
     async with loading_skeleton(call):
-        records = list(pm.plugins.values()) if pm.plugins else pm.load_all()
-        if hasattr(pm, "sort_records_pinned") and db:
-            records = await pm.sort_records_pinned(records)
-        total = max(1, (len(records) + PLUGINS_PER_PAGE - 1) // PLUGINS_PER_PAGE)
-        page = max(1, min(page, total))
-        await call.message.edit_text(
-            plugins_panel_text(records, page, total),
-            parse_mode="HTML",
-            reply_markup=plugins_panel_keyboard(records, page),
-        )
+        text, kb = await build_plugins_list(pm, db, page)
+        await call.message.edit_text(text, parse_mode="HTML", reply_markup=kb)

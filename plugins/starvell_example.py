@@ -69,6 +69,18 @@ class Plugin(StarvellPlugin):
         ]
         return text, InlineKeyboardMarkup(inline_keyboard=rows)
 
+    async def on_telegram_command(self, call, command: str) -> bool:
+        """Slash /stvexample → панель плагина."""
+        text, kb = await self.render_plugin_panel()
+        if hasattr(call.message, "edit_text"):
+            try:
+                await call.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+            except Exception:
+                await call.message.answer(text, parse_mode="HTML", reply_markup=kb)
+        else:
+            await call.message.answer(text, parse_mode="HTML", reply_markup=kb)
+        return True
+
     async def on_panel_action(self, call, action: str) -> bool:
         if action == "open_settings":
             from handlers.tg.plugin_settings import _show_settings
