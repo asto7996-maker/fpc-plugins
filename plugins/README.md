@@ -127,6 +127,5 @@ from starvell_sdk import StarvellPlugin, on_message, MessageContext
 
 ## Примеры
 
-- `starvell_example.py` — ответ на триггер + настройки
+- `vexboost_autosmm.py` — автонакрутка SMM через VexBoost (нативный плагин Starvell)
 - `_starvell_template.py` — пустой шаблон (не загружается автоматически)
-- `autodelivery_pro.py` — расширенная автовыдача

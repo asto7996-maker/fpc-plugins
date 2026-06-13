@@ -1,53 +1,49 @@
-# VexBoost AutoSMM — установка
+# VexBoost AutoSMM — установка (Starvell Cardinal)
 
-**Автор плагина:** @xei1y
+Нативный плагин для **Starvell Cardinal** (не FunPay Cardinal).
 
 ## 1. Зависимости
 
-```bash
-pip install requests pyTelegramBotAPI
-```
+`httpx` уже входит в зависимости Starvell Cardinal. Дополнительно ничего ставить не нужно.
 
-Если Cardinal в venv — установите пакеты внутри venv.
+## 2. Установка
 
-## 2. Установка плагина
+Плагин уже лежит в репозитории: `plugins/vexboost_autosmm.py`.
 
-Скопируйте `plugins/vexboost_autosmm.py` в папку `plugins` вашего FunPay Cardinal.
-
-Или через curl (подставьте свой URL файла):
-
-```bash
-curl -fsSL -o /path/to/FunPayCardinal/plugins/vexboost_autosmm.py "URL_ФАЙЛА"
-rm -rf /path/to/FunPayCardinal/plugins/__pycache__
-```
+При обновлении бота через `update_starvell_cardinal.sh` файл подтянется автоматически.
+Либо скопируйте файл в папку `plugins/` вашего бота.
 
 ## 3. Перезапуск
 
-В Telegram-боте Cardinal:
-
-```
-/restart
-```
+В Telegram-боте: **Плагины → 🔄** или перезапуск сервиса.
 
 ## 4. Настройка
 
-```
-/vexboost
-```
+1. **Плагины** → **VexBoost AutoSMM** → **⚙️ Настройки**
+2. Укажите **API Key** и при необходимости **API URL** (`https://vexboost.ru/api/v2`)
+3. Включите **Авто-SMM**
 
-- **URL** — адрес SMM-панели (например `https://vexboost.ru`)
-- **Логин + пароль** — данные аккаунта панели (рекомендуется)
-- Либо **AuthToken** / **API KEY** — альтернативные режимы
+Команды в Telegram:
 
-Проверка: `/vb_balance`
+- `/vexboost` — панель плагина
+- `/vb_balance` — баланс VexBoost
+- `/vb_stats` — статистика
 
-## 5. Лот FunPay
+## 5. Лот на Starvell
 
-В описании лота:
+В описании лота укажите:
 
 ```
 ID: 1000
 #Quan: 1
 ```
 
-`ID` — ID услуги в SMM-панели. `#Quan` — множитель количества (опционально).
+- `ID` — ID услуги в SMM-панели VexBoost
+- `#Quan` — множитель количества (опционально)
+
+## 6. Сценарий покупателя
+
+1. Покупатель оплачивает заказ → бот просит ссылку
+2. Покупатель отправляет ссылку → бот просит подтвердить `+`
+3. После `+` заказ создаётся в VexBoost
+4. `#статус ID` / `#рефилл ID` — проверка и рефилл SMM-заказа
