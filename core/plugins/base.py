@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
+from html import escape
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -103,8 +104,13 @@ class BasePlugin(ABC):
                 if field.get("type") == "bool":
                     icon = "🟢" if val else "🔴"
                     lines.append(f"{icon} {label}")
+                elif field.get("type") == "multiline":
+                    preview = str(val).replace("\n", " ")[:80]
+                    if len(str(val)) > 80:
+                        preview += "…"
+                    lines.append(f"• <b>{label}</b>: <i>{escape(preview)}</i>")
                 else:
-                    lines.append(f"• <b>{label}</b>: <code>{val}</code>")
+                    lines.append(f"• <b>{label}</b>: <code>{escape(str(val))}</code>")
         if self.CREDITS:
             lines.append(f"\n👤 {self.CREDITS}")
         return "\n".join(lines)

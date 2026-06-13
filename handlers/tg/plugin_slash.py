@@ -28,6 +28,7 @@ def create_plugin_slash_router(ctx: Any) -> Router:
 
             async def handler(message: Message, _uuid: str = uuid, _cmd: str = name) -> None:
                 if not await ctx._has_access(message.from_user.id):
+                    await message.answer("⛔ Нет доступа")
                     return
                 rec2 = pm.plugins.get(_uuid)
                 if not rec2 or not rec2.instance:
@@ -43,7 +44,12 @@ def create_plugin_slash_router(ctx: Any) -> Router:
                         async def answer(self, *a, **k):
                             pass
 
-                    handled = await inst.on_telegram_command(_SlashCtx(), _cmd)
+                    try:
+                        handled = await inst.on_telegram_command(_SlashCtx(), _cmd)
+                    except Exception as exc:
+                        logger.exception("slash command /%s: %s", _cmd, exc)
+                        await message.answer(f"❌ Ошибка /{_cmd}: {exc}")
+                        return
                     if handled:
                         return
                 if hasattr(inst, "has_plugin_panel") and inst.has_plugin_panel():

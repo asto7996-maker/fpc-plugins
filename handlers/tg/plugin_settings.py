@@ -83,6 +83,7 @@ def create_plugin_settings_router(ctx: Any) -> Router:
     @router.callback_query(F.data.startswith(CBT.PLUGIN_SETTINGS))
     async def cb_plugin_settings(call: CallbackQuery, state: FSMContext) -> None:
         if not await ctx._has_access(call.from_user.id):
+            await call.answer("⛔ Нет доступа", show_alert=True)
             return
         await state.clear()
         uuid = call.data.replace(CBT.PLUGIN_SETTINGS, "").split(":")[0]
@@ -197,6 +198,33 @@ def create_plugin_settings_router(ctx: Any) -> Router:
             return
 
         text_raw = message.text or ""
+        if text_raw.startswith("/"):
+            await state.clear()
+            low = text_raw.strip().lower()
+            if low in ("/cancel", "/отмена"):
+                await message.answer("❌ Редактирование отменено")
+                return
+            cmd = low.lstrip("/").split("@")[0].split()[0]
+            rec = pm.plugins.get(uuid) if uuid else None
+            if rec and rec.instance and hasattr(rec.instance, "on_telegram_command"):
+                class _SlashCtx:
+                    is_slash = True
+                    message = message
+                    from_user = message.from_user
+
+                    async def answer(self, *a, **k):
+                        pass
+
+                try:
+                    if await rec.instance.on_telegram_command(_SlashCtx(), cmd):
+                        return
+                except Exception as exc:
+                    logger.exception("plugin cmd in FSM /%s: %s", cmd, exc)
+                    await message.answer(f"❌ Ошибка /{cmd}: {exc}")
+                    return
+            await message.answer("❌ Редактирование отменено")
+            return
+
         if field.get("type") == "multiline":
             text = text_raw
         else:
