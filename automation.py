@@ -15,6 +15,7 @@ from config import Settings, load_settings
 from core.utils.message_anchor import MessageDedup, message_anchor as _message_anchor
 from core.utils.message_anchor import message_id as _message_id
 from core.utils.message_anchor import message_ts as _message_ts
+from core.utils.smm_lot import is_smm_lot_order
 from database import Database
 from handlers.builtin import BuiltinHandlers
 from core.delivery.templates import append_refund_disclaimer, render_delivery_template
@@ -365,6 +366,9 @@ class AutomationEngine:
 
         if not await self.db.get_feature_flag("auto_delivery", settings.auto_delivery_enabled):
             return
+        if is_smm_lot_order(order):
+            logger.debug("Заказ #%s: SMM-лот — автовыдача пропущена", order_id)
+            return
         if await self.db.is_blacklisted(username=buyer, check="block_delivery"):
             return
 
@@ -646,8 +650,12 @@ class AutomationEngine:
         my_user_id: int | None,
     ) -> None:
         chats = await api.fetch_chats()
+        chats = sorted(
+            chats,
+            key=lambda c: -int(c.get("unreadCount") or c.get("unread") or c.get("unreadMessagesCount") or 0),
+        )
         open_orders = await self._get_cached_open_orders(account_name, api)
-        sem = asyncio.Semaphore(4)
+        sem = asyncio.Semaphore(6)
 
         async def _run(chat: dict) -> None:
             async with sem:
@@ -701,7 +709,11 @@ class AutomationEngine:
                 interlocutor_id = pid
                 break
 
-        messages = await api.fetch_messages(chat_id, limit=15, interlocutor_id=interlocutor_id)
+        messages = await self._load_chat_messages(
+            api, chat, chat_id, last_notified, my_user_id, interlocutor_id, account_name,
+        )
+        if messages is None:
+            return
 
         if last_notified is None and await self.db.is_chats_bootstrapped(account_name):
             boot_at = await self.db.get_chats_bootstrapped_at(account_name) or 0
@@ -749,6 +761,72 @@ class AutomationEngine:
                 self._msg_dedup.mark(chat_id, anchor)
                 continue
 
+            processed = await self._dispatch_buyer_message(
+                account_name=account_name,
+                api=api,
+                settings=settings,
+                my_user_id=my_user_id,
+                chat_id=chat_id,
+                msg=msg,
+                anchor=anchor,
+                mid=mid,
+                author_id=author_id,
+                username=username,
+                text=text,
+                participants=participants,
+                open_orders=open_orders,
+                all_messages=messages,
+            )
+            if processed:
+                await self.db.set_last_notified_message(chat_id, anchor, account_name)
+                self._msg_dedup.mark(chat_id, anchor)
+
+    async def _load_chat_messages(
+        self,
+        api: StarvellAPI,
+        chat: dict,
+        chat_id: str,
+        last_notified: str | None,
+        my_user_id: int | None,
+        interlocutor_id: int | None,
+        account_name: str,
+    ) -> list[dict] | None:
+        """Загружает сообщения чата; быстрый путь через lastMessage без лишнего API."""
+        last_msg = chat.get("lastMessage") or chat.get("last_message")
+        unread = int(
+            chat.get("unreadCount") or chat.get("unread") or chat.get("unreadMessagesCount") or 0
+        )
+        if isinstance(last_msg, dict) and unread <= 1:
+            pending = self._iter_new_buyer_messages([last_msg], last_notified, my_user_id)
+            if pending:
+                return pending
+
+        try:
+            return await api.fetch_messages(chat_id, limit=15, interlocutor_id=interlocutor_id)
+        except Exception as exc:
+            logger.warning("fetch_messages %s: %s", chat_id[:8], exc)
+            return None
+
+    async def _dispatch_buyer_message(
+        self,
+        *,
+        account_name: str,
+        api: StarvellAPI,
+        settings: Settings,
+        my_user_id: int | None,
+        chat_id: str,
+        msg: dict,
+        anchor: str,
+        mid: str,
+        author_id: Any,
+        username: str,
+        text: str,
+        participants: list,
+        open_orders: list[dict],
+        all_messages: list[dict],
+    ) -> bool:
+        """Обрабатывает сообщение покупателя. True — пометить как обработанное."""
+        try:
             prev_buyer_ts = await self.db.get_chat_last_user_message_at(chat_id, account_name)
             msg_ts = _message_ts(msg) or int(time.time())
             await self.db.set_chat_last_user_message_at(chat_id, msg_ts, account_name)
@@ -758,13 +836,10 @@ class AutomationEngine:
             ):
                 await self.notify(
                     f"💬 <b>Новое сообщение</b> от {username or 'покупателя'}\n"
-                    f"<i>{str(msg.get('content') or msg.get('text') or '')[:300]}</i>",
+                    f"<i>{text[:300]}</i>",
                     "notify_chats",
                     chat_id=chat_id,
                 )
-
-            await self.db.set_last_notified_message(chat_id, anchor, account_name)
-            self._msg_dedup.mark(chat_id, anchor)
 
             handled = await self._handlers.on_chat_message(
                 text=text, chat_id=chat_id, api=api, account_name=account_name,
@@ -782,7 +857,7 @@ class AutomationEngine:
                 )
 
             if await self.db.get_feature_flag("ai_replies", settings.ai_replies_enabled):
-                await self._maybe_ai_reply(account_name, api, settings, chat_id, text, messages)
+                await self._maybe_ai_reply(account_name, api, settings, chat_id, text, all_messages)
 
             msg_ctx = MessageContext(
                 core=self.cardinal,
@@ -794,21 +869,19 @@ class AutomationEngine:
                 message_id=mid or anchor,
                 raw_message=msg,
             )
-            try:
-                await self._emit_starvell(STV_MESSAGE, msg_ctx)
-            except Exception as exc:
-                logger.warning("plugin message dispatch %s: %s", chat_id[:8], exc)
+            await self._emit_starvell(STV_MESSAGE, msg_ctx)
 
             ctx = PluginContext(api, self.db, settings, account_name)
             ctx.chat_id = chat_id
             ctx.message_author_id = author_id
-            try:
-                await self.cardinal.event_manager.dispatch(
-                    "on_message", {"message": text, "chat_id": chat_id, "ctx": ctx}
-                )
-                await self.cardinal.dispatch_plugins("BIND_TO_NEW_MESSAGE", text, chat_id)
-            except Exception as exc:
-                logger.warning("legacy message dispatch %s: %s", chat_id[:8], exc)
+            await self.cardinal.event_manager.dispatch(
+                "on_message", {"message": text, "chat_id": chat_id, "ctx": ctx}
+            )
+            await self.cardinal.dispatch_plugins("BIND_TO_NEW_MESSAGE", text, chat_id)
+            return True
+        except Exception as exc:
+            logger.exception("dispatch buyer message %s anchor=%s: %s", chat_id[:8], anchor, exc)
+            return False
 
     async def _maybe_ai_reply(
         self,

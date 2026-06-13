@@ -58,28 +58,22 @@ class MessageContext(StarvellContext):
         await self.reply(text)
 
 
+from core.utils.money import starvell_money_to_rub
+
+
 def _resolve_order_price(order: dict) -> float:
     """Итоговая сумма покупки в рублях."""
     total = order.get("totalPrice")
     if total is not None:
-        try:
-            val = float(total)
-            if val > 0:
-                return val
-        except (TypeError, ValueError):
-            pass
+        val = starvell_money_to_rub(total)
+        if val > 0:
+            return val
     base = order.get("basePrice")
     qty = max(1, int(order.get("quantity") or 1))
     if base is not None:
-        try:
-            return float(base) * qty
-        except (TypeError, ValueError):
-            pass
-    if base is not None:
-        try:
-            return float(base)
-        except (TypeError, ValueError):
-            pass
+        unit = starvell_money_to_rub(base)
+        if unit > 0:
+            return unit * qty
     return 0.0
 
 

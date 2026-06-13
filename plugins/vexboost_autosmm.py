@@ -40,7 +40,7 @@ from starvell_sdk import (
 )
 
 NAME = "VexBoost AutoSMM"
-VERSION = "3.1.3"
+VERSION = "3.1.4"
 DESCRIPTION = "Автонакрутка SMM через VexBoost для Starvell"
 CREDITS = "@xei1y"
 UUID = "a3f8c2e1-7b4d-4a9f-9e2c-1d5b8f6a0c3e"
@@ -802,7 +802,10 @@ class Plugin(StarvellPlugin):
 
         welcome = await self._msg("welcome_message", order_id=order_id)
         if entry["chat_id"]:
-            await ctx.send_to_buyer(welcome)
+            try:
+                await ctx.send_to_buyer(welcome)
+            except Exception as exc:
+                self.log("welcome send #%s: %s", order_id, exc, level="warning")
         else:
             await ctx.notify(f"⚠️ VexBoost #{order_id}: чат не найден", "notify_orders")
 
@@ -810,8 +813,11 @@ class Plugin(StarvellPlugin):
             api = await self._api()
             bal_txt = "н/д"
             if api:
-                bal, cur, err = await api.balance()
-                bal_txt = f"{bal:.2f} {cur}" if bal is not None else err
+                try:
+                    bal, cur, err = await asyncio.wait_for(api.balance(), timeout=6.0)
+                    bal_txt = f"{bal:.2f} {cur}" if bal is not None else err
+                except asyncio.TimeoutError:
+                    bal_txt = "таймаут"
             await ctx.notify(
                 f"📥 <b>VexBoost — новый заказ</b>\n\n"
                 f"🛒 {ctx.product_name}\n"
@@ -872,11 +878,17 @@ class Plugin(StarvellPlugin):
         return f"{ctx.chat_id}:{ctx.username}"
 
     def _find_waiting(self, waiting: list, ctx: MessageContext) -> dict | None:
+        uname = (ctx.username or "").strip().lower()
+        author_id = ctx.author_id
+        chat_id = str(ctx.chat_id or "")
         for o in waiting:
-            if o.get("buyer") == ctx.username:
+            if author_id and o.get("buyer_id") == author_id:
                 return o
         for o in waiting:
-            if str(o.get("chat_id")) == str(ctx.chat_id):
+            if uname and str(o.get("buyer") or "").strip().lower() == uname:
+                return o
+        for o in waiting:
+            if chat_id and str(o.get("chat_id") or "") == chat_id:
                 return o
         return None
 
@@ -902,13 +914,17 @@ class Plugin(StarvellPlugin):
         self._hint_sent.pop(pkey, None)
 
         display_link = link.replace("https://", "").replace("http://", "")
-        await ctx.reply(await self._msg(
-            "confirmation_message",
-            lot=order.get("product", "товар"),
-            price=_format_rub(order.get("price_rub", 0)),
-            amount=order.get("quantity", 1),
-            link=display_link,
-        ))
+        try:
+            await ctx.reply(await self._msg(
+                "confirmation_message",
+                lot=order.get("product", "товар"),
+                price=_format_rub(order.get("price_rub", 0)),
+                amount=order.get("quantity", 1),
+                link=display_link,
+            ))
+        except Exception as exc:
+            self.log("confirm reply #%s: %s", order.get("order_id"), exc, level="error")
+            raise
 
     async def _handle_pending(self, ctx: MessageContext, text: str, action: str | None) -> None:
         pkey = self._pending_key(ctx)
