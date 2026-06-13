@@ -159,7 +159,7 @@ After=network.target
 Type=simple
 User=$SERVICE_USER
 WorkingDirectory=$INSTALL_DIR
-ExecStart=$INSTALL_DIR/venv/bin/python main.py
+ExecStart=$INSTALL_DIR/venv/bin/python $INSTALL_DIR/main.py
 Restart=always
 RestartSec=10
 Environment=PYTHONUNBUFFERED=1
