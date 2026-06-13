@@ -458,7 +458,7 @@ class VexBoostAPI:
         if not login or not password:
             return None, "Логин/пароль не заданы"
         client = httpx.AsyncClient(
-            timeout=45.0,
+            timeout=20.0,
             headers={"User-Agent": "VexBoostAutoSMM/3.1", "Accept": "application/json"},
         )
         try:
