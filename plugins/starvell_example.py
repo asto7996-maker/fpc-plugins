@@ -27,7 +27,7 @@ class Plugin(StarvellPlugin):
     def get_settings_schema(self) -> list[dict]:
         return [
             {"key": "enabled", "label": "Активен", "type": "bool", "default": True},
-            {"key": "trigger", "label": "Триггер", "type": "text", "default": "тест"},
+            {"key": "trigger", "label": "Триггер", "type": "text", "default": "тест", "description": "Слово в сообщении покупателя"},
             {"key": "notify_admin", "label": "Уведомлять в TG", "type": "bool", "default": False},
             {"key": "test_reply", "label": "Тест ответа", "type": "action"},
         ]

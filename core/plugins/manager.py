@@ -189,6 +189,25 @@ class PluginEngine:
         except Exception as exc:
             logger.warning("Unload %s failed: %s", rec.name, exc)
 
+    def _has_settings_ui(
+        self,
+        settings_page: bool,
+        instance: Any | None,
+        is_base: bool,
+        is_stv: bool,
+        settings_cb: str | None,
+    ) -> bool:
+        if not settings_page or not instance or not (is_base or is_stv):
+            return bool(settings_cb)
+        if settings_cb:
+            return True
+        if hasattr(instance, "get_settings_schema"):
+            try:
+                return len(instance.get_settings_schema()) > 0
+            except Exception:
+                return True
+        return True
+
     def _load_one(self, file_path: str, force_reload: bool = False) -> PluginRecord:
         inline = self._extract_meta(file_path)
         fpc_only = self._is_fpc_only_plugin(file_path)
@@ -269,7 +288,7 @@ class PluginEngine:
             is_base_plugin=is_base,
             settings_callback=settings_cb,
             hook_only=hook_only,
-            has_settings_page=settings_page and (is_base or bool(settings_cb)),
+            has_settings_page=self._has_settings_ui(settings_page, instance, is_base, is_stv, settings_cb),
             pinned=False,
             is_starvell_native=is_stv,
         )

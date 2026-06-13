@@ -113,6 +113,7 @@ class BasePlugin(ABC):
         from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
         from keyboards import cbt as CBT
+        from keyboards.plugin_settings import plugin_settings_nav
 
         cfg = await self.plugin_settings.get_all(self.UUID)
         rows: list[list[InlineKeyboardButton]] = []
@@ -132,26 +133,57 @@ class BasePlugin(ABC):
             elif ftype == "action":
                 rows.append([
                     InlineKeyboardButton(
-                        text=label,
+                        text=f"▶️ {label}",
                         callback_data=f"{CBT.PLUGIN_ACTION}{self.UUID}:{key}",
                     )
                 ])
+            elif ftype == "select":
+                val = cfg.get(key, field.get("default", ""))
+                rows.append([
+                    InlineKeyboardButton(
+                        text=f"📋 {label}: {val}",
+                        callback_data=f"{CBT.PLUGIN_SELECT_MENU}{self.UUID}:{key}",
+                    )
+                ])
+            elif ftype in ("text", "str", "multiline"):
+                val = cfg.get(key, field.get("default", ""))
+                preview = str(val)[:24] + ("…" if len(str(val)) > 24 else "")
+                rows.append([
+                    InlineKeyboardButton(
+                        text=f"✏️ {label}: {preview or '—'}",
+                        callback_data=f"{CBT.PLUGIN_EDIT}{self.UUID}:{key}",
+                    )
+                ])
+            elif ftype == "int":
+                val = cfg.get(key, field.get("default", 0))
+                rows.append([
+                    InlineKeyboardButton(
+                        text=f"🔢 {label}: {val}",
+                        callback_data=f"{CBT.PLUGIN_EDIT}{self.UUID}:{key}",
+                    )
+                ])
 
-        rows.append([
-            InlineKeyboardButton(text="🔄 Сброс", callback_data=f"{CBT.PLUGIN_RESET}{self.UUID}"),
-            InlineKeyboardButton(text="◀️ Плагины", callback_data=CBT.PLUGINS),
-        ])
+        rows.extend(plugin_settings_nav(self.UUID))
         return InlineKeyboardMarkup(inline_keyboard=rows)
 
+    def get_schema_field(self, key: str) -> dict[str, Any] | None:
+        for field in self.get_settings_schema():
+            if field.get("key") == key:
+                return field
+        return None
+
+    async def apply_setting(self, key: str, value: Any) -> None:
+        """Сохраняет значение настройки и вызывает хук."""
+        await self.plugin_settings.set(self.UUID, key, value)
+        await self.on_setting_change(key, value)
+
     async def on_setting_toggle(self, key: str) -> None:
-        schema = {f["key"]: f for f in self.get_settings_schema()}
-        field = schema.get(key)
+        field = self.get_schema_field(key)
         if not field or field.get("type") != "bool":
             return
         cfg = await self.plugin_settings.get_all(self.UUID)
         current = bool(cfg.get(key, field.get("default", False)))
-        await self.plugin_settings.set(self.UUID, key, not current)
-        await self.on_setting_change(key, not current)
+        await self.apply_setting(key, not current)
 
     async def on_setting_change(self, key: str, value: Any) -> None:
         """Хук после изменения настройки."""

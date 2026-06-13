@@ -39,7 +39,7 @@ def plugins_panel_keyboard(
             InlineKeyboardButton(text="🔄", callback_data=f"{CBT.PLUGIN_RELOAD}{rec.uuid}"),
             InlineKeyboardButton(text="📌", callback_data=f"{CBT.PLUGIN_PIN}{rec.uuid}"),
         ]
-        if getattr(rec, "has_settings_page", False) or getattr(rec, "is_base_plugin", False):
+        if getattr(rec, "has_settings_page", False):
             action_row.append(
                 InlineKeyboardButton(text="⚙️", callback_data=f"{CBT.PLUGIN_SETTINGS}{rec.uuid}")
             )

@@ -36,7 +36,13 @@ class Plugin(StarvellPlugin):
     def get_settings_schema(self) -> list[dict]:
         return [
             {"key": "use_custom_template", "label": "Свой шаблон", "type": "bool", "default": False},
-            {"key": "custom_template", "label": "Шаблон выдачи", "type": "text", "default": ""},
+            {
+                "key": "custom_template",
+                "label": "Шаблон выдачи",
+                "type": "multiline",
+                "default": self.DEFAULT_TEMPLATE,
+                "description": "Плейсхолдеры: {order_id}, {username}, {product_name}, {content}, {date}",
+            },
         ]
 
     @on_order_paid

@@ -60,10 +60,17 @@ SETTINGS_PAGE = True
 def get_settings_schema(self) -> list[dict]:
     return [
         {"key": "enabled", "label": "Вкл", "type": "bool", "default": True},
+        {"key": "trigger", "label": "Триггер", "type": "text", "default": "тест"},
+        {"key": "mode", "label": "Режим", "type": "select", "default": "auto",
+         "options": ["auto", "manual"]},
+        {"key": "template", "label": "Шаблон", "type": "multiline", "default": "..."},
+        {"key": "test", "label": "Проверить", "type": "action"},
     ]
 ```
 
-Доступ к настройкам: `await self.get_cfg("enabled")` / `await self.set_cfg("enabled", True)`
+Типы: `bool` (переключатель), `text`/`multiline`, `int`, `select`, `action`.
+
+Доступ: `await self.get_cfg("enabled")` / `await self.set_cfg("enabled", True)`
 
 ## Жизненный цикл
 
