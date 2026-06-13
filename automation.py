@@ -10,9 +10,10 @@ import time
 from typing import Any, Callable, Awaitable
 
 from ai_service import AIService
-from config import Settings, load_settings, save_settings
+from config import Settings, load_settings
 from database import Database
-from plugin_manager import CardinalCore, PluginContext
+from handlers import BuiltinHandlers
+from plugin_manager import PluginContext
 from starvell_api import StarvellAPI
 
 logger = logging.getLogger("starvell.automation")
@@ -24,7 +25,7 @@ class AutomationEngine:
     def __init__(
         self,
         db: Database,
-        cardinal: CardinalCore,
+        cardinal: Any,
         notify_cb: Callable[[str], Awaitable[None]] | None = None,
     ) -> None:
         self.db = db
@@ -34,13 +35,17 @@ class AutomationEngine:
         self._tasks: list[asyncio.Task] = []
         self._apis: dict[str, StarvellAPI] = {}
         self._ai = AIService(load_settings())
+        self._handlers = BuiltinHandlers(cardinal)
 
-    async def notify(self, text: str, notify_type: str = "notify_orders") -> None:
+    async def notify(self, text: str, notify_type: str = "notify_orders", **extra) -> None:
         if self.notify_cb:
             try:
-                await self.notify_cb(text, notify_type)
+                await self.notify_cb(text, notify_type, **extra)
             except TypeError:
-                await self.notify_cb(text)
+                try:
+                    await self.notify_cb(text, notify_type)
+                except TypeError:
+                    await self.notify_cb(text)
             except Exception as exc:
                 logger.warning("notify failed: %s", exc)
 
@@ -147,8 +152,14 @@ class AutomationEngine:
                 await self.db.set_order_status(order_id, status, account_name)
             elif prev != status:
                 await self.db.set_order_status(order_id, status, account_name)
-                if status == "COMPLETED" and await self.db.get_feature_flag("auto_review", settings.auto_review_enabled):
-                    await self._handle_completed_order(account_name, api, settings, order)
+                if status == "COMPLETED":
+                    if await self.db.get_feature_flag("auto_review", settings.auto_review_enabled):
+                        await self._handle_completed_order(account_name, api, settings, order)
+                    buyer_id = (order.get("user") or {}).get("id")
+                    chat_id = await api.find_chat_by_buyer(int(buyer_id)) if buyer_id else None
+                    await self._handlers.on_order_confirm(
+                        order=order, api=api, settings=settings, chat_id=chat_id,
+                    )
 
     async def _handle_new_order(
         self, account_name: str, api: StarvellAPI, settings: Settings, order: dict
@@ -170,13 +181,17 @@ class AutomationEngine:
             f"Товар: {product_name}\n"
             f"Сумма: {price} ₽",
             "notify_orders",
+            order_id=order_id,
         )
+        await self.cardinal.dispatch_plugins("BIND_TO_NEW_ORDER", order)
 
         # Плагины
         ctx = PluginContext(api, self.db, settings, account_name)
         await self.cardinal.event_manager.dispatch("on_order", {"order": order, "ctx": ctx})
 
         if not await self.db.get_feature_flag("auto_delivery", settings.auto_delivery_enabled):
+            return
+        if await self.db.is_blacklisted(username=buyer, check="block_delivery"):
             return
 
         qty = max(1, int(order.get("quantity") or 1))
@@ -212,9 +227,11 @@ class AutomationEngine:
         if await self.db.is_order_reviewed(order_id, account_name):
             return
 
-        self._ai.settings = settings
-        review_text = await self._ai.generate_review_text(order)
-        review_text = api.apply_watermark(review_text, settings.watermark_on, settings.watermark_text)
+        review_text = await self._handlers.on_order_completed(
+            order=order, api=api, settings=settings, account_name=account_name
+        )
+        if not review_text:
+            return
 
         buyer_id = (order.get("user") or {}).get("id")
         chat_id = await api.find_chat_by_buyer(int(buyer_id)) if buyer_id else None
@@ -306,18 +323,26 @@ class AutomationEngine:
                         username = (p or {}).get("username") or ""
                         break
 
-                await self.notify(
-                    f"💬 <b>Новое сообщение</b> от {username or 'покупателя'}\n"
-                    f"<i>{text[:300]}</i>",
-                    "notify_chats",
-                )
+                if not await self.db.is_blacklisted(
+                    username=username, starvell_user_id=author_id, check="block_notify"
+                ):
+                    await self.notify(
+                        f"💬 <b>Новое сообщение</b> от {username or 'покупателя'}\n"
+                        f"<i>{text[:300]}</i>",
+                        "notify_chats",
+                        chat_id=chat_id,
+                    )
                 await self.db.set_last_notified_message(chat_id, mid, account_name)
 
-                # Приветствие
-                if await self.db.get_feature_flag("auto_welcome", settings.auto_welcome_enabled):
-                    await self._maybe_welcome(account_name, api, settings, chat_id)
+                handled = await self._handlers.on_chat_message(
+                    text=text, chat_id=chat_id, api=api, account_name=account_name,
+                    author_id=author_id, username=username, settings=settings,
+                )
+                if not handled:
+                    await self._handlers.on_welcome(
+                        chat_id=chat_id, api=api, settings=settings, account_name=account_name,
+                    )
 
-                # ИИ-ответ
                 if await self.db.get_feature_flag("ai_replies", settings.ai_replies_enabled):
                     await self._maybe_ai_reply(account_name, api, settings, chat_id, text, messages)
 
@@ -327,6 +352,7 @@ class AutomationEngine:
                 await self.cardinal.event_manager.dispatch(
                     "on_message", {"message": text, "chat_id": chat_id, "ctx": ctx}
                 )
+                await self.cardinal.dispatch_plugins("BIND_TO_NEW_MESSAGE", text, chat_id)
 
     async def _maybe_welcome(
         self, account_name: str, api: StarvellAPI, settings: Settings, chat_id: str

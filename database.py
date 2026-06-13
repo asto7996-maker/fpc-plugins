@@ -93,6 +93,30 @@ class Database:
                     key TEXT PRIMARY KEY,
                     value INTEGER DEFAULT 1
                 );
+
+                CREATE TABLE IF NOT EXISTS blacklist (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    username TEXT,
+                    starvell_user_id INTEGER,
+                    block_delivery INTEGER DEFAULT 1,
+                    block_response INTEGER DEFAULT 1,
+                    block_notify INTEGER DEFAULT 0,
+                    created_at INTEGER DEFAULT 0
+                );
+
+                CREATE TABLE IF NOT EXISTS auto_response_cmds (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    command TEXT UNIQUE NOT NULL,
+                    response TEXT NOT NULL,
+                    enabled INTEGER DEFAULT 1,
+                    notify INTEGER DEFAULT 0,
+                    created_at INTEGER DEFAULT 0
+                );
+
+                CREATE TABLE IF NOT EXISTS chat_welcomed (
+                    chat_id TEXT PRIMARY KEY,
+                    welcomed_at INTEGER DEFAULT 0
+                );
                 """
             )
             await db.commit()
@@ -355,6 +379,8 @@ class Database:
             "auto_welcome": settings.auto_welcome_enabled,
             "auto_review": settings.auto_review_enabled,
             "ai_replies": settings.ai_replies_enabled,
+            "auto_response": settings.auto_response_enabled,
+            "order_confirm": settings.order_confirm_enabled,
         }
         async with aiosqlite.connect(self.path) as db:
             for key, val in flags.items():
@@ -382,3 +408,138 @@ class Database:
             )
             await db.commit()
         return new_val
+
+    # ── Чёрный список ─────────────────────────────────────────────────────
+
+    async def add_blacklist(self, username: str = "", starvell_user_id: int | None = None) -> None:
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                "INSERT INTO blacklist (username, starvell_user_id, created_at) VALUES (?, ?, ?)",
+                (username.strip().lower(), starvell_user_id, int(time.time())),
+            )
+            await db.commit()
+
+    async def remove_blacklist(self, username: str = "", starvell_user_id: int | None = None) -> int:
+        async with aiosqlite.connect(self.path) as db:
+            if starvell_user_id:
+                cur = await db.execute("DELETE FROM blacklist WHERE starvell_user_id = ?", (starvell_user_id,))
+            else:
+                cur = await db.execute("DELETE FROM blacklist WHERE username = ?", (username.strip().lower(),))
+            await db.commit()
+            return cur.rowcount
+
+    async def list_blacklist(self) -> list[dict[str, Any]]:
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute("SELECT * FROM blacklist ORDER BY id")
+            rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
+    async def is_blacklisted(
+        self, username: str = "", starvell_user_id: int | None = None, check: str = "block_response"
+    ) -> bool:
+        async with aiosqlite.connect(self.path) as db:
+            if starvell_user_id:
+                cur = await db.execute(
+                    f"SELECT 1 FROM blacklist WHERE starvell_user_id = ? AND {check} = 1",
+                    (starvell_user_id,),
+                )
+                if await cur.fetchone():
+                    return True
+            if username:
+                cur = await db.execute(
+                    f"SELECT 1 FROM blacklist WHERE username = ? AND {check} = 1",
+                    (username.strip().lower(),),
+                )
+                return await cur.fetchone() is not None
+        return False
+
+    # ── Автоответчик ──────────────────────────────────────────────────────
+
+    async def add_ar_command(self, command: str, response: str) -> None:
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                "INSERT OR REPLACE INTO auto_response_cmds (command, response, enabled, created_at) VALUES (?, ?, 1, ?)",
+                (command.strip().lower(), response.strip(), int(time.time())),
+            )
+            await db.commit()
+
+    async def list_ar_commands(self) -> list[dict[str, Any]]:
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute("SELECT * FROM auto_response_cmds ORDER BY command")
+            return [dict(r) for r in await cur.fetchall()]
+
+    async def delete_ar_command(self, cmd_id: int) -> None:
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute("DELETE FROM auto_response_cmds WHERE id = ?", (cmd_id,))
+            await db.commit()
+
+    async def toggle_ar_command(self, cmd_id: int, field: str) -> bool:
+        if field not in ("enabled", "notify"):
+            raise ValueError(field)
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute("SELECT * FROM auto_response_cmds WHERE id = ?", (cmd_id,))
+            row = await cur.fetchone()
+            if not row:
+                return False
+            new_val = 0 if row[field] else 1
+            await db.execute(f"UPDATE auto_response_cmds SET {field} = ? WHERE id = ?", (new_val, cmd_id))
+            await db.commit()
+            return bool(new_val)
+
+    async def find_ar_response(self, text: str) -> dict[str, Any] | None:
+        text_l = text.strip().lower()
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute("SELECT * FROM auto_response_cmds WHERE enabled = 1")
+            for row in await cur.fetchall():
+                cmd = row["command"]
+                if cmd in text_l or text_l.startswith(cmd):
+                    return dict(row)
+        return None
+
+    # ── Шаблоны ───────────────────────────────────────────────────────────
+
+    async def list_templates(self, limit: int = 20) -> list[dict[str, Any]]:
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                "SELECT * FROM message_templates ORDER BY id DESC LIMIT ?", (limit,)
+            )
+            return [dict(r) for r in await cur.fetchall()]
+
+    async def add_template(self, content: str, title: str = "") -> int:
+        async with aiosqlite.connect(self.path) as db:
+            cur = await db.execute(
+                "INSERT INTO message_templates (title, content, created_at) VALUES (?, ?, ?)",
+                (title, content, int(time.time())),
+            )
+            await db.commit()
+            return cur.lastrowid or 0
+
+    async def get_template(self, tpl_id: int) -> dict[str, Any] | None:
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute("SELECT * FROM message_templates WHERE id = ?", (tpl_id,))
+            row = await cur.fetchone()
+        return dict(row) if row else None
+
+    async def delete_template(self, tpl_id: int) -> None:
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute("DELETE FROM message_templates WHERE id = ?", (tpl_id,))
+            await db.commit()
+
+    async def is_chat_welcomed(self, chat_id: str) -> bool:
+        async with aiosqlite.connect(self.path) as db:
+            cur = await db.execute("SELECT 1 FROM chat_welcomed WHERE chat_id = ?", (chat_id,))
+            return await cur.fetchone() is not None
+
+    async def mark_chat_welcomed(self, chat_id: str) -> None:
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                "INSERT OR REPLACE INTO chat_welcomed (chat_id, welcomed_at) VALUES (?, ?)",
+                (chat_id, int(time.time())),
+            )
+            await db.commit()

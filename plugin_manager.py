@@ -16,8 +16,7 @@ from types import ModuleType
 from typing import Any, Callable
 
 from config import PLUGINS_DIR, PLUGIN_STATE_PATH
-
-logger = logging.getLogger("starvell.plugins")
+from cardinal import Cardinal, CardinalCore, EventManager
 
 
 @dataclass
@@ -46,55 +45,7 @@ class PluginContext:
         self.message_author_id: int | None = None
 
 
-class EventManager:
-    """Менеджер событий (как в FunPay Cardinal)."""
-
-    def __init__(self) -> None:
-        self._handlers: dict[str, list[Callable]] = {}
-
-    def register_handler(self, event: str, handler: Callable) -> None:
-        self._handlers.setdefault(event, []).append(handler)
-
-    def unregister_handler(self, event: str, handler: Callable) -> None:
-        if event in self._handlers:
-            self._handlers[event] = [h for h in self._handlers[event] if h is not handler]
-
-    async def dispatch(self, event: str, data: dict[str, Any]) -> None:
-        for handler in self._handlers.get(event, []):
-            try:
-                result = handler(data)
-                if hasattr(result, "__await__"):
-                    await result
-            except Exception as exc:
-                logger.exception("Handler %s for %s failed: %s", handler, event, exc)
-
-
-class CardinalCore:
-    """Ядро бота — точка доступа для плагинов (аналог cardinal в FunPay Cardinal)."""
-
-    def __init__(self, settings: Any, db: Any, event_manager: EventManager) -> None:
-        self.settings = settings
-        self.db = db
-        self.event_manager = event_manager
-        self.logger = logging.getLogger("starvell.cardinal")
-        self._apis: dict[str, Any] = {}
-        self._send_message_cb: Callable | None = None
-
-    def register_api(self, account_name: str, api: Any) -> None:
-        self._apis[account_name] = api
-
-    def get_api(self, account_name: str = "default") -> Any | None:
-        return self._apis.get(account_name)
-
-    def set_send_message_callback(self, cb: Callable) -> None:
-        self._send_message_cb = cb
-
-    async def send_message(self, chat_id: str, text: str, account_name: str = "default") -> None:
-        api = self.get_api(account_name)
-        if api:
-            await api.send_message(chat_id, text)
-        if self._send_message_cb:
-            await self._send_message_cb(chat_id, text, account_name)
+logger = logging.getLogger("starvell.plugins")
 
 
 class PluginManager:
@@ -216,6 +167,47 @@ class PluginManager:
             name=name, uuid=uuid, version=version, description=description,
             credits=credits, path=file_path, module=module, enabled=enabled, instance=instance,
         )
+
+    def _fpc_hooks(self, module: ModuleType) -> dict[str, list]:
+        """Собирает BIND_TO_* хуки из FPC-стиля плагинов."""
+        hooks: dict[str, list] = {}
+        for attr in dir(module):
+            if attr.startswith("BIND_TO_") and not attr.endswith("_DELETE"):
+                funcs = getattr(module, attr)
+                if callable(funcs):
+                    funcs = [funcs]
+                elif isinstance(funcs, list):
+                    funcs = [f for f in funcs if callable(f)]
+                else:
+                    continue
+                hooks[attr] = funcs
+        return hooks
+
+    async def dispatch_hook(self, hook: str, cardinal: Any, *args, **kwargs) -> None:
+        """Вызывает BIND_TO_* обработчики FPC-плагинов."""
+        for meta in self.plugins.values():
+            if not meta.enabled or not meta.module:
+                continue
+            fpc = self._fpc_hooks(meta.module)
+            for fn in fpc.get(hook, []):
+                try:
+                    result = fn(cardinal, *args, **kwargs)
+                    if hasattr(result, "__await__"):
+                        await result
+                except Exception as exc:
+                    self._logger.exception("Plugin %s hook %s: %s", meta.name, hook, exc)
+
+    def run_pre_init(self) -> None:
+        """BIND_TO_PRE_INIT при загрузке."""
+        import asyncio
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                asyncio.create_task(self.dispatch_hook("BIND_TO_PRE_INIT", self.cardinal))
+            else:
+                loop.run_until_complete(self.dispatch_hook("BIND_TO_PRE_INIT", self.cardinal))
+        except Exception:
+            pass
 
     def toggle(self, uuid: str) -> bool:
         if uuid in self.disabled:

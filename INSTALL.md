@@ -10,10 +10,13 @@
 | Автобамп | Циклическое поднятие лотов по таймеру |
 | Приветствие | Авто-сообщение при новом диалоге |
 | Авто-отзывы | Благодарность покупателю после закрытия сделки |
-| ИИ-ответы | OpenAI / Gemini в чатах Starvell |
+| ИИ-ответы | Gemini в чатах Starvell |
 | Уведомления | Логи действий прямо в Telegram |
-| Плагины | Расширяемость через Python-модули |
+| Плагины | Расширяемость через Python-модули (BIND_TO_*) |
 | Профиль | Баланс, статус заказов, настройки сессии |
+| Автоответчик | Команды и шаблоны ответов |
+| Чёрный список | Бан покупателей |
+| Бэкап / логи | `/create_backup`, `/logs`, `/sys` |
 
 ---
 
@@ -29,7 +32,7 @@ Starvell session, Gemini и склад — в Telegram после `/start`.
 Скопируйте и выполните **целиком** на сервере под root:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/asto7996-maker/fpc-plugins/cursor/starvell-cardinal-bot-280c/install_starvell_cardinal.sh | bash
+curl -fsSL https://raw.githubusercontent.com/asto7996-maker/fpc-plugins/cursor/fpc-parity-280c/install_starvell_cardinal.sh | sudo bash
 ```
 
 Скрипт сам установит Python, скачает проект, спросит токены и запустит systemd-сервис.
@@ -38,7 +41,7 @@ curl -fsSL https://raw.githubusercontent.com/asto7996-maker/fpc-plugins/cursor/s
 
 ```bash
 apt update && apt install -y git
-git clone -b cursor/starvell-cardinal-bot-280c https://github.com/asto7996-maker/fpc-plugins.git /opt/starvell-cardinal
+git clone -b cursor/fpc-parity-280c https://github.com/asto7996-maker/fpc-plugins.git /opt/starvell-cardinal
 cd /opt/starvell-cardinal
 bash install_starvell_cardinal.sh
 ```
@@ -49,7 +52,7 @@ bash install_starvell_cardinal.sh
 apt update
 apt install -y python3 python3-venv python3-pip git sqlite3
 
-git clone -b cursor/starvell-cardinal-bot-280c https://github.com/asto7996-maker/fpc-plugins.git ~/starvell-cardinal
+git clone -b cursor/fpc-parity-280c https://github.com/asto7996-maker/fpc-plugins.git ~/starvell-cardinal
 cd ~/starvell-cardinal
 
 python3 -m venv venv
@@ -90,11 +93,29 @@ python main.py
 
 ```bash
 export BOT_TOKEN="123456:ABC..."
-export BOT_PASSWORD="мой_пароль"
 export SESSION_COOKIE="ваш_session_cookie"
 export GEMINI_API_KEY="AIza..."
 export ADMIN_IDS="123456789"
 ```
+
+---
+
+## Обновление бота
+
+На сервере с systemd (после первой установки):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/asto7996-maker/fpc-plugins/cursor/fpc-parity-280c/update_starvell_cardinal.sh | sudo bash
+```
+
+Или из каталога установки:
+
+```bash
+cd /opt/starvell-cardinal
+sudo bash update_starvell_cardinal.sh
+```
+
+В Telegram: `/update` — покажет ту же команду. `/check_updates` — проверка последнего коммита на GitHub.
 
 ---
 
@@ -105,10 +126,15 @@ starvell-cardinal/
 ├── main.py              # Точка входа
 ├── config.py            # Настройки, константы
 ├── starvell_api.py      # Клиент API Starvell
-├── tg_bot.py            # Telegram-интерфейс (aiogram 3)
+├── tg_bot.py            # Реэкспорт Telegram-бота
+├── tg_bot/              # Меню, команды, клавиатуры (стиль FPC)
+├── cardinal.py          # Ядро (аналог cardinal FPC)
+├── handlers.py          # Встроенные обработчики
+├── utils/tools.py       # Бэкап, логи, /sys
+├── update_starvell_cardinal.sh
 ├── automation.py        # Фоновая автоматизация
 ├── database.py          # SQLite
-├── ai_service.py        # OpenAI / Gemini
+├── ai_service.py        # Gemini
 ├── plugin_manager.py    # Система плагинов
 ├── requirements.txt
 ├── install_starvell_cardinal.sh
@@ -137,6 +163,14 @@ starvell-cardinal/
 | `/profile` | Аккаунт Starvell |
 | `/plugins` | Плагины |
 | `/restart` | Перезапуск |
+| `/about` | О боте |
+| `/sys` | Нагрузка CPU/RAM |
+| `/logs` | Архив логов |
+| `/golden_key` | Привязка session cookie |
+| `/ban`, `/unban`, `/black_list` | Чёрный список |
+| `/watermark` | Водяной знак в сообщениях |
+| `/check_updates`, `/update` | Проверка и команда обновления |
+| `/create_backup`, `/get_backup` | Резервная копия |
 
 ### Главное меню (инлайн-кнопки)
 
@@ -177,7 +211,7 @@ class Plugin:
     def unload(self): ...     # отписка от событий
 ```
 
-События: `on_message`, `on_order`, `on_order_completed`
+События: `on_message`, `on_order`, хуки `BIND_TO_NEW_ORDER`, `BIND_TO_NEW_MESSAGE`, `BIND_TO_PRE_INIT`
 
 Состояние (вкл/выкл): `storage/plugins/state.json`
 

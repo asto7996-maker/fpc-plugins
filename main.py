@@ -11,11 +11,11 @@ import logging
 import sys
 from logging.handlers import RotatingFileHandler
 
-from ai_service import AIService
 from automation import AutomationEngine
+from cardinal import Cardinal, EventManager
 from config import LOGS_DIR, VERSION, create_default_settings_file, load_settings
 from database import Database
-from plugin_manager import CardinalCore, EventManager, PluginManager
+from plugin_manager import PluginManager
 from tg_bot import TelegramBot
 
 
@@ -62,18 +62,26 @@ async def main() -> None:
     await db.sync_feature_flags(settings)
 
     event_manager = EventManager()
-    cardinal = CardinalCore(settings, db, event_manager)
+    cardinal = Cardinal(settings, db, event_manager)
     plugin_manager = PluginManager(cardinal)
+    cardinal.plugin_manager = plugin_manager
     plugin_manager.load_all()
 
     tg_bot: TelegramBot | None = None
     automation = AutomationEngine(db, cardinal)
 
-    async def notify(text: str, notify_type: str = "notify_orders") -> None:
-        if tg_bot:
+    async def notify(text: str, notify_type: str = "notify_orders", **extra) -> None:
+        if not tg_bot:
+            return
+        if extra.get("order_id"):
+            await tg_bot.notify_order(text, str(extra["order_id"]), str(extra.get("chat_id") or ""))
+        elif extra.get("chat_id") and notify_type == "notify_chats":
+            await tg_bot.notify_chat(text, str(extra["chat_id"]))
+        else:
             await tg_bot.broadcast(text, notify_type)
 
     automation.notify_cb = notify
+    cardinal.set_notify_callback(notify)
 
     tg_bot = TelegramBot(settings, db, cardinal, plugin_manager, automation)
 

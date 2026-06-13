@@ -2,7 +2,7 @@
 # Starvell Cardinal — установка на Ubuntu 24.04 / Debian
 #
 # Одной командой (скачать и установить):
-#   curl -fsSL https://raw.githubusercontent.com/asto7996-maker/fpc-plugins/cursor/starvell-cardinal-bot-280c/install_starvell_cardinal.sh | sudo bash
+#   curl -fsSL https://raw.githubusercontent.com/asto7996-maker/fpc-plugins/cursor/fpc-parity-280c/install_starvell_cardinal.sh | sudo bash
 #
 # Или из уже скачанного репозитория:
 #   cd fpc-plugins && sudo bash install_starvell_cardinal.sh
@@ -12,7 +12,7 @@ set -euo pipefail
 INSTALL_DIR="${INSTALL_DIR:-/opt/starvell-cardinal}"
 SERVICE_USER="${SERVICE_USER:-starvell}"
 REPO_URL="${REPO_URL:-https://github.com/asto7996-maker/fpc-plugins.git}"
-REPO_BRANCH="${REPO_BRANCH:-cursor/starvell-cardinal-bot-280c}"
+REPO_BRANCH="${REPO_BRANCH:-cursor/fpc-parity-280c}"
 TMP_CLONE=""
 
 echo "=============================================="

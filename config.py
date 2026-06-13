@@ -20,7 +20,11 @@ DB_PATH = STORAGE_DIR / "cardinal.sqlite3"
 SETTINGS_PATH = CONFIG_DIR / "settings.json"
 PLUGIN_STATE_PATH = STORAGE_DIR / "plugins" / "state.json"
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
+GITHUB_REPO = "asto7996-maker/fpc-plugins"
+GITHUB_BRANCH = "cursor/fpc-parity-280c"
+BACKUP_DIR = STORAGE_DIR / "backups"
+PRODUCTS_DIR = STORAGE_DIR / "products"
 
 DEFAULT_AI_SYSTEM_PROMPT = (
     "Ты — дружелюбный и профессиональный менеджер магазина на Starvell. "
@@ -56,12 +60,32 @@ class Settings:
     starvell_username: str = ""
     accounts: list[StarvellAccount] = field(default_factory=list)
 
-    # Функции
+    # Функции (как в FunPay Cardinal — секция main)
     auto_delivery_enabled: bool = True
     auto_bump_enabled: bool = True
     auto_welcome_enabled: bool = True
     auto_review_enabled: bool = True
+    auto_response_enabled: bool = True
     ai_replies_enabled: bool = False
+    multi_delivery: bool = True
+    order_confirm_enabled: bool = True
+
+    # Приветствие (gr)
+    greetings_only_new_chats: bool = False
+    greetings_ignore_system: bool = True
+
+    # Подтверждение заказа (oc)
+    order_confirm_text: str = "Спасибо за подтверждение заказа! Будем рады видеть вас снова! ⭐"
+
+    # Ответы на отзывы по звёздам (rr) — 1..5
+    review_replies: dict[str, str] = field(default_factory=lambda: {
+        "5": "Большое спасибо за отличный отзыв! ⭐",
+        "4": "Спасибо за хорошую оценку! Рады, что всё понравилось 😊",
+        "3": "Спасибо за отзыв! Если что-то можно улучшить — напишите нам.",
+        "2": "Жаль, что не всё идеально. Мы уже работаем над улучшением сервиса.",
+        "1": "Нам очень жаль за негативный опыт. Напишите в чат — разберёмся лично.",
+    })
+    review_use_gemini: bool = True
 
     # Тайминги
     chat_poll_interval: float = 5.0
@@ -121,7 +145,7 @@ class Settings:
         return bool(self.gemini_api_key.strip())
 
     def ensure_dirs(self) -> None:
-        for path in (CONFIG_DIR, STORAGE_DIR, LOGS_DIR, PLUGINS_DIR, PLUGIN_STATE_PATH.parent):
+        for path in (CONFIG_DIR, STORAGE_DIR, LOGS_DIR, PLUGINS_DIR, PLUGIN_STATE_PATH.parent, BACKUP_DIR, PRODUCTS_DIR):
             path.mkdir(parents=True, exist_ok=True)
 
 
@@ -159,9 +183,12 @@ def load_settings() -> Settings:
     if "accounts" in data and isinstance(data["accounts"], list):
         settings.accounts = [_account_from_dict(a) for a in data["accounts"] if isinstance(a, dict)]
 
-    skip = {"accounts", "bot_password_md5", "bot_password", "openai_api_key", "ai_provider", "openai_model"}
+    skip = {"accounts", "bot_password_md5", "bot_password", "openai_api_key", "ai_provider", "openai_model", "review_replies"}
     for key, value in data.items():
         if key in skip:
+            continue
+        if key == "review_replies" and isinstance(value, dict):
+            settings.review_replies.update({str(k): str(v) for k, v in value.items()})
             continue
         if hasattr(settings, key):
             setattr(settings, key, value)
