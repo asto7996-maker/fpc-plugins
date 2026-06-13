@@ -188,6 +188,13 @@ class TelegramBot:
         r.callback_query.register(self.cb_edit_bump, F.data == CB["edit_bump"])
         r.callback_query.register(self.cb_edit_delivery, F.data == CB["edit_delivery"])
 
+        # Premium UI layer (пагинация плагинов, скелетоны загрузки)
+        try:
+            from handlers.tg.plugins_panel import create_premium_router
+            self.dp.include_router(create_premium_router(self))
+        except Exception as exc:
+            logger.warning("Premium UI router: %s", exc)
+
     # ── Клавиатуры ────────────────────────────────────────────────────────
 
     def _flag(self, on: bool) -> str:

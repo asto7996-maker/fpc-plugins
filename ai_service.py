@@ -49,8 +49,21 @@ class AIService:
     ) -> str | None:
         if not self.settings.gemini_api_key.strip():
             return None
+        blocked = self.check_blacklist(buyer_message)
+        if blocked:
+            logger.warning("AI blacklist triggered: %s", blocked)
+            return None
         prompt = self._build_prompt(buyer_message, chat_history or [], product_hint)
         return await self._gemini(prompt)
+
+    def check_blacklist(self, text: str) -> str | None:
+        """Возвращает найденное слово или None."""
+        text_l = text.lower()
+        for word in self.settings.ai_word_blacklist:
+            w = word.strip().lower()
+            if w and w in text_l:
+                return w
+        return None
 
     async def generate_review_text(self, order: dict[str, Any]) -> str:
         offer = order.get("offerDetails") or {}

@@ -6,13 +6,16 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 import time
 from typing import Any, Callable, Awaitable
 
 from ai_service import AIService
 from config import Settings, load_settings
 from database import Database
-from handlers import BuiltinHandlers
+from handlers.builtin import BuiltinHandlers
+from core.delivery.templates import append_refund_disclaimer, render_delivery_template
+from core.security.payment_guard import PaymentGuard
 from plugin_manager import PluginContext
 from starvell_api import StarvellAPI
 
@@ -54,6 +57,7 @@ class AutomationEngine:
         self._apis: dict[str, StarvellAPI] = {}
         self._ai = AIService(load_settings())
         self._handlers = BuiltinHandlers(cardinal)
+        self._payment_guard = PaymentGuard()
 
     async def notify(self, text: str, notify_type: str = "notify_orders", **extra) -> None:
         if self.notify_cb:
@@ -72,7 +76,13 @@ class AutomationEngine:
 
     def _build_api(self, account) -> StarvellAPI:
         settings = self._get_settings()
-        return StarvellAPI(
+        try:
+            from api.starvell_client import StarvellClient
+
+            cls = StarvellClient
+        except ImportError:
+            cls = StarvellAPI
+        return cls(
             session_cookie=account.session_cookie,
             sid_cookie=account.sid_cookie,
             my_games_cookie=account.my_games_cookie,
@@ -205,6 +215,7 @@ class AutomationEngine:
             order_id=order_id,
         )
         await self.cardinal.dispatch_plugins("BIND_TO_NEW_ORDER", order)
+        await self.cardinal.events.emit("order:paid", {"order": order, "account": account_name})
 
         # Плагины
         ctx = PluginContext(api, self.db, settings, account_name)
@@ -227,7 +238,17 @@ class AutomationEngine:
             return
 
         content = "\n".join(codes)
-        delivery_text = settings.delivery_template.format(product=product_name, content=content)
+        delivery_text = render_delivery_template(
+            settings.delivery_template,
+            username=buyer,
+            order_id=order_id,
+            product_name=product_name,
+            product=product_name,
+            content=content,
+            price=price,
+            quantity=qty,
+        )
+        delivery_text = append_refund_disclaimer(delivery_text, strict=True)
         delivery_text = api.apply_watermark(delivery_text, settings.watermark_on, settings.watermark_text)
 
         buyer_id = (order.get("user") or {}).get("id")
@@ -483,6 +504,17 @@ class AutomationEngine:
                         username = (p or {}).get("username") or ""
                         break
 
+                text = str(msg.get("content") or msg.get("text") or "").strip()
+                guard = self._payment_guard.inspect(text)
+                if guard.is_suspicious:
+                    await self.notify(
+                        self._payment_guard.format_admin_alert(username, chat_id, text),
+                        "notify_chats",
+                        chat_id=chat_id,
+                    )
+                    await self.db.set_last_notified_message(chat_id, mid, account_name)
+                    continue
+
                 prev_buyer_ts = await self.db.get_chat_last_user_message_at(chat_id, account_name)
                 msg_ts = _message_ts(msg) or int(time.time())
                 await self.db.set_chat_last_user_message_at(chat_id, msg_ts, account_name)
@@ -541,6 +573,16 @@ class AutomationEngine:
         self._ai.settings = settings
         reply = await self._ai.generate_reply(buyer_message, history)
         if not reply:
+            blocked = self._ai.check_blacklist(buyer_message)
+            if blocked and settings.ai_blacklist_alert:
+                await self.notify(
+                    f"⚡️ <b>ИИ отключён</b> — чёрный список слов\n"
+                    f"Слово: <code>{blocked}</code>\n"
+                    f"Чат: <code>{chat_id[:12]}</code>\n"
+                    f"<i>Требуется живой оператор.</i>",
+                    "notify_chats",
+                    chat_id=chat_id,
+                )
             return
         reply = api.apply_watermark(reply, settings.watermark_on, settings.watermark_text)
         try:
@@ -558,6 +600,8 @@ class AutomationEngine:
                 await asyncio.sleep(60)
                 continue
             interval = max(300.0, settings.bump_interval)
+            jitter = random.randint(settings.bump_jitter_min, settings.bump_jitter_max)
+            interval = max(60.0, interval + jitter)
             try:
                 await self._do_bump(account_name, api, settings)
             except Exception as exc:

@@ -20,7 +20,7 @@ DB_PATH = STORAGE_DIR / "cardinal.sqlite3"
 SETTINGS_PATH = CONFIG_DIR / "settings.json"
 PLUGIN_STATE_PATH = STORAGE_DIR / "plugins" / "state.json"
 
-VERSION = "1.2.0"
+VERSION = "2.0.0"
 GITHUB_REPO = "asto7996-maker/fpc-plugins"
 GITHUB_BRANCH = "cursor/fpc-parity-280c"
 BACKUP_DIR = STORAGE_DIR / "backups"
@@ -34,6 +34,14 @@ DEFAULT_AI_SYSTEM_PROMPT = (
 REFUND_DISCLAIMER = (
     "⚠️ ВАЖНО! Совершая покупку, вы автоматически соглашаетесь с правилами магазина. "
     "Возврат средств (рефанд) не предусмотрен ни при каких условиях."
+)
+
+REFUND_DISCLAIMER_STRICT = (
+    "━━━━━━━━━━━━━━━━━━\n"
+    "⚠️ <b>ВНИМАНИЕ:</b> Совершая покупку, вы <b>безоговорочно</b> соглашаетесь "
+    "с правилами магазина.\n\n"
+    "❌ <b>ВОЗВРАТ СРЕДСТВ НЕ ПРЕДУСМОТРЕН НИ ПРИ КАКИХ УСЛОВИЯХ.</b>\n"
+    "━━━━━━━━━━━━━━━━━━"
 )
 
 
@@ -92,6 +100,8 @@ class Settings:
     chat_poll_interval: float = 5.0
     orders_poll_interval: float = 10.0
     bump_interval: float = 3600.0
+    bump_jitter_min: int = -30
+    bump_jitter_max: int = 45
     api_delay_seconds: float = 1.5
     api_max_per_minute: int = 40
 
@@ -102,13 +112,12 @@ class Settings:
     welcome_cooldown_minutes: int = 2880  # 2 суток — повторное приветствие после молчания
 
     delivery_template: str = (
-        "✅ Ваш заказ выполнен!\n\n"
-        "{product}\n\n"
-        "📦 Товар:\n{content}\n\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        "⚠️ ВАЖНО! Совершая покупку, вы автоматически соглашаетесь с правилами магазина.\n"
-        "❌ Возврат средств (рефанд) не предусмотрен ни при каких условиях.\n"
-        "━━━━━━━━━━━━━━━━━━"
+        "✅ <b>Ваш заказ #{order_id} выполнен!</b>\n\n"
+        "📦 <b>{product_name}</b>\n"
+        "👤 {username}\n"
+        "📅 {date}\n\n"
+        "<code>{content}</code>\n\n"
+        f"{REFUND_DISCLAIMER_STRICT}"
     )
 
     review_template: str = (
@@ -120,6 +129,11 @@ class Settings:
     gemini_api_key: str = ""
     gemini_model: str = "gemini-2.0-flash"
     ai_system_prompt: str = DEFAULT_AI_SYSTEM_PROMPT
+    ai_word_blacklist: list[str] = field(default_factory=lambda: [
+        "взлом", "чит", "обман", "скам", "refund", "возврат", "арбитраж", "мошенник",
+    ])
+    ai_blacklist_alert: bool = True
+    language: str = "ru"
 
     watermark_on: bool = False
     watermark_text: str = "[Starvell Cardinal]"

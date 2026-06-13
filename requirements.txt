@@ -4,3 +4,6 @@ aiosqlite>=0.19.0
 pydantic>=2.7.0,<3.0.0
 colorama>=0.4.6
 psutil>=6.0.0
+sqlalchemy[asyncio]>=2.0.0
+apscheduler>=3.10.0
+fluentogram>=1.1.0

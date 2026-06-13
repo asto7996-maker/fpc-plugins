@@ -1,5 +1,5 @@
 """
-Встроенные обработчики событий (аналог handlers.py в FunPay Cardinal).
+Встроенные обработчики событий Starvell (не Telegram).
 """
 
 from __future__ import annotations
@@ -15,7 +15,6 @@ logger = logging.getLogger("starvell.handlers")
 
 
 def format_vars(text: str, **kwargs: Any) -> str:
-    """Подстановка переменных $username, $order_id, $product и т.д."""
     for key, val in kwargs.items():
         text = text.replace(f"${key}", str(val))
         text = text.replace(f"{{{key}}}", str(val))
@@ -23,8 +22,6 @@ def format_vars(text: str, **kwargs: Any) -> str:
 
 
 class BuiltinHandlers:
-    """Обработчики автоматизации Starvell."""
-
     def __init__(self, cardinal: Any) -> None:
         self.cardinal = cardinal
         self._ai = AIService(load_settings())
@@ -44,17 +41,13 @@ class BuiltinHandlers:
         username: str,
         settings: Settings,
     ) -> bool:
-        """Возвращает True если сообщение обработано автоответчиком."""
         if await self.db.is_blacklisted(username=username, starvell_user_id=author_id, check="block_response"):
             return False
-
         if not await self.db.get_feature_flag("auto_response", settings.auto_response_enabled):
             return False
-
         ar = await self.db.find_ar_response(text)
         if not ar:
             return False
-
         reply = format_vars(ar["response"], username=username, chat_id=chat_id)
         reply = api.apply_watermark(reply, settings.watermark_on, settings.watermark_text)
         try:
@@ -80,56 +73,39 @@ class BuiltinHandlers:
     ) -> None:
         if not await self.db.get_feature_flag("auto_welcome", settings.auto_welcome_enabled):
             return
-
         inactivity_sec = max(1, settings.welcome_inactivity_days) * 86400
         last_welcome_at = await self.db.get_last_welcome_at(chat_id)
         now = int(time.time())
-
-        # Новый чат — покупатель пишет впервые с момента установки бота
         is_new_chat = previous_buyer_message_at is None and last_welcome_at is None
-
-        # Покупатель вернулся после паузы (минимум N дней без сообщений)
         returned_after_pause = (
             previous_buyer_message_at is not None
             and (now - previous_buyer_message_at) >= inactivity_sec
         )
-
         if settings.greetings_only_new_chats:
             if not is_new_chat and not returned_after_pause:
                 return
         elif last_welcome_at and (now - last_welcome_at) < inactivity_sec:
             return
-
         text = api.apply_watermark(settings.welcome_text, settings.watermark_on, settings.watermark_text)
         try:
             await api.send_message(chat_id, text)
             await self.db.mark_chat_welcomed(chat_id)
-            logger.info(
-                "welcome sent chat=%s new=%s after_pause=%s",
-                chat_id[:8],
-                is_new_chat,
-                returned_after_pause,
-            )
         except Exception as exc:
             logger.warning("welcome failed: %s", exc)
 
     async def on_order_completed(
         self, *, order: dict, api: Any, settings: Settings, account_name: str
     ) -> str | None:
-        """Благодарность / ответ на отзыв после COMPLETED."""
         if not await self.db.get_feature_flag("auto_review", settings.auto_review_enabled):
             return None
-
         order_id = str(order.get("id"))
         review = order.get("review") or {}
         stars = str(review.get("stars") or review.get("rating") or "5")
-
         if settings.review_use_gemini and settings.gemini_api_key:
             self._ai.settings = settings
             text = await self._ai.generate_review_text(order)
         else:
             text = settings.review_replies.get(stars) or settings.review_template
-
         text = format_vars(text, order_id=order_id, product=self._product_name(order))
         return api.apply_watermark(text, settings.watermark_on, settings.watermark_text)
 
