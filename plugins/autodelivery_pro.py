@@ -1,39 +1,29 @@
 """
-Auto-Delivery Pro — пример продвинутого плагина на BasePlugin.
-
-Демонстрирует:
-- умные плейсхолдеры {username}, {order_id}, {date}, {product_name}
-- доступ к BotCore и API
-- жёсткий дисклеймер о невозврате
+Auto-Delivery Pro — нативный плагин Starvell с кастомными шаблонами выдачи.
 """
 
 from __future__ import annotations
 
-import logging
-from typing import Any
-
 from core.delivery.templates import append_refund_disclaimer, render_delivery_template
-from core.plugins.base import BasePlugin
-
-logger = logging.getLogger("starvell.plugin.autodelivery_pro")
+from starvell_sdk import DeliveryContext, OrderContext, StarvellPlugin, on_order_paid, on_pre_delivery
 
 NAME = "Auto-Delivery Pro"
 UUID = "autodelivery-pro"
-VERSION = "2.0.0"
+VERSION = "2.1.0"
 DESCRIPTION = "Автовыдача 2.0 с умными плейсхолдерами и шаблонами"
 CREDITS = "Starvell Cardinal Team"
-SETTINGS_CALLBACK = "sc:adel"
+SETTINGS_PAGE = True
 
 
-class Plugin(BasePlugin):
-    """Плагин автовыдачи — расширяет встроенную логику шаблонами."""
+class Plugin(StarvellPlugin):
+    """Переопределяет текст автовыдачи через @on_pre_delivery."""
 
     NAME = NAME
     UUID = UUID
     VERSION = VERSION
     DESCRIPTION = DESCRIPTION
     CREDITS = CREDITS
-    SETTINGS_CALLBACK = SETTINGS_CALLBACK
+    SETTINGS_PAGE = True
 
     DEFAULT_TEMPLATE = (
         "✅ <b>Заказ #{order_id} выполнен!</b>\n\n"
@@ -43,20 +33,35 @@ class Plugin(BasePlugin):
         "<code>{content}</code>"
     )
 
-    def on_load(self) -> None:
-        self.logger.info("Auto-Delivery Pro v%s загружен", VERSION)
-        self.core.events.on("order:paid", self._on_order_paid)
+    def get_settings_schema(self) -> list[dict]:
+        return [
+            {"key": "use_custom_template", "label": "Свой шаблон", "type": "bool", "default": False},
+            {"key": "custom_template", "label": "Шаблон выдачи", "type": "text", "default": ""},
+        ]
 
-    def on_unload(self) -> None:
-        self.core.events.off("order:paid", self._on_order_paid)
-        self.logger.info("Auto-Delivery Pro выгружен")
+    @on_order_paid
+    async def on_paid(self, ctx: OrderContext) -> None:
+        self.log("Заказ #%s оплачен (%s)", ctx.order_id, ctx.product_name)
 
-    async def _on_order_paid(self, payload: dict[str, Any]) -> None:
-        """Дополнительная обработка (основная выдача — в automation)."""
-        order = payload.get("order") or {}
-        order_id = str(order.get("id") or "")
-        if order_id:
-            self.logger.debug("order:paid hook #%s", order_id)
+    @on_pre_delivery
+    async def customize_delivery(self, ctx: DeliveryContext) -> None:
+        if not await self.get_cfg("use_custom_template", False):
+            return
+        template = await self.get_cfg("custom_template", "") or self.DEFAULT_TEMPLATE
+        content = "\n".join(ctx.codes)
+        ctx.delivery_text = self.build_delivery_message(
+            template=template,
+            username=ctx.buyer_username,
+            order_id=ctx.order_id,
+            product_name=ctx.product_name,
+            content=content,
+            price=ctx.price,
+            quantity=ctx.quantity,
+        )
+        api = ctx.api()
+        if api:
+            s = ctx.settings
+            ctx.delivery_text = api.apply_watermark(ctx.delivery_text, s.watermark_on, s.watermark_text)
 
     def build_delivery_message(
         self,
@@ -69,7 +74,6 @@ class Plugin(BasePlugin):
         price: str | float = "",
         quantity: int = 1,
     ) -> str:
-        """Формирует сообщение выдачи с плейсхолдерами и дисклеймером."""
         text = render_delivery_template(
             template or self.DEFAULT_TEMPLATE,
             username=username,
@@ -81,13 +85,3 @@ class Plugin(BasePlugin):
             quantity=quantity,
         )
         return append_refund_disclaimer(text, strict=True)
-
-    @staticmethod
-    def extract_product_name(order: dict) -> str:
-        offer = order.get("offerDetails") or {}
-        desc = (offer.get("descriptions") or {}).get("rus") or {}
-        return (
-            str(desc.get("briefDescription") or "").strip()
-            or str(desc.get("description") or "").strip()
-            or "товар"
-        )

@@ -88,8 +88,9 @@ class Application:
             self.tg_bot.dp.include_router(self.core.telegram.router)
 
     async def start(self) -> None:
-        assert self.automation and self.tg_bot
+        assert self.automation and self.tg_bot and self.plugin_engine
         await self.automation.start()
+        await self.plugin_engine.startup_starvell_plugins()
         self._hot_reload_task = asyncio.create_task(self._watch_plugins())
         try:
             await self.tg_bot.start_polling()
@@ -120,6 +121,7 @@ class Application:
         if self.automation:
             await self.automation.stop()
         if self.plugin_engine:
+            await self.plugin_engine.shutdown_starvell_plugins()
             self.plugin_engine.unload_all()
         if self.tg_bot:
             await self.tg_bot.stop()

@@ -24,12 +24,14 @@ def plugins_panel_keyboard(
     rows: list[list[InlineKeyboardButton]] = []
     for rec in chunk:
         pin = "📌 " if getattr(rec, "pinned", False) else ""
+        native = " ⭐" if getattr(rec, "is_starvell_native", False) else ""
+        fpc = " 🎮" if getattr(rec, "is_fpc_only", False) else ""
         hook = " 🔗" if getattr(rec, "hook_only", False) else ""
         st = flag(rec.enabled)
         err = " ⚠️" if rec.load_error else ""
         rows.append([
             InlineKeyboardButton(
-                text=f"{pin}{st} {rec.name} v{rec.version}{hook}{err}",
+                text=f"{pin}{st} {rec.name} v{rec.version}{native}{fpc}{hook}{err}",
                 callback_data=f"{CBT.PLUGIN_TOGGLE}{rec.uuid}",
             ),
         ])
@@ -46,6 +48,9 @@ def plugins_panel_keyboard(
     pag = pagination_row(page, total, "plugins:")
     if pag:
         rows.append(pag)
+    rows.append([
+        InlineKeyboardButton(text="📤 Загрузить плагин", callback_data=CBT.PLUGIN_UPLOAD),
+    ])
     rows.append(nav_row(back=CBT.HOME, refresh=CBT.PLUGINS))
     return build_keyboard(rows)
 
@@ -57,5 +62,5 @@ def plugins_panel_text(records: list[Any], page: int, total_pages: int) -> str:
         "━━━━━━━━━━━━━━━━━━\n"
         f"Активно: <b>{enabled}</b> / {len(records)}\n"
         f"Страница {page} / {total_pages}\n\n"
-        "<i>🟢 Вкл · 🔴 Выкл · 📌 Закреп · ⚙️ Настройки · 🔗 Hook-only</i>"
+        "<i>🟢 Вкл · 🔴 Выкл · ⭐ Starvell · 🎮 FPC · 📌 Закреп · ⚙️ Настройки</i>"
     )

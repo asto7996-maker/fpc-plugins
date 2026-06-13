@@ -15,6 +15,8 @@ from config import Settings, load_settings
 from database import Database
 from handlers.builtin import BuiltinHandlers
 from core.delivery.templates import append_refund_disclaimer, render_delivery_template
+from core.plugins.context import BumpContext, DeliveryContext, MessageContext, OrderContext
+from core.plugins.hooks import STV_BUMP, STV_MESSAGE, STV_ORDER_COMPLETED, STV_ORDER_PAID, STV_ORDER_STATUS, STV_POST_DELIVERY, STV_PRE_DELIVERY
 from core.security.payment_guard import PaymentGuard
 from plugin_manager import PluginContext
 from starvell_api import StarvellAPI
@@ -70,6 +72,21 @@ class AutomationEngine:
                     await self.notify_cb(text)
             except Exception as exc:
                 logger.warning("notify failed: %s", exc)
+
+    def _plugin_engine(self) -> Any | None:
+        return getattr(self.cardinal, "plugin_manager", None)
+
+    async def _emit_starvell(self, event: str, ctx: Any) -> None:
+        pe = self._plugin_engine()
+        if pe and hasattr(pe, "emit_starvell"):
+            await pe.emit_starvell(event, ctx)
+
+    async def _build_order_ctx(self, account_name: str, order: dict) -> OrderContext:
+        ctx = OrderContext.from_order(self.cardinal, order, account_name)
+        api = self.cardinal.get_api(account_name)
+        if api and ctx.buyer_id:
+            ctx.chat_id = await api.find_chat_by_buyer(int(ctx.buyer_id))
+        return ctx
 
     def _get_settings(self) -> Settings:
         return load_settings()
@@ -183,6 +200,8 @@ class AutomationEngine:
                 await self.db.set_order_status(order_id, status, account_name)
             elif prev != status:
                 await self.db.set_order_status(order_id, status, account_name)
+                order_ctx = await self._build_order_ctx(account_name, order)
+                await self._emit_starvell(STV_ORDER_STATUS, order_ctx)
                 if status == "COMPLETED":
                     if await self.db.get_feature_flag("auto_review", settings.auto_review_enabled):
                         await self._handle_completed_order(account_name, api, settings, order)
@@ -217,7 +236,10 @@ class AutomationEngine:
         await self.cardinal.dispatch_plugins("BIND_TO_NEW_ORDER", order)
         await self.cardinal.events.emit("order:paid", {"order": order, "account": account_name})
 
-        # Плагины
+        order_ctx = await self._build_order_ctx(account_name, order)
+        await self._emit_starvell(STV_ORDER_PAID, order_ctx)
+
+        # Плагины (legacy EventManager)
         ctx = PluginContext(api, self.db, settings, account_name)
         await self.cardinal.event_manager.dispatch("on_order", {"order": order, "ctx": ctx})
 
@@ -251,16 +273,46 @@ class AutomationEngine:
         delivery_text = append_refund_disclaimer(delivery_text, strict=True)
         delivery_text = api.apply_watermark(delivery_text, settings.watermark_on, settings.watermark_text)
 
-        buyer_id = (order.get("user") or {}).get("id")
-        chat_id = await api.find_chat_by_buyer(int(buyer_id)) if buyer_id else None
+        delivery_ctx = DeliveryContext(
+            core=self.cardinal,
+            account_name=account_name,
+            order=order,
+            order_id=order_id,
+            status=str(order.get("status") or ""),
+            buyer_username=buyer,
+            buyer_id=(order.get("user") or {}).get("id"),
+            product_name=product_name,
+            price=price,
+            quantity=qty,
+            chat_id=order_ctx.chat_id,
+            delivery_text=delivery_text,
+            codes=codes,
+        )
+        await self._emit_starvell(STV_PRE_DELIVERY, delivery_ctx)
+        if delivery_ctx.skip_delivery:
+            logger.info("Заказ #%s: автовыдача отменена плагином", order_id)
+            return
+
+        delivery_text = delivery_ctx.delivery_text or delivery_text
+        buyer_id = delivery_ctx.buyer_id
+        chat_id = delivery_ctx.chat_id
+        if not chat_id and buyer_id:
+            chat_id = await api.find_chat_by_buyer(int(buyer_id))
+            delivery_ctx.chat_id = chat_id
+
         if chat_id:
             try:
                 await api.send_message(chat_id, delivery_text)
+                delivery_ctx.success = True
                 await self.notify(f"✅ Заказ #{order_id} оплачен. Товар выдан успешно.", "notify_delivery")
             except Exception as exc:
+                delivery_ctx.error = str(exc)
                 await self.notify(f"❌ Заказ #{order_id}: ошибка выдачи — {exc}", "notify_delivery")
         else:
+            delivery_ctx.error = "chat_not_found"
             await self.notify(f"⚠️ Заказ #{order_id}: товар готов, но чат с покупателем не найден", "notify_delivery")
+
+        await self._emit_starvell(STV_POST_DELIVERY, delivery_ctx)
 
     async def _handle_completed_order(
         self, account_name: str, api: StarvellAPI, settings: Settings, order: dict
@@ -299,6 +351,8 @@ class AutomationEngine:
             await self.db.mark_order_reviewed(order_id, account_name)
             await self.notify(f"⭐ Заказ #{order_id} завершён. Благодарность отправлена.", "notify_orders")
 
+        order_ctx = await self._build_order_ctx(account_name, order)
+        await self._emit_starvell(STV_ORDER_COMPLETED, order_ctx)
         await self.cardinal.event_manager.dispatch("on_order_completed", {"order": order, "account": account_name})
 
     async def _bootstrap_orders(self, account_name: str, api: StarvellAPI) -> None:
@@ -548,6 +602,18 @@ class AutomationEngine:
                 if await self.db.get_feature_flag("ai_replies", settings.ai_replies_enabled):
                     await self._maybe_ai_reply(account_name, api, settings, chat_id, text, messages)
 
+                msg_ctx = MessageContext(
+                    core=self.cardinal,
+                    account_name=account_name,
+                    chat_id=chat_id,
+                    text=text,
+                    author_id=author_id,
+                    username=username,
+                    message_id=mid or "",
+                    raw_message=msg,
+                )
+                await self._emit_starvell(STV_MESSAGE, msg_ctx)
+
                 ctx = PluginContext(api, self.db, settings, account_name)
                 ctx.chat_id = chat_id
                 ctx.message_author_id = author_id
@@ -634,6 +700,13 @@ class AutomationEngine:
 
         if bumped and settings.notify_bump:
             await self.notify(f"📈 [{account_name}] Лоты подняты ({bumped} категорий)", "notify_bump")
+
+        bump_ctx = BumpContext(
+            core=self.cardinal,
+            account_name=account_name,
+            categories_bumped=bumped,
+        )
+        await self._emit_starvell(STV_BUMP, bump_ctx)
 
     async def get_status(self) -> dict[str, Any]:
         """Сводка для Telegram-меню."""

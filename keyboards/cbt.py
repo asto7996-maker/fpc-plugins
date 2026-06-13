@@ -25,6 +25,7 @@ PLUGIN_RESET = "sc:plugrst:"
 PLUGIN_PIN = "sc:plugpin:"
 EDIT_PLUGIN = "sc:editplug:"
 PLUGIN_PAGE = "sc:plugpage:"
+PLUGIN_UPLOAD = "sc:plugupload"
 
 # Пагинация
 PAGE_PREV = "sc:page:prev:"

@@ -16,8 +16,9 @@ from dataclasses import dataclass, field
 from types import ModuleType
 from typing import Any, Callable
 
-from config import PLUGINS_DIR, PLUGIN_STATE_PATH
+from config import BASE_DIR, PLUGINS_DIR, PLUGIN_STATE_PATH
 from core.plugins.base import BasePlugin
+from core.plugins.starvell_plugin import StarvellPlugin
 from core.plugins.scheduler import TaskScheduler
 
 logger = logging.getLogger("starvell.plugins.engine")
@@ -41,6 +42,8 @@ class PluginRecord:
     hook_only: bool = False
     has_settings_page: bool = False
     pinned: bool = False
+    is_starvell_native: bool = False
+    is_fpc_only: bool = False
 
 
 class PluginEngine:
@@ -61,8 +64,10 @@ class PluginEngine:
         if state_dir:
             os.makedirs(state_dir, exist_ok=True)
         abs_plugins = os.path.abspath(self.root_dir)
-        if abs_plugins not in sys.path:
-            sys.path.insert(0, abs_plugins)
+        abs_root = os.path.abspath(str(BASE_DIR))
+        for p in (abs_root, abs_plugins):
+            if p not in sys.path:
+                sys.path.insert(0, p)
 
     def _load_state(self) -> None:
         self._ensure_dirs()
@@ -108,19 +113,36 @@ class PluginEngine:
         )
         return {m.group(1): m.group(2) for m in pat.finditer(text)}
 
-    def _instantiate(self, module: ModuleType, meta: dict[str, str]) -> tuple[Any | None, bool, str | None]:
+    def _is_fpc_only_plugin(self, file_path: str) -> bool:
+        """Плагины FunPay Cardinal (FunPayAPI/telebot) не запускаются в Starvell."""
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                text = f.read(12000)
+        except Exception:
+            return False
+        if "starvell_sdk" in text or "StarvellPlugin" in text:
+            return False
+        markers = (
+            "from FunPayAPI",
+            "from cardinal import Cardinal",
+            "import telebot",
+            "FunPay Cardinal plugin",
+        )
+        return any(m in text for m in markers)
+
+    def _instantiate(self, module: ModuleType, meta: dict[str, str]) -> tuple[Any | None, bool, bool, str | None]:
         config = getattr(self.core.settings, "__dict__", {}) if hasattr(self.core.settings, "__dict__") else {}
         if hasattr(module, "Plugin"):
             try:
                 inst = module.Plugin(self.core, config)
-                is_base = isinstance(inst, BasePlugin) or (
-                    hasattr(module, "Plugin") and issubclass(module.Plugin, BasePlugin)
-                )
-                return inst, is_base, None
+                is_base = isinstance(inst, BasePlugin) or issubclass(module.Plugin, BasePlugin)
+                is_stv = isinstance(inst, StarvellPlugin) or issubclass(module.Plugin, StarvellPlugin)
+                return inst, is_base, is_stv, None
             except Exception as exc:
-                is_base = hasattr(module, "Plugin") and issubclass(getattr(module, "Plugin"), BasePlugin)
-                return None, is_base, str(exc)
-        return None, False, None
+                is_base = issubclass(getattr(module, "Plugin", object), BasePlugin)
+                is_stv = issubclass(getattr(module, "Plugin", object), StarvellPlugin)
+                return None, is_base, is_stv, str(exc)
+        return None, False, False, None
 
     def load_all(self) -> list[PluginRecord]:
         self._load_state()
@@ -157,6 +179,20 @@ class PluginEngine:
 
     def _load_one(self, file_path: str, force_reload: bool = False) -> PluginRecord:
         inline = self._extract_meta(file_path)
+        fpc_only = self._is_fpc_only_plugin(file_path)
+        if fpc_only:
+            return PluginRecord(
+                name=inline.get("NAME", os.path.basename(file_path)),
+                uuid=inline.get("UUID") or os.path.basename(file_path),
+                version=inline.get("VERSION", "?"),
+                description=inline.get("DESCRIPTION", ""),
+                credits=inline.get("CREDITS", ""),
+                path=file_path,
+                module=None,
+                enabled=False,
+                load_error="FPC-only: требует FunPay Cardinal (не Starvell)",
+                is_fpc_only=True,
+            )
         try:
             module = self._import_module(file_path, force_reload=force_reload)
             name = getattr(module, "NAME", None) or inline.get("NAME") or os.path.basename(file_path)
@@ -185,15 +221,15 @@ class PluginEngine:
             )
 
         enabled = uuid not in self.disabled
-        instance, is_base, err = None, False, None
+        instance, is_base, is_stv, err = None, False, False, None
         hooks = self._fpc_hooks(module) if module else {}
         has_hooks = any(hooks.values())
 
         if enabled:
-            instance, is_base, err = self._instantiate(module, inline)
+            instance, is_base, is_stv, err = self._instantiate(module, inline)
             if instance and not err:
                 try:
-                    if is_base:
+                    if is_stv or is_base:
                         instance.on_load()
                     elif hasattr(instance, "setup"):
                         instance.setup()
@@ -205,7 +241,7 @@ class PluginEngine:
         can_run = enabled and (instance is not None or hook_only)
 
         if enabled and not can_run and not has_hooks:
-            err = err or "No Plugin class and no BIND_TO_* hooks"
+            err = err or "Нет class Plugin — см. plugins/README.md"
 
         return PluginRecord(
             name=name,
@@ -223,6 +259,7 @@ class PluginEngine:
             hook_only=hook_only,
             has_settings_page=settings_page and (is_base or bool(settings_cb)),
             pinned=False,
+            is_starvell_native=is_stv,
         )
 
     async def reload_plugin(self, uuid: str) -> PluginRecord | None:
@@ -332,6 +369,58 @@ class PluginEngine:
         for r in records:
             r.pinned = r.uuid in pin_set
         return sorted(records, key=lambda r: (not r.pinned, r.name.lower()))
+
+    async def emit_starvell(self, event: str, ctx: Any) -> None:
+        """Диспетчер нативных событий Starvell для плагинов."""
+        for rec in self.plugins.values():
+            if not rec.enabled or not rec.instance:
+                continue
+            inst = rec.instance
+            if rec.is_starvell_native and hasattr(inst, "_dispatch_with_fallback"):
+                try:
+                    await inst._dispatch_with_fallback(event, ctx)
+                except Exception as exc:
+                    logger.exception("Starvell plugin %s event %s: %s", rec.name, event, exc)
+
+    async def startup_starvell_plugins(self) -> None:
+        """on_startup() для всех нативных плагинов."""
+        for rec in self.plugins.values():
+            if rec.enabled and rec.is_starvell_native and rec.instance:
+                try:
+                    if hasattr(rec.instance, "on_startup"):
+                        await rec.instance.on_startup()
+                except Exception as exc:
+                    logger.exception("startup %s: %s", rec.name, exc)
+
+    async def shutdown_starvell_plugins(self) -> None:
+        for rec in self.plugins.values():
+            if rec.instance and rec.is_starvell_native:
+                try:
+                    if hasattr(rec.instance, "on_shutdown"):
+                        await rec.instance.on_shutdown()
+                except Exception as exc:
+                    logger.exception("shutdown %s: %s", rec.name, exc)
+
+    def validate_plugin_source(self, source: str) -> tuple[bool, str]:
+        """Проверяет исходник плагина перед загрузкой в plugins/."""
+        required = ("NAME", "UUID", "VERSION", "class Plugin")
+        for token in required:
+            if token == "class Plugin":
+                if "class Plugin" not in source:
+                    return False, "Отсутствует class Plugin"
+            elif f'{token} =' not in source and f"{token}=" not in source:
+                return False, f"Отсутствует {token} ="
+        if "StarvellPlugin" not in source and "starvell_sdk" not in source:
+            return False, "Плагин должен наследовать StarvellPlugin (from starvell_sdk import ...)"
+        return True, "OK"
+
+    def save_plugin_file(self, filename: str, content: str) -> str:
+        """Сохраняет .py файл в plugins/ и возвращает путь."""
+        safe = re.sub(r"[^\w\-]", "_", filename.replace(".py", "")) + ".py"
+        path = os.path.join(self.root_dir, safe)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(content)
+        return path
 
     def list_records(self) -> list[PluginRecord]:
         return list(self.plugins.values())

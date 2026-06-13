@@ -1,22 +1,43 @@
-# Это корневой файл правил для Cursor AI.
-# Он определяет контекст и правила для разработки плагинов FunPay Cardinal.
+# Правила разработки плагинов Starvell Cardinal
 
-# Контекст проекта
-Вы - AI-ассистент, специализирующийся на написании кода для плагинов FunPay Cardinal на языке Python.
-Ваша задача - генерировать код плагинов, строго следуя структуре и правилам, описанным ниже.
+Вы — AI-ассистент для написания **нативных** плагинов Starvell Cardinal на Python.
 
-# Правила разработки плагинов FunPay Cardinal
-1.  Каждый плагин должен быть написан на Python 3.8+[reference:6].
-2.  Весь код плагина должен находиться в одном файле `.py`.
-3.  Файл плагина должен содержать класс с именем `Plugin`.
-4.  Класс `Plugin` **ОБЯЗАТЕЛЬНО** должен содержать следующие методы:
-    *   `__init__(self, cardinal, config)`: конструктор, инициализирует плагин.
-    *   `setup(self)`: регистрирует обработчики событий (например, через `self.cardinal.event_manager.register_handler`).
-    *   `unload(self)`: выгружает плагин и отписывается от событий.
-5.  Любая бизнес-логика должна находиться в соответствующих методах-обработчиках (например, `on_message` для сообщений, `on_order` для заказов).
-6.  Для вывода информации в консоль бота используйте `self.logger.info()` (или `debug`, `warning`, `error`), который предоставляется через `import logging`.
-7.  Для отправки сообщений пользователям используйте метод `self.cardinal.send_message(chat_id, text)`.
-8.  Плагин устанавливается простым помещением его `.py` файла в папку `plugins` Cardinal и последующей перезагрузкой бота[reference:7].
+## Контракт плагина
 
-# Задача
-Ваша цель - помочь пользователю разработать плагин для FunPay Cardinal. Следуйте этому файлу правил и всегда имейте его в виду при генерации кода.
+1. Python 3.8+, весь код в одном файле `.py`.
+2. Обязательные метаданные: `NAME`, `UUID`, `VERSION`.
+3. Класс **обязательно** называется `Plugin` и наследует `StarvellPlugin`:
+
+```python
+from starvell_sdk import StarvellPlugin, on_message, MessageContext
+
+NAME = "My Plugin"
+UUID = "unique-uuid-here"
+VERSION = "1.0.0"
+
+class Plugin(StarvellPlugin):
+    @on_message
+    async def on_msg(self, ctx: MessageContext):
+        await ctx.reply("...")
+```
+
+4. Импорт только через `starvell_sdk` (не FunPayAPI, не telebot, не cardinal FPC).
+5. События — декораторы `@on_message`, `@on_order_paid`, `@on_pre_delivery` и т.д.
+6. Логирование: `self.log("...")` или `self.logger.info(...)`.
+7. Ответ покупателю: `await ctx.reply(text)` в `MessageContext`.
+8. Установка: положить `.py` в `plugins/` или загрузить через Telegram (📤).
+
+## Не использовать (FPC-only)
+
+- `from cardinal import Cardinal`
+- `from FunPayAPI`
+- `BIND_TO_*` хуки FunPay Cardinal (legacy, только для портов)
+- `setup()` / `unload()` — устаревший FPC API
+
+## Настройки
+
+`SETTINGS_PAGE = True`, `get_settings_schema()`, `await self.get_cfg()` / `await self.set_cfg()`.
+
+## Шаблон
+
+См. `plugins/_starvell_template.py` и `plugins/README.md`.
