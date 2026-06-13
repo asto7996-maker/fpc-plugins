@@ -19,47 +19,49 @@
 
 ## Быстрая установка на Ubuntu 24.04
 
-### Вариант 1: Автоматический скрипт
+> **Важно:** не копируйте буквально `<repo>` — это был плейсхолдер. Ниже готовые команды.
+
+### Вариант 1: Одна команда (рекомендуется)
+
+Скопируйте и выполните **целиком** на сервере под root:
 
 ```bash
-# Скачайте репозиторий
-git clone https://github.com/YOUR_REPO/starvell-cardinal.git
-cd starvell-cardinal
-
-# Запустите установщик (запросит токены интерактивно)
-sudo bash install_starvell_cardinal.sh
+curl -fsSL https://raw.githubusercontent.com/asto7996-maker/fpc-plugins/cursor/starvell-cardinal-bot-280c/install_starvell_cardinal.sh | bash
 ```
 
-Скрипт установит:
-- Python 3.11 + venv
-- Зависимости из `requirements.txt`
-- Systemd-сервис `starvell-cardinal`
-- Файл `config/settings.json` с вашими данными
+Скрипт сам установит Python, скачает проект, спросит токены и запустит systemd-сервис.
 
-### Вариант 2: Ручная установка
+### Вариант 2: Через git clone
 
 ```bash
-# 1. Зависимости системы
-sudo apt update
-sudo apt install -y python3.11 python3.11-venv python3-pip git sqlite3
+apt update && apt install -y git
+git clone -b cursor/starvell-cardinal-bot-280c https://github.com/asto7996-maker/fpc-plugins.git /opt/starvell-cardinal
+cd /opt/starvell-cardinal
+bash install_starvell_cardinal.sh
+```
 
-# 2. Клонирование
-git clone https://github.com/YOUR_REPO/starvell-cardinal.git
-cd starvell-cardinal
+### Вариант 3: Ручная установка (без systemd)
 
-# 3. Виртуальное окружение
-python3.11 -m venv venv
+```bash
+apt update
+apt install -y python3 python3-venv python3-pip git sqlite3
+
+git clone -b cursor/starvell-cardinal-bot-280c https://github.com/asto7996-maker/fpc-plugins.git ~/starvell-cardinal
+cd ~/starvell-cardinal
+
+python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
 
-# 4. Конфигурация
 mkdir -p config storage/plugins logs
 cp config/settings.json.example config/settings.json
-nano config/settings.json   # заполните поля
+nano config/settings.json
 
-# 5. Запуск
 python main.py
 ```
+
+> На Ubuntu 24.04 используйте **`python3`**, не `python3.11` — его может не быть в системе.
+> Команда `pip` работает только внутри venv после `source venv/bin/activate`.
 
 ---
 
