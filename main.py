@@ -13,12 +13,10 @@ from logging.handlers import RotatingFileHandler
 
 from ai_service import AIService
 from automation import AutomationEngine
-from config import LOGS_DIR, create_default_settings_file, load_settings
+from config import LOGS_DIR, VERSION, create_default_settings_file, load_settings
 from database import Database
 from plugin_manager import CardinalCore, EventManager, PluginManager
 from tg_bot import TelegramBot
-
-VERSION = "1.0.0"
 
 
 def setup_logging(debug: bool = False) -> None:
@@ -71,9 +69,9 @@ async def main() -> None:
     tg_bot: TelegramBot | None = None
     automation = AutomationEngine(db, cardinal)
 
-    async def notify(text: str) -> None:
+    async def notify(text: str, notify_type: str = "notify_orders") -> None:
         if tg_bot:
-            await tg_bot.broadcast(text)
+            await tg_bot.broadcast(text, notify_type)
 
     automation.notify_cb = notify
 

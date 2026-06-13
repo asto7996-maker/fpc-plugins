@@ -35,9 +35,11 @@ class AutomationEngine:
         self._apis: dict[str, StarvellAPI] = {}
         self._ai = AIService(load_settings())
 
-    async def notify(self, text: str) -> None:
+    async def notify(self, text: str, notify_type: str = "notify_orders") -> None:
         if self.notify_cb:
             try:
+                await self.notify_cb(text, notify_type)
+            except TypeError:
                 await self.notify_cb(text)
             except Exception as exc:
                 logger.warning("notify failed: %s", exc)
@@ -85,7 +87,16 @@ class AutomationEngine:
         self._running = False
         for task in self._tasks:
             task.cancel()
+        if self._tasks:
+            await asyncio.gather(*self._tasks, return_exceptions=True)
         self._tasks.clear()
+        self._apis.clear()
+
+    async def reload(self) -> None:
+        """Перезапускает фоновые задачи (после смены session cookie)."""
+        await self.stop()
+        self._ai = AIService(load_settings())
+        await self.start()
 
     async def _auth_loop(self, account_name: str, api: StarvellAPI) -> None:
         """Периодическая проверка авторизации."""
@@ -95,7 +106,8 @@ class AutomationEngine:
                 info = await api.fetch_homepage()
                 if not info.get("authorized"):
                     await self.notify(
-                        f"❌ [{account_name}] Сессия Starvell недействительна! Обновите cookie в профиле бота."
+                        f"❌ [{account_name}] Сессия Starvell недействительна! Обновите cookie в профиле бота.",
+                        "notify_auth",
                     )
             except Exception as exc:
                 logger.warning("auth_check %s: %s", account_name, exc)
@@ -156,7 +168,8 @@ class AutomationEngine:
             f"🛒 <b>Новый заказ #{order_id}</b>\n"
             f"Покупатель: {buyer}\n"
             f"Товар: {product_name}\n"
-            f"Сумма: {price} ₽"
+            f"Сумма: {price} ₽",
+            "notify_orders",
         )
 
         # Плагины
@@ -174,7 +187,7 @@ class AutomationEngine:
                 codes.append(code)
 
         if not codes:
-            await self.notify(f"⚠️ Заказ #{order_id}: автовыдача — нет товара «{product_name}» на складе")
+            await self.notify(f"⚠️ Заказ #{order_id}: автовыдача — нет товара «{product_name}» на складе", "notify_delivery")
             return
 
         content = "\n".join(codes)
@@ -186,11 +199,11 @@ class AutomationEngine:
         if chat_id:
             try:
                 await api.send_message(chat_id, delivery_text)
-                await self.notify(f"✅ Заказ #{order_id} оплачен. Товар выдан успешно.")
+                await self.notify(f"✅ Заказ #{order_id} оплачен. Товар выдан успешно.", "notify_delivery")
             except Exception as exc:
-                await self.notify(f"❌ Заказ #{order_id}: ошибка выдачи — {exc}")
+                await self.notify(f"❌ Заказ #{order_id}: ошибка выдачи — {exc}", "notify_delivery")
         else:
-            await self.notify(f"⚠️ Заказ #{order_id}: товар готов, но чат с покупателем не найден")
+            await self.notify(f"⚠️ Заказ #{order_id}: товар готов, но чат с покупателем не найден", "notify_delivery")
 
     async def _handle_completed_order(
         self, account_name: str, api: StarvellAPI, settings: Settings, order: dict
@@ -225,7 +238,7 @@ class AutomationEngine:
 
         if sent:
             await self.db.mark_order_reviewed(order_id, account_name)
-            await self.notify(f"⭐ Заказ #{order_id} завершён. Благодарность отправлена.")
+            await self.notify(f"⭐ Заказ #{order_id} завершён. Благодарность отправлена.", "notify_orders")
 
         await self.cardinal.event_manager.dispatch("on_order_completed", {"order": order, "account": account_name})
 
@@ -293,11 +306,11 @@ class AutomationEngine:
                         username = (p or {}).get("username") or ""
                         break
 
-                if settings.notify_chats:
-                    await self.notify(
-                        f"💬 <b>Новое сообщение</b> от {username or 'покупателя'}\n"
-                        f"<i>{text[:300]}</i>"
-                    )
+                await self.notify(
+                    f"💬 <b>Новое сообщение</b> от {username or 'покупателя'}\n"
+                    f"<i>{text[:300]}</i>",
+                    "notify_chats",
+                )
                 await self.db.set_last_notified_message(chat_id, mid, account_name)
 
                 # Приветствие
@@ -352,7 +365,7 @@ class AutomationEngine:
         try:
             await api.send_message(chat_id, reply)
             await self.db.set_ai_cooldown(chat_id, account_name)
-            await self.notify(f"🤖 ИИ ответил в чате {chat_id[:8]}…")
+            await self.notify(f"🤖 Gemini ответил в чате {chat_id[:8]}…", "notify_chats")
         except Exception as exc:
             logger.warning("ai reply failed: %s", exc)
 
@@ -395,7 +408,7 @@ class AutomationEngine:
                 bumped += len(cat_ids)
 
         if bumped and settings.notify_bump:
-            await self.notify(f"📈 [{account_name}] Лоты подняты ({bumped} категорий)")
+            await self.notify(f"📈 [{account_name}] Лоты подняты ({bumped} категорий)", "notify_bump")
 
     async def get_status(self) -> dict[str, Any]:
         """Сводка для Telegram-меню."""

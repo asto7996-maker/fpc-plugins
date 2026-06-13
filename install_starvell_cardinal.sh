@@ -86,7 +86,10 @@ if [ "$SOURCE_DIR" != "$INSTALL_DIR" ]; then
         --exclude='logs' \
         --exclude='config/settings.json' \
         "$SOURCE_DIR/" "$INSTALL_DIR/"
-    rm -rf "${TMP_CLONE:-}"
+fi
+
+if [ -n "$TMP_CLONE" ] && [ -d "$TMP_CLONE" ]; then
+    rm -rf "$TMP_CLONE"
 fi
 
 if [ ! -f "$INSTALL_DIR/main.py" ]; then
@@ -115,50 +118,30 @@ if [ ! -f "$INSTALL_DIR/config/settings.json" ]; then
     fi
 fi
 
-# ── 5. Конфигурация ─────────────────────────────────────────────────────────
+# ── 5. Конфигурация — только BOT_TOKEN (остальное в Telegram) ───────────────
 echo ""
-echo "=== 5/6. Настройка (введите данные) ==="
-echo "Подсказка: Telegram user_id узнайте у @userinfobot"
+echo "=== 5/6. Telegram BOT_TOKEN ==="
+echo "Всё остальное (Starvell session, Gemini) настраивается в боте через /start"
 echo ""
-
 read -rp "Telegram BOT_TOKEN (@BotFather): " BOT_TOKEN
-read -rsp "Пароль для входа в бота: " BOT_PASSWORD
-echo ""
-read -rp "SESSION_COOKIE Starvell (cookie 'session'): " SESSION_COOKIE
-read -rp "Gemini API ключ (Enter — пропустить): " GEMINI_KEY
-read -rp "OpenAI API ключ (Enter — пропустить): " OPENAI_KEY
-read -rp "Ваш Telegram user_id: " ADMIN_ID
 
 if [ -z "$BOT_TOKEN" ]; then
     echo "ОШИБКА: BOT_TOKEN обязателен"
     exit 1
 fi
-if [ -z "$BOT_PASSWORD" ]; then
-    echo "ОШИБКА: пароль бота обязателен"
-    exit 1
-fi
-
-PASS_MD5="$(echo -n "$BOT_PASSWORD" | md5sum | awk '{print $1}')"
-ADMIN_ID="${ADMIN_ID:-0}"
 
 cat > "$INSTALL_DIR/config/settings.json" <<EOF
 {
   "bot_token": "$BOT_TOKEN",
-  "bot_password_md5": "$PASS_MD5",
-  "admin_ids": [$ADMIN_ID],
-  "session_cookie": "$SESSION_COOKIE",
+  "owner_id": 0,
+  "admin_ids": [],
+  "session_cookie": "",
+  "gemini_api_key": "",
   "auto_delivery_enabled": true,
   "auto_bump_enabled": true,
   "auto_welcome_enabled": true,
   "auto_review_enabled": true,
-  "ai_replies_enabled": true,
-  "gemini_api_key": "$GEMINI_KEY",
-  "openai_api_key": "$OPENAI_KEY",
-  "ai_provider": "gemini",
-  "bump_interval": 3600,
-  "chat_poll_interval": 5,
-  "orders_poll_interval": 10,
-  "api_delay_seconds": 1.5
+  "ai_replies_enabled": false
 }
 EOF
 chown "$SERVICE_USER:$SERVICE_USER" "$INSTALL_DIR/config/settings.json"
