@@ -15,7 +15,13 @@ from config import Settings, load_settings
 from database import Database
 from handlers.builtin import BuiltinHandlers
 from core.delivery.templates import append_refund_disclaimer, render_delivery_template
-from core.plugins.context import BumpContext, DeliveryContext, MessageContext, OrderContext
+from core.plugins.context import (
+    BumpContext,
+    DeliveryContext,
+    MessageContext,
+    OrderContext,
+    _resolve_order_price,
+)
 from core.plugins.hooks import STV_BUMP, STV_MESSAGE, STV_ORDER_COMPLETED, STV_ORDER_PAID, STV_ORDER_STATUS, STV_POST_DELIVERY, STV_PRE_DELIVERY
 from core.security.payment_guard import PaymentGuard
 from plugin_manager import PluginContext
@@ -223,7 +229,7 @@ class AutomationEngine:
             or str(desc.get("description") or "").strip()
             or "товар"
         )
-        price = order.get("basePrice") or order.get("totalPrice") or 0
+        price = _resolve_order_price(order)
 
         await self.notify(
             f"🛒 <b>Новый заказ #{order_id}</b>\n"
