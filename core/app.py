@@ -37,6 +37,7 @@ class Application:
         self.automation: AutomationEngine | None = None
         self.tg_bot: TelegramBot | None = None
         self._hot_reload_task: asyncio.Task | None = None
+        self._services_task: asyncio.Task | None = None
 
     async def setup(self) -> None:
         setup_i18n(self.settings.language if hasattr(self.settings, "language") else "ru")
@@ -89,13 +90,22 @@ class Application:
 
     async def start(self) -> None:
         assert self.automation and self.tg_bot and self.plugin_engine
-        await self.automation.start()
-        await self.plugin_engine.startup_starvell_plugins()
         self._hot_reload_task = asyncio.create_task(self._watch_plugins())
+        self._services_task = asyncio.create_task(self._start_services())
         try:
             await self.tg_bot.start_polling()
         finally:
             await self.shutdown()
+
+    async def _start_services(self) -> None:
+        """Автоматизация и плагины — в фоне, не блокируют Telegram."""
+        assert self.automation and self.plugin_engine
+        try:
+            await self.automation.start()
+            await self.plugin_engine.startup_starvell_plugins()
+            logger.info("Фоновые сервисы (automation + plugins) запущены")
+        except Exception as exc:
+            logger.exception("Ошибка фоновых сервисов: %s", exc)
 
     async def _watch_plugins(self) -> None:
         """Фоновая hot-reload проверка изменений плагинов."""
@@ -112,6 +122,12 @@ class Application:
                 logger.debug("plugin watch: %s", exc)
 
     async def shutdown(self) -> None:
+        if self._services_task:
+            self._services_task.cancel()
+            try:
+                await self._services_task
+            except asyncio.CancelledError:
+                pass
         if self._hot_reload_task:
             self._hot_reload_task.cancel()
             try:

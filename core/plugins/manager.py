@@ -146,6 +146,8 @@ class PluginEngine:
 
     def load_all(self) -> list[PluginRecord]:
         self._load_state()
+        for rec in self.plugins.values():
+            self._unload_instance(rec)
         self.plugins.clear()
         self._ensure_dirs()
         for fname in sorted(os.listdir(self.root_dir)):
@@ -165,17 +167,27 @@ class PluginEngine:
         """BIND_TO_PRE_INIT — как в FunPay Cardinal при старте."""
         import asyncio
 
-        async def _run():
+        async def _run() -> None:
             await self.dispatch_hook("BIND_TO_PRE_INIT", self.core)
 
         try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                asyncio.create_task(_run())
-            else:
-                loop.run_until_complete(_run())
+            loop = asyncio.get_running_loop()
+            loop.create_task(_run())
+        except RuntimeError:
+            logger.debug("PRE_INIT: нет event loop, пропуск")
         except Exception as exc:
             logger.debug("PRE_INIT: %s", exc)
+
+    def _unload_instance(self, rec: PluginRecord) -> None:
+        if not rec.instance:
+            return
+        try:
+            if rec.is_starvell_native or rec.is_base_plugin:
+                rec.instance.on_unload()
+            elif hasattr(rec.instance, "unload"):
+                rec.instance.unload()
+        except Exception as exc:
+            logger.warning("Unload %s failed: %s", rec.name, exc)
 
     def _load_one(self, file_path: str, force_reload: bool = False) -> PluginRecord:
         inline = self._extract_meta(file_path)
@@ -268,13 +280,7 @@ class PluginEngine:
         if not rec:
             return None
         if rec.instance:
-            try:
-                if rec.is_base_plugin:
-                    rec.instance.on_unload()
-                elif hasattr(rec.instance, "unload"):
-                    rec.instance.unload()
-            except Exception as exc:
-                logger.warning("unload %s: %s", uuid, exc)
+            self._unload_instance(rec)
         new_rec = self._load_one(rec.path, force_reload=True)
         self.plugins[uuid] = new_rec
         logger.info("Hot-reload плагина %s v%s", new_rec.name, new_rec.version)
@@ -343,15 +349,7 @@ class PluginEngine:
 
     def unload_all(self) -> None:
         for rec in self.plugins.values():
-            if not rec.instance:
-                continue
-            try:
-                if rec.is_base_plugin:
-                    rec.instance.on_unload()
-                elif hasattr(rec.instance, "unload"):
-                    rec.instance.unload()
-            except Exception as exc:
-                logger.error("Unload %s failed: %s", rec.name, exc)
+            self._unload_instance(rec)
 
     def get_plugin_instance(self, uuid: str) -> BasePlugin | Any | None:
         rec = self.plugins.get(uuid)
@@ -372,13 +370,17 @@ class PluginEngine:
 
     async def emit_starvell(self, event: str, ctx: Any) -> None:
         """Диспетчер нативных событий Starvell для плагинов."""
+        import asyncio
+
         for rec in self.plugins.values():
             if not rec.enabled or not rec.instance:
                 continue
             inst = rec.instance
             if rec.is_starvell_native and hasattr(inst, "_dispatch_with_fallback"):
                 try:
-                    await inst._dispatch_with_fallback(event, ctx)
+                    await asyncio.wait_for(inst._dispatch_with_fallback(event, ctx), timeout=30.0)
+                except asyncio.TimeoutError:
+                    logger.error("Starvell plugin %s event %s: timeout 30s", rec.name, event)
                 except Exception as exc:
                     logger.exception("Starvell plugin %s event %s: %s", rec.name, event, exc)
 

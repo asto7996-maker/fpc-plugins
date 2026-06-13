@@ -69,7 +69,6 @@ def create_plugin_upload_router(ctx: Any) -> Router:
         try:
             path = pm.save_plugin_file(doc.file_name or "plugin.py", source)
             pm.load_all()
-            await pm.startup_starvell_plugins()
         except Exception as exc:
             logger.exception("plugin upload failed")
             await message.answer(f"❌ Ошибка сохранения: {exc}")
