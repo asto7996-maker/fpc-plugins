@@ -29,6 +29,57 @@ from starvell_api import StarvellAPI
 
 logger = logging.getLogger("starvell.automation")
 
+# Статусы заказа, при которых покупатель уже оплатил — приветствие не нужно
+_OPEN_ORDER_STATUSES = frozenset({"CREATED", "PAID", "IN_PROGRESS", "CONFIRMED", "PENDING"})
+
+# Текстовые маркеры системных уведомлений Starvell (не от покупателя)
+_PLATFORM_SYSTEM_MARKERS = (
+    "вернул деньги покупателю",
+    "вернул средства покупателю",
+    "покупатель подтвердил",
+    "продавец подтвердил",
+    "сделка завершена",
+    "ожидает подтверждения покупателем",
+)
+
+
+def _is_platform_system_message(msg: dict, text: str, settings: Settings) -> bool:
+    """Сообщение платформы / системное — не от покупателя."""
+    if not settings.greetings_ignore_system:
+        return False
+    if msg.get("isSystem") or msg.get("system") or msg.get("isService"):
+        return True
+    msg_type = str(msg.get("type") or msg.get("messageType") or "").upper()
+    if msg_type in ("SYSTEM", "SERVICE", "ORDER", "NOTIFICATION"):
+        return True
+    if msg.get("orderId") or msg.get("order_id"):
+        return True
+    author_id = msg.get("authorId") or msg.get("author")
+    if author_id is None and text:
+        return True
+    low = text.lower()
+    return any(marker in low for marker in _PLATFORM_SYSTEM_MARKERS)
+
+
+def _buyer_has_open_order(
+    orders: list[dict],
+    author_id: int | None,
+    username: str,
+) -> bool:
+    """Покупатель уже оплатил заказ — приветствие не отправляем."""
+    uname = (username or "").strip().lower()
+    for order in orders:
+        if not isinstance(order, dict):
+            continue
+        if str(order.get("status") or "") not in _OPEN_ORDER_STATUSES:
+            continue
+        buyer = order.get("user") or {}
+        if author_id is not None and buyer.get("id") == author_id:
+            return True
+        if uname and str(buyer.get("username") or "").lower() == uname:
+            return True
+    return False
+
 
 def _message_id(msg: dict) -> str:
     return str(msg.get("id") or msg.get("messageId") or "")
@@ -241,6 +292,15 @@ class AutomationEngine:
         )
         await self.cardinal.dispatch_plugins("BIND_TO_NEW_ORDER", order)
         await self.cardinal.events.emit("order:paid", {"order": order, "account": account_name})
+
+        buyer_id = (order.get("user") or {}).get("id")
+        if buyer_id:
+            try:
+                chat_id = await api.find_chat_by_buyer(int(buyer_id))
+                if chat_id:
+                    await self.db.mark_chat_welcomed(chat_id)
+            except Exception:
+                pass
 
         order_ctx = await self._build_order_ctx(account_name, order)
         await self._emit_starvell(STV_ORDER_PAID, order_ctx)
@@ -525,6 +585,12 @@ class AutomationEngine:
         my_user_id: int | None,
     ) -> None:
         chats = await api.fetch_chats()
+        open_orders: list[dict] = []
+        try:
+            open_orders = await api.fetch_orders()
+        except Exception as exc:
+            logger.debug("fetch_orders for welcome skip: %s", exc)
+
         for chat in chats:
             chat_id = str(chat.get("id") or "")
             if not chat_id:
@@ -565,6 +631,10 @@ class AutomationEngine:
                         break
 
                 text = str(msg.get("content") or msg.get("text") or "").strip()
+                if _is_platform_system_message(msg, text, settings):
+                    await self.db.set_last_notified_message(chat_id, mid, account_name)
+                    continue
+
                 guard = self._payment_guard.inspect(text)
                 if guard.is_suspicious:
                     await self.notify(
@@ -597,12 +667,14 @@ class AutomationEngine:
                     author_id=author_id, username=username, settings=settings,
                 )
                 if not handled:
+                    has_open_order = _buyer_has_open_order(open_orders, author_id, username)
                     await self._handlers.on_welcome(
                         chat_id=chat_id,
                         api=api,
                         settings=settings,
                         account_name=account_name,
                         previous_buyer_message_at=prev_buyer_ts,
+                        has_open_order=has_open_order,
                     )
 
                 if await self.db.get_feature_flag("ai_replies", settings.ai_replies_enabled):

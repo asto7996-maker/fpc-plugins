@@ -70,8 +70,11 @@ class BuiltinHandlers:
         settings: Settings,
         account_name: str,
         previous_buyer_message_at: int | None = None,
+        has_open_order: bool = False,
     ) -> None:
         if not await self.db.get_feature_flag("auto_welcome", settings.auto_welcome_enabled):
+            return
+        if has_open_order:
             return
         inactivity_sec = max(1, settings.welcome_inactivity_days) * 86400
         last_welcome_at = await self.db.get_last_welcome_at(chat_id)
