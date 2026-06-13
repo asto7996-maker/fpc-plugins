@@ -12,6 +12,9 @@ from typing import Any, Callable, Awaitable
 
 from ai_service import AIService
 from config import Settings, load_settings
+from core.utils.message_anchor import MessageDedup, message_anchor as _message_anchor
+from core.utils.message_anchor import message_id as _message_id
+from core.utils.message_anchor import message_ts as _message_ts
 from database import Database
 from handlers.builtin import BuiltinHandlers
 from core.delivery.templates import append_refund_disclaimer, render_delivery_template
@@ -96,33 +99,18 @@ def _chat_has_new_activity(
     last_msg = chat.get("lastMessage") or chat.get("last_message")
     if not isinstance(last_msg, dict):
         return True
-    mid = _message_id(last_msg)
-    if not mid:
+    msg_anchor = _message_anchor(last_msg)
+    if not msg_anchor:
         return True
-    if mid == last_notified_id:
+    if msg_anchor == last_notified_id:
         return False
+    if last_notified_id and last_notified_id.startswith("id:"):
+        if _message_id(last_msg) == last_notified_id[3:]:
+            return False
     author = last_msg.get("authorId") or last_msg.get("author")
     if my_user_id and author == my_user_id:
         return False
     return True
-
-
-def _message_id(msg: dict) -> str:
-    return str(msg.get("id") or msg.get("messageId") or "")
-
-
-def _message_ts(msg: dict) -> int:
-    for key in ("createdAt", "created_at", "sentAt", "sent_at", "timestamp", "date"):
-        val = msg.get(key)
-        if val is None:
-            continue
-        if isinstance(val, (int, float)):
-            ts = int(val)
-            return ts // 1000 if ts > 10_000_000_000 else ts
-        if isinstance(val, str) and val.isdigit():
-            ts = int(val)
-            return ts // 1000 if ts > 10_000_000_000 else ts
-    return 0
 
 
 class AutomationEngine:
@@ -147,6 +135,8 @@ class AutomationEngine:
         self._user_id_cache: dict[str, tuple[float, int | None]] = {}
         self._OPEN_ORDERS_TTL = 30.0
         self._USER_ID_TTL = 90.0
+        self._msg_dedup = MessageDedup(ttl=600.0)
+        self._chat_locks: dict[str, asyncio.Lock] = {}
 
     async def notify(self, text: str, notify_type: str = "notify_orders", **extra) -> None:
         if self.notify_cb:
@@ -236,6 +226,8 @@ class AutomationEngine:
         self._apis.clear()
         self._open_orders_cache.clear()
         self._user_id_cache.clear()
+        self._msg_dedup = MessageDedup(ttl=600.0)
+        self._chat_locks.clear()
 
     async def reload(self) -> None:
         """Перезапускает фоновые задачи (после смены session cookie)."""
@@ -525,9 +517,9 @@ class AutomationEngine:
 
                 sorted_msgs = sorted(messages, key=_message_ts)
                 latest = sorted_msgs[-1]
-                latest_id = _message_id(latest)
-                if latest_id:
-                    await self.db.set_last_notified_message(chat_id, latest_id, account_name)
+                latest_anchor = _message_anchor(latest)
+                if latest_anchor:
+                    await self.db.set_last_notified_message(chat_id, latest_anchor, account_name)
 
                 last_buyer_ts = 0
                 for msg in reversed(sorted_msgs):
@@ -583,7 +575,7 @@ class AutomationEngine:
         if not old_msgs:
             return None
 
-        anchor = _message_id(old_msgs[-1])
+        anchor = _message_anchor(old_msgs[-1])
         if anchor:
             await self.db.set_last_notified_message(chat_id, anchor, account_name)
         if last_buyer_ts:
@@ -612,21 +604,26 @@ class AutomationEngine:
     def _iter_new_buyer_messages(
         self,
         messages: list[dict],
-        last_notified_id: str | None,
+        last_notified_anchor: str | None,
         my_user_id: int | None,
     ) -> list[dict]:
-        """Возвращает только сообщения покупателя, появившиеся после last_notified_id."""
+        """Возвращает только новые сообщения покупателя после last_notified_anchor."""
         sorted_msgs = sorted(messages, key=_message_ts)
         result: list[dict] = []
-        seen_last = not last_notified_id
+        seen_last = not last_notified_anchor
 
         for msg in sorted_msgs:
-            mid = _message_id(msg)
-            if not mid:
+            anchor = _message_anchor(msg)
+            if not anchor:
                 continue
             if not seen_last:
-                if mid == last_notified_id:
+                if anchor == last_notified_anchor:
                     seen_last = True
+                    continue
+                if last_notified_anchor and last_notified_anchor.startswith("id:"):
+                    if _message_id(msg) == last_notified_anchor[3:]:
+                        seen_last = True
+                        continue
                 continue
 
             author_id = msg.get("authorId") or msg.get("author")
@@ -650,7 +647,7 @@ class AutomationEngine:
     ) -> None:
         chats = await api.fetch_chats()
         open_orders = await self._get_cached_open_orders(account_name, api)
-        sem = asyncio.Semaphore(6)
+        sem = asyncio.Semaphore(4)
 
         async def _run(chat: dict) -> None:
             async with sem:
@@ -673,7 +670,26 @@ class AutomationEngine:
         if not chat_id:
             return
 
+        if chat_id not in self._chat_locks:
+            self._chat_locks[chat_id] = asyncio.Lock()
+        async with self._chat_locks[chat_id]:
+            await self._process_single_chat_locked(
+                account_name, api, settings, my_user_id, chat, open_orders, chat_id,
+            )
+
+    async def _process_single_chat_locked(
+        self,
+        account_name: str,
+        api: StarvellAPI,
+        settings: Settings,
+        my_user_id: int | None,
+        chat: dict,
+        open_orders: list[dict],
+        chat_id: str,
+    ) -> None:
         last_notified = await self.db.get_last_notified_message(chat_id, account_name)
+        if last_notified == "":
+            last_notified = None
         if not _chat_has_new_activity(chat, last_notified, my_user_id):
             return
 
@@ -701,6 +717,12 @@ class AutomationEngine:
                     return
 
         for msg in self._iter_new_buyer_messages(messages, last_notified, my_user_id):
+            anchor = _message_anchor(msg)
+            if not anchor:
+                continue
+            if self._msg_dedup.was_seen(chat_id, anchor):
+                continue
+
             mid = _message_id(msg)
             author_id = msg.get("authorId") or msg.get("author")
 
@@ -712,7 +734,8 @@ class AutomationEngine:
 
             text = str(msg.get("content") or msg.get("text") or "").strip()
             if _is_platform_system_message(msg, text, settings):
-                await self.db.set_last_notified_message(chat_id, mid, account_name)
+                await self.db.set_last_notified_message(chat_id, anchor, account_name)
+                self._msg_dedup.mark(chat_id, anchor)
                 continue
 
             guard = self._payment_guard.inspect(text)
@@ -722,7 +745,8 @@ class AutomationEngine:
                     "notify_chats",
                     chat_id=chat_id,
                 )
-                await self.db.set_last_notified_message(chat_id, mid, account_name)
+                await self.db.set_last_notified_message(chat_id, anchor, account_name)
+                self._msg_dedup.mark(chat_id, anchor)
                 continue
 
             prev_buyer_ts = await self.db.get_chat_last_user_message_at(chat_id, account_name)
@@ -739,7 +763,8 @@ class AutomationEngine:
                     chat_id=chat_id,
                 )
 
-            await self.db.set_last_notified_message(chat_id, mid, account_name)
+            await self.db.set_last_notified_message(chat_id, anchor, account_name)
+            self._msg_dedup.mark(chat_id, anchor)
 
             handled = await self._handlers.on_chat_message(
                 text=text, chat_id=chat_id, api=api, account_name=account_name,
@@ -766,18 +791,24 @@ class AutomationEngine:
                 text=text,
                 author_id=author_id,
                 username=username,
-                message_id=mid or "",
+                message_id=mid or anchor,
                 raw_message=msg,
             )
-            await self._emit_starvell(STV_MESSAGE, msg_ctx)
+            try:
+                await self._emit_starvell(STV_MESSAGE, msg_ctx)
+            except Exception as exc:
+                logger.warning("plugin message dispatch %s: %s", chat_id[:8], exc)
 
             ctx = PluginContext(api, self.db, settings, account_name)
             ctx.chat_id = chat_id
             ctx.message_author_id = author_id
-            await self.cardinal.event_manager.dispatch(
-                "on_message", {"message": text, "chat_id": chat_id, "ctx": ctx}
-            )
-            await self.cardinal.dispatch_plugins("BIND_TO_NEW_MESSAGE", text, chat_id)
+            try:
+                await self.cardinal.event_manager.dispatch(
+                    "on_message", {"message": text, "chat_id": chat_id, "ctx": ctx}
+                )
+                await self.cardinal.dispatch_plugins("BIND_TO_NEW_MESSAGE", text, chat_id)
+            except Exception as exc:
+                logger.warning("legacy message dispatch %s: %s", chat_id[:8], exc)
 
     async def _maybe_ai_reply(
         self,

@@ -27,6 +27,7 @@ from aiogram.types import InlineKeyboardMarkup
 
 from config import BASE_DIR
 from core.plugins.context import _resolve_order_price
+from core.utils.message_anchor import MessageDedup, anchor_from_context
 from starvell_sdk import (
     DeliveryContext,
     MessageContext,
@@ -39,7 +40,7 @@ from starvell_sdk import (
 )
 
 NAME = "VexBoost AutoSMM"
-VERSION = "3.1.0"
+VERSION = "3.1.1"
 DESCRIPTION = "Автонакрутка SMM через VexBoost для Starvell"
 CREDITS = "@xei1y"
 UUID = "a3f8c2e1-7b4d-4a9f-9e2c-1d5b8f6a0c3e"
@@ -621,6 +622,8 @@ class Plugin(StarvellPlugin):
         self._locks: set[str] = set()
         self._pending: dict[str, dict] = {}
         self._api_client: VexBoostAPI | None = None
+        self._msg_dedup = MessageDedup(ttl=600.0)
+        self._hint_sent: dict[str, str] = {}
 
     async def on_startup(self) -> None:
         self._pending = _load_json("pending.json", {})
@@ -640,8 +643,31 @@ class Plugin(StarvellPlugin):
                 await self._status_task
             except asyncio.CancelledError:
                 pass
+        self._save_pending()
         if self._api_client:
             await self._api_client.close()
+
+    def _save_pending(self) -> None:
+        _save_json("pending.json", self._pending)
+
+    def _sync_pending(self) -> None:
+        disk = _load_json("pending.json", {})
+        if isinstance(disk, dict):
+            self._pending.update(disk)
+
+    def _msg_anchor(self, ctx: MessageContext) -> str:
+        return anchor_from_context(
+            ctx.chat_id, ctx.message_id, ctx.text or "", ctx.raw_message,
+        )
+
+    def _skip_duplicate(self, ctx: MessageContext) -> bool:
+        anchor = self._msg_anchor(ctx)
+        if not anchor:
+            return False
+        if self._msg_dedup.was_seen(ctx.chat_id, anchor):
+            return True
+        self._msg_dedup.mark(ctx.chat_id, anchor)
+        return False
 
     def get_settings_schema(self) -> list[dict]:
         return [
@@ -809,6 +835,10 @@ class Plugin(StarvellPlugin):
         text = (ctx.text or "").strip()
         if not text:
             return
+        if self._skip_duplicate(ctx):
+            return
+
+        self._sync_pending()
 
         low = text.lower()
         if "вернул" in low and ("деньг" in low or "средств" in low):
@@ -851,6 +881,11 @@ class Plugin(StarvellPlugin):
         return None
 
     async def _request_link_confirm(self, ctx: MessageContext, order: dict, link: str) -> None:
+        pkey = self._pending_key(ctx)
+        existing = self._pending.get(pkey)
+        if existing and existing.get("link") == link:
+            return
+
         allow_private = await self.get_cfg("allow_private_tg", False)
         if not allow_private and _is_private_tg(link):
             await ctx.reply(await self._msg("private_telegram_message"))
@@ -862,9 +897,9 @@ class Plugin(StarvellPlugin):
 
         order["link"] = link
         order["chat_id"] = ctx.chat_id
-        pkey = self._pending_key(ctx)
         self._pending[pkey] = order
-        _save_json("pending.json", self._pending)
+        self._save_pending()
+        self._hint_sent.pop(pkey, None)
 
         display_link = link.replace("https://", "").replace("http://", "")
         await ctx.reply(await self._msg(
@@ -892,13 +927,15 @@ class Plugin(StarvellPlugin):
                 await ctx.reply(await self._msg("send_link_first_message"))
                 return
             self._pending.pop(pkey, None)
-            _save_json("pending.json", self._pending)
+            self._save_pending()
+            self._hint_sent.pop(pkey, None)
             await self._submit_order(ctx, order)
             return
 
         if action == "-":
             self._pending.pop(pkey, None)
-            _save_json("pending.json", self._pending)
+            self._save_pending()
+            self._hint_sent.pop(pkey, None)
             self._remove_waiting(order.get("order_id"))
             await self._refund_starvell(ctx, str(order.get("order_id", "")))
             await ctx.reply(await self._msg("order_cancelled_message"))
@@ -909,6 +946,11 @@ class Plugin(StarvellPlugin):
         if links:
             await self._request_link_confirm(ctx, order, links[0])
             return
+
+        anchor = self._msg_anchor(ctx)
+        if self._hint_sent.get(pkey) == anchor:
+            return
+        self._hint_sent[pkey] = anchor
         await ctx.reply(await self._msg("pending_hint_message"))
 
     async def _submit_order(self, ctx: MessageContext, order: dict) -> None:
@@ -1017,7 +1059,8 @@ class Plugin(StarvellPlugin):
         waiting = [o for o in waiting if o.get("buyer") != buyer]
         _save_json("waiting.json", waiting)
         self._pending = {k: v for k, v in self._pending.items() if v.get("buyer") != buyer}
-        _save_json("pending.json", self._pending)
+        self._save_pending()
+        self._hint_sent = {k: v for k, v in self._hint_sent.items() if not k.startswith(f"{chat_id}:")}
 
     async def _cmd_status(self, ctx: MessageContext, text: str) -> None:
         parts = text.split()

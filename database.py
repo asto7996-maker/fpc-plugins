@@ -4,6 +4,7 @@ SQLite-хранилище: пользователи Telegram, заказы, ав
 
 from __future__ import annotations
 
+import asyncio
 import time
 from typing import Any
 
@@ -288,12 +289,20 @@ class Database:
         return row[0] if row else None
 
     async def set_last_notified_message(self, chat_id: str, message_id: str, account: str = "default") -> None:
-        async with aiosqlite.connect(self.path) as db:
-            await db.execute(
-                "INSERT OR REPLACE INTO chat_last_notified (chat_id, message_id, account_name) VALUES (?, ?, ?)",
-                (chat_id, message_id, account),
-            )
-            await db.commit()
+        if not message_id:
+            return
+        for attempt in range(3):
+            try:
+                async with aiosqlite.connect(self.path) as db:
+                    await db.execute(
+                        "INSERT OR REPLACE INTO chat_last_notified (chat_id, message_id, account_name) VALUES (?, ?, ?)",
+                        (chat_id, message_id, account),
+                    )
+                    await db.commit()
+                return
+            except Exception:
+                if attempt < 2:
+                    await asyncio.sleep(0.05 * (attempt + 1))
 
     async def get_chat_last_user_message_at(self, chat_id: str, account: str = "default") -> int | None:
         async with aiosqlite.connect(self.path) as db:
