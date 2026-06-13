@@ -54,6 +54,15 @@ mkdir -p "$INSTALL_DIR"/{config,storage/plugins,logs,plugins}
 chown -R "$SERVICE_USER:$SERVICE_USER" "$INSTALL_DIR"
 chmod 755 "$INSTALL_DIR"
 chmod 755 "$INSTALL_DIR"/{config,storage,logs,plugins} 2>/dev/null || true
+# Пользователь starvell должен иметь доступ к /opt
+if [ -d /opt ] && ! sudo -u "$SERVICE_USER" test -x /opt; then
+  chmod o+x /opt
+fi
+if ! sudo -u "$SERVICE_USER" test -x "$INSTALL_DIR"; then
+  echo "ОШИБКА: пользователь $SERVICE_USER не может войти в $INSTALL_DIR"
+  ls -la "$INSTALL_DIR" /opt 2>/dev/null || true
+  exit 1
+fi
 
 # Виртуальное окружение
 if [ ! -f "$INSTALL_DIR/venv/bin/pip" ]; then
