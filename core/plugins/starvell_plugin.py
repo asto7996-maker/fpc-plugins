@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import logging
 from typing import Any
@@ -107,6 +108,8 @@ class StarvellPlugin(BasePlugin):
                 result = method(ctx)
                 if inspect.isawaitable(result):
                     await result
+            except asyncio.CancelledError:
+                raise
             except Exception as exc:
                 self.logger.exception("Hook %s.%s: %s", event, method_name, exc)
 
