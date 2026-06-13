@@ -188,12 +188,12 @@ class TelegramBot:
         r.callback_query.register(self.cb_edit_bump, F.data == CB["edit_bump"])
         r.callback_query.register(self.cb_edit_delivery, F.data == CB["edit_delivery"])
 
-        # Premium UI layer (пагинация плагинов, скелетоны загрузки)
+        # Premium UI hub (плагины, настройки, автоответчик, уведомления)
         try:
-            from handlers.tg.plugins_panel import create_premium_router
-            self.dp.include_router(create_premium_router(self))
+            from handlers.tg.hub import create_hub_router
+            self.dp.include_router(create_hub_router(self))
         except Exception as exc:
-            logger.warning("Premium UI router: %s", exc)
+            logger.warning("Premium UI hub: %s", exc)
 
     # ── Клавиатуры ────────────────────────────────────────────────────────
 
@@ -798,16 +798,13 @@ class TelegramBot:
         if cat == "main":
             await call.message.edit_text("🌐 Глобальные переключатели", reply_markup=KB.category_main(s))
         elif cat == "tg":
-            await self.cb_notify(call)
+            from handlers.tg.notifications import _render_notify
+            await _render_notify(call, self)
             return
         elif cat == "ar":
-            cmds = await self.db.list_ar_commands()
-            text = "💬 <b>Автоответчик</b>\n" + "\n".join(f"• {c['command']}" for c in cmds) or "Пусто"
-            kb = InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="➕ Команда", callback_data=CBT.AR_ADD)],
-                [InlineKeyboardButton(text="◀️", callback_data=CBT.MAIN)],
-            ])
-            await call.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+            from handlers.tg.autoresponder import _render_ar_page
+            await _render_ar_page(call, self, page=1)
+            return
         elif cat == "ad":
             await self.cb_adel(call)
             return

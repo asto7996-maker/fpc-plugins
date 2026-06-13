@@ -30,12 +30,16 @@
 └── locales/                # Fluent .ftl files
 ```
 
-## Plugin Engine
+## Plugin Engine (FPC parity)
 
 1. Наследуйте `core.plugins.base.BasePlugin`
 2. Реализуйте `on_load()` / `on_unload()`
-3. Опционально: `get_router()` для aiogram, `schedule_task()` для таймеров
-4. Hot-reload: измените `.py` в `plugins/` — движок перезагрузит за ~5 сек
+3. Настройки: `SETTINGS_PAGE = True`, `get_settings_schema()`, `on_setting_change()`
+4. Хранилище: `plugin_settings` таблица SQLite (через `PluginSettingsStore`)
+5. Telegram UI: `sc:plugcfg:{uuid}` / `EDIT_PLUGIN` — панель ⚙️ в списке плагинов
+6. Hook-only модули с `BIND_TO_*` работают без class Plugin
+7. `cardinal.telegram` — FPC-адаптер для aiogram
+8. Hot-reload + 📌 закрепление плагинов
 
 ## Premium UI
 

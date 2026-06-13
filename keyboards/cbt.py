@@ -1,5 +1,5 @@
 """
-Callback-токены Premium UI.
+Callback-токены Premium UI + FPC parity.
 """
 
 # Навигация
@@ -7,30 +7,60 @@ HOME = "sc:main"
 SETTINGS = "sc:settings_menu"
 BACK = "sc:back"
 REFRESH = "sc:refresh"
+MAIN = HOME
+MAIN2 = "sc:2"
 
-# Плагины
+# Категории настроек
+CATEGORY = "sc:cat:"
+SWITCH = "sc:sw:"
+
+# Плагины (FPC-style)
 PLUGINS = "sc:plugins"
 PLUGIN_TOGGLE = "sc:plug:"
 PLUGIN_RELOAD = "sc:plugreload:"
 PLUGIN_SETTINGS = "sc:plugcfg:"
+PLUGIN_SETTING = "sc:plugset:"
+PLUGIN_ACTION = "sc:plugact:"
+PLUGIN_RESET = "sc:plugrst:"
+PLUGIN_PIN = "sc:plugpin:"
+EDIT_PLUGIN = "sc:editplug:"
 PLUGIN_PAGE = "sc:plugpage:"
 
 # Пагинация
 PAGE_PREV = "sc:page:prev:"
 PAGE_NEXT = "sc:page:next:"
 
-# Legacy (совместимость с tg_bot/cbt.py)
-MAIN = HOME
-MAIN2 = "sc:2"
-CATEGORY = "sc:cat:"
-SWITCH = "sc:sw:"
+# Автоответчик
+AR_LIST = "sc:ar"
+AR_ADD = "sc:aradd"
+AR_DEL = "sc:ardel:"
+AR_TOGGLE = "sc:art:"
+AR_NOTIFY = "sc:arnot:"
+AR_EDIT = "sc:aredit:"
+AR_PAGE = "sc:arpage:"
+
+# Уведомления
+NOTIFY = "sc:notify:"
+NOTIFY_ALL_ON = "sc:notifyall:1"
+NOTIFY_ALL_OFF = "sc:notifyall:0"
+
+# Прочее
 STATUS = "sc:status"
 PROFILE = "sc:profile"
 ADEL = "sc:adel"
+ADEL_ADD = "sc:adel_add"
 GEMINI = "sc:gemini"
 SETUP = "sc:setup"
+TMPLT_LIST = "sc:tmpl"
+TMPLT_USE = "sc:tmplu:"
 REPLY_CHAT = "sc:reply:"
 REFUND_ORDER = "sc:refund:"
 REFUND_OK = "sc:refundok:"
-TMPLT_LIST = "sc:tmpl"
-AR_ADD = "sc:aradd"
+BL_LIST = "sc:bl"
+CHECK_AUTH = "sc:check_auth"
+CHECK_GEMINI = "sc:check_gemini"
+SET_SESSION = "sc:set_session"
+SET_GEMINI = "sc:set_gemini"
+EDIT_WELCOME = "sc:edit_welcome"
+EDIT_BUMP = "sc:edit_bump"
+EDIT_DELIVERY = "sc:edit_delivery"

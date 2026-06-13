@@ -38,6 +38,9 @@ class PluginRecord:
     loaded_at: float = field(default_factory=time.time)
     is_base_plugin: bool = False
     settings_callback: str | None = None
+    hook_only: bool = False
+    has_settings_page: bool = False
+    pinned: bool = False
 
 
 class PluginEngine:
@@ -100,26 +103,24 @@ class PluginEngine:
         except Exception:
             return {}
         pat = re.compile(
-            r'^\s*(NAME|UUID|VERSION|DESCRIPTION|CREDITS|SETTINGS_CALLBACK)\s*=\s*["\'](.+?)["\']\s*$',
+            r'^\s*(NAME|UUID|VERSION|DESCRIPTION|CREDITS|SETTINGS_CALLBACK|SETTINGS_PAGE)\s*=\s*["\']?(.+?)["\']?\s*$',
             re.MULTILINE,
         )
         return {m.group(1): m.group(2) for m in pat.finditer(text)}
 
     def _instantiate(self, module: ModuleType, meta: dict[str, str]) -> tuple[Any | None, bool, str | None]:
         config = getattr(self.core.settings, "__dict__", {}) if hasattr(self.core.settings, "__dict__") else {}
-        if hasattr(module, "Plugin") and issubclass(module.Plugin, BasePlugin):
-            try:
-                inst = module.Plugin(self.core, config)
-                return inst, True, None
-            except Exception as exc:
-                return None, True, str(exc)
         if hasattr(module, "Plugin"):
             try:
                 inst = module.Plugin(self.core, config)
-                return inst, False, None
+                is_base = isinstance(inst, BasePlugin) or (
+                    hasattr(module, "Plugin") and issubclass(module.Plugin, BasePlugin)
+                )
+                return inst, is_base, None
             except Exception as exc:
-                return None, False, str(exc)
-        return None, False, "No Plugin class"
+                is_base = hasattr(module, "Plugin") and issubclass(getattr(module, "Plugin"), BasePlugin)
+                return None, is_base, str(exc)
+        return None, False, None
 
     def load_all(self) -> list[PluginRecord]:
         self._load_state()
@@ -135,7 +136,24 @@ class PluginEngine:
                 self._mtime_cache[path] = os.path.getmtime(path)
             except Exception as exc:
                 logger.error("Failed to load %s: %s", fname, exc)
+        self.run_pre_init()
         return list(self.plugins.values())
+
+    def run_pre_init(self) -> None:
+        """BIND_TO_PRE_INIT — как в FunPay Cardinal при старте."""
+        import asyncio
+
+        async def _run():
+            await self.dispatch_hook("BIND_TO_PRE_INIT", self.core)
+
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                asyncio.create_task(_run())
+            else:
+                loop.run_until_complete(_run())
+        except Exception as exc:
+            logger.debug("PRE_INIT: %s", exc)
 
     def _load_one(self, file_path: str, force_reload: bool = False) -> PluginRecord:
         inline = self._extract_meta(file_path)
@@ -147,6 +165,11 @@ class PluginEngine:
             description = getattr(module, "DESCRIPTION", None) or inline.get("DESCRIPTION") or ""
             credits = getattr(module, "CREDITS", None) or inline.get("CREDITS") or ""
             settings_cb = getattr(module, "SETTINGS_CALLBACK", None) or inline.get("SETTINGS_CALLBACK")
+            settings_page = getattr(module, "SETTINGS_PAGE", None)
+            if settings_page is None:
+                settings_page = inline.get("SETTINGS_PAGE", "True").lower() in ("true", "1", "yes")
+            else:
+                settings_page = bool(settings_page)
         except Exception as exc:
             uuid = inline.get("UUID") or os.path.basename(file_path)
             return PluginRecord(
@@ -163,6 +186,9 @@ class PluginEngine:
 
         enabled = uuid not in self.disabled
         instance, is_base, err = None, False, None
+        hooks = self._fpc_hooks(module) if module else {}
+        has_hooks = any(hooks.values())
+
         if enabled:
             instance, is_base, err = self._instantiate(module, inline)
             if instance and not err:
@@ -175,6 +201,12 @@ class PluginEngine:
                     err = str(exc)
                     instance = None
 
+        hook_only = has_hooks and instance is None and err is None
+        can_run = enabled and (instance is not None or hook_only)
+
+        if enabled and not can_run and not has_hooks:
+            err = err or "No Plugin class and no BIND_TO_* hooks"
+
         return PluginRecord(
             name=name,
             uuid=uuid,
@@ -183,11 +215,14 @@ class PluginEngine:
             credits=credits,
             path=file_path,
             module=module,
-            enabled=enabled and instance is not None,
+            enabled=can_run,
             instance=instance,
-            load_error=err,
+            load_error=err if not can_run else None,
             is_base_plugin=is_base,
             settings_callback=settings_cb,
+            hook_only=hook_only,
+            has_settings_page=settings_page and (is_base or bool(settings_cb)),
+            pinned=False,
         )
 
     async def reload_plugin(self, uuid: str) -> PluginRecord | None:
@@ -280,6 +315,23 @@ class PluginEngine:
                     rec.instance.unload()
             except Exception as exc:
                 logger.error("Unload %s failed: %s", rec.name, exc)
+
+    def get_plugin_instance(self, uuid: str) -> BasePlugin | Any | None:
+        rec = self.plugins.get(uuid)
+        return rec.instance if rec else None
+
+    async def sort_records_pinned(self, records: list[PluginRecord]) -> list[PluginRecord]:
+        db = getattr(self.core, "db", None)
+        if not db:
+            return records
+        try:
+            pins = await db.list_pinned_plugins()
+        except Exception:
+            return records
+        pin_set = set(pins)
+        for r in records:
+            r.pinned = r.uuid in pin_set
+        return sorted(records, key=lambda r: (not r.pinned, r.name.lower()))
 
     def list_records(self) -> list[PluginRecord]:
         return list(self.plugins.values())

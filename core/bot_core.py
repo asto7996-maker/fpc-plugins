@@ -74,6 +74,15 @@ class BotCore:
         self._apis: dict[str, Any] = {}
         self._notify_cb: Callable[..., Awaitable[None]] | None = None
         self.account = None
+        self.telegram: Any = None
+        self._commands: list[tuple] = []
+
+    def register_telegram(self, adapter: Any) -> None:
+        self.telegram = adapter
+
+    def add_telegram_commands(self, commands: list[tuple]) -> None:
+        """FPC: [(command, description, handler), ...]"""
+        self._commands.extend(commands)
 
     def register_api(self, account_name: str, api: Any) -> None:
         self._apis[account_name] = api

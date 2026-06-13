@@ -123,6 +123,17 @@ class Database:
                     chats_at INTEGER DEFAULT 0,
                     orders_at INTEGER DEFAULT 0
                 );
+
+                CREATE TABLE IF NOT EXISTS plugin_settings (
+                    plugin_uuid TEXT PRIMARY KEY,
+                    config_json TEXT DEFAULT '{}',
+                    updated_at INTEGER DEFAULT 0
+                );
+
+                CREATE TABLE IF NOT EXISTS plugin_pins (
+                    plugin_uuid TEXT PRIMARY KEY,
+                    pinned_at INTEGER DEFAULT 0
+                );
                 """
             )
             await db.commit()
@@ -609,4 +620,38 @@ class Database:
                 """,
                 (account, now),
             )
+            await db.commit()
+
+    # ── Плагины (pins) ────────────────────────────────────────────────────
+
+    async def list_pinned_plugins(self) -> list[str]:
+        async with aiosqlite.connect(self.path) as db:
+            cur = await db.execute("SELECT plugin_uuid FROM plugin_pins ORDER BY pinned_at")
+            rows = await cur.fetchall()
+        return [str(r[0]) for r in rows]
+
+    async def toggle_plugin_pin(self, plugin_uuid: str) -> bool:
+        async with aiosqlite.connect(self.path) as db:
+            cur = await db.execute("SELECT 1 FROM plugin_pins WHERE plugin_uuid = ?", (plugin_uuid,))
+            if await cur.fetchone():
+                await db.execute("DELETE FROM plugin_pins WHERE plugin_uuid = ?", (plugin_uuid,))
+                await db.commit()
+                return False
+            await db.execute(
+                "INSERT INTO plugin_pins (plugin_uuid, pinned_at) VALUES (?, ?)",
+                (plugin_uuid, int(time.time())),
+            )
+            await db.commit()
+            return True
+
+    async def get_ar_command(self, cmd_id: int) -> dict[str, Any] | None:
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute("SELECT * FROM auto_response_cmds WHERE id = ?", (cmd_id,))
+            row = await cur.fetchone()
+        return dict(row) if row else None
+
+    async def update_ar_response(self, cmd_id: int, response: str) -> None:
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute("UPDATE auto_response_cmds SET response = ? WHERE id = ?", (response, cmd_id))
             await db.commit()

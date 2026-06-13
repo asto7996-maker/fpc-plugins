@@ -86,6 +86,15 @@ def create_premium_router(bot_context: Any) -> Router:
                 reply_markup=plugins_panel_keyboard(records, 1),
             )
 
+    @router.callback_query(F.data.startswith(CBT.PLUGIN_TOGGLE))
+    async def cb_plugin_toggle(call: CallbackQuery) -> None:
+        if not await bot_context._has_access(call.from_user.id):
+            return
+        uuid = call.data.replace(CBT.PLUGIN_TOGGLE, "")
+        pm.toggle(uuid)
+        await call.answer("Переключено")
+        await _render_plugins_page(call, pm, page=1, db=bot_context.db)
+
     @router.callback_query(F.data == CBT.REFRESH)
     async def cb_refresh(call: CallbackQuery) -> None:
         if not await bot_context._has_access(call.from_user.id):
@@ -104,9 +113,11 @@ def create_premium_router(bot_context: Any) -> Router:
     return router
 
 
-async def _render_plugins_page(call: CallbackQuery, pm: Any, page: int) -> None:
+async def _render_plugins_page(call: CallbackQuery, pm: Any, page: int, db: Any = None) -> None:
     async with loading_skeleton(call):
         records = list(pm.plugins.values()) if pm.plugins else pm.load_all()
+        if hasattr(pm, "sort_records_pinned") and db:
+            records = await pm.sort_records_pinned(records)
         total = max(1, (len(records) + PLUGINS_PER_PAGE - 1) // PLUGINS_PER_PAGE)
         page = max(1, min(page, total))
         await call.message.edit_text(

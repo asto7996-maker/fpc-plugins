@@ -71,10 +71,21 @@ class Application:
             self.automation,
         )
 
-        # Роутеры плагинов BasePlugin
+        # FPC Telegram adapter
+        from core.fpc.telegram import TelegramAdapter
+        self.core.telegram = TelegramAdapter()
+        self.core.telegram.attach(
+            self.tg_bot.bot,
+            self.tg_bot.dp,
+            self.settings.owner_id,
+            self.settings.admin_ids,
+        )
+
+        # Роутеры плагинов BasePlugin + FPC compat
         if self.tg_bot and self.plugin_engine:
             for router in self.plugin_engine.get_tg_routers():
                 self.tg_bot.dp.include_router(router)
+            self.tg_bot.dp.include_router(self.core.telegram.router)
 
     async def start(self) -> None:
         assert self.automation and self.tg_bot

@@ -23,18 +23,21 @@ def plugins_panel_keyboard(
 
     rows: list[list[InlineKeyboardButton]] = []
     for rec in chunk:
+        pin = "📌 " if getattr(rec, "pinned", False) else ""
+        hook = " 🔗" if getattr(rec, "hook_only", False) else ""
         st = flag(rec.enabled)
         err = " ⚠️" if rec.load_error else ""
         rows.append([
             InlineKeyboardButton(
-                text=f"{st} {rec.name} v{rec.version}{err}",
+                text=f"{pin}{st} {rec.name} v{rec.version}{hook}{err}",
                 callback_data=f"{CBT.PLUGIN_TOGGLE}{rec.uuid}",
             ),
         ])
         action_row = [
-            InlineKeyboardButton(text="🔄 Reload", callback_data=f"{CBT.PLUGIN_RELOAD}{rec.uuid}"),
+            InlineKeyboardButton(text="🔄", callback_data=f"{CBT.PLUGIN_RELOAD}{rec.uuid}"),
+            InlineKeyboardButton(text="📌", callback_data=f"{CBT.PLUGIN_PIN}{rec.uuid}"),
         ]
-        if getattr(rec, "settings_callback", None):
+        if getattr(rec, "has_settings_page", False) or getattr(rec, "is_base_plugin", False):
             action_row.append(
                 InlineKeyboardButton(text="⚙️", callback_data=f"{CBT.PLUGIN_SETTINGS}{rec.uuid}")
             )
@@ -54,5 +57,5 @@ def plugins_panel_text(records: list[Any], page: int, total_pages: int) -> str:
         "━━━━━━━━━━━━━━━━━━\n"
         f"Активно: <b>{enabled}</b> / {len(records)}\n"
         f"Страница {page} / {total_pages}\n\n"
-        "<i>🟢 Включено · 🔴 Выключено · 🔄 Hot-reload</i>"
+        "<i>🟢 Вкл · 🔴 Выкл · 📌 Закреп · ⚙️ Настройки · 🔗 Hook-only</i>"
     )

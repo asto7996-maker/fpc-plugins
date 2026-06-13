@@ -20,7 +20,7 @@ DB_PATH = STORAGE_DIR / "cardinal.sqlite3"
 SETTINGS_PATH = CONFIG_DIR / "settings.json"
 PLUGIN_STATE_PATH = STORAGE_DIR / "plugins" / "state.json"
 
-VERSION = "2.0.0"
+VERSION = "2.1.0"
 GITHUB_REPO = "asto7996-maker/fpc-plugins"
 GITHUB_BRANCH = "cursor/fpc-parity-280c"
 BACKUP_DIR = STORAGE_DIR / "backups"
