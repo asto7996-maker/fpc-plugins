@@ -40,7 +40,7 @@ from starvell_sdk import (
 )
 
 NAME = "VexBoost AutoSMM"
-VERSION = "3.1.1"
+VERSION = "3.1.2"
 DESCRIPTION = "Автонакрутка SMM через VexBoost для Starvell"
 CREDITS = "@xei1y"
 UUID = "a3f8c2e1-7b4d-4a9f-9e2c-1d5b8f6a0c3e"
@@ -1237,8 +1237,11 @@ class Plugin(StarvellPlugin):
         api = await self._api()
         bal_line = "API: ❌ не настроен"
         if api:
-            bal, cur, err = await api.balance()
-            bal_line = f"💰 <b>{bal:.2f}</b> {cur}" if bal is not None else f"💰 ⚠️ {err}"
+            try:
+                bal, cur, err = await asyncio.wait_for(api.balance(), timeout=8.0)
+                bal_line = f"💰 <b>{bal:.2f}</b> {cur}" if bal is not None else f"💰 ⚠️ {err}"
+            except asyncio.TimeoutError:
+                bal_line = "💰 ⚠️ таймаут API"
         return (
             f"{bal_line}\n"
             f"📋 Активных: <b>{len(active)}</b> · ⏳ Ожидают: <b>{len(waiting)}</b>\n"
@@ -1257,8 +1260,11 @@ class Plugin(StarvellPlugin):
 
         bal_txt = "—"
         if api:
-            bal, cur, err = await api.balance()
-            bal_txt = f"{bal:.2f} {cur}" if bal is not None else f"ошибка: {err}"
+            try:
+                bal, cur, err = await asyncio.wait_for(api.balance(), timeout=8.0)
+                bal_txt = f"{bal:.2f} {cur}" if bal is not None else f"ошибка: {err}"
+            except asyncio.TimeoutError:
+                bal_txt = "таймаут API"
 
         profit_net = float(stats.get("profit", 0)) * (1 - commission / 100)
 
@@ -1376,19 +1382,33 @@ class Plugin(StarvellPlugin):
         return False
 
     async def on_telegram_command(self, call, command: str) -> bool:
-        if command == "vexboost":
-            text, kb = await self.render_plugin_panel()
+        is_slash = getattr(call, "is_slash", False)
+
+        async def _send(text: str, kb=None) -> None:
+            if is_slash:
+                await call.message.answer(text, parse_mode="HTML", reply_markup=kb)
+                return
             try:
                 await call.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
             except Exception:
                 await call.message.answer(text, parse_mode="HTML", reply_markup=kb)
+            if hasattr(call, "answer"):
+                await call.answer()
+
+        if command == "vexboost":
+            text, kb = await self.render_plugin_panel()
+            await _send(text, kb)
             return True
         if command == "vb_balance":
             api = await self._api()
             if not api:
                 await call.message.answer("❌ API не настроен")
                 return True
-            bal, cur, err = await api.balance()
+            try:
+                bal, cur, err = await asyncio.wait_for(api.balance(), timeout=10.0)
+            except asyncio.TimeoutError:
+                await call.message.answer("❌ Таймаут запроса баланса")
+                return True
             if bal is not None:
                 await call.message.answer(f"💰 Баланс VexBoost: <b>{bal:.2f}</b> {cur}", parse_mode="HTML")
             else:

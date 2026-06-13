@@ -112,13 +112,14 @@ class BasePlugin(ABC):
     async def build_settings_keyboard(self) -> InlineKeyboardMarkup:
         from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
+        from core.plugins.tg_callback import field_cb
         from keyboards import cbt as CBT
         from keyboards.plugin_settings import plugin_settings_nav
 
         cfg = await self.plugin_settings.get_all(self.UUID)
         rows: list[list[InlineKeyboardButton]] = []
 
-        for field in self.get_settings_schema():
+        for idx, field in enumerate(self.get_settings_schema()):
             key = field["key"]
             label = field.get("label", key)
             ftype = field.get("type", "str")
@@ -127,14 +128,14 @@ class BasePlugin(ABC):
                 rows.append([
                     InlineKeyboardButton(
                         text=f"{'🟢' if on else '🔴'} {label}",
-                        callback_data=f"{CBT.PLUGIN_SETTING}{self.UUID}:{key}",
+                        callback_data=field_cb(CBT.PLUGIN_SETTING, self.UUID, idx),
                     )
                 ])
             elif ftype == "action":
                 rows.append([
                     InlineKeyboardButton(
                         text=f"▶️ {label}",
-                        callback_data=f"{CBT.PLUGIN_SCHEMA_ACT}{self.UUID}:{key}",
+                        callback_data=field_cb(CBT.PLUGIN_SCHEMA_ACT, self.UUID, idx),
                     )
                 ])
             elif ftype == "select":
@@ -142,7 +143,7 @@ class BasePlugin(ABC):
                 rows.append([
                     InlineKeyboardButton(
                         text=f"📋 {label}: {val}",
-                        callback_data=f"{CBT.PLUGIN_SELECT_MENU}{self.UUID}:{key}",
+                        callback_data=field_cb(CBT.PLUGIN_SELECT_MENU, self.UUID, idx),
                     )
                 ])
             elif ftype in ("text", "str", "multiline"):
@@ -151,7 +152,7 @@ class BasePlugin(ABC):
                 rows.append([
                     InlineKeyboardButton(
                         text=f"✏️ {label}: {preview or '—'}",
-                        callback_data=f"{CBT.PLUGIN_EDIT}{self.UUID}:{key}",
+                        callback_data=field_cb(CBT.PLUGIN_EDIT, self.UUID, idx),
                     )
                 ])
             elif ftype == "int":
@@ -159,7 +160,7 @@ class BasePlugin(ABC):
                 rows.append([
                     InlineKeyboardButton(
                         text=f"🔢 {label}: {val}",
-                        callback_data=f"{CBT.PLUGIN_EDIT}{self.UUID}:{key}",
+                        callback_data=field_cb(CBT.PLUGIN_EDIT, self.UUID, idx),
                     )
                 ])
 

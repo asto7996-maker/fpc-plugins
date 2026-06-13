@@ -13,6 +13,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message
 
 from handlers.tg.loading import loading_skeleton
+from core.plugins.tg_callback import field_key_by_index, parse_field_cb, parse_select_set_cb
 from keyboards import cbt as CBT
 from keyboards.plugin_settings import plugin_select_keyboard
 
@@ -24,9 +25,20 @@ class PluginSettingsStates(StatesGroup):
 
 
 def _parse_uuid_key(payload: str, prefix: str) -> tuple[str, str]:
+    """Legacy: uuid:key — для обратной совместимости."""
     body = payload.replace(prefix, "", 1)
     uuid, _, key = body.partition(":")
     return uuid, key
+
+
+def _resolve_field_key(inst: Any, uuid: str, payload: str, prefix: str) -> tuple[str, str | None]:
+    """Разбор callback: сначала индекс поля, иначе legacy key."""
+    body = payload.replace(prefix, "", 1)
+    uuid_part, _, tail = body.partition(":")
+    if tail.isdigit():
+        key = field_key_by_index(inst, int(tail))
+        return uuid_part, key
+    return _parse_uuid_key(payload, prefix)
 
 
 def _get_plugin_instance(pm: Any, uuid: str) -> Any | None:
@@ -88,7 +100,20 @@ def create_plugin_settings_router(ctx: Any) -> Router:
     async def cb_plugin_setting_toggle(call: CallbackQuery) -> None:
         if not await ctx._has_access(call.from_user.id):
             return
-        uuid, key = _parse_uuid_key(call.data, CBT.PLUGIN_SETTING)
+        inst_probe = None
+        try:
+            uuid_probe, idx = parse_field_cb(call.data, CBT.PLUGIN_SETTING)
+            inst_probe = _get_plugin_instance(pm, uuid_probe)
+            if inst_probe:
+                key_probe = field_key_by_index(inst_probe, idx)
+                if key_probe:
+                    uuid, key = uuid_probe, key_probe
+                else:
+                    uuid, key = _parse_uuid_key(call.data, CBT.PLUGIN_SETTING)
+            else:
+                uuid, key = _parse_uuid_key(call.data, CBT.PLUGIN_SETTING)
+        except ValueError:
+            uuid, key = _parse_uuid_key(call.data, CBT.PLUGIN_SETTING)
         inst = _get_plugin_instance(pm, uuid)
         if not inst:
             await call.answer("Плагин не загружен", show_alert=True)
@@ -105,7 +130,11 @@ def create_plugin_settings_router(ctx: Any) -> Router:
     async def cb_plugin_edit_field(call: CallbackQuery, state: FSMContext) -> None:
         if not await ctx._has_access(call.from_user.id):
             return
-        uuid, key = _parse_uuid_key(call.data, CBT.PLUGIN_EDIT)
+        inst_probe = _get_plugin_instance(pm, call.data.replace(CBT.PLUGIN_EDIT, "").split(":")[0])
+        if inst_probe:
+            uuid, key = _resolve_field_key(inst_probe, "", call.data, CBT.PLUGIN_EDIT)
+        else:
+            uuid, key = _parse_uuid_key(call.data, CBT.PLUGIN_EDIT)
         inst = _get_plugin_instance(pm, uuid)
         if not inst:
             await call.answer("Плагин не загружен", show_alert=True)
@@ -195,7 +224,16 @@ def create_plugin_settings_router(ctx: Any) -> Router:
     async def cb_plugin_select_menu(call: CallbackQuery) -> None:
         if not await ctx._has_access(call.from_user.id):
             return
-        uuid, key = _parse_uuid_key(call.data, CBT.PLUGIN_SELECT_MENU)
+        inst_probe = _get_plugin_instance(pm, call.data.replace(CBT.PLUGIN_SELECT_MENU, "").split(":")[0])
+        if inst_probe:
+            uuid, key = _resolve_field_key(inst_probe, "", call.data, CBT.PLUGIN_SELECT_MENU)
+            field_idx = next(
+                (i for i, f in enumerate(inst_probe.get_settings_schema()) if f.get("key") == key),
+                0,
+            )
+        else:
+            uuid, key = _parse_uuid_key(call.data, CBT.PLUGIN_SELECT_MENU)
+            field_idx = 0
         inst = _get_plugin_instance(pm, uuid)
         if not inst:
             await call.answer("Плагин не загружен", show_alert=True)
@@ -217,7 +255,7 @@ def create_plugin_settings_router(ctx: Any) -> Router:
         await call.message.edit_text(
             f"📋 <b>{label}</b>\nВыберите значение:",
             parse_mode="HTML",
-            reply_markup=plugin_select_keyboard(uuid, key, options, current),
+            reply_markup=plugin_select_keyboard(uuid, field_idx, options, current),
         )
         await call.answer()
 
@@ -225,21 +263,37 @@ def create_plugin_settings_router(ctx: Any) -> Router:
     async def cb_plugin_select_set(call: CallbackQuery) -> None:
         if not await ctx._has_access(call.from_user.id):
             return
-        body = call.data.replace(CBT.PLUGIN_SELECT_SET, "", 1)
-        parts = body.split(":")
-        if len(parts) < 3:
-            await call.answer("Ошибка данных", show_alert=True)
-            return
-        uuid, key, idx_s = parts[0], parts[1], parts[2]
         try:
-            idx = int(idx_s)
+            uuid, field_idx, idx = parse_select_set_cb(call.data, CBT.PLUGIN_SELECT_SET)
         except ValueError:
-            await call.answer("Ошибка", show_alert=True)
-            return
+            body = call.data.replace(CBT.PLUGIN_SELECT_SET, "", 1)
+            parts = body.split(":")
+            if len(parts) < 3:
+                await call.answer("Ошибка данных", show_alert=True)
+                return
+            uuid, key_legacy, idx_s = parts[0], parts[1], parts[2]
+            inst_tmp = _get_plugin_instance(pm, uuid)
+            field_idx = 0
+            if inst_tmp and not key_legacy.isdigit():
+                found = next(
+                    (i for i, f in enumerate(inst_tmp.get_settings_schema()) if f.get("key") == key_legacy),
+                    None,
+                )
+                if found is not None:
+                    field_idx = found
+            try:
+                idx = int(idx_s)
+            except ValueError:
+                await call.answer("Ошибка", show_alert=True)
+                return
 
         inst = _get_plugin_instance(pm, uuid)
         if not inst:
             await call.answer("Плагин не загружен", show_alert=True)
+            return
+        key = field_key_by_index(inst, field_idx)
+        if not key:
+            await call.answer("Поле не найдено", show_alert=True)
             return
         field = inst.get_schema_field(key)
         if not field:
@@ -262,7 +316,11 @@ def create_plugin_settings_router(ctx: Any) -> Router:
     async def cb_plugin_action(call: CallbackQuery) -> None:
         if not await ctx._has_access(call.from_user.id):
             return
-        uuid, key = _parse_uuid_key(call.data, CBT.PLUGIN_SCHEMA_ACT)
+        inst_probe = _get_plugin_instance(pm, call.data.replace(CBT.PLUGIN_SCHEMA_ACT, "").split(":")[0])
+        if inst_probe:
+            uuid, key = _resolve_field_key(inst_probe, "", call.data, CBT.PLUGIN_SCHEMA_ACT)
+        else:
+            uuid, key = _parse_uuid_key(call.data, CBT.PLUGIN_SCHEMA_ACT)
         inst = _get_plugin_instance(pm, uuid)
         if inst and hasattr(inst, "on_settings_action"):
             handled = await inst.on_settings_action(call, key)
@@ -300,15 +358,26 @@ async def _show_settings(call: CallbackQuery, pm: Any, uuid: str, skip_loading: 
     inst = rec.instance
     if inst and hasattr(inst, "render_settings_text") and hasattr(inst, "build_settings_keyboard"):
         async def render() -> None:
-            text = await inst.render_settings_text()
-            kb = await inst.build_settings_keyboard()
-            await call.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+            try:
+                text = await inst.render_settings_text()
+                kb = await inst.build_settings_keyboard()
+                await call.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+            except Exception as exc:
+                logger.exception("settings render %s: %s", uuid, exc)
+                await call.answer(f"Ошибка настроек: {exc}", show_alert=True)
+                raise
 
         if skip_loading:
-            await render()
+            try:
+                await render()
+            except Exception:
+                pass
         else:
             async with loading_skeleton(call):
-                await render()
+                try:
+                    await render()
+                except Exception:
+                    pass
         return
 
     text = (

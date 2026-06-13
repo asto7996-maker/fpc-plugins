@@ -43,6 +43,16 @@ async def loading_skeleton(
     loading_task = asyncio.create_task(_show_loading())
     try:
         yield message
+    except Exception:
+        if message:
+            try:
+                await message.edit_text(
+                    "❌ <i>Не удалось выполнить запрос. Попробуйте ещё раз.</i>",
+                    parse_mode="HTML",
+                )
+            except Exception:
+                pass
+        raise
     finally:
         loading_task.cancel()
         with suppress(asyncio.CancelledError):

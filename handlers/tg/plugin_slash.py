@@ -35,12 +35,15 @@ def create_plugin_slash_router(ctx: Any) -> Router:
                     return
                 inst = rec2.instance
                 if hasattr(inst, "on_telegram_command"):
-                    class _FakeCall:
+                    class _SlashCtx:
+                        is_slash = True
                         message = message
                         from_user = message.from_user
+
                         async def answer(self, *a, **k):
                             pass
-                    handled = await inst.on_telegram_command(_FakeCall(), _cmd)
+
+                    handled = await inst.on_telegram_command(_SlashCtx(), _cmd)
                     if handled:
                         return
                 if hasattr(inst, "has_plugin_panel") and inst.has_plugin_panel():

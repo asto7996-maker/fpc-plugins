@@ -18,7 +18,7 @@ def plugin_settings_nav(uuid: str) -> list[list[InlineKeyboardButton]]:
     ]
 
 
-def plugin_select_keyboard(uuid: str, key: str, options: list[Any], current: Any) -> InlineKeyboardMarkup:
+def plugin_select_keyboard(uuid: str, field_idx: int, options: list[Any], current: Any) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
     for idx, opt in enumerate(options):
         if isinstance(opt, dict):
@@ -31,7 +31,7 @@ def plugin_select_keyboard(uuid: str, key: str, options: list[Any], current: Any
         rows.append([
             InlineKeyboardButton(
                 text=f"{mark}{label}",
-                callback_data=f"{CBT.PLUGIN_SELECT_SET}{uuid}:{key}:{idx}",
+                callback_data=f"{CBT.PLUGIN_SELECT_SET}{uuid}:{field_idx}:{idx}",
             ),
         ])
     rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data=f"{CBT.PLUGIN_SETTINGS}{uuid}")])
