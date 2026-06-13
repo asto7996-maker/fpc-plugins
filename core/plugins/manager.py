@@ -44,6 +44,7 @@ class PluginRecord:
     pinned: bool = False
     is_starvell_native: bool = False
     is_fpc_only: bool = False
+    telegram_commands: list = field(default_factory=list)
 
 
 class PluginEngine:
@@ -274,6 +275,8 @@ class PluginEngine:
         if enabled and not can_run and not has_hooks:
             err = err or "Нет class Plugin — см. plugins/README.md"
 
+        tg_commands = self._collect_telegram_commands(instance, module, uuid)
+
         return PluginRecord(
             name=name,
             uuid=uuid,
@@ -291,6 +294,8 @@ class PluginEngine:
             has_settings_page=self._has_settings_ui(settings_page, instance, is_base, is_stv, settings_cb),
             pinned=False,
             is_starvell_native=is_stv,
+            is_fpc_only=False,
+            telegram_commands=tg_commands,
         )
 
     async def reload_plugin(self, uuid: str) -> PluginRecord | None:
@@ -421,6 +426,73 @@ class PluginEngine:
                         await rec.instance.on_shutdown()
                 except Exception as exc:
                     logger.exception("shutdown %s: %s", rec.name, exc)
+
+    def _collect_telegram_commands(self, instance: Any, module: ModuleType | None, uuid: str) -> list[dict]:
+        cmds: list[dict] = []
+        if instance and hasattr(instance, "get_telegram_commands"):
+            try:
+                cmds.extend(instance.get_telegram_commands() or [])
+            except Exception:
+                pass
+        if instance:
+            tc = getattr(instance, "TELEGRAM_COMMANDS", None) or getattr(type(instance), "TELEGRAM_COMMANDS", None)
+            if tc:
+                for item in tc:
+                    if isinstance(item, dict):
+                        cmds.append(item)
+                    elif isinstance(item, (list, tuple)) and len(item) >= 2:
+                        cmds.append({"command": str(item[0]).lstrip("/"), "description": str(item[1])})
+        if module:
+            tc_mod = getattr(module, "TELEGRAM_COMMANDS", None)
+            if tc_mod:
+                for item in tc_mod:
+                    if isinstance(item, dict):
+                        cmds.append(item)
+                    elif isinstance(item, (list, tuple)) and len(item) >= 2:
+                        cmds.append({"command": str(item[0]).lstrip("/"), "description": str(item[1])})
+        cmds.extend(self.core.get_plugin_commands(uuid))
+        seen: set[str] = set()
+        result: list[dict] = []
+        for c in cmds:
+            name = str(c.get("command", "")).lstrip("/")
+            if name and name not in seen:
+                seen.add(name)
+                result.append({"command": name, "description": c.get("description", "")})
+        return result
+
+    def get_plugin_commands(self, uuid: str) -> list[dict]:
+        rec = self.plugins.get(uuid)
+        if rec and rec.telegram_commands:
+            return rec.telegram_commands
+        return self.core.get_plugin_commands(uuid)
+
+    def delete_plugin(self, uuid: str) -> tuple[bool, str]:
+        rec = self.plugins.get(uuid)
+        if not rec:
+            return False, "Плагин не найден"
+        if rec.instance:
+            self._unload_instance(rec)
+        try:
+            from core.plugins.settings_store import PluginSettingsStore
+            store = PluginSettingsStore(self.core.db)
+            import asyncio
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(store.delete_plugin(uuid))
+            except RuntimeError:
+                pass
+        except Exception:
+            pass
+        try:
+            if os.path.isfile(rec.path):
+                os.remove(rec.path)
+        except Exception as exc:
+            return False, str(exc)
+        self.plugins.pop(uuid, None)
+        self._mtime_cache.pop(rec.path, None)
+        self.disabled.discard(uuid)
+        self._save_state()
+        return True, "✅ Плагин удалён"
 
     def validate_plugin_source(self, source: str) -> tuple[bool, str]:
         """Проверяет исходник плагина перед загрузкой в plugins/."""

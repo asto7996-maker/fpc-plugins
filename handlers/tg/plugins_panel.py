@@ -68,33 +68,6 @@ def create_premium_router(bot_context: Any) -> Router:
         page = int(call.data.split(":")[-1]) + 1
         await _render_plugins_page(call, pm, page=page)
 
-    @router.callback_query(F.data.startswith(CBT.PLUGIN_RELOAD))
-    async def cb_plugin_reload(call: CallbackQuery) -> None:
-        if not await bot_context._has_access(call.from_user.id):
-            return
-        uuid = call.data.replace(CBT.PLUGIN_RELOAD, "")
-        async with loading_skeleton(call):
-            if hasattr(pm, "reload_plugin"):
-                await pm.reload_plugin(uuid)
-            else:
-                pm.load_all()
-            records = list(pm.plugins.values()) if pm.plugins else pm.load_all()
-            total = max(1, (len(records) + PLUGINS_PER_PAGE - 1) // PLUGINS_PER_PAGE)
-            await call.message.edit_text(
-                plugins_panel_text(records, 1, total),
-                parse_mode="HTML",
-                reply_markup=plugins_panel_keyboard(records, 1),
-            )
-
-    @router.callback_query(F.data.startswith(CBT.PLUGIN_TOGGLE))
-    async def cb_plugin_toggle(call: CallbackQuery) -> None:
-        if not await bot_context._has_access(call.from_user.id):
-            return
-        uuid = call.data.replace(CBT.PLUGIN_TOGGLE, "")
-        pm.toggle(uuid)
-        await call.answer("Переключено")
-        await _render_plugins_page(call, pm, page=1, db=bot_context.db)
-
     @router.callback_query(F.data == CBT.REFRESH)
     async def cb_refresh(call: CallbackQuery) -> None:
         if not await bot_context._has_access(call.from_user.id):

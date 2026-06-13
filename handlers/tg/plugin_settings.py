@@ -288,17 +288,6 @@ def create_plugin_settings_router(ctx: Any) -> Router:
             return
         await call.answer("Плагин не найден", show_alert=True)
 
-    @router.callback_query(F.data.startswith(CBT.PLUGIN_PIN))
-    async def cb_plugin_pin(call: CallbackQuery) -> None:
-        if not await ctx._has_access(call.from_user.id):
-            return
-        uuid = call.data.replace(CBT.PLUGIN_PIN, "")
-        pinned = await ctx.db.toggle_plugin_pin(uuid)
-        await call.answer("📌 Закреплён" if pinned else "📌 Откреплён")
-        from handlers.tg.plugins_panel import _render_plugins_page
-
-        await _render_plugins_page(call, pm, page=1)
-
     return router
 
 

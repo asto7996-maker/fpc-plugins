@@ -192,6 +192,53 @@ class BasePlugin(ABC):
         """Кастомное действие (type=action). Верните True если обработано."""
         return False
 
+    # ── Панель плагина (как MM2 / VexBoost в FPC) ─────────────────────────
+
+    TELEGRAM_COMMANDS: list[dict] | list[tuple] = []
+
+    def get_telegram_commands(self) -> list[dict]:
+        """Команды для страницы ⌨️ Команды."""
+        raw = getattr(self, "TELEGRAM_COMMANDS", None) or []
+        result: list[dict] = []
+        for item in raw:
+            if isinstance(item, dict):
+                result.append(item)
+            elif isinstance(item, (list, tuple)) and len(item) >= 2:
+                result.append({"command": str(item[0]).lstrip("/"), "description": str(item[1])})
+        return result
+
+    def has_plugin_panel(self) -> bool:
+        """Есть ли кастомная панель (кнопка 🎛 Панель плагина)."""
+        return type(self).render_plugin_panel is not BasePlugin.render_plugin_panel
+
+    async def render_plugin_card_extras(self) -> str:
+        """Доп. строки на карточке плагина (статус, счётчики)."""
+        return ""
+
+    async def render_plugin_panel(self) -> tuple[str, Any] | None:
+        """
+        Кастомная панель плагина — своя менюшка с кнопками.
+        Верните (text, InlineKeyboardMarkup) или None.
+        """
+        return None
+
+    async def on_panel_action(self, call: CallbackQuery, action: str) -> bool:
+        """Обработка кнопок панели (callback sc:plugpact:uuid:action)."""
+        return False
+
+    @staticmethod
+    def panel_btn(label: str, uuid: str, action: str):
+        """Хелпер для кнопок панели."""
+        from aiogram.types import InlineKeyboardButton
+        from keyboards import cbt as CBT
+        return InlineKeyboardButton(text=label, callback_data=f"{CBT.PLUGIN_PANEL_ACT}{uuid}:{action}")
+
+    @staticmethod
+    def panel_back_btn(uuid: str):
+        from aiogram.types import InlineKeyboardButton
+        from keyboards import cbt as CBT
+        return InlineKeyboardButton(text="◀️ Назад", callback_data=f"{CBT.PLUGIN_VIEW}{uuid}")
+
     def schedule_task(self, job_id: str, coro_factory, interval_seconds: float, **kwargs) -> None:
         if self.core.scheduler:
             self.core.scheduler.add_interval_job(

@@ -76,13 +76,28 @@ class BotCore:
         self.account = None
         self.telegram: Any = None
         self._commands: list[tuple] = []
+        self._plugin_commands: dict[str, list[dict]] = {}
 
     def register_telegram(self, adapter: Any) -> None:
         self.telegram = adapter
 
-    def add_telegram_commands(self, commands: list[tuple]) -> None:
-        """FPC: [(command, description, handler), ...]"""
-        self._commands.extend(commands)
+    def add_telegram_commands(self, plugin_uuid_or_commands: Any, commands: list | None = None) -> None:
+        """FPC: add_telegram_commands(UUID, [...]) или legacy list of tuples."""
+        if commands is not None:
+            uuid = str(plugin_uuid_or_commands)
+            for item in commands:
+                if isinstance(item, (list, tuple)) and len(item) >= 2:
+                    cmd, desc = item[0], item[1]
+                    self._plugin_commands.setdefault(uuid, []).append({
+                        "command": str(cmd).lstrip("/"),
+                        "description": str(desc),
+                    })
+            return
+        if isinstance(plugin_uuid_or_commands, list):
+            self._commands.extend(plugin_uuid_or_commands)
+
+    def get_plugin_commands(self, plugin_uuid: str) -> list[dict]:
+        return list(self._plugin_commands.get(plugin_uuid, []))
 
     def register_api(self, account_name: str, api: Any) -> None:
         self._apis[account_name] = api

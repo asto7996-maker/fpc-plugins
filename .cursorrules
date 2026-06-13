@@ -27,6 +27,13 @@ class Plugin(StarvellPlugin):
 7. Ответ покупателю: `await ctx.reply(text)` в `MessageContext`.
 8. Установка: положить `.py` в `plugins/` или загрузить через Telegram (📤).
 
+## Панель плагина (FPC-style)
+
+- Список плагинов → клик по имени → карточка (UUID, автор, кнопки)
+- `render_plugin_panel()` — своя менюшка с кнопками (как MM2/VexBoost)
+- `TELEGRAM_COMMANDS` — команды для страницы ⌨️ Команды
+- `on_panel_action(call, action)` — обработка кнопок панели
+
 ## Не использовать (FPC-only)
 
 - `from cardinal import Cardinal`

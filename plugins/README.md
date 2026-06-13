@@ -52,6 +52,38 @@ class Plugin(StarvellPlugin):
 - `OrderContext` — `ctx.order_id`, `ctx.buyer_username`, `ctx.send_to_buyer()`
 - `DeliveryContext` — `ctx.codes`, `ctx.delivery_text`, `ctx.cancel()`
 
+## Навигация (как FunPay Cardinal)
+
+1. **Плагины** — список всех плагинов (🟢/🔴)
+2. Нажать на плагин → **карточка**: UUID, автор, Деактивировать, Закрепить, Команды, Панель, Настройки, Удалить
+3. **🎛 Панель** — своя менюшка плагина (`render_plugin_panel`)
+4. **⌨️ Команды** — список `/команд` плагина
+5. **⚙️ Настройки** — параметры из `get_settings_schema()`
+
+### Своя панель (как MM2 / VexBoost)
+
+```python
+class Plugin(StarvellPlugin):
+    TELEGRAM_COMMANDS = [
+        {"command": "myplugin", "description": "панель моего плагина"},
+    ]
+
+    async def render_plugin_panel(self):
+        from aiogram.types import InlineKeyboardMarkup
+        text = "📊 <b>Мой плагин</b>\nСтатус: 🟢"
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [self.panel_btn("⚙️ Настройки", self.UUID, "settings")],
+            [self.panel_back_btn(self.UUID)],
+        ])
+        return text, kb
+
+    async def on_panel_action(self, call, action: str) -> bool:
+        if action == "settings":
+            ...
+            return True
+        return False
+```
+
 ## Настройки в Telegram
 
 ```python

@@ -13,7 +13,7 @@ def plugin_settings_nav(uuid: str) -> list[list[InlineKeyboardButton]]:
     return [
         [
             InlineKeyboardButton(text="🔄 Сброс", callback_data=f"{CBT.PLUGIN_RESET}{uuid}"),
-            InlineKeyboardButton(text="◀️ Плагины", callback_data=CBT.PLUGINS),
+            InlineKeyboardButton(text="◀️ Назад", callback_data=f"{CBT.PLUGIN_VIEW}{uuid}"),
         ],
     ]
 
