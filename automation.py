@@ -110,7 +110,8 @@ def _chat_has_new_activity(
             return False
     author = last_msg.get("authorId") or last_msg.get("author")
     if my_user_id and author == my_user_id:
-        return False
+        # Последнее в списке чатов — наше сообщение; покупатель мог уже ответить
+        return True
     return True
 
 
@@ -341,7 +342,7 @@ class AutomationEngine:
             f"🛒 <b>Новый заказ #{order_id}</b>\n"
             f"Покупатель: {buyer}\n"
             f"Товар: {product_name}\n"
-            f"Сумма: {price} ₽",
+            f"Сумма: {price:.2f} ₽",
             "notify_orders",
             order_id=order_id,
         )
@@ -796,10 +797,13 @@ class AutomationEngine:
         unread = int(
             chat.get("unreadCount") or chat.get("unread") or chat.get("unreadMessagesCount") or 0
         )
-        if isinstance(last_msg, dict) and unread <= 1:
-            pending = self._iter_new_buyer_messages([last_msg], last_notified, my_user_id)
-            if pending:
-                return pending
+        if isinstance(last_msg, dict):
+            author = last_msg.get("authorId") or last_msg.get("author")
+            seller_last = bool(my_user_id and author == my_user_id)
+            if not seller_last and unread <= 1:
+                pending = self._iter_new_buyer_messages([last_msg], last_notified, my_user_id)
+                if pending:
+                    return pending
 
         try:
             return await api.fetch_messages(chat_id, limit=15, interlocutor_id=interlocutor_id)
@@ -827,6 +831,30 @@ class AutomationEngine:
     ) -> bool:
         """Обрабатывает сообщение покупателя. True — пометить как обработанное."""
         try:
+            msg_ctx = MessageContext(
+                core=self.cardinal,
+                account_name=account_name,
+                chat_id=chat_id,
+                text=text,
+                author_id=author_id,
+                username=username,
+                message_id=mid or anchor,
+                raw_message=msg,
+            )
+            # Плагины первыми — ответ покупателю важнее уведомлений в TG
+            try:
+                await asyncio.wait_for(self._emit_starvell(STV_MESSAGE, msg_ctx), timeout=20.0)
+            except asyncio.TimeoutError:
+                logger.error("plugin message timeout %s anchor=%s", chat_id[:8], anchor)
+                await self.notify(
+                    f"⚠️ Таймаут обработки сообщения в чате <code>{chat_id[:12]}</code>\n"
+                    f"<i>{text[:200]}</i>",
+                    "notify_chats",
+                    chat_id=chat_id,
+                )
+            except Exception as exc:
+                logger.exception("plugin message %s: %s", chat_id[:8], exc)
+
             prev_buyer_ts = await self.db.get_chat_last_user_message_at(chat_id, account_name)
             msg_ts = _message_ts(msg) or int(time.time())
             await self.db.set_chat_last_user_message_at(chat_id, msg_ts, account_name)
@@ -859,25 +887,16 @@ class AutomationEngine:
             if await self.db.get_feature_flag("ai_replies", settings.ai_replies_enabled):
                 await self._maybe_ai_reply(account_name, api, settings, chat_id, text, all_messages)
 
-            msg_ctx = MessageContext(
-                core=self.cardinal,
-                account_name=account_name,
-                chat_id=chat_id,
-                text=text,
-                author_id=author_id,
-                username=username,
-                message_id=mid or anchor,
-                raw_message=msg,
-            )
-            await self._emit_starvell(STV_MESSAGE, msg_ctx)
-
             ctx = PluginContext(api, self.db, settings, account_name)
             ctx.chat_id = chat_id
             ctx.message_author_id = author_id
-            await self.cardinal.event_manager.dispatch(
-                "on_message", {"message": text, "chat_id": chat_id, "ctx": ctx}
-            )
-            await self.cardinal.dispatch_plugins("BIND_TO_NEW_MESSAGE", text, chat_id)
+            try:
+                await self.cardinal.event_manager.dispatch(
+                    "on_message", {"message": text, "chat_id": chat_id, "ctx": ctx}
+                )
+                await self.cardinal.dispatch_plugins("BIND_TO_NEW_MESSAGE", text, chat_id)
+            except Exception as exc:
+                logger.warning("legacy message dispatch %s: %s", chat_id[:8], exc)
             return True
         except Exception as exc:
             logger.exception("dispatch buyer message %s anchor=%s: %s", chat_id[:8], anchor, exc)

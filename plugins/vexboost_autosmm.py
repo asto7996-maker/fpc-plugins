@@ -40,7 +40,7 @@ from starvell_sdk import (
 )
 
 NAME = "VexBoost AutoSMM"
-VERSION = "3.1.4"
+VERSION = "3.1.5"
 DESCRIPTION = "Автонакрутка SMM через VexBoost для Starvell"
 CREDITS = "@xei1y"
 UUID = "a3f8c2e1-7b4d-4a9f-9e2c-1d5b8f6a0c3e"
@@ -664,10 +664,12 @@ class Plugin(StarvellPlugin):
         anchor = self._msg_anchor(ctx)
         if not anchor:
             return False
-        if self._msg_dedup.was_seen(ctx.chat_id, anchor):
-            return True
-        self._msg_dedup.mark(ctx.chat_id, anchor)
-        return False
+        return self._msg_dedup.was_seen(ctx.chat_id, anchor)
+
+    def _mark_processed(self, ctx: MessageContext) -> None:
+        anchor = self._msg_anchor(ctx)
+        if anchor:
+            self._msg_dedup.mark(ctx.chat_id, anchor)
 
     def get_settings_schema(self) -> list[dict]:
         return [
@@ -849,30 +851,41 @@ class Plugin(StarvellPlugin):
         low = text.lower()
         if "вернул" in low and ("деньг" in low or "средств" in low):
             self._clear_buyer_state(ctx.username, ctx.chat_id)
+            self._mark_processed(ctx)
             return
 
         if low.startswith("#статус"):
             await self._cmd_status(ctx, text)
+            self._mark_processed(ctx)
             return
         if low.startswith("#рефилл") or low.startswith("#refill"):
             await self._cmd_refill(ctx, text)
+            self._mark_processed(ctx)
             return
 
         action = _confirm_action(text)
         pkey = self._pending_key(ctx)
         if action or pkey in self._pending:
             await self._handle_pending(ctx, text, action)
+            self._mark_processed(ctx)
             return
 
         waiting = _load_json("waiting.json", [])
         order = self._find_waiting(waiting, ctx)
         if not order:
+            links = _extract_links(text)
+            if links:
+                self.log(
+                    "Ссылка без ожидающего заказа: user=%s chat=%s",
+                    ctx.username, ctx.chat_id, level="warning",
+                )
             return
 
         links = _extract_links(text)
         if not links:
             return
         await self._request_link_confirm(ctx, order, links[0])
+        self._mark_processed(ctx)
 
     def _pending_key(self, ctx: MessageContext) -> str:
         return f"{ctx.chat_id}:{ctx.username}"

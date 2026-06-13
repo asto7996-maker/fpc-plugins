@@ -90,7 +90,13 @@ class TelegramBot:
         self.dp = Dispatcher()
         self.router = Router()
         self._register_handlers()
-        # Hub (плагины FPC) — регистрируем ПЕРВЫМ, чтобы перехватывал sc:plug*
+        # Slash-команды плагинов — ПЕРВЫМИ (выше hub и FSM)
+        try:
+            from handlers.tg.plugin_slash import create_plugin_slash_router
+            self.dp.include_router(create_plugin_slash_router(self))
+        except Exception as exc:
+            logger.warning("Plugin slash router: %s", exc)
+        # Hub (плагины FPC)
         try:
             from handlers.tg.hub import create_hub_router
             self.dp.include_router(create_hub_router(self))
