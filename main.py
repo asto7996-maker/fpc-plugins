@@ -52,7 +52,11 @@ async def main() -> None:
         sys.exit(1)
 
     app = Application()
-    await app.setup()
+    try:
+        await app.setup()
+    except Exception as exc:
+        logger.exception("Ошибка инициализации: %s", exc)
+        sys.exit(1)
     await app.start()
 
 

@@ -82,11 +82,10 @@ class Application:
             self.settings.admin_ids,
         )
 
-        # Роутеры плагинов BasePlugin + FPC compat
+        # Роутеры плагинов BasePlugin (FPC adapter уже подключён в attach())
         if self.tg_bot and self.plugin_engine:
             for router in self.plugin_engine.get_tg_routers():
                 self.tg_bot.dp.include_router(router)
-            self.tg_bot.dp.include_router(self.core.telegram.router)
 
     async def start(self) -> None:
         assert self.automation and self.tg_bot and self.plugin_engine
