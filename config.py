@@ -71,8 +71,9 @@ class Settings:
     order_confirm_enabled: bool = True
 
     # Приветствие (gr)
-    greetings_only_new_chats: bool = False
+    greetings_only_new_chats: bool = True
     greetings_ignore_system: bool = True
+    welcome_inactivity_days: int = 2
 
     # Подтверждение заказа (oc)
     order_confirm_text: str = "Спасибо за подтверждение заказа! Будем рады видеть вас снова! ⭐"
@@ -98,7 +99,7 @@ class Settings:
         "Здравствуйте! 👋 Рады видеть вас в нашем магазине на Starvell. "
         "Напишите, чем можем помочь!"
     )
-    welcome_cooldown_minutes: int = 60
+    welcome_cooldown_minutes: int = 2880  # 2 суток — повторное приветствие после молчания
 
     delivery_template: str = (
         "✅ Ваш заказ выполнен!\n\n"

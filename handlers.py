@@ -70,24 +70,46 @@ class BuiltinHandlers:
         return False
 
     async def on_welcome(
-        self, *, chat_id: str, api: Any, settings: Settings, account_name: str
+        self,
+        *,
+        chat_id: str,
+        api: Any,
+        settings: Settings,
+        account_name: str,
+        previous_buyer_message_at: int | None = None,
     ) -> None:
         if not await self.db.get_feature_flag("auto_welcome", settings.auto_welcome_enabled):
             return
-        if settings.greetings_only_new_chats and await self.db.is_chat_welcomed(chat_id):
-            return
 
-        cooldown = settings.welcome_cooldown_minutes * 60
-        last = await self.db.get_chat_last_user_message_at(chat_id, account_name)
+        inactivity_sec = max(1, settings.welcome_inactivity_days) * 86400
+        last_welcome_at = await self.db.get_last_welcome_at(chat_id)
         now = int(time.time())
-        if last and (now - last) < cooldown:
+
+        # Новый чат — покупатель пишет впервые с момента установки бота
+        is_new_chat = previous_buyer_message_at is None and last_welcome_at is None
+
+        # Покупатель вернулся после паузы (минимум N дней без сообщений)
+        returned_after_pause = (
+            previous_buyer_message_at is not None
+            and (now - previous_buyer_message_at) >= inactivity_sec
+        )
+
+        if settings.greetings_only_new_chats:
+            if not is_new_chat and not returned_after_pause:
+                return
+        elif last_welcome_at and (now - last_welcome_at) < inactivity_sec:
             return
 
         text = api.apply_watermark(settings.welcome_text, settings.watermark_on, settings.watermark_text)
         try:
             await api.send_message(chat_id, text)
-            await self.db.set_chat_last_user_message_at(chat_id, now, account_name)
             await self.db.mark_chat_welcomed(chat_id)
+            logger.info(
+                "welcome sent chat=%s new=%s after_pause=%s",
+                chat_id[:8],
+                is_new_chat,
+                returned_after_pause,
+            )
         except Exception as exc:
             logger.warning("welcome failed: %s", exc)
 

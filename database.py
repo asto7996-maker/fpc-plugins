@@ -117,6 +117,12 @@ class Database:
                     chat_id TEXT PRIMARY KEY,
                     welcomed_at INTEGER DEFAULT 0
                 );
+
+                CREATE TABLE IF NOT EXISTS account_bootstrap (
+                    account_name TEXT PRIMARY KEY,
+                    chats_at INTEGER DEFAULT 0,
+                    orders_at INTEGER DEFAULT 0
+                );
                 """
             )
             await db.commit()
@@ -541,5 +547,66 @@ class Database:
             await db.execute(
                 "INSERT OR REPLACE INTO chat_welcomed (chat_id, welcomed_at) VALUES (?, ?)",
                 (chat_id, int(time.time())),
+            )
+            await db.commit()
+
+    async def get_last_welcome_at(self, chat_id: str) -> int | None:
+        async with aiosqlite.connect(self.path) as db:
+            cur = await db.execute("SELECT welcomed_at FROM chat_welcomed WHERE chat_id = ?", (chat_id,))
+            row = await cur.fetchone()
+        return int(row[0]) if row else None
+
+    # ── Baseline (только новые сообщения с момента установки) ─────────────
+
+    async def is_chats_bootstrapped(self, account: str = "default") -> bool:
+        async with aiosqlite.connect(self.path) as db:
+            cur = await db.execute(
+                "SELECT chats_at FROM account_bootstrap WHERE account_name = ? AND chats_at > 0",
+                (account,),
+            )
+            row = await cur.fetchone()
+        return row is not None
+
+    async def set_chats_bootstrapped(self, account: str = "default") -> None:
+        now = int(time.time())
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                """
+                INSERT INTO account_bootstrap (account_name, chats_at, orders_at)
+                VALUES (?, ?, 0)
+                ON CONFLICT(account_name) DO UPDATE SET chats_at = excluded.chats_at
+                """,
+                (account, now),
+            )
+            await db.commit()
+
+    async def get_chats_bootstrapped_at(self, account: str = "default") -> int | None:
+        async with aiosqlite.connect(self.path) as db:
+            cur = await db.execute(
+                "SELECT chats_at FROM account_bootstrap WHERE account_name = ? AND chats_at > 0",
+                (account,),
+            )
+            row = await cur.fetchone()
+        return int(row[0]) if row else None
+
+    async def is_orders_bootstrapped(self, account: str = "default") -> bool:
+        async with aiosqlite.connect(self.path) as db:
+            cur = await db.execute(
+                "SELECT orders_at FROM account_bootstrap WHERE account_name = ? AND orders_at > 0",
+                (account,),
+            )
+            row = await cur.fetchone()
+        return row is not None
+
+    async def set_orders_bootstrapped(self, account: str = "default") -> None:
+        now = int(time.time())
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                """
+                INSERT INTO account_bootstrap (account_name, chats_at, orders_at)
+                VALUES (?, 0, ?)
+                ON CONFLICT(account_name) DO UPDATE SET orders_at = excluded.orders_at
+                """,
+                (account, now),
             )
             await db.commit()

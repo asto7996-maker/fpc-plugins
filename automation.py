@@ -19,6 +19,24 @@ from starvell_api import StarvellAPI
 logger = logging.getLogger("starvell.automation")
 
 
+def _message_id(msg: dict) -> str:
+    return str(msg.get("id") or msg.get("messageId") or "")
+
+
+def _message_ts(msg: dict) -> int:
+    for key in ("createdAt", "created_at", "sentAt", "sent_at", "timestamp", "date"):
+        val = msg.get(key)
+        if val is None:
+            continue
+        if isinstance(val, (int, float)):
+            ts = int(val)
+            return ts // 1000 if ts > 10_000_000_000 else ts
+        if isinstance(val, str) and val.isdigit():
+            ts = int(val)
+            return ts // 1000 if ts > 10_000_000_000 else ts
+    return 0
+
+
 class AutomationEngine:
     """Движок фоновых задач для одного или нескольких аккаунтов Starvell."""
 
@@ -130,6 +148,9 @@ class AutomationEngine:
             await asyncio.sleep(interval)
 
     async def _process_orders(self, account_name: str, api: StarvellAPI, settings: Settings) -> None:
+        if not await self.db.is_orders_bootstrapped(account_name):
+            await self._bootstrap_orders(account_name, api)
+
         orders = await api.fetch_orders()
         for order in orders:
             if not isinstance(order, dict):
@@ -259,19 +280,161 @@ class AutomationEngine:
 
         await self.cardinal.event_manager.dispatch("on_order_completed", {"order": order, "account": account_name})
 
+    async def _bootstrap_orders(self, account_name: str, api: StarvellAPI) -> None:
+        """Помечает существующие заказы как уже обработанные (не уведомлять о старых)."""
+        try:
+            orders = await api.fetch_orders()
+            for order in orders:
+                if not isinstance(order, dict):
+                    continue
+                order_id = str(order.get("id") or "")
+                if not order_id:
+                    continue
+                await self.db.mark_order_notified(order_id, account_name)
+                status = str(order.get("status") or "")
+                if status:
+                    await self.db.set_order_status(order_id, status, account_name)
+            await self.db.set_orders_bootstrapped(account_name)
+            logger.info("[%s] Baseline заказов: %d шт. (старые не будут обрабатываться)", account_name, len(orders))
+        except Exception as exc:
+            logger.warning("bootstrap_orders %s: %s", account_name, exc)
+
+    async def _bootstrap_chats(self, account_name: str, api: StarvellAPI, my_user_id: int | None) -> None:
+        """Фиксирует текущие сообщения как уже прочитанные — бот реагирует только на новые."""
+        try:
+            chats = await api.fetch_chats()
+            for chat in chats:
+                chat_id = str(chat.get("id") or "")
+                if not chat_id:
+                    continue
+
+                participants = chat.get("participants") or []
+                interlocutor_id = None
+                for p in participants:
+                    pid = (p or {}).get("id")
+                    if my_user_id and pid != my_user_id:
+                        interlocutor_id = pid
+                        break
+
+                messages = await api.fetch_messages(chat_id, limit=30, interlocutor_id=interlocutor_id)
+                if not messages:
+                    continue
+
+                sorted_msgs = sorted(messages, key=_message_ts)
+                latest = sorted_msgs[-1]
+                latest_id = _message_id(latest)
+                if latest_id:
+                    await self.db.set_last_notified_message(chat_id, latest_id, account_name)
+
+                last_buyer_ts = 0
+                for msg in reversed(sorted_msgs):
+                    author_id = msg.get("authorId") or msg.get("author")
+                    if my_user_id and author_id == my_user_id:
+                        continue
+                    text = str(msg.get("content") or msg.get("text") or "").strip()
+                    if not text:
+                        continue
+                    last_buyer_ts = _message_ts(msg) or int(time.time())
+                    break
+
+                if last_buyer_ts:
+                    await self.db.set_chat_last_user_message_at(chat_id, last_buyer_ts, account_name)
+
+            await self.db.set_chats_bootstrapped(account_name)
+            logger.info("[%s] Baseline чатов: %d шт. (старые сообщения игнорируются)", account_name, len(chats))
+        except Exception as exc:
+            logger.warning("bootstrap_chats %s: %s", account_name, exc)
+
+    async def _bootstrap_single_chat(
+        self,
+        account_name: str,
+        api: StarvellAPI,
+        chat_id: str,
+        my_user_id: int | None,
+        interlocutor_id: int | None,
+        messages: list[dict] | None = None,
+    ) -> str | None:
+        """Помечает старые сообщения чата как прочитанные. Возвращает anchor id или None."""
+        if messages is None:
+            messages = await api.fetch_messages(chat_id, limit=30, interlocutor_id=interlocutor_id)
+        if not messages:
+            return None
+
+        boot_at = await self.db.get_chats_bootstrapped_at(account_name) or 0
+        sorted_msgs = sorted(messages, key=_message_ts)
+        old_msgs = [
+            m for m in sorted_msgs
+            if boot_at and _message_ts(m) and _message_ts(m) <= boot_at
+        ]
+
+        last_buyer_ts = 0
+        for msg in reversed(sorted_msgs):
+            author_id = msg.get("authorId") or msg.get("author")
+            if my_user_id and author_id == my_user_id:
+                continue
+            text = str(msg.get("content") or msg.get("text") or "").strip()
+            if text:
+                last_buyer_ts = _message_ts(msg) or int(time.time())
+                break
+
+        if not old_msgs:
+            return None
+
+        anchor = _message_id(old_msgs[-1])
+        if anchor:
+            await self.db.set_last_notified_message(chat_id, anchor, account_name)
+        if last_buyer_ts:
+            await self.db.set_chat_last_user_message_at(chat_id, last_buyer_ts, account_name)
+
+        logger.debug("[%s] Baseline чата %s (anchor=%s)", account_name, chat_id[:8], anchor)
+        return anchor
+
     async def _chats_loop(self, account_name: str, api: StarvellAPI) -> None:
         """Мониторинг чатов: приветствие и ИИ-ответы."""
-        seen: dict[str, set[str]] = {}
         while self._running:
             settings = self._get_settings()
             interval = max(3.0, settings.chat_poll_interval)
             try:
                 user_info = await api.fetch_homepage()
                 my_id = (user_info.get("user") or {}).get("id")
-                await self._process_chats(account_name, api, settings, my_id, seen)
+                if not await self.db.is_chats_bootstrapped(account_name):
+                    await self._bootstrap_chats(account_name, api, my_id)
+                await self._process_chats(account_name, api, settings, my_id)
             except Exception as exc:
                 logger.warning("chats_loop %s: %s", account_name, exc)
             await asyncio.sleep(interval)
+
+    def _iter_new_buyer_messages(
+        self,
+        messages: list[dict],
+        last_notified_id: str | None,
+        my_user_id: int | None,
+    ) -> list[dict]:
+        """Возвращает только сообщения покупателя, появившиеся после last_notified_id."""
+        sorted_msgs = sorted(messages, key=_message_ts)
+        result: list[dict] = []
+        seen_last = not last_notified_id
+
+        for msg in sorted_msgs:
+            mid = _message_id(msg)
+            if not mid:
+                continue
+            if not seen_last:
+                if mid == last_notified_id:
+                    seen_last = True
+                continue
+
+            author_id = msg.get("authorId") or msg.get("author")
+            if my_user_id and author_id == my_user_id:
+                continue
+
+            text = str(msg.get("content") or msg.get("text") or "").strip()
+            if not text:
+                continue
+
+            result.append(msg)
+
+        return result
 
     async def _process_chats(
         self,
@@ -279,7 +442,6 @@ class AutomationEngine:
         api: StarvellAPI,
         settings: Settings,
         my_user_id: int | None,
-        seen: dict[str, set[str]],
     ) -> None:
         chats = await api.fetch_chats()
         for chat in chats:
@@ -296,26 +458,24 @@ class AutomationEngine:
                     break
 
             messages = await api.fetch_messages(chat_id, limit=30, interlocutor_id=interlocutor_id)
-            if chat_id not in seen:
-                seen[chat_id] = set()
+            last_notified = await self.db.get_last_notified_message(chat_id, account_name)
 
-            for msg in messages:
-                mid = str(msg.get("id") or msg.get("messageId") or "")
-                if not mid or mid in seen[chat_id]:
-                    continue
-                seen[chat_id].add(mid)
+            if last_notified is None and await self.db.is_chats_bootstrapped(account_name):
+                boot_at = await self.db.get_chats_bootstrapped_at(account_name) or 0
+                has_old = any(
+                    boot_at and _message_ts(m) and _message_ts(m) <= boot_at
+                    for m in messages
+                )
+                if has_old:
+                    last_notified = await self._bootstrap_single_chat(
+                        account_name, api, chat_id, my_user_id, interlocutor_id, messages
+                    )
+                    if last_notified and not self._iter_new_buyer_messages(messages, last_notified, my_user_id):
+                        continue
 
+            for msg in self._iter_new_buyer_messages(messages, last_notified, my_user_id):
+                mid = _message_id(msg)
                 author_id = msg.get("authorId") or msg.get("author")
-                if my_user_id and author_id == my_user_id:
-                    continue
-
-                text = str(msg.get("content") or msg.get("text") or "").strip()
-                if not text:
-                    continue
-
-                last_notified = await self.db.get_last_notified_message(chat_id, account_name)
-                if last_notified == mid:
-                    continue
 
                 username = ""
                 for p in participants:
@@ -323,15 +483,21 @@ class AutomationEngine:
                         username = (p or {}).get("username") or ""
                         break
 
+                prev_buyer_ts = await self.db.get_chat_last_user_message_at(chat_id, account_name)
+                msg_ts = _message_ts(msg) or int(time.time())
+                await self.db.set_chat_last_user_message_at(chat_id, msg_ts, account_name)
+
                 if not await self.db.is_blacklisted(
                     username=username, starvell_user_id=author_id, check="block_notify"
                 ):
                     await self.notify(
                         f"💬 <b>Новое сообщение</b> от {username or 'покупателя'}\n"
-                        f"<i>{text[:300]}</i>",
+                        f"<i>{str(msg.get('content') or msg.get('text') or '')[:300]}</i>",
                         "notify_chats",
                         chat_id=chat_id,
                     )
+
+                text = str(msg.get("content") or msg.get("text") or "").strip()
                 await self.db.set_last_notified_message(chat_id, mid, account_name)
 
                 handled = await self._handlers.on_chat_message(
@@ -340,7 +506,11 @@ class AutomationEngine:
                 )
                 if not handled:
                     await self._handlers.on_welcome(
-                        chat_id=chat_id, api=api, settings=settings, account_name=account_name,
+                        chat_id=chat_id,
+                        api=api,
+                        settings=settings,
+                        account_name=account_name,
+                        previous_buyer_message_at=prev_buyer_ts,
                     )
 
                 if await self.db.get_feature_flag("ai_replies", settings.ai_replies_enabled):
@@ -353,21 +523,6 @@ class AutomationEngine:
                     "on_message", {"message": text, "chat_id": chat_id, "ctx": ctx}
                 )
                 await self.cardinal.dispatch_plugins("BIND_TO_NEW_MESSAGE", text, chat_id)
-
-    async def _maybe_welcome(
-        self, account_name: str, api: StarvellAPI, settings: Settings, chat_id: str
-    ) -> None:
-        cooldown = settings.welcome_cooldown_minutes * 60
-        last = await self.db.get_chat_last_user_message_at(chat_id, account_name)
-        now = int(time.time())
-        if last and (now - last) < cooldown:
-            return
-        welcome = api.apply_watermark(settings.welcome_text, settings.watermark_on, settings.watermark_text)
-        try:
-            await api.send_message(chat_id, welcome)
-            await self.db.set_chat_last_user_message_at(chat_id, now, account_name)
-        except Exception as exc:
-            logger.warning("welcome failed: %s", exc)
 
     async def _maybe_ai_reply(
         self,
