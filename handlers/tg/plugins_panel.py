@@ -88,7 +88,9 @@ def create_premium_router(bot_context: Any) -> Router:
 
 async def build_plugins_list(pm: Any, db: Any = None, page: int = 1) -> tuple[str, object]:
     """Текст и клавиатура списка плагинов (FPC)."""
-    records = list(pm.plugins.values()) if pm.plugins else pm.load_all()
+    if not pm.plugins:
+        pm.load_all()
+    records = list(pm.plugins.values())
     if hasattr(pm, "sort_records_pinned") and db:
         records = await pm.sort_records_pinned(records)
     total = max(1, (len(records) + PLUGINS_PER_PAGE - 1) // PLUGINS_PER_PAGE)

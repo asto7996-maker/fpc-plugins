@@ -21,6 +21,9 @@ class Database:
     async def init(self) -> None:
         """Создаёт таблицы при первом запуске."""
         async with aiosqlite.connect(self.path) as db:
+            await db.execute("PRAGMA journal_mode=WAL")
+            await db.execute("PRAGMA synchronous=NORMAL")
+            await db.execute("PRAGMA cache_size=-8000")
             await db.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS tg_users (

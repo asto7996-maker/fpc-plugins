@@ -5,7 +5,7 @@ UX-хелперы: скелетоны загрузки при ожидании A
 from __future__ import annotations
 
 import asyncio
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from typing import AsyncIterator
 
 from aiogram.types import CallbackQuery, Message
@@ -17,14 +17,11 @@ LOADING_TEXT = "⚡️ <i>Запрос обрабатывается…</i>"
 async def loading_skeleton(
     target: Message | CallbackQuery,
     loading_text: str = LOADING_TEXT,
+    min_delay: float = 0.35,
 ) -> AsyncIterator[Message]:
     """
-    Мгновенно показывает скелетон загрузки, затем восстанавливает контекст.
-
-    Usage:
-        async with loading_skeleton(call) as msg:
-            data = await slow_api()
-            await msg.edit_text(format_result(data), ...)
+    Показывает скелетон только если операция длится дольше min_delay.
+    Быстрые ответы не мигают «Запрос обрабатывается…».
     """
     if isinstance(target, CallbackQuery):
         message = target.message
@@ -36,18 +33,20 @@ async def loading_skeleton(
         yield message  # type: ignore[misc]
         return
 
-    original_text = message.html_text or message.text or ""
-    original_markup = message.reply_markup
+    async def _show_loading() -> None:
+        await asyncio.sleep(min_delay)
+        try:
+            await message.edit_text(loading_text, parse_mode="HTML")
+        except Exception:
+            pass
 
-    try:
-        await message.edit_text(loading_text, parse_mode="HTML")
-    except Exception:
-        pass
-
+    loading_task = asyncio.create_task(_show_loading())
     try:
         yield message
     finally:
-        pass
+        loading_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await loading_task
 
 
 async def with_loading(
@@ -55,19 +54,8 @@ async def with_loading(
     coro,
     *,
     loading_text: str = LOADING_TEXT,
+    min_delay: float = 0.35,
 ):
     """Обёртка: показать загрузку → выполнить coro → вернуть результат."""
-    if isinstance(target, CallbackQuery):
-        msg = target.message
-        await target.answer()
-    else:
-        msg = target
-
-    if msg:
-        try:
-            await msg.edit_text(loading_text, parse_mode="HTML")
-        except Exception:
-            pass
-
-    result = await coro
-    return result
+    async with loading_skeleton(target, loading_text=loading_text, min_delay=min_delay):
+        return await coro

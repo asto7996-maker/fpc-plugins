@@ -96,14 +96,14 @@ class Settings:
     })
     review_use_gemini: bool = True
 
-    # Тайминги
-    chat_poll_interval: float = 5.0
-    orders_poll_interval: float = 10.0
+    # Тайминги (оптимизированы для быстрого отклика)
+    chat_poll_interval: float = 2.0
+    orders_poll_interval: float = 5.0
     bump_interval: float = 3600.0
     bump_jitter_min: int = -30
     bump_jitter_max: int = 45
-    api_delay_seconds: float = 1.5
-    api_max_per_minute: int = 40
+    api_delay_seconds: float = 0.35
+    api_max_per_minute: int = 50
 
     welcome_text: str = (
         "Здравствуйте! 👋 Рады видеть вас в нашем магазине на Starvell. "

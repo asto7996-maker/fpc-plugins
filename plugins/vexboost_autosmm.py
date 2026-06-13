@@ -436,7 +436,7 @@ class VexBoostAPI:
                 return None, "AuthToken не задан"
             cookie_name = str(self.cfg.get("cookie_name", "socpanel_session"))
             client = httpx.AsyncClient(
-                timeout=45.0,
+                timeout=20.0,
                 headers={"User-Agent": "VexBoostAutoSMM/3.1", "Accept": "application/json"},
             )
             host = urlparse(self._panel_url()).netloc
@@ -486,12 +486,12 @@ class VexBoostAPI:
         if not key:
             return {"error": "API KEY не задан"}
         data = {**payload, "key": key}
-        retries = int(self.cfg.get("api_retry_count", 3))
-        delay = int(self.cfg.get("api_retry_delay", 2))
+        retries = int(self.cfg.get("api_retry_count", 2))
+        delay = int(self.cfg.get("api_retry_delay", 1))
         last_err = "Нет ответа"
         for attempt in range(1, retries + 1):
             try:
-                async with httpx.AsyncClient(timeout=45.0) as client:
+                async with httpx.AsyncClient(timeout=20.0) as client:
                     resp = await client.post(self._api_url(), data=data)
                     result = resp.json()
             except Exception as exc:
@@ -654,7 +654,7 @@ class Plugin(StarvellPlugin):
             {"key": "auth_token", "label": "AuthToken", "type": "text", "default": ""},
             {"key": "api_url", "label": "API URL (key)", "type": "text", "default": "https://vexboost.ru/api/v2"},
             {"key": "api_key", "label": "API Key", "type": "text", "default": ""},
-            {"key": "status_interval", "label": "Интервал проверки (сек)", "type": "int", "default": 60, "min": 30, "max": 600},
+            {"key": "status_interval", "label": "Интервал проверки (сек)", "type": "int", "default": 45, "min": 20, "max": 600},
             {"key": "auto_refund_on_error", "label": "Авто-возврат при ошибке", "type": "bool", "default": True},
             {"key": "auto_refund_on_cancel", "label": "Авто-возврат при отмене SMM", "type": "bool", "default": True},
             {"key": "allow_private_tg", "label": "Приватные TG-ссылки", "type": "bool", "default": False},
@@ -1071,7 +1071,7 @@ class Plugin(StarvellPlugin):
         while True:
             try:
                 interval = int(await self.get_cfg("status_interval", 60))
-                await asyncio.sleep(max(30, interval))
+                await asyncio.sleep(max(20, interval))
                 if await self._enabled():
                     await self._check_active_orders()
             except asyncio.CancelledError:

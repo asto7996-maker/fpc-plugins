@@ -81,6 +81,32 @@ def _buyer_has_open_order(
     return False
 
 
+def _chat_has_new_activity(
+    chat: dict,
+    last_notified_id: str | None,
+    my_user_id: int | None,
+) -> bool:
+    """Пропускаем чат, если новых сообщений покупателя нет."""
+    if not last_notified_id:
+        return True
+    for key in ("unreadCount", "unread", "unreadMessagesCount", "hasUnread"):
+        val = chat.get(key)
+        if val and int(val) > 0:
+            return True
+    last_msg = chat.get("lastMessage") or chat.get("last_message")
+    if not isinstance(last_msg, dict):
+        return True
+    mid = _message_id(last_msg)
+    if not mid:
+        return True
+    if mid == last_notified_id:
+        return False
+    author = last_msg.get("authorId") or last_msg.get("author")
+    if my_user_id and author == my_user_id:
+        return False
+    return True
+
+
 def _message_id(msg: dict) -> str:
     return str(msg.get("id") or msg.get("messageId") or "")
 
@@ -117,6 +143,10 @@ class AutomationEngine:
         self._ai = AIService(load_settings())
         self._handlers = BuiltinHandlers(cardinal)
         self._payment_guard = PaymentGuard()
+        self._open_orders_cache: dict[str, tuple[float, list[dict]]] = {}
+        self._user_id_cache: dict[str, tuple[float, int | None]] = {}
+        self._OPEN_ORDERS_TTL = 30.0
+        self._USER_ID_TTL = 90.0
 
     async def notify(self, text: str, notify_type: str = "notify_orders", **extra) -> None:
         if self.notify_cb:
@@ -197,13 +227,44 @@ class AutomationEngine:
         if self._tasks:
             await asyncio.gather(*self._tasks, return_exceptions=True)
         self._tasks.clear()
+        for api in self._apis.values():
+            if hasattr(api, "aclose"):
+                try:
+                    await api.aclose()
+                except Exception:
+                    pass
         self._apis.clear()
+        self._open_orders_cache.clear()
+        self._user_id_cache.clear()
 
     async def reload(self) -> None:
         """Перезапускает фоновые задачи (после смены session cookie)."""
         await self.stop()
         self._ai = AIService(load_settings())
         await self.start()
+
+    async def _get_cached_user_id(self, account_name: str, api: StarvellAPI) -> int | None:
+        cached = self._user_id_cache.get(account_name)
+        now = time.time()
+        if cached and now - cached[0] < self._USER_ID_TTL:
+            return cached[1]
+        info = await api.fetch_homepage()
+        uid = (info.get("user") or {}).get("id")
+        self._user_id_cache[account_name] = (now, uid)
+        return uid
+
+    async def _get_cached_open_orders(self, account_name: str, api: StarvellAPI) -> list[dict]:
+        cached = self._open_orders_cache.get(account_name)
+        now = time.time()
+        if cached and now - cached[0] < self._OPEN_ORDERS_TTL:
+            return cached[1]
+        try:
+            orders = await api.fetch_orders()
+        except Exception as exc:
+            logger.debug("fetch_orders cache: %s", exc)
+            orders = cached[1] if cached else []
+        self._open_orders_cache[account_name] = (now, orders)
+        return orders
 
     async def _auth_loop(self, account_name: str, api: StarvellAPI) -> None:
         """Периодическая проверка авторизации."""
@@ -224,7 +285,7 @@ class AutomationEngine:
         """Мониторинг заказов: автовыдача и авто-отзывы."""
         while self._running:
             settings = self._get_settings()
-            interval = max(5.0, settings.orders_poll_interval)
+            interval = max(3.0, settings.orders_poll_interval)
             try:
                 await self._process_orders(account_name, api, settings)
             except Exception as exc:
@@ -236,6 +297,7 @@ class AutomationEngine:
             await self._bootstrap_orders(account_name, api)
 
         orders = await api.fetch_orders()
+        self._open_orders_cache[account_name] = (time.time(), orders)
         for order in orders:
             if not isinstance(order, dict):
                 continue
@@ -534,11 +596,13 @@ class AutomationEngine:
         """Мониторинг чатов: приветствие и ИИ-ответы."""
         while self._running:
             settings = self._get_settings()
-            interval = max(3.0, settings.chat_poll_interval)
+            interval = max(1.5, settings.chat_poll_interval)
             try:
-                user_info = await api.fetch_homepage()
-                my_id = (user_info.get("user") or {}).get("id")
+                my_id = await self._get_cached_user_id(account_name, api)
                 if not await self.db.is_chats_bootstrapped(account_name):
+                    info = await api.fetch_homepage()
+                    my_id = (info.get("user") or {}).get("id")
+                    self._user_id_cache[account_name] = (time.time(), my_id)
                     await self._bootstrap_chats(account_name, api, my_id)
                 await self._process_chats(account_name, api, settings, my_id)
             except Exception as exc:
@@ -585,120 +649,135 @@ class AutomationEngine:
         my_user_id: int | None,
     ) -> None:
         chats = await api.fetch_chats()
-        open_orders: list[dict] = []
-        try:
-            open_orders = await api.fetch_orders()
-        except Exception as exc:
-            logger.debug("fetch_orders for welcome skip: %s", exc)
+        open_orders = await self._get_cached_open_orders(account_name, api)
+        sem = asyncio.Semaphore(6)
 
-        for chat in chats:
-            chat_id = str(chat.get("id") or "")
-            if not chat_id:
-                continue
+        async def _run(chat: dict) -> None:
+            async with sem:
+                await self._process_single_chat(
+                    account_name, api, settings, my_user_id, chat, open_orders,
+                )
 
-            participants = chat.get("participants") or []
-            interlocutor_id = None
+        await asyncio.gather(*[_run(c) for c in chats], return_exceptions=True)
+
+    async def _process_single_chat(
+        self,
+        account_name: str,
+        api: StarvellAPI,
+        settings: Settings,
+        my_user_id: int | None,
+        chat: dict,
+        open_orders: list[dict],
+    ) -> None:
+        chat_id = str(chat.get("id") or "")
+        if not chat_id:
+            return
+
+        last_notified = await self.db.get_last_notified_message(chat_id, account_name)
+        if not _chat_has_new_activity(chat, last_notified, my_user_id):
+            return
+
+        participants = chat.get("participants") or []
+        interlocutor_id = None
+        for p in participants:
+            pid = (p or {}).get("id")
+            if my_user_id and pid != my_user_id:
+                interlocutor_id = pid
+                break
+
+        messages = await api.fetch_messages(chat_id, limit=15, interlocutor_id=interlocutor_id)
+
+        if last_notified is None and await self.db.is_chats_bootstrapped(account_name):
+            boot_at = await self.db.get_chats_bootstrapped_at(account_name) or 0
+            has_old = any(
+                boot_at and _message_ts(m) and _message_ts(m) <= boot_at
+                for m in messages
+            )
+            if has_old:
+                last_notified = await self._bootstrap_single_chat(
+                    account_name, api, chat_id, my_user_id, interlocutor_id, messages
+                )
+                if last_notified and not self._iter_new_buyer_messages(messages, last_notified, my_user_id):
+                    return
+
+        for msg in self._iter_new_buyer_messages(messages, last_notified, my_user_id):
+            mid = _message_id(msg)
+            author_id = msg.get("authorId") or msg.get("author")
+
+            username = ""
             for p in participants:
-                pid = (p or {}).get("id")
-                if my_user_id and pid != my_user_id:
-                    interlocutor_id = pid
+                if (p or {}).get("id") == author_id:
+                    username = (p or {}).get("username") or ""
                     break
 
-            messages = await api.fetch_messages(chat_id, limit=30, interlocutor_id=interlocutor_id)
-            last_notified = await self.db.get_last_notified_message(chat_id, account_name)
-
-            if last_notified is None and await self.db.is_chats_bootstrapped(account_name):
-                boot_at = await self.db.get_chats_bootstrapped_at(account_name) or 0
-                has_old = any(
-                    boot_at and _message_ts(m) and _message_ts(m) <= boot_at
-                    for m in messages
-                )
-                if has_old:
-                    last_notified = await self._bootstrap_single_chat(
-                        account_name, api, chat_id, my_user_id, interlocutor_id, messages
-                    )
-                    if last_notified and not self._iter_new_buyer_messages(messages, last_notified, my_user_id):
-                        continue
-
-            for msg in self._iter_new_buyer_messages(messages, last_notified, my_user_id):
-                mid = _message_id(msg)
-                author_id = msg.get("authorId") or msg.get("author")
-
-                username = ""
-                for p in participants:
-                    if (p or {}).get("id") == author_id:
-                        username = (p or {}).get("username") or ""
-                        break
-
-                text = str(msg.get("content") or msg.get("text") or "").strip()
-                if _is_platform_system_message(msg, text, settings):
-                    await self.db.set_last_notified_message(chat_id, mid, account_name)
-                    continue
-
-                guard = self._payment_guard.inspect(text)
-                if guard.is_suspicious:
-                    await self.notify(
-                        self._payment_guard.format_admin_alert(username, chat_id, text),
-                        "notify_chats",
-                        chat_id=chat_id,
-                    )
-                    await self.db.set_last_notified_message(chat_id, mid, account_name)
-                    continue
-
-                prev_buyer_ts = await self.db.get_chat_last_user_message_at(chat_id, account_name)
-                msg_ts = _message_ts(msg) or int(time.time())
-                await self.db.set_chat_last_user_message_at(chat_id, msg_ts, account_name)
-
-                if not await self.db.is_blacklisted(
-                    username=username, starvell_user_id=author_id, check="block_notify"
-                ):
-                    await self.notify(
-                        f"💬 <b>Новое сообщение</b> от {username or 'покупателя'}\n"
-                        f"<i>{str(msg.get('content') or msg.get('text') or '')[:300]}</i>",
-                        "notify_chats",
-                        chat_id=chat_id,
-                    )
-
-                text = str(msg.get("content") or msg.get("text") or "").strip()
+            text = str(msg.get("content") or msg.get("text") or "").strip()
+            if _is_platform_system_message(msg, text, settings):
                 await self.db.set_last_notified_message(chat_id, mid, account_name)
+                continue
 
-                handled = await self._handlers.on_chat_message(
-                    text=text, chat_id=chat_id, api=api, account_name=account_name,
-                    author_id=author_id, username=username, settings=settings,
-                )
-                if not handled:
-                    has_open_order = _buyer_has_open_order(open_orders, author_id, username)
-                    await self._handlers.on_welcome(
-                        chat_id=chat_id,
-                        api=api,
-                        settings=settings,
-                        account_name=account_name,
-                        previous_buyer_message_at=prev_buyer_ts,
-                        has_open_order=has_open_order,
-                    )
-
-                if await self.db.get_feature_flag("ai_replies", settings.ai_replies_enabled):
-                    await self._maybe_ai_reply(account_name, api, settings, chat_id, text, messages)
-
-                msg_ctx = MessageContext(
-                    core=self.cardinal,
-                    account_name=account_name,
+            guard = self._payment_guard.inspect(text)
+            if guard.is_suspicious:
+                await self.notify(
+                    self._payment_guard.format_admin_alert(username, chat_id, text),
+                    "notify_chats",
                     chat_id=chat_id,
-                    text=text,
-                    author_id=author_id,
-                    username=username,
-                    message_id=mid or "",
-                    raw_message=msg,
                 )
-                await self._emit_starvell(STV_MESSAGE, msg_ctx)
+                await self.db.set_last_notified_message(chat_id, mid, account_name)
+                continue
 
-                ctx = PluginContext(api, self.db, settings, account_name)
-                ctx.chat_id = chat_id
-                ctx.message_author_id = author_id
-                await self.cardinal.event_manager.dispatch(
-                    "on_message", {"message": text, "chat_id": chat_id, "ctx": ctx}
+            prev_buyer_ts = await self.db.get_chat_last_user_message_at(chat_id, account_name)
+            msg_ts = _message_ts(msg) or int(time.time())
+            await self.db.set_chat_last_user_message_at(chat_id, msg_ts, account_name)
+
+            if not await self.db.is_blacklisted(
+                username=username, starvell_user_id=author_id, check="block_notify"
+            ):
+                await self.notify(
+                    f"💬 <b>Новое сообщение</b> от {username or 'покупателя'}\n"
+                    f"<i>{str(msg.get('content') or msg.get('text') or '')[:300]}</i>",
+                    "notify_chats",
+                    chat_id=chat_id,
                 )
-                await self.cardinal.dispatch_plugins("BIND_TO_NEW_MESSAGE", text, chat_id)
+
+            await self.db.set_last_notified_message(chat_id, mid, account_name)
+
+            handled = await self._handlers.on_chat_message(
+                text=text, chat_id=chat_id, api=api, account_name=account_name,
+                author_id=author_id, username=username, settings=settings,
+            )
+            if not handled:
+                has_open_order = _buyer_has_open_order(open_orders, author_id, username)
+                await self._handlers.on_welcome(
+                    chat_id=chat_id,
+                    api=api,
+                    settings=settings,
+                    account_name=account_name,
+                    previous_buyer_message_at=prev_buyer_ts,
+                    has_open_order=has_open_order,
+                )
+
+            if await self.db.get_feature_flag("ai_replies", settings.ai_replies_enabled):
+                await self._maybe_ai_reply(account_name, api, settings, chat_id, text, messages)
+
+            msg_ctx = MessageContext(
+                core=self.cardinal,
+                account_name=account_name,
+                chat_id=chat_id,
+                text=text,
+                author_id=author_id,
+                username=username,
+                message_id=mid or "",
+                raw_message=msg,
+            )
+            await self._emit_starvell(STV_MESSAGE, msg_ctx)
+
+            ctx = PluginContext(api, self.db, settings, account_name)
+            ctx.chat_id = chat_id
+            ctx.message_author_id = author_id
+            await self.cardinal.event_manager.dispatch(
+                "on_message", {"message": text, "chat_id": chat_id, "ctx": ctx}
+            )
+            await self.cardinal.dispatch_plugins("BIND_TO_NEW_MESSAGE", text, chat_id)
 
     async def _maybe_ai_reply(
         self,

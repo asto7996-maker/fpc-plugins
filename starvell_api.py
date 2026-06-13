@@ -21,6 +21,7 @@ USER_AGENT = (
     "(KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36"
 )
 BASE_URL = "https://starvell.com"
+REQUEST_TIMEOUT = 15.0
 
 
 class RateLimiter:
@@ -73,6 +74,24 @@ class StarvellAPI:
         self.account_name = account_name
         self._limiter = RateLimiter(max_per_minute)
         self._extra_delay = max(0.0, delay_seconds)
+        self._http: httpx.AsyncClient | None = None
+
+    async def aclose(self) -> None:
+        if self._http and not self._http.is_closed:
+            await self._http.aclose()
+        self._http = None
+
+    async def _get_client(self) -> httpx.AsyncClient:
+        if self._http is None or self._http.is_closed:
+            self._http = httpx.AsyncClient(
+                cookies=self._cookies(),
+                timeout=REQUEST_TIMEOUT,
+                follow_redirects=True,
+                limits=httpx.Limits(max_connections=24, max_keepalive_connections=12),
+            )
+        else:
+            self._http.cookies.update(self._cookies())
+        return self._http
 
     def _cookies(self) -> dict[str, str]:
         cookies = {
@@ -115,17 +134,11 @@ class StarvellAPI:
         next_data: bool = False,
     ) -> httpx.Response:
         await self._throttle()
-        async with httpx.AsyncClient(
-            cookies=self._cookies(),
-            headers=self._headers(referer or f"{BASE_URL}/", json_request=not next_data and method != "GET"),
-            timeout=30.0,
-            follow_redirects=True,
-        ) as client:
-            if method == "GET":
-                resp = await client.get(url)
-            else:
-                resp = await client.post(url, json=json_body)
-            return resp
+        client = await self._get_client()
+        headers = self._headers(referer or f"{BASE_URL}/", json_request=not next_data and method != "GET")
+        if method == "GET":
+            return await client.get(url, headers=headers)
+        return await client.post(url, json=json_body, headers=headers)
 
     async def get_build_id(self) -> str:
         """Получает buildId Next.js (кешируется на 30 минут)."""
@@ -135,14 +148,13 @@ class StarvellAPI:
                 return StarvellAPI._build_id
 
             await self._throttle()
-            async with httpx.AsyncClient(
-                cookies=self._cookies(),
+            client = await self._get_client()
+            resp = await client.get(
+                f"{BASE_URL}/",
                 headers={"user-agent": USER_AGENT, "accept": "text/html"},
-                timeout=30.0,
-            ) as client:
-                resp = await client.get(f"{BASE_URL}/")
-                resp.raise_for_status()
-                html = resp.text
+            )
+            resp.raise_for_status()
+            html = resp.text
 
             match = re.search(
                 r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>',
