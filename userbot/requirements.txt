@@ -1,4 +1,4 @@
 telethon>=1.36.0
 httpx[socks]>=0.27.0
 aiosqlite>=0.20.0
-google-generativeai>=0.8.0
+Pillow>=10.0.0
