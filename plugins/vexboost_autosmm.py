@@ -2,7 +2,7 @@ from __future__ import annotations
 
 # === ОБЯЗАТЕЛЬНЫЕ ПОЛЯ FunPay Cardinal (НЕ УДАЛЯТЬ) ===
 NAME = "VexBoost AutoSMM"
-VERSION = "2.4.6"
+VERSION = "2.4.7"
 DESCRIPTION = "Автонакрутка SMM-услуг для FunPay Cardinal"
 CREDITS = "@xei1y"
 UUID = "a3f8c2e1-7b4d-4a9f-9e2c-1d5b8f6a0c3e"
@@ -1224,31 +1224,87 @@ class VexBoostAPI:
         return {"error": "Не удалось получить баланс из /api/user"}
 
     @classmethod
+    def _coerce_order_id(cls, value: Any) -> Optional[int]:
+        if value is None or isinstance(value, bool):
+            return None
+        if isinstance(value, int):
+            return value if value > 0 else None
+        if isinstance(value, float) and value.is_integer() and value > 0:
+            return int(value)
+        text = str(value).strip()
+        if text.isdigit():
+            return int(text)
+        match = re.search(r"\d+", text)
+        if match:
+            return int(match.group())
+        return None
+
+    @classmethod
+    def _extract_api_error(cls, data: Any) -> str:
+        if not isinstance(data, dict):
+            return ""
+        if data.get("error"):
+            return cls.format_error(data["error"])
+        if data.get("success") is False:
+            for key in ("message", "msg", "detail", "description"):
+                if data.get(key):
+                    return cls.format_error(data[key])
+        errors = data.get("errors")
+        if isinstance(errors, dict):
+            parts = []
+            for key, value in errors.items():
+                if isinstance(value, list):
+                    parts.extend(str(v) for v in value)
+                else:
+                    parts.append(f"{key}: {value}")
+            if parts:
+                return cls.format_error("; ".join(parts))
+        if isinstance(errors, list) and errors:
+            return cls.format_error("; ".join(str(x) for x in errors))
+        for key in ("message", "msg", "detail", "description"):
+            value = data.get(key)
+            if value and str(value).strip().lower() not in ("ok", "success", "true"):
+                lowered = str(value).lower()
+                if any(token in lowered for token in (
+                    "error", "ошиб", "invalid", "неверн", "недостат", "not enough", "denied",
+                )):
+                    return cls.format_error(value)
+        return ""
+
+    @classmethod
     def _extract_created_order_id(cls, data: Dict[str, Any]) -> Optional[int]:
         if not isinstance(data, dict):
             return None
-        for key in ("id", "order_id", "orderId"):
-            value = data.get(key)
-            if value is not None and str(value).isdigit():
-                return int(value)
+        for key in ("id", "order_id", "orderId", "orderID", "smm_id", "smm_order_id"):
+            order_id = cls._coerce_order_id(data.get(key))
+            if order_id is not None:
+                return order_id
         order = data.get("order")
         if isinstance(order, dict):
             nested = cls._extract_created_order_id(order)
             if nested is not None:
                 return nested
-        if isinstance(order, (int, str)) and str(order).isdigit():
-            return int(order)
+        order_id = cls._coerce_order_id(order)
+        if order_id is not None:
+            return order_id
         nested_data = data.get("data")
         if isinstance(nested_data, dict):
             return cls._extract_created_order_id(nested_data)
+        orders = data.get("orders")
+        if isinstance(orders, list) and orders:
+            first = orders[0]
+            if isinstance(first, dict):
+                return cls._extract_created_order_id(first)
+            return cls._coerce_order_id(first)
         return None
 
     @classmethod
     def _token_create_order(cls, service_id: int, link: str, quantity: int) -> Dict[str, Any]:
         body = {"service_id": service_id, "link": link, "quantity": quantity}
         data = cls._request_token("POST", "orders", json_body=body)
-        if data.get("error"):
-            return data
+        api_error = cls._extract_api_error(data)
+        if api_error:
+            return {"error": api_error}
         order_id = cls._extract_created_order_id(data)
         if order_id is not None:
             logger.info(
@@ -1256,7 +1312,17 @@ class VexBoostAPI:
                 LOGGER_PREFIX, order_id, service_id, quantity,
             )
             return {"order": order_id}
-        return {"error": "Заказ не создан: ID не найден в ответе API"}
+        preview = json.dumps(data, ensure_ascii=False)[:240] if isinstance(data, dict) else str(data)[:240]
+        logger.warning(
+            "%s: VexBoost POST /api/orders без ID (service=%s qty=%s link=%s): %s",
+            LOGGER_PREFIX, service_id, quantity, link[:80], preview,
+        )
+        return {
+            "error": (
+                "Заказ не создан: VexBoost не вернул ID заказа. "
+                f"Ответ API: {preview or 'пустой ответ'}"
+            ),
+        }
 
     @classmethod
     def _token_order_status(cls, order_id: int) -> Dict[str, Any]:
@@ -1459,7 +1525,10 @@ def send_order_error_notification(c: "Cardinal", error: str, order: Dict[str, An
         f"❌ <b>Ошибка {NAME}</b>\n\n"
         f"📇 FunPay: <code>#{order['OrderID']}</code>\n"
         f"🙍 Покупатель: {order.get('buyer')}\n"
-        f"⚠️ Ошибка: <code>{error}</code>"
+        f"🔍 Service ID: <code>{order.get('service_id')}</code>\n"
+        f"🔢 Кол-во: <b>{order.get('Amount')}</b>\n"
+        f"🔗 Ссылка: <code>{html.escape(str(order.get('url') or '—'))}</code>\n"
+        f"⚠️ Ошибка: <code>{html.escape(str(error))}</code>"
     )
     _send_tg_to_admins(c, text, kb)
     if settings.get("set_alert_smmbalance"):
