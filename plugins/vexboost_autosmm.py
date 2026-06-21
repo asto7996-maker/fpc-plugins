@@ -2,7 +2,7 @@ from __future__ import annotations
 
 # === ОБЯЗАТЕЛЬНЫЕ ПОЛЯ FunPay Cardinal (НЕ УДАЛЯТЬ) ===
 NAME = "VexBoost AutoSMM"
-VERSION = "2.4.4"
+VERSION = "2.4.5"
 DESCRIPTION = "Автонакрутка SMM-услуг для FunPay Cardinal"
 CREDITS = "@xei1y"
 UUID = "a3f8c2e1-7b4d-4a9f-9e2c-1d5b8f6a0c3e"
@@ -236,6 +236,7 @@ _fp_orders_in_flight: Set[str] = set()
 _message_dedup_lock = threading.RLock()
 _recent_message_keys: Dict[str, float] = {}
 _MESSAGE_DEDUP_TTL = 5.0
+_tg_handlers_registered = False
 
 URL_PATTERN = re.compile(
     r"https?://(?:[a-zA-Z0-9]|[$-_@.&+]|(?:%[0-9a-fA-F][0-9a-fA-F]))+"
@@ -1824,8 +1825,6 @@ def _process_buyer_message(
 
 def msg_hook(c: "Cardinal", e: NewMessageEvent) -> None:
     try:
-        if getattr(c, "old_mode_enabled", False):
-            return
         msg = e.message
         text = _get_message_text(msg)
         if not _should_process_message(msg.chat_id, text, getattr(msg, "id", None)):
@@ -2219,15 +2218,17 @@ GUIDE_SECTIONS: Dict[str, Tuple[str, str]] = {
     "fix": (
         "🔧 Решение проблем",
         (
+            "<b>Команды /vexboost не отвечают</b>\n"
+            "• Авторизуйтесь в боте Cardinal (пароль админа)\n"
+            "• Telegram включён в configs/_main.cfg\n"
+            "• /restart после обновления плагина\n"
+            "• Логи: «Telegram-команды зарегистрированы»\n\n"
             "<b>Нет баланса / API</b>\n"
-            "🏥 Диагностика → проверьте логин/пароль\n"
-            "<code>curl -I https://vexboost.ru</code> с сервера\n\n"
-            "<b>FunPay timeout</b>\n"
-            "Проблема сети VPS, не плагина. Нужен другой хостинг.\n\n"
-            "<b>Заказ не создаётся</b>\n"
-            "Баланс · ID в лоте · ссылка https:// · логи Cardinal\n\n"
-            "<b>Дубли заказов</b>\n"
-            "Обновите до v2.4.3+. Старые — отмените вручную в панели."
+            "🏥 Диагностика → логин/пароль\n"
+            "<code>curl -I https://vexboost.ru</code>\n\n"
+            "<b>FunPay timeout</b> — сеть VPS\n\n"
+            "<b>Покупатель пишет + — тишина</b>\n"
+            "Проверьте ID в лоте и логи Cardinal"
         ),
     ),
 }
@@ -2453,38 +2454,64 @@ def _help_text() -> str:
 
 
 def init_commands(cardinal: "Cardinal", *args) -> None:
-    send_start_notification(cardinal)
+    global _tg_handlers_registered
+
+    try:
+        send_start_notification(cardinal)
+    except Exception as exc:
+        logger.warning("%s: уведомление о старте не отправлено: %s", LOGGER_PREFIX, exc)
 
     if not cardinal.telegram:
+        logger.warning(
+            "%s: Telegram отключён — команды /vexboost не зарегистрированы",
+            LOGGER_PREFIX,
+        )
+        return
+
+    if _tg_handlers_registered:
+        logger.debug("%s: Telegram-обработчики уже зарегистрированы", LOGGER_PREFIX)
         return
 
     tg = cardinal.telegram
     bot = tg.bot
 
     def send_main_panel(message):
-        settings = load_settings()
-        bot.reply_to(
-            message, _settings_summary(settings),
-            reply_markup=_main_keyboard(), parse_mode="HTML",
-        )
+        try:
+            settings = load_settings()
+            bot.reply_to(
+                message, _settings_summary(settings),
+                reply_markup=_main_keyboard(), parse_mode="HTML",
+            )
+        except Exception as exc:
+            logger.error("%s: ошибка /vexboost: %s", LOGGER_PREFIX, exc)
+            logger.debug(traceback.format_exc())
+            bot.reply_to(message, f"⚠️ Ошибка панели: {exc}")
 
     def send_stats_cmd(message):
-        text = StatisticsManager.format_stats_text(0)
-        bot.reply_to(message, text, parse_mode="HTML", reply_markup=_stats_keyboard())
+        try:
+            text = StatisticsManager.format_stats_text(0)
+            bot.reply_to(message, text, parse_mode="HTML", reply_markup=_stats_keyboard())
+        except Exception as exc:
+            logger.error("%s: ошибка /vb_stats: %s", LOGGER_PREFIX, exc)
+            bot.reply_to(message, f"⚠️ Ошибка статистики: {exc}")
 
     def send_balance_cmd(message):
-        balance = VexBoostAPI.get_balance()
-        if balance:
-            text = f"💰 <b>Баланс VexBoost:</b> {balance[0]:.2f} {balance[1]}"
-        else:
-            err = VexBoostAPI.get_balance_error()
-            text = f"🔴 <b>VexBoost:</b> {err or 'Проверьте API KEY в /vexboost'}"
         try:
-            fp = cardinal.get_balance()
-            text += f"\n💰 <b>FunPay:</b> {fp.total_rub}₽, {fp.available_usd}$, {fp.total_eur}€"
-        except Exception:
-            pass
-        bot.reply_to(message, text, parse_mode="HTML")
+            balance = VexBoostAPI.get_balance()
+            if balance:
+                text = f"💰 <b>Баланс VexBoost:</b> {balance[0]:.2f} {balance[1]}"
+            else:
+                err = VexBoostAPI.get_balance_error()
+                text = f"🔴 <b>VexBoost:</b> {err or 'Проверьте настройки в /vexboost'}"
+            try:
+                fp = cardinal.get_balance()
+                text += f"\n💰 <b>FunPay:</b> {fp.total_rub}₽, {fp.available_usd}$, {fp.total_eur}€"
+            except Exception:
+                pass
+            bot.reply_to(message, text, parse_mode="HTML")
+        except Exception as exc:
+            logger.error("%s: ошибка /vb_balance: %s", LOGGER_PREFIX, exc)
+            bot.reply_to(message, f"⚠️ Ошибка баланса: {exc}")
 
     def handle_callback(call):
         settings = load_settings()
@@ -2853,11 +2880,20 @@ def init_commands(cardinal: "Cardinal", *args) -> None:
     tg.msg_handler(send_stats_cmd, commands=["vb_stats"])
     tg.msg_handler(send_balance_cmd, commands=["vb_balance"])
 
-    cardinal.add_telegram_commands(UUID, [
-        ("vexboost", f"панель {NAME}", True),
-        ("vb_stats", f"статистика {NAME}", True),
-        ("vb_balance", f"баланс {NAME}", True),
-    ])
+    try:
+        cardinal.add_telegram_commands(UUID, [
+            ("vexboost", f"панель {NAME}", True),
+            ("vb_stats", f"статистика {NAME}", True),
+            ("vb_balance", f"баланс {NAME}", True),
+        ])
+    except Exception as exc:
+        logger.error("%s: add_telegram_commands: %s", LOGGER_PREFIX, exc)
+
+    _tg_handlers_registered = True
+    logger.info(
+        "%s: Telegram-команды зарегистрированы (/vexboost /vb_stats /vb_balance)",
+        LOGGER_PREFIX,
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3215,11 +3251,10 @@ def safe_handler(func: Callable) -> Callable:
 _safe_bind_to_new_order = safe_handler(bind_to_new_order)
 _safe_msg_hook = safe_handler(msg_hook)
 _safe_last_chat_hook = safe_handler(last_chat_msg_hook)
-_safe_init_commands = safe_handler(init_commands)
 _safe_start_status_checker = safe_handler(start_status_checker)
 
-# Переопределяем BIND_TO с безопасными обёртками
-BIND_TO_PRE_INIT = [_safe_init_commands]
+# init_commands без safe_handler — ошибки регистрации TG должны быть видны в логах
+BIND_TO_PRE_INIT = [init_commands]
 BIND_TO_POST_INIT = [_safe_start_status_checker]
 BIND_TO_NEW_ORDER = [_safe_bind_to_new_order]
 BIND_TO_NEW_MESSAGE = [_safe_msg_hook]
