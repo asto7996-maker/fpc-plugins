@@ -2,11 +2,11 @@ from __future__ import annotations
 
 # === ОБЯЗАТЕЛЬНЫЕ ПОЛЯ FunPay Cardinal (НЕ УДАЛЯТЬ) ===
 NAME = "VexBoost AutoSMM"
-VERSION = "2.4.5"
+VERSION = "2.4.6"
 DESCRIPTION = "Автонакрутка SMM-услуг для FunPay Cardinal"
 CREDITS = "@xei1y"
 UUID = "a3f8c2e1-7b4d-4a9f-9e2c-1d5b8f6a0c3e"
-SETTINGS_PAGE = False
+SETTINGS_PAGE = True
 BIND_TO_DELETE = None
 # === КОНЕЦ ОБЯЗАТЕЛЬНЫХ ПОЛЕЙ ===
 
@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tupl
 import requests
 from telebot.types import InlineKeyboardButton, InlineKeyboardMarkup
 
+from tg_bot import CBT
 from FunPayAPI.types import MessageTypes
 from FunPayAPI.updater.events import LastChatMessageChangedEvent, NewMessageEvent, NewOrderEvent
 
@@ -236,7 +237,7 @@ _fp_orders_in_flight: Set[str] = set()
 _message_dedup_lock = threading.RLock()
 _recent_message_keys: Dict[str, float] = {}
 _MESSAGE_DEDUP_TTL = 5.0
-_tg_handlers_registered = False
+_tg_bot_instance_id: Optional[int] = None
 
 URL_PATTERN = re.compile(
     r"https?://(?:[a-zA-Z0-9]|[$-_@.&+]|(?:%[0-9a-fA-F][0-9a-fA-F]))+"
@@ -1506,9 +1507,12 @@ def send_start_notification(c: "Cardinal") -> None:
         f"✅ <b>{NAME} v{VERSION} запущен</b>\n\n"
         f"⚙️ Настройки: /vexboost\n"
         f"📊 Статистика: /vb_stats\n"
-        f"💰 Баланс: /vb_balance"
+        f"💰 Баланс: /vb_balance\n\n"
+        f"<i>Если команда не отвечает, нажмите кнопку ниже</i>"
     )
-    _send_tg_to_admins(c, text)
+    kb = InlineKeyboardMarkup()
+    kb.add(InlineKeyboardButton("⚙️ Открыть панель VexBoost", callback_data="vb_open_panel"))
+    _send_tg_to_admins(c, text, kb)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2453,8 +2457,36 @@ def _help_text() -> str:
     )
 
 
+def _tg_command_name(message) -> str:
+    text = getattr(message, "text", None) or ""
+    if not text.startswith("/"):
+        return ""
+    return text.split()[0].split("@")[0][1:].lower()
+
+
+def _tg_matches_command(message, *commands: str) -> bool:
+    cmd = _tg_command_name(message)
+    return bool(cmd) and cmd in {c.lower().lstrip("/") for c in commands}
+
+
+def _send_vb_panel(bot, chat_id: int, *, reply_to: Any = None) -> None:
+    settings = load_settings()
+    text = _settings_summary(settings)
+    markup = _main_keyboard()
+    if reply_to is not None:
+        bot.reply_to(
+            reply_to, text, reply_markup=markup, parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+    else:
+        bot.send_message(
+            chat_id, text, reply_markup=markup, parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+
+
 def init_commands(cardinal: "Cardinal", *args) -> None:
-    global _tg_handlers_registered
+    global _tg_bot_instance_id
 
     try:
         send_start_notification(cardinal)
@@ -2468,20 +2500,17 @@ def init_commands(cardinal: "Cardinal", *args) -> None:
         )
         return
 
-    if _tg_handlers_registered:
-        logger.debug("%s: Telegram-обработчики уже зарегистрированы", LOGGER_PREFIX)
-        return
-
     tg = cardinal.telegram
     bot = tg.bot
+    bot_instance_id = id(bot)
+    if _tg_bot_instance_id == bot_instance_id:
+        logger.debug("%s: Telegram-обработчики уже зарегистрированы для этого бота", LOGGER_PREFIX)
+        return
 
     def send_main_panel(message):
         try:
-            settings = load_settings()
-            bot.reply_to(
-                message, _settings_summary(settings),
-                reply_markup=_main_keyboard(), parse_mode="HTML",
-            )
+            logger.info("%s: команда /vexboost от user %s", LOGGER_PREFIX, message.from_user.id)
+            _send_vb_panel(bot, message.chat.id, reply_to=message)
         except Exception as exc:
             logger.error("%s: ошибка /vexboost: %s", LOGGER_PREFIX, exc)
             logger.debug(traceback.format_exc())
@@ -2489,6 +2518,7 @@ def init_commands(cardinal: "Cardinal", *args) -> None:
 
     def send_stats_cmd(message):
         try:
+            logger.info("%s: команда /vb_stats от user %s", LOGGER_PREFIX, message.from_user.id)
             text = StatisticsManager.format_stats_text(0)
             bot.reply_to(message, text, parse_mode="HTML", reply_markup=_stats_keyboard())
         except Exception as exc:
@@ -2497,6 +2527,7 @@ def init_commands(cardinal: "Cardinal", *args) -> None:
 
     def send_balance_cmd(message):
         try:
+            logger.info("%s: команда /vb_balance от user %s", LOGGER_PREFIX, message.from_user.id)
             balance = VexBoostAPI.get_balance()
             if balance:
                 text = f"💰 <b>Баланс VexBoost:</b> {balance[0]:.2f} {balance[1]}"
@@ -2513,13 +2544,32 @@ def init_commands(cardinal: "Cardinal", *args) -> None:
             logger.error("%s: ошибка /vb_balance: %s", LOGGER_PREFIX, exc)
             bot.reply_to(message, f"⚠️ Ошибка баланса: {exc}")
 
+    def open_plugin_settings(call):
+        try:
+            settings = load_settings()
+            bot.edit_message_text(
+                _settings_summary(settings),
+                call.message.chat.id,
+                call.message.message_id,
+                reply_markup=_main_keyboard(),
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
+        except Exception:
+            _send_vb_panel(bot, call.message.chat.id)
+        bot.answer_callback_query(call.id)
+
     def handle_callback(call):
         settings = load_settings()
         chat_id = call.message.chat.id
         msg_id = call.message.message_id
 
         try:
-            if call.data == "vb_back_main":
+            if call.data == "vb_open_panel":
+                _send_vb_panel(bot, chat_id)
+                bot.answer_callback_query(call.id)
+
+            elif call.data == "vb_back_main":
                 bot.edit_message_text(
                     _settings_summary(settings), chat_id, msg_id,
                     reply_markup=_main_keyboard(), parse_mode="HTML",
@@ -2862,6 +2912,8 @@ def init_commands(cardinal: "Cardinal", *args) -> None:
         tg.clear_state(message.chat.id, message.from_user.id)
 
     def _has_text_input_state(message):
+        if _tg_matches_command(message, "vexboost", "vb_stats", "vb_balance"):
+            return False
         base_states = (
             "vb_panel_url", "vb_panel_login", "vb_panel_password",
             "vb_auth_token", "vb_api_url", "vb_api_key",
@@ -2874,11 +2926,12 @@ def init_commands(cardinal: "Cardinal", *args) -> None:
             return state.replace("vb_tpl_", "") in MESSAGE_TEMPLATE_LABELS
         return False
 
+    tg.msg_handler(send_main_panel, func=lambda m: _tg_matches_command(m, "vexboost"))
+    tg.msg_handler(send_stats_cmd, func=lambda m: _tg_matches_command(m, "vb_stats"))
+    tg.msg_handler(send_balance_cmd, func=lambda m: _tg_matches_command(m, "vb_balance"))
+    tg.cbq_handler(open_plugin_settings, lambda c: c.data.startswith(f"{CBT.PLUGIN_SETTINGS}:{UUID}:"))
     tg.cbq_handler(handle_callback, lambda c: c.data.startswith("vb_"))
     tg.msg_handler(handle_text_input, func=_has_text_input_state)
-    tg.msg_handler(send_main_panel, commands=["vexboost"])
-    tg.msg_handler(send_stats_cmd, commands=["vb_stats"])
-    tg.msg_handler(send_balance_cmd, commands=["vb_balance"])
 
     try:
         cardinal.add_telegram_commands(UUID, [
@@ -2889,7 +2942,7 @@ def init_commands(cardinal: "Cardinal", *args) -> None:
     except Exception as exc:
         logger.error("%s: add_telegram_commands: %s", LOGGER_PREFIX, exc)
 
-    _tg_handlers_registered = True
+    _tg_bot_instance_id = bot_instance_id
     logger.info(
         "%s: Telegram-команды зарегистрированы (/vexboost /vb_stats /vb_balance)",
         LOGGER_PREFIX,
