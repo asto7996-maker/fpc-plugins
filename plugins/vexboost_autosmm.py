@@ -2,7 +2,7 @@ from __future__ import annotations
 
 # === ОБЯЗАТЕЛЬНЫЕ ПОЛЯ FunPay Cardinal (НЕ УДАЛЯТЬ) ===
 NAME = "VexBoost AutoSMM"
-VERSION = "2.4.7"
+VERSION = "2.4.8"
 DESCRIPTION = "Автонакрутка SMM-услуг для FunPay Cardinal"
 CREDITS = "@xei1y"
 UUID = "a3f8c2e1-7b4d-4a9f-9e2c-1d5b8f6a0c3e"
@@ -79,6 +79,8 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "set_alert_smmbalance_new": False,
     "set_start_mess": True,
     "set_recreated_order": False,
+    "set_notify_buyer_partial": False,
+    "set_alert_partial": True,
     "set_tg_private": False,
     "commission_percent": 6.0,
     "welcome_message": (
@@ -1552,6 +1554,27 @@ def send_order_complete_notification(
     _send_tg_to_admins(c, text, kb)
 
 
+def send_partial_order_notification(
+    c: "Cardinal", smm_id: str, info: Dict[str, Any], remains: int,
+) -> None:
+    settings = load_settings()
+    if not settings.get("set_alert_partial"):
+        return
+    funpay_id = info.get("order_id", "")
+    btn = InlineKeyboardButton("🌐 Заказ FunPay", url=get_funpay_order_url(funpay_id))
+    kb = InlineKeyboardMarkup().add(btn)
+    text = (
+        f"⏸ <b>Partial {NAME}</b>\n\n"
+        f"📇 FunPay: <code>#{funpay_id}</code>\n"
+        f"🆔 VexBoost: <code>{smm_id}</code>\n"
+        f"🙍 Покупатель: {info.get('buyer', '—')}\n"
+        f"🔍 Service ID: <code>{info.get('service_id')}</code>\n"
+        f"👀 Остаток: <b>{remains}</b> ед.\n\n"
+        f"<i>Покупателю сообщение не отправлено (настройка по умолчанию).</i>"
+    )
+    _send_tg_to_admins(c, text, kb)
+
+
 def send_balance_notification(c: "Cardinal") -> None:
     balance = VexBoostAPI.get_balance()
     if not balance:
@@ -2057,7 +2080,15 @@ def _check_all_active_orders(c: "Cardinal") -> None:
         _handle_canceled_order(c, smm_id, updated.pop(smm_id, {}))
 
     for smm_id in to_notify_partial:
-        _handle_partial_order(c, smm_id, updated.get(smm_id, {}), api_url, api_key)
+        info = updated.get(smm_id, {})
+        if info.get("partial_notified"):
+            continue
+        if _handle_partial_order(c, smm_id, info, api_url, api_key):
+            info["partial_notified"] = True
+            if info.get("partial_recreated"):
+                updated.pop(smm_id, None)
+            else:
+                updated[smm_id] = info
 
     save_active_orders(updated)
 
@@ -2137,14 +2168,16 @@ def _handle_canceled_order(c: "Cardinal", smm_id: str, info: Dict[str, Any]) -> 
 def _handle_partial_order(
     c: "Cardinal", smm_id: str, info: Dict[str, Any],
     api_url: str, api_key: str,
-) -> None:
+) -> bool:
+    """Обрабатывает Partial-заказ. Возвращает True, если обработка завершена."""
     settings = load_settings()
     chat_id = info.get("chat_id")
     funpay_id = info.get("order_id", "")
     partial_amount = int(info.get("partial_amount", 0))
 
     if not settings.get("set_recreated_order"):
-        if chat_id:
+        send_partial_order_notification(c, smm_id, info, partial_amount)
+        if chat_id and settings.get("set_notify_buyer_partial"):
             send_fp(
                 c, chat_id,
                 _format_buyer_template(
@@ -2153,10 +2186,10 @@ def _handle_partial_order(
                     remains=partial_amount,
                 ),
             )
-        return
+        return True
 
     if partial_amount <= 0:
-        return
+        return True
 
     new_service_id = info.get("service_id")
     new_link = info.get("order_url", "")
@@ -2184,8 +2217,11 @@ def _handle_partial_order(
                         partial_amount=partial_amount,
                     ),
                 )
+            info["partial_recreated"] = True
+            return True
     except Exception as exc:
         logger.error("%s: ошибка пересоздания partial: %s", LOGGER_PREFIX, exc)
+    return False
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2447,6 +2483,8 @@ def _settings_keyboard(settings: Dict[str, Any]) -> InlineKeyboardMarkup:
     kb.add(toggle_btn("set_alert_smmbalance_new", "Баланс до заказа", "Баланс до заказа"))
     kb.add(toggle_btn("set_start_mess", "Сообщение при старте", "Сообщение при старте"))
     kb.add(toggle_btn("set_recreated_order", "Пересоздание Partial", "Пересоздание Partial"))
+    kb.add(toggle_btn("set_notify_buyer_partial", "Partial → покупателю", "Partial → покупателю"))
+    kb.add(toggle_btn("set_alert_partial", "Увед. Partial (TG)", "Увед. Partial (TG)"))
     kb.add(toggle_btn("set_tg_private", "Закрытые TG каналы", "Закрытые TG каналы"))
     kb.add(InlineKeyboardButton("⬅️ Назад", callback_data="vb_back_main"))
     return kb
