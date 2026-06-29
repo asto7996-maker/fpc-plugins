@@ -39,7 +39,7 @@ from starvell_sdk import (
 )
 
 NAME = "VexBoost AutoSMM"
-VERSION = "4.0.0"
+VERSION = "4.1.0"
 DESCRIPTION = "Автонакрутка SMM через VexBoost для Starvell"
 CREDITS = "@xei1y"
 UUID = "a3f8c2e1-7b4d-4a9f-9e2c-1d5b8f6a0c3e"
@@ -52,12 +52,23 @@ TELEGRAM_COMMANDS = [
     {"command": "vb_balance", "description": "баланс VexBoost AutoSMM"},
 ]
 
-SERVICE_ID_RE = re.compile(r"ID:\s*(\d+)", re.IGNORECASE)
-QUAN_RE = re.compile(r"#Quan:\s*(\d+)", re.IGNORECASE)
+SERVICE_ID_RE = re.compile(r"ID\s*[:=\-]\s*(\d+)", re.IGNORECASE)
+QUAN_RE = re.compile(r"#?\s*Quan\s*[:=\-]\s*(\d+)", re.IGNORECASE)
 LINK_RE = re.compile(
     r"https?://(?:[a-zA-Z0-9]|[$-_@.&+]|[%][0-9a-fA-F]{2})+",
     re.IGNORECASE,
 )
+BARE_DOMAIN_RE = re.compile(
+    r"(?:"
+    r"(?:www\.)?(?:t\.me|telegram\.me|vk\.com|vk\.ru|instagram\.com|"
+    r"tiktok\.com|youtube\.com|youtu\.be|twitter\.com|x\.com|"
+    r"facebook\.com|fb\.com|ok\.ru|discord\.gg|discord\.com|"
+    r"twitch\.tv|threads\.net|kick\.com|pinterest\.com|snapchat\.com)"
+    r"/[^\s<>\"']+"
+    r")",
+    re.IGNORECASE,
+)
+TG_AT_RE = re.compile(r"@([a-zA-Z0-9_]{4,32})\b")
 
 CONFIRM_PLUS = {"+", "➕", "✅", "yes", "да", "ok", "подтверждаю"}
 CONFIRM_MINUS = {"-", "➖", "❌", "no", "нет", "отмена"}
@@ -247,22 +258,61 @@ def _order_search_blob(order: dict) -> str:
 
 
 def _extract_links(text: str) -> list[str]:
-    raw = text or ""
+    raw = (text or "").strip()
+    if not raw:
+        return []
     links = LINK_RE.findall(raw)
     if links:
         return links
-    bare = re.findall(
-        r"(?:t\.me|telegram\.me|vk\.com|instagram\.com|tiktok\.com|youtube\.com|youtu\.be|twitter\.com|x\.com)/[^\s]+",
-        raw,
-        re.IGNORECASE,
-    )
     result: list[str] = []
-    for item in bare:
-        link = item.strip().rstrip(".,;)")
+    for item in BARE_DOMAIN_RE.findall(raw):
+        link = item.strip().rstrip(".,;)>]}")
         if not link.startswith(("http://", "https://")):
             link = f"https://{link}"
         result.append(link)
+    if result:
+        return result
+    for handle in TG_AT_RE.findall(raw):
+        result.append(f"https://t.me/{handle}")
     return result
+
+
+def _looks_like_link_attempt(text: str) -> bool:
+    low = (text or "").lower()
+    if _extract_links(text):
+        return True
+    markers = (
+        "http", "www.", "t.me/", "telegram.me/", "vk.com/", "instagram.com/",
+        "tiktok.com/", "youtube.com/", "youtu.be/", ".com/", ".ru/",
+    )
+    return any(m in low for m in markers)
+
+
+def _deep_search_service_id(obj: Any, depth: int = 0) -> tuple[int, int] | None:
+    """Рекурсивный поиск ID: / #Quan: в любом поле JSON заказа."""
+    if depth > 12:
+        return None
+    if isinstance(obj, str):
+        m = SERVICE_ID_RE.search(obj)
+        if not m:
+            return None
+        service_id = int(m.group(1))
+        mult = 1
+        qm = QUAN_RE.search(obj)
+        if qm:
+            mult = max(1, int(qm.group(1)))
+        return service_id, mult
+    if isinstance(obj, dict):
+        for val in obj.values():
+            found = _deep_search_service_id(val, depth + 1)
+            if found:
+                return found
+    elif isinstance(obj, list):
+        for item in obj[:50]:
+            found = _deep_search_service_id(item, depth + 1)
+            if found:
+                return found
+    return None
 
 
 def _is_private_tg(link: str) -> bool:
@@ -774,6 +824,7 @@ class Plugin(StarvellPlugin):
         self._pending = _load_json("pending.json", {})
         self._status_task = asyncio.create_task(self._status_loop())
         asyncio.create_task(self._catchup_created_orders(), name="vexboost-catchup")
+        asyncio.create_task(self._periodic_created_scan(), name="vexboost-scan")
         if await self.get_cfg("notify_startup", True):
             await self.core.notify(
                 f"✅ <b>{NAME} v{VERSION}</b> запущен\n"
@@ -785,15 +836,22 @@ class Plugin(StarvellPlugin):
     async def _catchup_created_orders(self) -> None:
         """После рестарта подхватывает CREATED заказы и буферные ссылки."""
         await asyncio.sleep(3)
+        await self._scan_created_orders_impl()
+
+    async def _scan_created_orders_impl(self) -> None:
         if not await self._enabled():
             return
         api = self.core.get_api()
         if not api:
             return
         try:
-            orders = await api.fetch_orders()
+            orders = (
+                await api.fetch_all_orders()
+                if hasattr(api, "fetch_all_orders")
+                else await api.fetch_orders()
+            )
         except Exception as exc:
-            self.log("catchup orders: %s", exc, level="warning")
+            self.log("scan orders: %s", exc, level="warning")
             return
         waiting_ids = {str(o.get("order_id")) for o in _load_json("waiting.json", [])}
         submitted = _load_json("submitted.json", {})
@@ -829,6 +887,18 @@ class Plugin(StarvellPlugin):
                         text=orphan_link, author_id=octx.buyer_id, username=octx.buyer_username,
                     )
                     await self._process_link_and_submit(msg_ctx, entry, orphan_link)
+
+    async def _periodic_created_scan(self) -> None:
+        """Каждые 45 с подхватывает CREATED заказы без waiting (если on_order_paid пропустил)."""
+        await asyncio.sleep(8)
+        while True:
+            try:
+                await asyncio.sleep(45)
+                await self._scan_created_orders_impl()
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                self.log("periodic scan: %s", exc, level="warning")
 
     async def on_shutdown(self) -> None:
         if self._status_task:
@@ -958,38 +1028,96 @@ class Plugin(StarvellPlugin):
     def _parse_lot(self, order: dict) -> tuple[int, int] | None:
         blob = _order_search_blob(order)
         m = SERVICE_ID_RE.search(blob)
-        if not m:
+        if m:
+            service_id = int(m.group(1))
+            mult = 1
+            qm = QUAN_RE.search(blob)
+            if qm:
+                mult = max(1, int(qm.group(1)))
+            qty = max(1, int(order.get("quantity") or 1)) * mult
+            return service_id, qty
+        deep = _deep_search_service_id(order)
+        if deep:
+            service_id, mult = deep
+            qty = max(1, int(order.get("quantity") or 1)) * mult
+            return service_id, qty
+        return None
+
+    def _lot_cache_get(self, offer_id: str) -> tuple[int, int] | None:
+        if not offer_id:
             return None
-        service_id = int(m.group(1))
-        mult = 1
-        qm = QUAN_RE.search(blob)
-        if qm:
-            mult = max(1, int(qm.group(1)))
-        qty = max(1, int(order.get("quantity") or 1)) * mult
-        return service_id, qty
+        cache = _load_json("lot_cache.json", {})
+        entry = cache.get(str(offer_id))
+        if isinstance(entry, dict) and entry.get("service_id"):
+            return int(entry["service_id"]), max(1, int(entry.get("mult") or 1))
+        return None
+
+    def _lot_cache_set(self, offer_id: str, service_id: int, mult: int = 1) -> None:
+        if not offer_id:
+            return
+        cache = _load_json("lot_cache.json", {})
+        cache[str(offer_id)] = {"service_id": service_id, "mult": mult}
+        _save_json("lot_cache.json", cache)
 
     async def _resolve_lot(self, order: dict, account_name: str = "default") -> tuple[int, int] | None:
         parsed = self._parse_lot(order)
         if parsed:
+            api = self.core.get_api(account_name)
+            if api and hasattr(api, "offer_id_from_order"):
+                offer_key = api.offer_id_from_order(order)
+                if offer_key:
+                    mult = parsed[1] // max(1, int(order.get("quantity") or 1))
+                    self._lot_cache_set(offer_key, parsed[0], max(1, mult))
             return parsed
+
         order_id = str(order.get("id") or order.get("order_id") or "")
-        if not order_id:
-            return None
         api = self.core.get_api(account_name)
-        if not api or not hasattr(api, "fetch_order"):
+        if not api:
             return None
-        try:
-            full = await api.fetch_order(order_id)
-            if full:
-                merged = {**order, **full}
-                if full.get("offerDetails"):
-                    merged["offerDetails"] = full["offerDetails"]
-                parsed = self._parse_lot(merged)
-                if parsed:
-                    self.log("ID услуги найден в полной карточке заказа #%s", order_id)
-                    return parsed
-        except Exception as exc:
-            self.log("_resolve_lot #%s: %s", order_id, exc, level="warning")
+
+        offer_id = ""
+        if hasattr(api, "offer_id_from_order"):
+            offer_id = api.offer_id_from_order(order)
+        if offer_id:
+            cached = self._lot_cache_get(offer_id)
+            if cached:
+                service_id, mult = cached
+                qty = max(1, int(order.get("quantity") or 1)) * mult
+                self.log("ID услуги из кеша лота %s → %s", offer_id, service_id)
+                return service_id, qty
+
+        candidates: list[dict] = [order]
+        if order_id and hasattr(api, "fetch_order"):
+            try:
+                full = await api.fetch_order(order_id)
+                if full:
+                    candidates.append({**order, **full})
+            except Exception as exc:
+                self.log("_resolve_lot fetch_order #%s: %s", order_id, exc, level="warning")
+
+        if offer_id and hasattr(api, "fetch_offer"):
+            try:
+                offer = await api.fetch_offer(offer_id)
+                if offer:
+                    candidates.append({"offerDetails": offer, "offer": offer})
+            except Exception as exc:
+                self.log("_resolve_lot fetch_offer %s: %s", offer_id, exc, level="debug")
+
+        for candidate in candidates:
+            parsed = self._parse_lot(candidate)
+            if parsed:
+                if offer_id:
+                    mult = parsed[1] // max(1, int(order.get("quantity") or 1))
+                    self._lot_cache_set(offer_id, parsed[0], mult)
+                self.log("ID услуги найден для заказа #%s → %s", order_id or "?", parsed[0])
+                return parsed
+
+        if order_id:
+            self.log(
+                "Заказ #%s: ID услуги не найден. Добавьте в описание лота: ID: 1234",
+                order_id,
+                level="warning",
+            )
         return None
 
     async def _safe_reply(self, ctx: MessageContext, text: str) -> bool:
@@ -1082,13 +1210,24 @@ class Plugin(StarvellPlugin):
         if not api:
             return None
         try:
-            orders = await api.fetch_orders()
+            orders = (
+                await api.fetch_all_orders()
+                if hasattr(api, "fetch_all_orders")
+                else await api.fetch_orders()
+            )
         except Exception as exc:
             self.log("recover orders: %s", exc, level="warning")
             return None
         username = (ctx.username or "").strip().lower()
+        submitted = _load_json("submitted.json", {})
+        waiting_ids = {str(o.get("order_id")) for o in _load_json("waiting.json", [])}
+
+        matches: list[dict] = []
         for order in orders:
             if str(order.get("status") or "") != "CREATED":
+                continue
+            oid = str(order.get("id") or "")
+            if not oid or oid in submitted or oid in waiting_ids:
                 continue
             buyer = order.get("user") or {}
             if not (
@@ -1096,6 +1235,9 @@ class Plugin(StarvellPlugin):
                 or (username and (buyer.get("username") or "").strip().lower() == username)
             ):
                 continue
+            matches.append(order)
+
+        for order in matches:
             parsed = await self._resolve_lot(order, ctx.account_name)
             if not parsed:
                 continue
@@ -1115,6 +1257,9 @@ class Plugin(StarvellPlugin):
     async def _process_link_and_submit(
         self, ctx: MessageContext, order: dict, link: str,
     ) -> None:
+        link = (link or "").strip()
+        if link and not link.startswith(("http://", "https://")):
+            link = f"https://{link.lstrip('/')}"
         allow_private = await self.get_cfg("allow_private_tg", False)
         if not allow_private and _is_private_tg(link):
             await self._safe_reply(ctx, await self._msg("private_telegram_message"))
@@ -1168,7 +1313,15 @@ class Plugin(StarvellPlugin):
             return
         parsed = await self._resolve_lot(ctx.order, ctx.account_name)
         if not parsed:
-            self.log("Заказ #%s: ID: не найден в описании лота", ctx.order_id, level="debug")
+            self.log("Заказ #%s: ID: не найден в описании лота", ctx.order_id, level="warning")
+            await ctx.notify(
+                f"⚠️ <b>VexBoost #{ctx.order_id}</b>: в описании лота нет <code>ID: 1234</code>.\n"
+                f"Покупатель: {ctx.buyer_username}\n"
+                f"Товар: {ctx.product_name}\n"
+                f"Добавьте ID услуги VexBoost в описание лота на Starvell.",
+                "notify_orders",
+                order_id=ctx.order_id,
+            )
             return
         service_id, quantity = parsed
         if not await self._api():
@@ -1301,12 +1454,12 @@ class Plugin(StarvellPlugin):
         links = _extract_links(text)
         order = await self._locate_waiting_order(ctx)
 
-        if not order and links:
+        if not order and (links or _looks_like_link_attempt(text)):
             order = await self._recover_order_for_buyer(ctx)
 
         if order and links:
-            await self._process_link_and_submit(ctx, order, links[0])
             ctx.mark_handled()
+            await self._process_link_and_submit(ctx, order, links[0])
             return
 
         if order:
@@ -1314,16 +1467,36 @@ class Plugin(StarvellPlugin):
             await self._safe_reply(ctx, await self._msg("welcome_message"))
             return
 
-        if links:
+        if links or _looks_like_link_attempt(text):
+            link = links[0] if links else text.strip()
             orphans = _load_json("orphan_links.json", {})
-            orphans[str(ctx.chat_id)] = links[0]
+            orphans[str(ctx.chat_id)] = link
             _save_json("orphan_links.json", orphans)
             ctx.mark_handled()
-            await self._safe_reply(ctx, "⏳ Ссылка получена. Ожидаю подтверждение оплаты, создам заказ автоматически.")
+            await self._safe_reply(
+                ctx,
+                "⏳ Ссылка получена. Ожидаю подтверждение оплаты, создам заказ автоматически.",
+            )
             recovered = await self._recover_order_for_buyer(ctx)
             if recovered:
-                await self._process_link_and_submit(ctx, recovered, links[0])
+                await self._process_link_and_submit(ctx, recovered, link)
+            else:
+                await self._scan_created_orders_impl()
+                recovered = await self._locate_waiting_order(ctx)
+                if recovered:
+                    await self._process_link_and_submit(ctx, recovered, link)
             return
+
+        waiting_any = _load_json("waiting.json", [])
+        if waiting_any and _looks_like_link_attempt(text):
+            ctx.mark_handled()
+            await self._safe_reply(
+                ctx,
+                await self._msg(
+                    "invalid_link_message",
+                    error="Не удалось распознать ссылку. Отправьте полный URL (https://...).",
+                ),
+            )
 
     def _pending_key(self, ctx: MessageContext) -> str:
         uid = ctx.author_id or ctx.username or ctx.chat_id

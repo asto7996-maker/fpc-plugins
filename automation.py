@@ -548,11 +548,24 @@ class AutomationEngine:
         messages: list[dict],
         last_notified_id: str | None,
         my_user_id: int | None,
+        min_ts: int | None = None,
     ) -> list[dict]:
         """Возвращает только сообщения покупателя, появившиеся после last_notified_id."""
         sorted_msgs = sorted(messages, key=_message_ts)
         result: list[dict] = []
-        seen_last = not last_notified_id
+
+        anchor_in_batch = True
+        if last_notified_id:
+            batch_ids = {_message_id(m) for m in sorted_msgs if _message_id(m)}
+            anchor_in_batch = last_notified_id in batch_ids
+            if not anchor_in_batch:
+                logger.debug(
+                    "chat anchor %s not in batch (%d msgs) — fallback to timestamp",
+                    last_notified_id[:16] if last_notified_id else "?",
+                    len(sorted_msgs),
+                )
+
+        seen_last = not last_notified_id or not anchor_in_batch
 
         for msg in sorted_msgs:
             mid = _message_id(msg)
@@ -561,6 +574,10 @@ class AutomationEngine:
             if not seen_last:
                 if mid == last_notified_id:
                     seen_last = True
+                continue
+
+            msg_ts = _message_ts(msg)
+            if min_ts and msg_ts and msg_ts <= min_ts:
                 continue
 
             author_id = msg.get("authorId") or msg.get("author")
@@ -602,8 +619,15 @@ class AutomationEngine:
                     interlocutor_id = pid
                     break
 
-            messages = await api.fetch_messages(chat_id, limit=30, interlocutor_id=interlocutor_id)
+            messages = await api.fetch_messages(chat_id, limit=50, interlocutor_id=interlocutor_id)
             last_notified = await self.db.get_last_notified_message(chat_id, account_name)
+            last_user_ts = await self.db.get_chat_last_user_message_at(chat_id, account_name)
+            batch_ids = {_message_id(m) for m in messages if _message_id(m)}
+            ts_fallback = (
+                last_user_ts
+                if last_notified and last_notified not in batch_ids
+                else None
+            )
 
             if last_notified is None and await self.db.is_chats_bootstrapped(account_name):
                 boot_at = await self.db.get_chats_bootstrapped_at(account_name) or 0
@@ -615,10 +639,14 @@ class AutomationEngine:
                     last_notified = await self._bootstrap_single_chat(
                         account_name, api, chat_id, my_user_id, interlocutor_id, messages
                     )
-                    if last_notified and not self._iter_new_buyer_messages(messages, last_notified, my_user_id):
+                    if last_notified and not self._iter_new_buyer_messages(
+                        messages, last_notified, my_user_id, min_ts=ts_fallback,
+                    ):
                         continue
 
-            for msg in self._iter_new_buyer_messages(messages, last_notified, my_user_id):
+            for msg in self._iter_new_buyer_messages(
+                messages, last_notified, my_user_id, min_ts=ts_fallback,
+            ):
                 mid = _message_id(msg)
                 author_id = msg.get("authorId") or msg.get("author")
 

@@ -225,16 +225,73 @@ class StarvellAPI:
         oid = str(order_id or "").strip()
         if not oid:
             return {}
+        merged: dict[str, Any] = {}
+        for path, referer in (
+            (f"order/{oid}.json", f"{BASE_URL}/order/{oid}"),
+            (f"account/sells/{oid}.json", f"{BASE_URL}/account/sells"),
+        ):
+            try:
+                data = await self._next_data_get(path, referer)
+                props = data.get("pageProps") or {}
+                order = props.get("order") or props.get("orderDetails") or {}
+                if isinstance(order, dict) and order:
+                    merged = {**merged, **order}
+                for key in ("offerDetails", "offer", "bff"):
+                    val = props.get(key)
+                    if isinstance(val, dict) and val:
+                        if key == "bff" and isinstance(val.get("order"), dict):
+                            merged = {**merged, **val["order"]}
+                        elif key in ("offerDetails", "offer"):
+                            merged[key] = {**(merged.get(key) or {}), **val}
+            except Exception as exc:
+                logger.debug("fetch_order path %s #%s: %s", path, oid[:12], exc)
+        if merged:
+            return merged
         try:
             data = await self._next_data_get(f"order/{oid}.json", f"{BASE_URL}/order/{oid}")
             props = data.get("pageProps") or {}
-            order = props.get("order") or props.get("orderDetails") or {}
-            if isinstance(order, dict) and order:
-                return order
             return props if isinstance(props, dict) else {}
         except Exception as exc:
             logger.warning("fetch_order %s: %s", oid[:12], exc)
             return {}
+
+    @staticmethod
+    def offer_id_from_order(order: dict[str, Any]) -> str:
+        """ID лота из объекта заказа (разные поля API)."""
+        for key in ("offerId", "offer_id", "lotId", "lot_id"):
+            val = order.get(key)
+            if val is not None and str(val).strip():
+                return str(val).strip()
+        for block_key in ("offerDetails", "offer"):
+            block = order.get(block_key) or {}
+            if not isinstance(block, dict):
+                continue
+            for key in ("id", "offerId", "offer_id"):
+                val = block.get(key)
+                if val is not None and str(val).strip():
+                    return str(val).strip()
+        return ""
+
+    async def fetch_offer(self, offer_id: str) -> dict[str, Any]:
+        """Описание лота — для поиска ID: / #Quan: в тексте."""
+        oid = str(offer_id or "").strip()
+        if not oid:
+            return {}
+        for path, referer in (
+            (f"offers/{oid}.json", f"{BASE_URL}/offers/{oid}"),
+            (f"offer/{oid}.json", f"{BASE_URL}/offer/{oid}"),
+        ):
+            try:
+                data = await self._next_data_get(path, referer)
+                props = data.get("pageProps") or {}
+                offer = props.get("offer") or props.get("offerDetails") or props.get("lot") or {}
+                if isinstance(offer, dict) and offer:
+                    return offer
+                if isinstance(props, dict) and props:
+                    return props
+            except Exception as exc:
+                logger.debug("fetch_offer path %s: %s", path, exc)
+        return {}
 
     async def fetch_all_orders(self, max_pages: int = 20) -> list[dict[str, Any]]:
         """Загружает все страницы заказов."""
