@@ -39,7 +39,7 @@ from starvell_sdk import (
 )
 
 NAME = "VexBoost AutoSMM"
-VERSION = "3.3.2"
+VERSION = "3.3.3"
 DESCRIPTION = "Автонакрутка SMM через VexBoost для Starvell"
 CREDITS = "@xei1y"
 UUID = "a3f8c2e1-7b4d-4a9f-9e2c-1d5b8f6a0c3e"
@@ -222,14 +222,26 @@ def _format_rub(amount: Any) -> str:
 
 
 def _order_description(order: dict) -> str:
-    offer = order.get("offerDetails") or {}
+    offer = order.get("offerDetails") or order.get("offer") or {}
     desc = (offer.get("descriptions") or {}).get("rus") or {}
     parts = [
         str(desc.get("description") or ""),
         str(desc.get("briefDescription") or ""),
         str(offer.get("title") or ""),
+        str(order.get("productName") or ""),
+        str(order.get("title") or ""),
     ]
     return "\n".join(p for p in parts if p)
+
+
+def _order_search_blob(order: dict) -> str:
+    """Весь текст заказа для поиска ID: / #Quan: (API может отдавать описание частично)."""
+    chunks = [_order_description(order)]
+    try:
+        chunks.append(json.dumps(order, ensure_ascii=False, default=str))
+    except Exception:
+        pass
+    return "\n".join(chunks)
 
 
 def _extract_links(text: str) -> list[str]:
@@ -848,17 +860,24 @@ class Plugin(StarvellPlugin):
             return _sanitize_buyer_text(str(tpl))
 
     def _parse_lot(self, order: dict) -> tuple[int, int] | None:
-        desc = _order_description(order)
-        m = SERVICE_ID_RE.search(desc)
+        blob = _order_search_blob(order)
+        m = SERVICE_ID_RE.search(blob)
         if not m:
             return None
         service_id = int(m.group(1))
         mult = 1
-        qm = QUAN_RE.search(desc)
+        qm = QUAN_RE.search(blob)
         if qm:
             mult = max(1, int(qm.group(1)))
         qty = max(1, int(order.get("quantity") or 1)) * mult
         return service_id, qty
+
+    def _waiting_for_chat(self, chat_id: str) -> dict | None:
+        waiting = _load_json("waiting.json", [])
+        matches = [o for o in waiting if str(o.get("chat_id") or "") == str(chat_id)]
+        if not matches:
+            return None
+        return max(matches, key=lambda x: int(x.get("created_at") or 0))
 
     # ── @on_pre_delivery — отмена автовыдачи для SMM-лотов ─────────────────
 
@@ -991,13 +1010,18 @@ class Plugin(StarvellPlugin):
         waiting = _load_json("waiting.json", [])
         order = self._find_waiting(waiting, ctx)
         if not order:
+            order = self._waiting_for_chat(ctx.chat_id)
+        if not order:
             return
 
         links = _extract_links(text)
-        if not links:
+        if links:
+            await self._handle_buyer_link(ctx, order, links[0])
+            ctx.mark_handled()
             return
-        await self._handle_buyer_link(ctx, order, links[0])
+
         ctx.mark_handled()
+        await ctx.reply(await self._msg("welcome_message"))
 
     def _pending_key(self, ctx: MessageContext) -> str:
         uid = ctx.author_id or ctx.username or ctx.chat_id

@@ -22,6 +22,7 @@ from core.plugins.context import (
     MessageContext,
     OrderContext,
     _resolve_order_price,
+    format_rub,
 )
 from core.plugins.hooks import STV_BUMP, STV_MESSAGE, STV_ORDER_COMPLETED, STV_ORDER_PAID, STV_ORDER_STATUS, STV_POST_DELIVERY, STV_PRE_DELIVERY
 from core.security.payment_guard import PaymentGuard
@@ -264,7 +265,7 @@ class AutomationEngine:
             f"🛒 <b>Новый заказ #{order_id}</b>\n"
             f"Покупатель: {buyer}\n"
             f"Товар: {product_name}\n"
-            f"Сумма: {price} ₽",
+            f"Сумма: {format_rub(price)}",
             "notify_orders",
             order_id=order_id,
         )
@@ -284,6 +285,28 @@ class AutomationEngine:
             return
 
         qty = max(1, int(order.get("quantity") or 1))
+
+        # Плагины (VexBoost SMM) могут отменить автовыдачу до проверки склада
+        probe_ctx = DeliveryContext(
+            core=self.cardinal,
+            account_name=account_name,
+            order=order,
+            order_id=order_id,
+            status=str(order.get("status") or ""),
+            buyer_username=buyer,
+            buyer_id=(order.get("user") or {}).get("id"),
+            product_name=product_name,
+            price=price,
+            quantity=qty,
+            chat_id=order_ctx.chat_id,
+            delivery_text="",
+            codes=[],
+        )
+        await self._emit_starvell(STV_PRE_DELIVERY, probe_ctx)
+        if probe_ctx.skip_delivery:
+            logger.info("Заказ #%s: автовыдача отменена плагином", order_id)
+            return
+
         codes: list[str] = []
         for _ in range(qty):
             code = await self.db.pop_autodelivery_item(product_name)
@@ -291,7 +314,10 @@ class AutomationEngine:
                 codes.append(code)
 
         if not codes:
-            await self.notify(f"⚠️ Заказ #{order_id}: автовыдача — нет товара «{product_name}» на складе", "notify_delivery")
+            await self.notify(
+                f"⚠️ Заказ #{order_id}: автовыдача — нет товара «{product_name}» на складе",
+                "notify_delivery",
+            )
             return
 
         content = "\n".join(codes)
@@ -323,10 +349,6 @@ class AutomationEngine:
             delivery_text=delivery_text,
             codes=codes,
         )
-        await self._emit_starvell(STV_PRE_DELIVERY, delivery_ctx)
-        if delivery_ctx.skip_delivery:
-            logger.info("Заказ #%s: автовыдача отменена плагином", order_id)
-            return
 
         delivery_text = delivery_ctx.delivery_text or delivery_text
         buyer_id = delivery_ctx.buyer_id
@@ -614,16 +636,6 @@ class AutomationEngine:
                 msg_ts = _message_ts(msg) or int(time.time())
                 await self.db.set_chat_last_user_message_at(chat_id, msg_ts, account_name)
 
-                if not await self.db.is_blacklisted(
-                    username=username, starvell_user_id=author_id, check="block_notify"
-                ):
-                    await self.notify(
-                        f"💬 <b>Новое сообщение</b> от {username or 'покупателя'}\n"
-                        f"<i>{str(msg.get('content') or msg.get('text') or '')[:300]}</i>",
-                        "notify_chats",
-                        chat_id=chat_id,
-                    )
-
                 text = str(msg.get("content") or msg.get("text") or "").strip()
                 handled = await self._handlers.on_chat_message(
                     text=text, chat_id=chat_id, api=api, account_name=account_name,
@@ -642,6 +654,17 @@ class AutomationEngine:
                 )
                 await self._emit_starvell(STV_MESSAGE, msg_ctx)
                 plugin_handled = msg_ctx.handled
+
+                if not await self.db.is_blacklisted(
+                    username=username, starvell_user_id=author_id, check="block_notify"
+                ):
+                    preview = text[:300]
+                    asyncio.create_task(self.notify(
+                        f"💬 <b>Новое сообщение</b> от {username or 'покупателя'}\n"
+                        f"<i>{preview}</i>",
+                        "notify_chats",
+                        chat_id=chat_id,
+                    ))
 
                 if not handled and not plugin_handled:
                     await self._handlers.on_welcome(

@@ -63,29 +63,52 @@ class MessageContext(StarvellContext):
         await self.reply(text)
 
 
+def _starvell_amount_to_rub(value: Any) -> float:
+    """Starvell API передаёт суммы в копейках (целое число)."""
+    try:
+        val = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if val == 0:
+        return 0.0
+    # 224 → 2.24 ₽; уже дробные рубли (2.24) не трогаем
+    if abs(val - round(val)) < 1e-9:
+        return round(val) / 100.0
+    return val
+
+
 def _resolve_order_price(order: dict) -> float:
     """Итоговая сумма покупки в рублях."""
     total = order.get("totalPrice")
     if total is not None:
-        try:
-            val = float(total)
-            if val > 0:
-                return val
-        except (TypeError, ValueError):
-            pass
+        val = _starvell_amount_to_rub(total)
+        if val > 0:
+            return val
     base = order.get("basePrice")
     qty = max(1, int(order.get("quantity") or 1))
     if base is not None:
         try:
-            return float(base) * qty
+            unit = _starvell_amount_to_rub(base)
+            if unit > 0:
+                return unit * qty
         except (TypeError, ValueError):
             pass
-    if base is not None:
-        try:
-            return float(base)
-        except (TypeError, ValueError):
-            pass
+        val = _starvell_amount_to_rub(base)
+        if val > 0:
+            return val
+    for key in ("price", "amount", "sum", "total"):
+        if order.get(key) is not None:
+            val = _starvell_amount_to_rub(order[key])
+            if val > 0:
+                return val
     return 0.0
+
+
+def format_rub(amount: Any) -> str:
+    try:
+        return f"{float(amount):.2f} ₽"
+    except (TypeError, ValueError):
+        return "0.00 ₽"
 
 
 @dataclass
