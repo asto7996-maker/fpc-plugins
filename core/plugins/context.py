@@ -4,11 +4,14 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import Any, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from core.bot_core import BotCore
+
+logger = logging.getLogger("starvell.context")
 
 
 @dataclass
@@ -50,17 +53,27 @@ class MessageContext(StarvellContext):
         """Плагин обработал сообщение — ядро не шлёт welcome/ИИ."""
         self.handled = True
 
-    async def reply(self, text: str) -> None:
-        api = self.api()
-        if api and self.chat_id:
-            await api.send_message(self.chat_id, text)
+    async def reply(self, text: str) -> bool:
+        api = self.api() or self.core.get_api("default")
+        if not api or not self.chat_id:
+            logger.error(
+                "MessageContext.reply: не отправлено (api=%s chat_id=%s account=%s)",
+                bool(api), self.chat_id, self.account_name,
+            )
+            return False
+        try:
+            await api.send_message(str(self.chat_id), text)
+            return True
+        except Exception as exc:
+            logger.error("MessageContext.reply failed chat=%s: %s", self.chat_id, exc)
+            return False
 
-    async def reply_watermarked(self, text: str) -> None:
-        api = self.api()
+    async def reply_watermarked(self, text: str) -> bool:
+        api = self.api() or self.core.get_api("default")
         s = self.settings
         if api:
             text = api.apply_watermark(text, s.watermark_on, s.watermark_text)
-        await self.reply(text)
+        return await self.reply(text)
 
 
 def _starvell_amount_to_rub(value: Any) -> float:
@@ -150,15 +163,24 @@ class OrderContext(StarvellContext):
         )
 
     async def send_to_buyer(self, text: str) -> bool:
-        api = self.api()
+        api = self.api() or self.core.get_api("default")
         if not api:
+            logger.error("OrderContext.send_to_buyer: API недоступен order=%s", self.order_id)
             return False
         if not self.chat_id and self.buyer_id:
             self.chat_id = await api.find_chat_by_buyer(int(self.buyer_id))
-        if self.chat_id:
-            await api.send_message(self.chat_id, text)
+        if not self.chat_id:
+            logger.error(
+                "OrderContext.send_to_buyer: чат не найден order=%s buyer=%s",
+                self.order_id, self.buyer_id,
+            )
+            return False
+        try:
+            await api.send_message(str(self.chat_id), text)
             return True
-        return False
+        except Exception as exc:
+            logger.error("OrderContext.send_to_buyer failed order=%s: %s", self.order_id, exc)
+            return False
 
 
 @dataclass

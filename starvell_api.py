@@ -220,6 +220,22 @@ class StarvellAPI:
         data = await self._next_data_get(path, f"{BASE_URL}/account/sells")
         return (data.get("pageProps") or {}).get("orders") or []
 
+    async def fetch_order(self, order_id: str) -> dict[str, Any]:
+        """Полная карточка заказа (описание лота с ID: / #Quan:)."""
+        oid = str(order_id or "").strip()
+        if not oid:
+            return {}
+        try:
+            data = await self._next_data_get(f"order/{oid}.json", f"{BASE_URL}/order/{oid}")
+            props = data.get("pageProps") or {}
+            order = props.get("order") or props.get("orderDetails") or {}
+            if isinstance(order, dict) and order:
+                return order
+            return props if isinstance(props, dict) else {}
+        except Exception as exc:
+            logger.warning("fetch_order %s: %s", oid[:12], exc)
+            return {}
+
     async def fetch_all_orders(self, max_pages: int = 20) -> list[dict[str, Any]]:
         """Загружает все страницы заказов."""
         items: list[dict[str, Any]] = []
@@ -350,10 +366,19 @@ class StarvellAPI:
 
     async def find_chat_by_buyer(self, buyer_id: int) -> str | None:
         """Находит chat_id по ID покупателя."""
+        try:
+            target = int(buyer_id)
+        except (TypeError, ValueError):
+            return None
         for chat in await self.fetch_chats():
             for participant in chat.get("participants") or []:
-                if (participant or {}).get("id") == buyer_id:
-                    return chat.get("id")
+                pid = (participant or {}).get("id")
+                try:
+                    if pid is not None and int(pid) == target:
+                        cid = chat.get("id")
+                        return str(cid) if cid else None
+                except (TypeError, ValueError):
+                    continue
         return None
 
     async def send_review_reply(self, order_id: str, text: str) -> dict[str, Any]:

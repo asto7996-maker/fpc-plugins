@@ -402,9 +402,9 @@ class PluginEngine:
             inst = rec.instance
             if rec.is_starvell_native and hasattr(inst, "_dispatch_with_fallback"):
                 try:
-                    await asyncio.wait_for(inst._dispatch_with_fallback(event, ctx), timeout=90.0)
+                    await asyncio.wait_for(inst._dispatch_with_fallback(event, ctx), timeout=120.0)
                 except asyncio.TimeoutError:
-                    logger.error("Starvell plugin %s event %s: timeout 90s", rec.name, event)
+                    logger.error("Starvell plugin %s event %s: timeout 120s", rec.name, event)
                 except Exception as exc:
                     logger.exception("Starvell plugin %s event %s: %s", rec.name, event, exc)
 

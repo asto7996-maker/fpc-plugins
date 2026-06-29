@@ -56,7 +56,7 @@ def _vexboost_priority_chat_ids() -> set[str]:
     """Чаты с ожидающими SMM-заказами — обрабатываем первыми."""
     base = BASE_DIR / "storage" / "plugins" / VEXBOOST_PLUGIN_UUID
     ids: set[str] = set()
-    for name in ("waiting.json", "pending.json"):
+    for name in ("waiting.json", "pending.json", "orphan_links.json"):
         path = base / name
         if not path.exists():
             continue
@@ -71,7 +71,11 @@ def _vexboost_priority_chat_ids() -> set[str]:
                 if cid:
                     ids.add(cid)
         elif isinstance(data, dict):
-            for item in data.values():
+            for key, item in data.items():
+                if name == "orphan_links.json":
+                    if key.strip():
+                        ids.add(str(key).strip())
+                    continue
                 cid = str((item or {}).get("chat_id") or "").strip()
                 if cid:
                     ids.add(cid)
@@ -203,7 +207,7 @@ class AutomationEngine:
         """Мониторинг заказов: автовыдача и авто-отзывы."""
         while self._running:
             settings = self._get_settings()
-            interval = max(3.0, settings.orders_poll_interval)
+            interval = max(2.0, settings.orders_poll_interval)
             try:
                 await self._process_orders(account_name, api, settings)
             except Exception as exc:
@@ -422,10 +426,13 @@ class AutomationEngine:
                 order_id = str(order.get("id") or "")
                 if not order_id:
                     continue
-                await self.db.mark_order_notified(order_id, account_name)
                 status = str(order.get("status") or "")
                 if status:
                     await self.db.set_order_status(order_id, status, account_name)
+                # CREATED — активные заказы должны попасть в VexBoost после рестарта
+                if status == "CREATED":
+                    continue
+                await self.db.mark_order_notified(order_id, account_name)
             await self.db.set_orders_bootstrapped(account_name)
             logger.info("[%s] Baseline заказов: %d шт. (старые не будут обрабатываться)", account_name, len(orders))
         except Exception as exc:

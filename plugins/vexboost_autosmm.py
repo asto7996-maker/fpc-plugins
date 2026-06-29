@@ -39,7 +39,7 @@ from starvell_sdk import (
 )
 
 NAME = "VexBoost AutoSMM"
-VERSION = "3.3.3"
+VERSION = "4.0.0"
 DESCRIPTION = "Автонакрутка SMM через VexBoost для Starvell"
 CREDITS = "@xei1y"
 UUID = "a3f8c2e1-7b4d-4a9f-9e2c-1d5b8f6a0c3e"
@@ -143,7 +143,7 @@ logger = logging.getLogger("starvell.plugin.vexboost")
 
 # Starvell rate-limit уже в starvell_api._throttle; здесь только минимальный зазор.
 STV_MIN_API_GAP = 0.3
-MESSAGE_DEDUP_TTL = 60.0
+MESSAGE_DEDUP_TTL = 15.0
 
 
 class _MessageDedup:
@@ -153,7 +153,9 @@ class _MessageDedup:
         self._seen: dict[str, float] = {}
 
     def is_duplicate(self, chat_id: str, message_id: str, text: str) -> bool:
-        key = f"{chat_id}:{message_id}" if message_id else f"{chat_id}:{hash(text.strip())}"
+        if not message_id:
+            return False
+        key = f"{chat_id}:{message_id}"
         now = time.monotonic()
         expired = [k for k, ts in self._seen.items() if now - ts > MESSAGE_DEDUP_TTL]
         for k in expired:
@@ -642,12 +644,9 @@ class VexBoostAPI:
                 data = await self._request_token("POST", "orders", json=body)
                 if data.get("error"):
                     return data
-                for key in ("id", "order_id", "orderId", "order"):
-                    val = data.get(key)
-                    if isinstance(val, dict):
-                        val = val.get("id")
-                    if val is not None and str(val).isdigit():
-                        return {"order": int(val)}
+                oid = VexBoostAPI._extract_created_order_id(data)
+                if oid is not None:
+                    return {"order": oid}
                 return {"error": "ID заказа не найден в ответе"}
             if action == "status":
                 oid = int(payload["order"])
@@ -681,13 +680,61 @@ class VexBoostAPI:
             return None, "", "Неверный ответ баланса"
         return float(m.group()), str(data.get("currency", "RUB")), ""
 
+    @staticmethod
+    def _coerce_order_id(value: Any) -> int | None:
+        if value is None:
+            return None
+        if isinstance(value, dict):
+            for key in ("id", "order_id", "orderId"):
+                inner = VexBoostAPI._coerce_order_id(value.get(key))
+                if inner is not None:
+                    return inner
+            return None
+        text = str(value).strip()
+        if text.isdigit():
+            return int(text)
+        m = re.search(r"\d+", text)
+        return int(m.group()) if m else None
+
+    @classmethod
+    def _extract_created_order_id(cls, data: dict[str, Any]) -> int | None:
+        if not isinstance(data, dict):
+            return None
+        for key in ("order", "id", "order_id", "orderId", "orderID", "smm_id"):
+            val = data.get(key)
+            if key == "order" and isinstance(val, dict):
+                nested = cls._extract_created_order_id(val)
+                if nested is not None:
+                    return nested
+            oid = cls._coerce_order_id(val)
+            if oid is not None:
+                return oid
+        nested = data.get("data")
+        if isinstance(nested, dict):
+            oid = cls._extract_created_order_id(nested)
+            if oid is not None:
+                return oid
+        orders = data.get("orders")
+        if isinstance(orders, list) and orders:
+            first = orders[0]
+            if isinstance(first, dict):
+                return cls._extract_created_order_id(first)
+            return cls._coerce_order_id(first)
+        return None
+
     async def create_order(self, service_id: int, link: str, quantity: int) -> int | str:
         data = await self._request({
             "action": "add", "service": service_id, "link": link, "quantity": quantity,
         })
         if "order" in data:
             return int(data["order"])
-        return self._format_error(data.get("error", "Неизвестная ошибка"))
+        oid = self._extract_created_order_id(data)
+        if oid is not None:
+            return oid
+        if data.get("error"):
+            return self._format_error(data["error"])
+        logger.warning("VexBoost create_order: no id in response: %s", str(data)[:300])
+        return self._format_error("ID заказа не найден в ответе VexBoost")
 
     async def status(self, order_id: int) -> dict[str, Any] | None:
         data = await self._request({"action": "status", "order": order_id})
@@ -726,6 +773,7 @@ class Plugin(StarvellPlugin):
     async def on_startup(self) -> None:
         self._pending = _load_json("pending.json", {})
         self._status_task = asyncio.create_task(self._status_loop())
+        asyncio.create_task(self._catchup_created_orders(), name="vexboost-catchup")
         if await self.get_cfg("notify_startup", True):
             await self.core.notify(
                 f"✅ <b>{NAME} v{VERSION}</b> запущен\n"
@@ -733,6 +781,54 @@ class Plugin(StarvellPlugin):
                 "notify_orders",
             )
         self.log("VexBoost AutoSMM v%s запущен", VERSION)
+
+    async def _catchup_created_orders(self) -> None:
+        """После рестарта подхватывает CREATED заказы и буферные ссылки."""
+        await asyncio.sleep(3)
+        if not await self._enabled():
+            return
+        api = self.core.get_api()
+        if not api:
+            return
+        try:
+            orders = await api.fetch_orders()
+        except Exception as exc:
+            self.log("catchup orders: %s", exc, level="warning")
+            return
+        waiting_ids = {str(o.get("order_id")) for o in _load_json("waiting.json", [])}
+        submitted = _load_json("submitted.json", {})
+        orphans = _load_json("orphan_links.json", {})
+        for order in orders:
+            if str(order.get("status") or "") != "CREATED":
+                continue
+            oid = str(order.get("id") or "")
+            if not oid or oid in waiting_ids or oid in submitted:
+                continue
+            parsed = await self._resolve_lot(order, "default")
+            if not parsed:
+                continue
+            service_id, quantity = parsed
+            octx = OrderContext.from_order(self.core, order, "default")
+            if not octx.chat_id and octx.buyer_id:
+                octx.chat_id = await api.find_chat_by_buyer(int(octx.buyer_id))
+            entry = await self._register_waiting(octx, service_id, quantity)
+            if not entry:
+                continue
+            self.log("catchup: waiting #%s buyer=%s", oid, octx.buyer_username)
+            chat_id = str(entry.get("chat_id") or "")
+            if chat_id:
+                try:
+                    await api.send_message(chat_id, await self._msg("welcome_message", order_id=oid))
+                except Exception as exc:
+                    self.log("catchup welcome #%s: %s", oid, exc, level="warning")
+                orphan_link = orphans.pop(chat_id, None)
+                if orphan_link:
+                    _save_json("orphan_links.json", orphans)
+                    msg_ctx = MessageContext(
+                        core=self.core, account_name="default", chat_id=chat_id,
+                        text=orphan_link, author_id=octx.buyer_id, username=octx.buyer_username,
+                    )
+                    await self._process_link_and_submit(msg_ctx, entry, orphan_link)
 
     async def on_shutdown(self) -> None:
         if self._status_task:
@@ -872,6 +968,71 @@ class Plugin(StarvellPlugin):
         qty = max(1, int(order.get("quantity") or 1)) * mult
         return service_id, qty
 
+    async def _resolve_lot(self, order: dict, account_name: str = "default") -> tuple[int, int] | None:
+        parsed = self._parse_lot(order)
+        if parsed:
+            return parsed
+        order_id = str(order.get("id") or order.get("order_id") or "")
+        if not order_id:
+            return None
+        api = self.core.get_api(account_name)
+        if not api or not hasattr(api, "fetch_order"):
+            return None
+        try:
+            full = await api.fetch_order(order_id)
+            if full:
+                merged = {**order, **full}
+                if full.get("offerDetails"):
+                    merged["offerDetails"] = full["offerDetails"]
+                parsed = self._parse_lot(merged)
+                if parsed:
+                    self.log("ID услуги найден в полной карточке заказа #%s", order_id)
+                    return parsed
+        except Exception as exc:
+            self.log("_resolve_lot #%s: %s", order_id, exc, level="warning")
+        return None
+
+    async def _safe_reply(self, ctx: MessageContext, text: str) -> bool:
+        if await ctx.reply(text):
+            return True
+        api = ctx.api() or self.core.get_api(ctx.account_name) or self.core.get_api("default")
+        if api and ctx.chat_id:
+            try:
+                await api.send_message(str(ctx.chat_id), text)
+                return True
+            except Exception as exc:
+                self.log("_safe_reply fallback: %s", exc, level="error")
+        await self.core.notify(
+            f"⚠️ VexBoost: не удалось ответить в чат <code>{ctx.chat_id}</code>\n"
+            f"Покупатель: {ctx.username}\n"
+            f"<i>{text[:200]}</i>",
+            "notify_orders",
+            chat_id=ctx.chat_id,
+        )
+        return False
+
+    def _find_waiting_by_buyer(self, waiting: list, username: str) -> dict | None:
+        name = (username or "").strip().lower()
+        if not name:
+            return None
+        matches = [
+            o for o in waiting
+            if (o.get("buyer") or "").strip().lower() == name
+        ]
+        if not matches:
+            return None
+        return max(matches, key=lambda x: int(x.get("created_at") or 0))
+
+    async def _locate_waiting_order(self, ctx: MessageContext) -> dict | None:
+        waiting = _load_json("waiting.json", [])
+        order = self._find_waiting(waiting, ctx)
+        if order:
+            return order
+        order = self._waiting_for_chat(ctx.chat_id)
+        if order:
+            return order
+        return self._find_waiting_by_buyer(waiting, ctx.username)
+
     def _waiting_for_chat(self, chat_id: str) -> dict | None:
         waiting = _load_json("waiting.json", [])
         matches = [o for o in waiting if str(o.get("chat_id") or "") == str(chat_id)]
@@ -879,38 +1040,22 @@ class Plugin(StarvellPlugin):
             return None
         return max(matches, key=lambda x: int(x.get("created_at") or 0))
 
-    # ── @on_pre_delivery — отмена автовыдачи для SMM-лотов ─────────────────
-
-    @on_pre_delivery
-    async def block_autodelivery(self, ctx: DeliveryContext) -> None:
-        if self._parse_lot(ctx.order):
-            ctx.cancel()
-            self.log("Автовыдача отменена для SMM-заказа #%s", ctx.order_id)
-
-    # ── @on_order_paid — новый заказ (НЕ сообщение) ─────────────────────────
-
-    @on_order_paid
-    async def on_new_order(self, ctx: OrderContext) -> None:
-        if not await self._enabled():
-            return
-        parsed = self._parse_lot(ctx.order)
-        if not parsed:
-            return
-        service_id, quantity = parsed
-        if not await self._api():
-            self.log("VexBoost не настроен", level="warning")
-            return
-
+    async def _register_waiting(
+        self,
+        ctx: OrderContext,
+        service_id: int,
+        quantity: int,
+    ) -> dict | None:
         order_id = ctx.order_id
-        price_rub = _resolve_order_price(ctx.order)
-
         submitted = _load_json("submitted.json", {})
         if order_id in submitted:
-            return
+            return None
         waiting = _load_json("waiting.json", [])
-        if any(str(o.get("order_id")) == order_id for o in waiting):
-            return
+        for item in waiting:
+            if str(item.get("order_id")) == order_id:
+                return item
 
+        price_rub = _resolve_order_price(ctx.order)
         entry = {
             "order_id": order_id,
             "service_id": service_id,
@@ -926,20 +1071,155 @@ class Plugin(StarvellPlugin):
             api = ctx.api()
             if api:
                 entry["chat_id"] = await api.find_chat_by_buyer(int(ctx.buyer_id)) or ""
-
         waiting.append(entry)
         _save_json("waiting.json", waiting)
         StatisticsManager.record_created(service_id, float(price_rub))
+        return entry
 
-        welcome = await self._msg("welcome_message", order_id=order_id)
-        if entry["chat_id"]:
-            await ctx.send_to_buyer(welcome)
-        else:
-            await ctx.notify(f"⚠️ VexBoost #{order_id}: чат не найден", "notify_orders")
+    async def _recover_order_for_buyer(self, ctx: MessageContext) -> dict | None:
+        """Если waiting пуст — ищем CREATED заказ покупателя в Starvell (как FPC payorders)."""
+        api = ctx.api() or self.core.get_api(ctx.account_name)
+        if not api:
+            return None
+        try:
+            orders = await api.fetch_orders()
+        except Exception as exc:
+            self.log("recover orders: %s", exc, level="warning")
+            return None
+        username = (ctx.username or "").strip().lower()
+        for order in orders:
+            if str(order.get("status") or "") != "CREATED":
+                continue
+            buyer = order.get("user") or {}
+            if not (
+                (ctx.author_id and _same_id(buyer.get("id"), ctx.author_id))
+                or (username and (buyer.get("username") or "").strip().lower() == username)
+            ):
+                continue
+            parsed = await self._resolve_lot(order, ctx.account_name)
+            if not parsed:
+                continue
+            service_id, quantity = parsed
+            octx = OrderContext.from_order(self.core, order, ctx.account_name)
+            if ctx.chat_id:
+                octx.chat_id = ctx.chat_id
+            entry = await self._register_waiting(octx, service_id, quantity)
+            if entry:
+                self.log(
+                    "Восстановлен waiting #%s buyer=%s service=%s",
+                    entry.get("order_id"), ctx.username, service_id,
+                )
+                return entry
+        return None
+
+    async def _process_link_and_submit(
+        self, ctx: MessageContext, order: dict, link: str,
+    ) -> None:
+        allow_private = await self.get_cfg("allow_private_tg", False)
+        if not allow_private and _is_private_tg(link):
+            await self._safe_reply(ctx, await self._msg("private_telegram_message"))
+            return
+        ok, err = OrderValidator.validate(link)
+        if not ok:
+            await self._safe_reply(ctx, await self._msg("invalid_link_message", error=err))
+            return
+
+        order = dict(order)
+        order["link"] = link
+        order["chat_id"] = ctx.chat_id
+        if ctx.author_id:
+            order["buyer_id"] = int(ctx.author_id)
+        if ctx.username:
+            order["buyer"] = ctx.username
+        self._persist_waiting_order(order)
+
+        require_confirm = await self.get_cfg("require_link_confirm", False)
+        if require_confirm:
+            pkey = self._pending_key(ctx)
+            self._pending[pkey] = order
+            _save_json("pending.json", self._pending)
+            display_link = link.replace("https://", "").replace("http://", "")
+            await self._safe_reply(ctx, await self._msg(
+                "confirmation_message",
+                lot=order.get("product", "товар"),
+                price=_format_rub(order.get("price_rub", 0)),
+                amount=order.get("quantity", 1),
+                link=display_link,
+            ))
+            return
+
+        await self._safe_reply(ctx, await self._msg("creating_order_message"))
+        await self._submit_order_impl(order, ctx.chat_id, ctx.account_name, reply_ctx=ctx)
+
+    # ── @on_pre_delivery — отмена автовыдачи для SMM-лотов ─────────────────
+
+    @on_pre_delivery
+    async def block_autodelivery(self, ctx: DeliveryContext) -> None:
+        parsed = await self._resolve_lot(ctx.order, ctx.account_name)
+        if parsed:
+            ctx.cancel()
+            self.log("Автовыдача отменена для SMM-заказа #%s", ctx.order_id)
+
+    # ── @on_order_paid — новый заказ (НЕ сообщение) ─────────────────────────
+
+    @on_order_paid
+    async def on_new_order(self, ctx: OrderContext) -> None:
+        if not await self._enabled():
+            return
+        parsed = await self._resolve_lot(ctx.order, ctx.account_name)
+        if not parsed:
+            self.log("Заказ #%s: ID: не найден в описании лота", ctx.order_id, level="debug")
+            return
+        service_id, quantity = parsed
+        if not await self._api():
+            self.log("VexBoost не настроен — проверьте API Key в настройках", level="warning")
+            await ctx.notify(
+                f"⚠️ VexBoost #{ctx.order_id}: API не настроен. Заказ SMM не обработан.",
+                "notify_orders", order_id=ctx.order_id,
+            )
+            return
+
+        entry = await self._register_waiting(ctx, service_id, quantity)
+        if not entry:
+            return
+
+        welcome = await self._msg("welcome_message", order_id=ctx.order_id)
+        sent = await ctx.send_to_buyer(welcome)
+        if not sent and entry.get("chat_id"):
+            api = ctx.api()
+            if api:
+                try:
+                    await api.send_message(str(entry["chat_id"]), welcome)
+                    sent = True
+                except Exception as exc:
+                    self.log("welcome send: %s", exc, level="error")
+        if not sent:
+            await ctx.notify(
+                f"⚠️ VexBoost #{ctx.order_id}: не удалось отправить приветствие "
+                f"(buyer={ctx.buyer_username}, chat={entry.get('chat_id') or '—'})",
+                "notify_orders", order_id=ctx.order_id,
+            )
+
+        orphans = _load_json("orphan_links.json", {})
+        orphan_link = orphans.pop(str(entry.get("chat_id") or ""), None)
+        if orphan_link:
+            _save_json("orphan_links.json", orphans)
+            self.log("Найдена буферная ссылка для #%s", ctx.order_id)
+            msg_ctx = MessageContext(
+                core=self.core,
+                account_name=ctx.account_name,
+                chat_id=str(entry.get("chat_id") or ""),
+                text=orphan_link,
+                author_id=ctx.buyer_id,
+                username=ctx.buyer_username,
+            )
+            await self._process_link_and_submit(msg_ctx, entry, orphan_link)
 
         if await self.get_cfg("notify_admin", True) and await self.get_cfg("notify_new_order", True):
-            asyncio.create_task(self._notify_admin_new_order(ctx, order_id, service_id, quantity, price_rub))
-        self.log("Новый заказ #%s service=%s qty=%s price=%s", order_id, service_id, quantity, price_rub)
+            asyncio.create_task(self._notify_admin_new_order(
+                ctx, ctx.order_id, service_id, quantity, entry.get("price_rub", 0),
+            ))
+        self.log("Новый заказ #%s service=%s qty=%s", ctx.order_id, service_id, quantity)
 
     async def _notify_admin_new_order(
         self,
@@ -975,6 +1255,17 @@ class Plugin(StarvellPlugin):
 
     @on_message
     async def on_buyer_chat(self, ctx: MessageContext) -> None:
+        try:
+            await self._handle_buyer_message(ctx)
+        except Exception as exc:
+            self.log("on_buyer_chat: %s", exc, level="error")
+            await self._safe_reply(
+                ctx,
+                await self._msg("error_message", error="Ошибка обработки. Продавец уведомлён."),
+            )
+            ctx.mark_handled()
+
+    async def _handle_buyer_message(self, ctx: MessageContext) -> None:
         if not await self._enabled():
             return
         text = (ctx.text or "").strip()
@@ -1007,21 +1298,32 @@ class Plugin(StarvellPlugin):
             ctx.mark_handled()
             return
 
-        waiting = _load_json("waiting.json", [])
-        order = self._find_waiting(waiting, ctx)
-        if not order:
-            order = self._waiting_for_chat(ctx.chat_id)
-        if not order:
-            return
-
         links = _extract_links(text)
-        if links:
-            await self._handle_buyer_link(ctx, order, links[0])
+        order = await self._locate_waiting_order(ctx)
+
+        if not order and links:
+            order = await self._recover_order_for_buyer(ctx)
+
+        if order and links:
+            await self._process_link_and_submit(ctx, order, links[0])
             ctx.mark_handled()
             return
 
-        ctx.mark_handled()
-        await ctx.reply(await self._msg("welcome_message"))
+        if order:
+            ctx.mark_handled()
+            await self._safe_reply(ctx, await self._msg("welcome_message"))
+            return
+
+        if links:
+            orphans = _load_json("orphan_links.json", {})
+            orphans[str(ctx.chat_id)] = links[0]
+            _save_json("orphan_links.json", orphans)
+            ctx.mark_handled()
+            await self._safe_reply(ctx, "⏳ Ссылка получена. Ожидаю подтверждение оплаты, создам заказ автоматически.")
+            recovered = await self._recover_order_for_buyer(ctx)
+            if recovered:
+                await self._process_link_and_submit(ctx, recovered, links[0])
+            return
 
     def _pending_key(self, ctx: MessageContext) -> str:
         uid = ctx.author_id or ctx.username or ctx.chat_id
@@ -1060,72 +1362,10 @@ class Plugin(StarvellPlugin):
             _save_json("waiting.json", waiting)
 
     async def _handle_buyer_link(self, ctx: MessageContext, order: dict, link: str) -> None:
-        allow_private = await self.get_cfg("allow_private_tg", False)
-        if not allow_private and _is_private_tg(link):
-            await ctx.reply(await self._msg("private_telegram_message"))
-            return
-        ok, err = OrderValidator.validate(link)
-        if not ok:
-            await ctx.reply(await self._msg("invalid_link_message", error=err))
-            return
-
-        order["link"] = link
-        order["chat_id"] = ctx.chat_id
-        if ctx.author_id:
-            order["buyer_id"] = int(ctx.author_id)
-        if ctx.username:
-            order["buyer"] = ctx.username
-        self._persist_waiting_order(order)
-
-        require_confirm = await self.get_cfg("require_link_confirm", False)
-        if require_confirm:
-            pkey = self._pending_key(ctx)
-            self._pending[pkey] = order
-            _save_json("pending.json", self._pending)
-            display_link = link.replace("https://", "").replace("http://", "")
-            await ctx.reply(await self._msg(
-                "confirmation_message",
-                lot=order.get("product", "товар"),
-                price=_format_rub(order.get("price_rub", 0)),
-                amount=order.get("quantity", 1),
-                link=display_link,
-            ))
-            return
-
-        await ctx.reply(await self._msg("creating_order_message"))
-        asyncio.create_task(
-            self._submit_order_async(dict(order), ctx.chat_id, ctx.account_name),
-            name=f"vexboost-submit-{order.get('order_id')}",
-        )
+        await self._process_link_and_submit(ctx, order, link)
 
     async def _request_link_confirm(self, ctx: MessageContext, order: dict, link: str) -> None:
-        allow_private = await self.get_cfg("allow_private_tg", False)
-        if not allow_private and _is_private_tg(link):
-            await ctx.reply(await self._msg("private_telegram_message"))
-            return
-        ok, err = OrderValidator.validate(link)
-        if not ok:
-            await ctx.reply(await self._msg("invalid_link_message", error=err))
-            return
-
-        order["link"] = link
-        order["chat_id"] = ctx.chat_id
-        if ctx.author_id:
-            order["buyer_id"] = ctx.author_id
-        if ctx.username:
-            order["buyer"] = ctx.username
-        pkey = self._pending_key(ctx)
-        self._pending[pkey] = order
-        _save_json("pending.json", self._pending)
-
-        display_link = link.replace("https://", "").replace("http://", "")
-        await ctx.reply(await self._msg(
-            "confirmation_message",
-            lot=order.get("product", "товар"),
-            price=_format_rub(order.get("price_rub", 0)),
-            amount=order.get("quantity", 1),
-            link=display_link,
-        ))
+        await self._process_link_and_submit(ctx, order, link)
 
     async def _handle_pending(self, ctx: MessageContext, text: str, action: str | None) -> None:
         pkey = self._pending_key(ctx)
@@ -1136,20 +1376,18 @@ class Plugin(StarvellPlugin):
                     pkey, order = k, v
                     break
         if not order:
+            await self._safe_reply(ctx, await self._msg("send_link_first_message"))
             return
 
         action = action or _confirm_action(text)
         if action == "+":
             if not order.get("link"):
-                await ctx.reply(await self._msg("send_link_first_message"))
+                await self._safe_reply(ctx, await self._msg("send_link_first_message"))
                 return
             self._pending.pop(pkey, None)
             _save_json("pending.json", self._pending)
-            await ctx.reply(await self._msg("creating_order_message"))
-            asyncio.create_task(
-                self._submit_order_async(dict(order), ctx.chat_id, ctx.account_name),
-                name=f"vexboost-submit-{order.get('order_id')}",
-            )
+            await self._safe_reply(ctx, await self._msg("creating_order_message"))
+            await self._submit_order_impl(dict(order), ctx.chat_id, ctx.account_name, reply_ctx=ctx)
             return
 
         if action == "-":
@@ -1157,15 +1395,15 @@ class Plugin(StarvellPlugin):
             _save_json("pending.json", self._pending)
             self._remove_waiting(order.get("order_id"))
             await self._refund_starvell(ctx, str(order.get("order_id", "")))
-            await ctx.reply(await self._msg("order_cancelled_message"))
+            await self._safe_reply(ctx, await self._msg("order_cancelled_message"))
             StatisticsManager.record_canceled(refunded=True)
             return
 
         links = _extract_links(text)
         if links:
-            await self._request_link_confirm(ctx, order, links[0])
+            await self._process_link_and_submit(ctx, order, links[0])
             return
-        await ctx.reply(await self._msg("pending_hint_message"))
+        await self._safe_reply(ctx, await self._msg("pending_hint_message"))
 
     async def _submit_order(self, ctx: MessageContext, order: dict) -> None:
         await self._submit_order_impl(order, ctx.chat_id, ctx.account_name, reply_ctx=ctx)
@@ -1252,11 +1490,11 @@ class Plugin(StarvellPlugin):
 
                 created_msg = await self._msg("order_created_message", smm_id=smm_id, order_id=oid)
                 if reply_ctx:
-                    await reply_ctx.reply(created_msg)
+                    await self._safe_reply(reply_ctx, created_msg)
                 elif chat_id:
-                    starvell = self.core.get_api(account_name)
+                    starvell = self.core.get_api(account_name) or self.core.get_api("default")
                     if starvell:
-                        await starvell.send_message(chat_id, created_msg)
+                        await starvell.send_message(str(chat_id), created_msg)
 
                 asyncio.create_task(self._fill_order_cost(smm_id, oid, order, account_name))
 
@@ -1266,11 +1504,11 @@ class Plugin(StarvellPlugin):
                 err = _buyer_error(result)
                 err_msg = await self._msg("error_message", error=err)
                 if reply_ctx:
-                    await reply_ctx.reply(err_msg)
+                    await self._safe_reply(reply_ctx, err_msg)
                 elif chat_id:
-                    starvell = self.core.get_api(account_name)
+                    starvell = self.core.get_api(account_name) or self.core.get_api("default")
                     if starvell:
-                        await starvell.send_message(chat_id, err_msg)
+                        await starvell.send_message(str(chat_id), err_msg)
                 StatisticsManager.record_failed()
                 OrderHistory.add({
                     "order_id": oid, "status": "Failed", "error": str(result),
