@@ -6,6 +6,7 @@ from typing import Any
 
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
+from core.plugins.settings_cb import cb_select_set, cb_settings_page
 from keyboards import cbt as CBT
 
 
@@ -18,7 +19,14 @@ def plugin_settings_nav(uuid: str) -> list[list[InlineKeyboardButton]]:
     ]
 
 
-def plugin_select_keyboard(uuid: str, key: str, options: list[Any], current: Any) -> InlineKeyboardMarkup:
+def plugin_select_keyboard(
+    uuid: str,
+    field_idx: int,
+    options: list[Any],
+    current: Any,
+    *,
+    settings_page: int = 0,
+) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
     for idx, opt in enumerate(options):
         if isinstance(opt, dict):
@@ -31,8 +39,11 @@ def plugin_select_keyboard(uuid: str, key: str, options: list[Any], current: Any
         rows.append([
             InlineKeyboardButton(
                 text=f"{mark}{label}",
-                callback_data=f"{CBT.PLUGIN_SELECT_SET}{uuid}:{key}:{idx}",
+                callback_data=cb_select_set(uuid, field_idx, idx),
             ),
         ])
-    rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data=f"{CBT.PLUGIN_SETTINGS}{uuid}")])
+    rows.append([InlineKeyboardButton(
+        text="◀️ Назад",
+        callback_data=cb_settings_page(uuid, settings_page),
+    )])
     return InlineKeyboardMarkup(inline_keyboard=rows)

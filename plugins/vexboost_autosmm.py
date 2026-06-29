@@ -39,7 +39,7 @@ from starvell_sdk import (
 )
 
 NAME = "VexBoost AutoSMM"
-VERSION = "3.3.1"
+VERSION = "3.3.2"
 DESCRIPTION = "Автонакрутка SMM через VexBoost для Starvell"
 CREDITS = "@xei1y"
 UUID = "a3f8c2e1-7b4d-4a9f-9e2c-1d5b8f6a0c3e"

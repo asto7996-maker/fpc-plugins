@@ -161,23 +161,30 @@ class BasePlugin(ABC):
         cfg = await self.plugin_settings.get_all(self.UUID)
         rows: list[list[InlineKeyboardButton]] = []
 
-        for field in chunk:
+        for local_i, field in enumerate(chunk):
             key = field["key"]
+            field_idx = page * page_size + local_i
             label = field.get("label", key)
             ftype = field.get("type", "str")
+            from core.plugins.settings_cb import (
+                cb_schema_action,
+                cb_select_menu,
+                cb_setting_edit,
+                cb_setting_toggle,
+            )
             if ftype == "bool":
                 on = bool(cfg.get(key, field.get("default", False)))
                 rows.append([
                     InlineKeyboardButton(
                         text=f"{'🟢' if on else '🔴'} {label[:40]}",
-                        callback_data=f"{CBT.PLUGIN_SETTING}{self.UUID}:{key}",
+                        callback_data=cb_setting_toggle(self.UUID, field_idx),
                     )
                 ])
             elif ftype == "action":
                 rows.append([
                     InlineKeyboardButton(
                         text=f"▶️ {label[:40]}",
-                        callback_data=f"{CBT.PLUGIN_SCHEMA_ACT}{self.UUID}:{key}",
+                        callback_data=cb_schema_action(self.UUID, field_idx),
                     )
                 ])
             elif ftype == "select":
@@ -186,7 +193,7 @@ class BasePlugin(ABC):
                 rows.append([
                     InlineKeyboardButton(
                         text=f"📋 {label[:24]}: {val_s}",
-                        callback_data=f"{CBT.PLUGIN_SELECT_MENU}{self.UUID}:{key}",
+                        callback_data=cb_select_menu(self.UUID, field_idx),
                     )
                 ])
             elif ftype in ("text", "str", "multiline"):
@@ -197,7 +204,7 @@ class BasePlugin(ABC):
                 rows.append([
                     InlineKeyboardButton(
                         text=f"✏️ {label[:22]}: {preview or '—'}",
-                        callback_data=f"{CBT.PLUGIN_EDIT}{self.UUID}:{key}",
+                        callback_data=cb_setting_edit(self.UUID, field_idx),
                     )
                 ])
             elif ftype == "int":
@@ -205,22 +212,24 @@ class BasePlugin(ABC):
                 rows.append([
                     InlineKeyboardButton(
                         text=f"🔢 {label[:30]}: {val}",
-                        callback_data=f"{CBT.PLUGIN_EDIT}{self.UUID}:{key}",
+                        callback_data=cb_setting_edit(self.UUID, field_idx),
                     )
                 ])
 
         if pages > 1:
+            from core.plugins.settings_cb import cb_settings_page
+
             nav: list[InlineKeyboardButton] = []
             if page > 0:
                 nav.append(InlineKeyboardButton(
                     text="◀️",
-                    callback_data=f"{CBT.PLUGIN_SETTINGS}{self.UUID}:{page - 1}",
+                    callback_data=cb_settings_page(self.UUID, page - 1),
                 ))
             nav.append(InlineKeyboardButton(text=f"{page + 1}/{pages}", callback_data="sc:noop"))
             if page < pages - 1:
                 nav.append(InlineKeyboardButton(
                     text="▶️",
-                    callback_data=f"{CBT.PLUGIN_SETTINGS}{self.UUID}:{page + 1}",
+                    callback_data=cb_settings_page(self.UUID, page + 1),
                 ))
             rows.append(nav)
 

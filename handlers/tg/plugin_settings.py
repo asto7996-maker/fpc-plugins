@@ -14,6 +14,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message
 
 from handlers.tg.loading import loading_skeleton
+from core.plugins.settings_cb import parse_uuid_token, resolve_schema_field
 from keyboards import cbt as CBT
 from keyboards.plugin_settings import plugin_select_keyboard
 
@@ -25,9 +26,12 @@ class PluginSettingsStates(StatesGroup):
 
 
 def _parse_uuid_key(payload: str, prefix: str) -> tuple[str, str]:
-    body = payload.replace(prefix, "", 1)
-    uuid, _, key = body.partition(":")
-    return uuid, key
+    return parse_uuid_token(payload, prefix)
+
+
+def _field_page(inst: Any, field_idx: int) -> int:
+    page_size = max(4, inst.settings_page_size()) if hasattr(inst, "settings_page_size") else 10
+    return max(0, field_idx // page_size)
 
 
 def _get_plugin_instance(pm: Any, uuid: str) -> Any | None:
@@ -103,32 +107,36 @@ def create_plugin_settings_router(ctx: Any) -> Router:
     async def cb_plugin_setting_toggle(call: CallbackQuery) -> None:
         if not await ctx._has_access(call.from_user.id):
             return
-        uuid, key = _parse_uuid_key(call.data, CBT.PLUGIN_SETTING)
+        uuid, token = _parse_uuid_key(call.data, CBT.PLUGIN_SETTING)
         inst = _get_plugin_instance(pm, uuid)
         if not inst:
             await call.answer("Плагин не загружен", show_alert=True)
             return
-        field = inst.get_schema_field(key) if hasattr(inst, "get_schema_field") else None
+        field = resolve_schema_field(inst, token)
         if not field or field.get("type") != "bool":
             await call.answer("Настройка недоступна", show_alert=True)
             return
+        key = field["key"]
+        page = _field_page(inst, int(token)) if token.isdigit() else 0
         async with loading_skeleton(call):
             await inst.on_setting_toggle(key)
-            await _show_settings(call, pm, uuid, skip_loading=True)
+            await _show_settings(call, pm, uuid, page=page, skip_loading=True)
 
     @router.callback_query(F.data.startswith(CBT.PLUGIN_EDIT))
     async def cb_plugin_edit_field(call: CallbackQuery, state: FSMContext) -> None:
         if not await ctx._has_access(call.from_user.id):
             return
-        uuid, key = _parse_uuid_key(call.data, CBT.PLUGIN_EDIT)
+        uuid, token = _parse_uuid_key(call.data, CBT.PLUGIN_EDIT)
         inst = _get_plugin_instance(pm, uuid)
         if not inst:
             await call.answer("Плагин не загружен", show_alert=True)
             return
-        field = inst.get_schema_field(key)
+        field = resolve_schema_field(inst, token)
         if not field:
             await call.answer("Поле не найдено", show_alert=True)
             return
+        key = field["key"]
+        page = _field_page(inst, int(token)) if token.isdigit() else 0
 
         ftype = field.get("type", "str")
         if ftype not in ("text", "str", "multiline", "int"):
@@ -141,7 +149,7 @@ def create_plugin_settings_router(ctx: Any) -> Router:
         hint = field.get("description", "")
 
         await state.set_state(PluginSettingsStates.waiting_value)
-        await state.update_data(uuid=uuid, key=key)
+        await state.update_data(uuid=uuid, key=key, page=page)
 
         prompt = f"✏️ <b>{inst.NAME}</b> → <b>{label}</b>\n"
         if hint:
@@ -201,8 +209,13 @@ def create_plugin_settings_router(ctx: Any) -> Router:
         await inst.apply_setting(key, value)
         await state.clear()
 
-        text_page = await inst.render_settings_text()
-        kb = await inst.build_settings_keyboard()
+        page = int(data.get("page") or 0)
+        try:
+            text_page = await inst.render_settings_text(page=page)
+            kb = await inst.build_settings_keyboard(page=page)
+        except TypeError:
+            text_page = await inst.render_settings_text()
+            kb = await inst.build_settings_keyboard()
         await message.answer(f"✅ Сохранено: <b>{field.get('label', key)}</b>", parse_mode="HTML")
         await message.answer(text_page, parse_mode="HTML", reply_markup=kb)
 
@@ -210,15 +223,18 @@ def create_plugin_settings_router(ctx: Any) -> Router:
     async def cb_plugin_select_menu(call: CallbackQuery) -> None:
         if not await ctx._has_access(call.from_user.id):
             return
-        uuid, key = _parse_uuid_key(call.data, CBT.PLUGIN_SELECT_MENU)
+        uuid, token = _parse_uuid_key(call.data, CBT.PLUGIN_SELECT_MENU)
         inst = _get_plugin_instance(pm, uuid)
         if not inst:
             await call.answer("Плагин не загружен", show_alert=True)
             return
-        field = inst.get_schema_field(key)
+        field = resolve_schema_field(inst, token)
         if not field or field.get("type") != "select":
             await call.answer("Список недоступен", show_alert=True)
             return
+        key = field["key"]
+        field_idx = int(token) if token.isdigit() else 0
+        page = _field_page(inst, field_idx)
 
         options = field.get("options") or []
         if not options:
@@ -232,7 +248,9 @@ def create_plugin_settings_router(ctx: Any) -> Router:
         await call.message.edit_text(
             f"📋 <b>{label}</b>\nВыберите значение:",
             parse_mode="HTML",
-            reply_markup=plugin_select_keyboard(uuid, key, options, current),
+            reply_markup=plugin_select_keyboard(
+                uuid, field_idx, options, current, settings_page=page,
+            ),
         )
         await call.answer()
 
@@ -245,8 +263,9 @@ def create_plugin_settings_router(ctx: Any) -> Router:
         if len(parts) < 3:
             await call.answer("Ошибка данных", show_alert=True)
             return
-        uuid, key, idx_s = parts[0], parts[1], parts[2]
+        uuid, field_token, idx_s = parts[0], parts[1], parts[2]
         try:
+            field_idx = int(field_token)
             idx = int(idx_s)
         except ValueError:
             await call.answer("Ошибка", show_alert=True)
@@ -256,10 +275,12 @@ def create_plugin_settings_router(ctx: Any) -> Router:
         if not inst:
             await call.answer("Плагин не загружен", show_alert=True)
             return
-        field = inst.get_schema_field(key)
+        field = resolve_schema_field(inst, field_token)
         if not field:
             await call.answer("Поле не найдено", show_alert=True)
             return
+        key = field["key"]
+        page = _field_page(inst, field_idx)
 
         options = field.get("options") or []
         if idx < 0 or idx >= len(options):
@@ -271,18 +292,21 @@ def create_plugin_settings_router(ctx: Any) -> Router:
 
         async with loading_skeleton(call):
             await inst.apply_setting(key, value)
-            await _show_settings(call, pm, uuid, skip_loading=True)
+            await _show_settings(call, pm, uuid, page=page, skip_loading=True)
 
     @router.callback_query(F.data.startswith(CBT.PLUGIN_SCHEMA_ACT))
     async def cb_plugin_action(call: CallbackQuery) -> None:
         if not await ctx._has_access(call.from_user.id):
             return
-        uuid, key = _parse_uuid_key(call.data, CBT.PLUGIN_SCHEMA_ACT)
+        uuid, token = _parse_uuid_key(call.data, CBT.PLUGIN_SCHEMA_ACT)
         inst = _get_plugin_instance(pm, uuid)
+        field = resolve_schema_field(inst, token) if inst else None
+        key = field["key"] if field else token
+        page = _field_page(inst, int(token)) if inst and token.isdigit() else 0
         if inst and hasattr(inst, "on_settings_action"):
             handled = await inst.on_settings_action(call, key)
             if handled:
-                await _show_settings(call, pm, uuid, skip_loading=True)
+                await _show_settings(call, pm, uuid, page=page, skip_loading=True)
                 return
         await call.answer("Действие не реализовано", show_alert=True)
 
