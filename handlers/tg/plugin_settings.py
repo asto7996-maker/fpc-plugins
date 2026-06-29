@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
 
@@ -64,17 +65,31 @@ def _validate_value(field: dict[str, Any], raw: str) -> tuple[Any | None, str | 
     return text, None
 
 
+def _parse_settings_payload(data: str) -> tuple[str, int]:
+    body = data.replace(CBT.PLUGIN_SETTINGS, "", 1)
+    parts = body.split(":", 1)
+    uuid = parts[0]
+    page = 0
+    if len(parts) > 1 and parts[1].isdigit():
+        page = int(parts[1])
+    return uuid, page
+
+
 def create_plugin_settings_router(ctx: Any) -> Router:
     router = Router(name="plugin_settings")
     pm = ctx.plugin_manager
+
+    @router.callback_query(F.data == "sc:noop")
+    async def cb_noop(call: CallbackQuery) -> None:
+        await call.answer()
 
     @router.callback_query(F.data.startswith(CBT.PLUGIN_SETTINGS))
     async def cb_plugin_settings(call: CallbackQuery, state: FSMContext) -> None:
         if not await ctx._has_access(call.from_user.id):
             return
         await state.clear()
-        uuid = call.data.replace(CBT.PLUGIN_SETTINGS, "").split(":")[0]
-        await _show_settings(call, pm, uuid)
+        uuid, page = _parse_settings_payload(call.data)
+        await _show_settings(call, pm, uuid, page=page)
 
     @router.callback_query(F.data.startswith(CBT.EDIT_PLUGIN))
     async def cb_edit_plugin(call: CallbackQuery, state: FSMContext) -> None:
@@ -291,7 +306,14 @@ def create_plugin_settings_router(ctx: Any) -> Router:
     return router
 
 
-async def _show_settings(call: CallbackQuery, pm: Any, uuid: str, skip_loading: bool = False) -> None:
+async def _show_settings(
+    call: CallbackQuery,
+    pm: Any,
+    uuid: str,
+    *,
+    page: int = 0,
+    skip_loading: bool = False,
+) -> None:
     rec = pm.plugins.get(uuid)
     if not rec:
         await call.answer("Плагин не найден", show_alert=True)
@@ -300,15 +322,32 @@ async def _show_settings(call: CallbackQuery, pm: Any, uuid: str, skip_loading: 
     inst = rec.instance
     if inst and hasattr(inst, "render_settings_text") and hasattr(inst, "build_settings_keyboard"):
         async def render() -> None:
-            text = await inst.render_settings_text()
-            kb = await inst.build_settings_keyboard()
+            try:
+                text = await inst.render_settings_text(page=page)
+                kb = await inst.build_settings_keyboard(page=page)
+            except TypeError:
+                text = await inst.render_settings_text()
+                kb = await inst.build_settings_keyboard()
             await call.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
 
-        if skip_loading:
-            await render()
-        else:
-            async with loading_skeleton(call):
-                await render()
+        try:
+            if skip_loading:
+                await asyncio.wait_for(render(), timeout=20.0)
+            else:
+                async with loading_skeleton(call):
+                    await asyncio.wait_for(render(), timeout=20.0)
+        except asyncio.TimeoutError:
+            logger.error("plugin settings timeout %s page %s", uuid, page)
+            try:
+                await call.answer("Таймаут загрузки настроек", show_alert=True)
+            except Exception:
+                pass
+        except Exception as exc:
+            logger.exception("plugin settings %s page %s: %s", uuid, page, exc)
+            try:
+                await call.answer("Не удалось открыть настройки", show_alert=True)
+            except Exception:
+                pass
         return
 
     text = (

@@ -4,11 +4,14 @@ UX-хелперы: скелетоны загрузки при ожидании A
 
 from __future__ import annotations
 
-import asyncio
+import html
+import logging
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
 from aiogram.types import CallbackQuery, Message
+
+logger = logging.getLogger("starvell.handlers.loading")
 
 LOADING_TEXT = "⚡️ <i>Запрос обрабатывается…</i>"
 
@@ -19,16 +22,19 @@ async def loading_skeleton(
     loading_text: str = LOADING_TEXT,
 ) -> AsyncIterator[Message]:
     """
-    Мгновенно показывает скелетон загрузки, затем восстанавливает контекст.
-
-    Usage:
-        async with loading_skeleton(call) as msg:
-            data = await slow_api()
-            await msg.edit_text(format_result(data), ...)
+    Показывает скелетон загрузки и гарантирует, что сообщение не останется
+    в состоянии «обрабатывается» при ошибке внутри блока.
     """
+    message: Message | None = None
+    original_text = ""
+    original_markup = None
+
     if isinstance(target, CallbackQuery):
         message = target.message
-        await target.answer()
+        try:
+            await target.answer()
+        except Exception:
+            pass
     else:
         message = target
 
@@ -46,8 +52,30 @@ async def loading_skeleton(
 
     try:
         yield message
-    finally:
-        pass
+    except Exception as exc:
+        logger.exception("loading_skeleton failed: %s", exc)
+        err = html.escape(str(exc))[:400]
+        fallback = f"❌ <b>Ошибка</b>\n\n<code>{err}</code>"
+        restored = False
+        for text, markup in (
+            (fallback, original_markup),
+            (fallback, None),
+            (original_text or fallback, original_markup),
+        ):
+            if not text:
+                continue
+            try:
+                await message.edit_text(text, parse_mode="HTML", reply_markup=markup)
+                restored = True
+                break
+            except Exception:
+                continue
+        if not restored and isinstance(target, CallbackQuery):
+            try:
+                await target.answer(f"Ошибка: {str(exc)[:180]}", show_alert=True)
+            except Exception:
+                pass
+        raise
 
 
 async def with_loading(
@@ -57,17 +85,5 @@ async def with_loading(
     loading_text: str = LOADING_TEXT,
 ):
     """Обёртка: показать загрузку → выполнить coro → вернуть результат."""
-    if isinstance(target, CallbackQuery):
-        msg = target.message
-        await target.answer()
-    else:
-        msg = target
-
-    if msg:
-        try:
-            await msg.edit_text(loading_text, parse_mode="HTML")
-        except Exception:
-            pass
-
-    result = await coro
-    return result
+    async with loading_skeleton(target, loading_text=loading_text):
+        return await coro

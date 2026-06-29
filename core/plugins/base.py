@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import html
 import logging
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any
@@ -82,43 +83,85 @@ class BasePlugin(ABC):
         """
         return []
 
-    async def render_settings_text(self) -> str:
+    @staticmethod
+    def settings_page_size() -> int:
+        return 10
+
+    @staticmethod
+    def _escape(val: Any) -> str:
+        return html.escape(str(val if val is not None else ""))
+
+    @classmethod
+    def _format_setting_line(cls, field: dict[str, Any], val: Any) -> str:
+        label = cls._escape(field.get("label", field.get("key", "")))
+        ftype = field.get("type", "str")
+        if ftype == "bool":
+            icon = "🟢" if val else "🔴"
+            return f"{icon} {label}"
+        if ftype in ("multiline",):
+            text = str(val or "")
+            return f"• <b>{label}</b>: <i>{len(text)} симв.</i>"
+        if ftype in ("text", "str"):
+            preview = cls._escape(str(val or "")[:80])
+            if len(str(val or "")) > 80:
+                preview += "…"
+            return f"• <b>{label}</b>: <code>{preview or '—'}</code>"
+        if ftype == "int":
+            return f"• <b>{label}</b>: <code>{cls._escape(val)}</code>"
+        if ftype == "select":
+            return f"• <b>{label}</b>: <code>{cls._escape(val)}</code>"
+        return f"• <b>{label}</b>: <code>{cls._escape(val)}</code>"
+
+    async def render_settings_text(self, page: int = 0) -> str:
         """Текст страницы настроек плагина."""
+        schema = self.get_settings_schema()
+        page_size = max(4, self.settings_page_size())
+        pages = max(1, (len(schema) + page_size - 1) // page_size) if schema else 1
+        page = max(0, min(page, pages - 1))
+        chunk = schema[page * page_size:(page + 1) * page_size]
+
         lines = [
-            f"⚙️ <b>{self.NAME}</b> v{self.VERSION}",
+            f"⚙️ <b>{self._escape(self.NAME)}</b> v{self._escape(self.VERSION)}",
             "━━━━━━━━━━━━━━━━━━",
-            f"<i>{self.DESCRIPTION}</i>",
+            f"<i>{self._escape(self.DESCRIPTION)}</i>",
             "",
         ]
+        if pages > 1:
+            lines.append(f"📄 Страница <b>{page + 1}</b> / {pages}")
+            lines.append("")
+
         cfg = await self.plugin_settings.get_all(self.UUID)
-        schema = self.get_settings_schema()
-        if not schema:
+        if not chunk:
             lines.append("<i>Нет настраиваемых параметров</i>")
         else:
             lines.append("<b>Параметры:</b>")
-            for field in schema:
+            for field in chunk:
                 key = field["key"]
                 val = cfg.get(key, field.get("default"))
-                label = field.get("label", key)
-                if field.get("type") == "bool":
-                    icon = "🟢" if val else "🔴"
-                    lines.append(f"{icon} {label}")
-                else:
-                    lines.append(f"• <b>{label}</b>: <code>{val}</code>")
+                lines.append(self._format_setting_line(field, val))
         if self.CREDITS:
-            lines.append(f"\n👤 {self.CREDITS}")
-        return "\n".join(lines)
+            lines.append(f"\n👤 {self._escape(self.CREDITS)}")
+        text = "\n".join(lines)
+        if len(text) > 4000:
+            text = text[:3990] + "\n…"
+        return text
 
-    async def build_settings_keyboard(self) -> InlineKeyboardMarkup:
+    async def build_settings_keyboard(self, page: int = 0) -> InlineKeyboardMarkup:
         from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
         from keyboards import cbt as CBT
         from keyboards.plugin_settings import plugin_settings_nav
 
+        schema = self.get_settings_schema()
+        page_size = max(4, self.settings_page_size())
+        pages = max(1, (len(schema) + page_size - 1) // page_size) if schema else 1
+        page = max(0, min(page, pages - 1))
+        chunk = schema[page * page_size:(page + 1) * page_size]
+
         cfg = await self.plugin_settings.get_all(self.UUID)
         rows: list[list[InlineKeyboardButton]] = []
 
-        for field in self.get_settings_schema():
+        for field in chunk:
             key = field["key"]
             label = field.get("label", key)
             ftype = field.get("type", "str")
@@ -126,31 +169,34 @@ class BasePlugin(ABC):
                 on = bool(cfg.get(key, field.get("default", False)))
                 rows.append([
                     InlineKeyboardButton(
-                        text=f"{'🟢' if on else '🔴'} {label}",
+                        text=f"{'🟢' if on else '🔴'} {label[:40]}",
                         callback_data=f"{CBT.PLUGIN_SETTING}{self.UUID}:{key}",
                     )
                 ])
             elif ftype == "action":
                 rows.append([
                     InlineKeyboardButton(
-                        text=f"▶️ {label}",
+                        text=f"▶️ {label[:40]}",
                         callback_data=f"{CBT.PLUGIN_SCHEMA_ACT}{self.UUID}:{key}",
                     )
                 ])
             elif ftype == "select":
                 val = cfg.get(key, field.get("default", ""))
+                val_s = str(val)[:16]
                 rows.append([
                     InlineKeyboardButton(
-                        text=f"📋 {label}: {val}",
+                        text=f"📋 {label[:24]}: {val_s}",
                         callback_data=f"{CBT.PLUGIN_SELECT_MENU}{self.UUID}:{key}",
                     )
                 ])
             elif ftype in ("text", "str", "multiline"):
                 val = cfg.get(key, field.get("default", ""))
-                preview = str(val)[:24] + ("…" if len(str(val)) > 24 else "")
+                preview = str(val).replace("\n", " ")[:20]
+                if len(str(val)) > 20:
+                    preview += "…"
                 rows.append([
                     InlineKeyboardButton(
-                        text=f"✏️ {label}: {preview or '—'}",
+                        text=f"✏️ {label[:22]}: {preview or '—'}",
                         callback_data=f"{CBT.PLUGIN_EDIT}{self.UUID}:{key}",
                     )
                 ])
@@ -158,10 +204,25 @@ class BasePlugin(ABC):
                 val = cfg.get(key, field.get("default", 0))
                 rows.append([
                     InlineKeyboardButton(
-                        text=f"🔢 {label}: {val}",
+                        text=f"🔢 {label[:30]}: {val}",
                         callback_data=f"{CBT.PLUGIN_EDIT}{self.UUID}:{key}",
                     )
                 ])
+
+        if pages > 1:
+            nav: list[InlineKeyboardButton] = []
+            if page > 0:
+                nav.append(InlineKeyboardButton(
+                    text="◀️",
+                    callback_data=f"{CBT.PLUGIN_SETTINGS}{self.UUID}:{page - 1}",
+                ))
+            nav.append(InlineKeyboardButton(text=f"{page + 1}/{pages}", callback_data="sc:noop"))
+            if page < pages - 1:
+                nav.append(InlineKeyboardButton(
+                    text="▶️",
+                    callback_data=f"{CBT.PLUGIN_SETTINGS}{self.UUID}:{page + 1}",
+                ))
+            rows.append(nav)
 
         rows.extend(plugin_settings_nav(self.UUID))
         return InlineKeyboardMarkup(inline_keyboard=rows)

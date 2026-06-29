@@ -39,7 +39,7 @@ from starvell_sdk import (
 )
 
 NAME = "VexBoost AutoSMM"
-VERSION = "3.3.0"
+VERSION = "3.3.1"
 DESCRIPTION = "Автонакрутка SMM через VexBoost для Starvell"
 CREDITS = "@xei1y"
 UUID = "a3f8c2e1-7b4d-4a9f-9e2c-1d5b8f6a0c3e"
@@ -732,6 +732,9 @@ class Plugin(StarvellPlugin):
         if self._api_client:
             await self._api_client.close()
 
+    def settings_page_size(self) -> int:
+        return 8
+
     def get_settings_schema(self) -> list[dict]:
         return [
             {"key": "enabled", "label": "Авто-SMM", "type": "bool", "default": True},
@@ -774,8 +777,25 @@ class Plugin(StarvellPlugin):
                 schema[key] = await self.get_cfg(key, val)
         return schema
 
+    async def _api_cfg(self) -> dict[str, Any]:
+        """Только поля, нужные для VexBoost API (без загрузки всех шаблонов)."""
+        keys = (
+            "auth_mode", "panel_url", "api_url", "api_key",
+            "vexboost_login", "vexboost_password", "auth_token",
+            "api_retry_count", "api_retry_delay", "session_ttl",
+        )
+        cfg: dict[str, Any] = {}
+        for key in keys:
+            default = None
+            for field in self.get_settings_schema():
+                if field.get("key") == key:
+                    default = field.get("default")
+                    break
+            cfg[key] = await self.get_cfg(key, default)
+        return cfg
+
     async def _api(self) -> VexBoostAPI | None:
-        cfg = await self._cfg_all()
+        cfg = await self._api_cfg()
         mode = str(cfg.get("auth_mode", "api_key"))
         if mode == "api_key" and not str(cfg.get("api_key", "")).strip():
             return None
@@ -1554,7 +1574,14 @@ class Plugin(StarvellPlugin):
             from handlers.tg.plugin_settings import _show_settings
             pm = self.core.plugin_manager
             if pm:
-                await _show_settings(call, pm, self.UUID)
+                try:
+                    await _show_settings(call, pm, self.UUID, page=0)
+                except Exception as exc:
+                    self.log("settings panel: %s", exc, level="error")
+                    try:
+                        await call.answer(f"Ошибка настроек: {exc}", show_alert=True)
+                    except Exception:
+                        pass
             return True
         if action == "refresh":
             text, kb = await self.render_plugin_panel()

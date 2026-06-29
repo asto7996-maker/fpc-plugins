@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from typing import Any
@@ -160,8 +161,18 @@ def create_plugin_card_router(ctx: Any) -> Router:
             await call.answer("Панель не настроена", show_alert=True)
             return
         text, kb = result
-        async with loading_skeleton(call):
+
+        async def _render_panel() -> None:
             await call.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+
+        try:
+            async with loading_skeleton(call):
+                await asyncio.wait_for(_render_panel(), timeout=15.0)
+        except asyncio.TimeoutError:
+            await call.answer("Таймаут загрузки панели", show_alert=True)
+        except Exception as exc:
+            logger.exception("panel render %s: %s", uuid, exc)
+            await call.answer(f"Ошибка: {exc}", show_alert=True)
 
     @router.callback_query(F.data.startswith(CBT.PLUGIN_PANEL_ACT))
     async def cb_plugin_panel_action(call: CallbackQuery) -> None:
