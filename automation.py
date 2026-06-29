@@ -596,17 +596,6 @@ class AutomationEngine:
                     text=text, chat_id=chat_id, api=api, account_name=account_name,
                     author_id=author_id, username=username, settings=settings,
                 )
-                if not handled:
-                    await self._handlers.on_welcome(
-                        chat_id=chat_id,
-                        api=api,
-                        settings=settings,
-                        account_name=account_name,
-                        previous_buyer_message_at=prev_buyer_ts,
-                    )
-
-                if await self.db.get_feature_flag("ai_replies", settings.ai_replies_enabled):
-                    await self._maybe_ai_reply(account_name, api, settings, chat_id, text, messages)
 
                 msg_ctx = MessageContext(
                     core=self.cardinal,
@@ -619,6 +608,19 @@ class AutomationEngine:
                     raw_message=msg,
                 )
                 await self._emit_starvell(STV_MESSAGE, msg_ctx)
+                plugin_handled = msg_ctx.handled
+
+                if not handled and not plugin_handled:
+                    await self._handlers.on_welcome(
+                        chat_id=chat_id,
+                        api=api,
+                        settings=settings,
+                        account_name=account_name,
+                        previous_buyer_message_at=prev_buyer_ts,
+                    )
+
+                if not plugin_handled and await self.db.get_feature_flag("ai_replies", settings.ai_replies_enabled):
+                    await self._maybe_ai_reply(account_name, api, settings, chat_id, text, messages)
 
                 ctx = PluginContext(api, self.db, settings, account_name)
                 ctx.chat_id = chat_id

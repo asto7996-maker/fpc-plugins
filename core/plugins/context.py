@@ -44,6 +44,11 @@ class MessageContext(StarvellContext):
     username: str = ""
     message_id: str = ""
     raw_message: dict = field(default_factory=dict)
+    handled: bool = False
+
+    def mark_handled(self) -> None:
+        """Плагин обработал сообщение — ядро не шлёт welcome/ИИ."""
+        self.handled = True
 
     async def reply(self, text: str) -> None:
         api = self.api()

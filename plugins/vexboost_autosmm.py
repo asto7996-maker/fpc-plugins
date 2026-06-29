@@ -39,7 +39,7 @@ from starvell_sdk import (
 )
 
 NAME = "VexBoost AutoSMM"
-VERSION = "3.1.0"
+VERSION = "3.2.0"
 DESCRIPTION = "Автонакрутка SMM через VexBoost для Starvell"
 CREDITS = "@xei1y"
 UUID = "a3f8c2e1-7b4d-4a9f-9e2c-1d5b8f6a0c3e"
@@ -140,6 +140,41 @@ DEFAULT_TEMPLATES: dict[str, str] = {
 }
 
 logger = logging.getLogger("starvell.plugin.vexboost")
+
+# Starvell: ~40 req/min + delay 1.5s между запросами (см. config.py)
+STV_MIN_API_GAP = 1.5
+MESSAGE_DEDUP_TTL = 5.0
+
+
+class _MessageDedup:
+    """Не обрабатывает одно сообщение дважды (poll чата каждые ~5 с)."""
+
+    def __init__(self) -> None:
+        self._seen: dict[str, float] = {}
+
+    def is_duplicate(self, chat_id: str, message_id: str, text: str) -> bool:
+        key = f"{chat_id}:{message_id}" if message_id else f"{chat_id}:{hash(text.strip())}"
+        now = time.monotonic()
+        expired = [k for k, ts in self._seen.items() if now - ts > MESSAGE_DEDUP_TTL]
+        for k in expired:
+            del self._seen[k]
+        if key in self._seen:
+            return True
+        self._seen[key] = now
+        return False
+
+
+_dedup = _MessageDedup()
+
+
+async def _starvell_pause(core: Any, extra: float = 0.0) -> None:
+    """Пауза под rate-limit Starvell API."""
+    delay = STV_MIN_API_GAP
+    try:
+        delay = max(STV_MIN_API_GAP, float(getattr(core.settings, "api_delay_seconds", 1.5)))
+    except (TypeError, ValueError):
+        pass
+    await asyncio.sleep(delay + extra)
 
 
 # ── Утилиты ───────────────────────────────────────────────────────────────────
@@ -486,37 +521,66 @@ class VexBoostAPI:
         if not key:
             return {"error": "API KEY не задан"}
         data = {**payload, "key": key}
-        retries = int(self.cfg.get("api_retry_count", 3))
-        delay = int(self.cfg.get("api_retry_delay", 2))
-        last_err = "Нет ответа"
-        for attempt in range(1, retries + 1):
+        action = payload.get("action", "")
+
+        # add/refill/cancel — один POST, без retry (иначе дубли заказов)
+        if action in ("add", "refill", "cancel"):
             try:
                 async with httpx.AsyncClient(timeout=45.0) as client:
                     resp = await client.post(self._api_url(), data=data)
                     result = resp.json()
             except Exception as exc:
-                last_err = str(exc)
-                if attempt < retries:
-                    await asyncio.sleep(delay * attempt)
-                continue
+                return {"error": str(exc)}
             if isinstance(result, dict) and result.get("error"):
                 result["error"] = self._format_error(result["error"])
             return result if isinstance(result, dict) else {"raw": result}
+
+        retries = int(self.cfg.get("api_retry_count", 3))
+        delay = int(self.cfg.get("api_retry_delay", 2))
+        last_err = "Нет ответа"
+        for attempt in range(1, retries + 1):
+            for method, url, body in (
+                ("POST", self._api_url(), data),
+                ("GET", f"{self._api_url()}?key={key}&action={action}", None),
+            ):
+                try:
+                    async with httpx.AsyncClient(timeout=45.0) as client:
+                        if method == "POST":
+                            resp = await client.post(url, data=body)
+                        else:
+                            params = {k: v for k, v in data.items()}
+                            resp = await client.get(self._api_url(), params=params)
+                        result = resp.json()
+                except Exception as exc:
+                    last_err = str(exc)
+                    continue
+                if isinstance(result, dict):
+                    if result.get("error"):
+                        result["error"] = self._format_error(result["error"])
+                    return result
+            if attempt < retries:
+                await asyncio.sleep(delay * attempt)
         return {"error": last_err}
 
     async def _request_token(self, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
-        session, err = await self._get_session()
-        if not session:
-            return {"error": err}
-        api_path = path.lstrip("/")
-        if not api_path.startswith("api/"):
-            api_path = f"api/{api_path}"
-        url = f"{self._panel_url()}/{api_path}"
-        try:
-            resp = await session.request(method.upper(), url, **kwargs)
-            return resp.json() if resp.content else {}
-        except Exception as exc:
-            return {"error": str(exc)}
+        for attempt in range(2):
+            session, err = await self._get_session(force=attempt > 0)
+            if not session:
+                return {"error": err}
+            api_path = path.lstrip("/")
+            if not api_path.startswith("api/"):
+                api_path = f"api/{api_path}"
+            url = f"{self._panel_url()}/{api_path}"
+            try:
+                resp = await session.request(method.upper(), url, **kwargs)
+                if resp.status_code in (401, 419) and attempt == 0:
+                    self._session = None
+                    self._session_expires = 0
+                    continue
+                return resp.json() if resp.content else {}
+            except Exception as exc:
+                return {"error": str(exc)}
+        return {"error": "Сессия VexBoost истекла"}
 
     async def _request(self, payload: dict[str, Any]) -> dict[str, Any]:
         if self._mode() in ("login", "token"):
@@ -664,7 +728,8 @@ class Plugin(StarvellPlugin):
             {"key": "notify_startup", "label": "Уведомление при старте", "type": "bool", "default": True},
             {"key": "notify_new_order", "label": "Уведомление о новом заказе", "type": "bool", "default": True},
             {"key": "notify_complete", "label": "Уведомление о выполнении", "type": "bool", "default": True},
-            {"key": "notify_error", "label": "Уведомление об ошибках", "type": "bool", "default": True},
+            {"key": "low_balance_threshold", "label": "Порог низкого баланса", "type": "int", "default": 50, "min": 0, "max": 100000},
+            {"key": "notify_low_balance", "label": "Уведомление о низком балансе", "type": "bool", "default": True},
             {"key": "welcome_message", "label": "Шаблон: приветствие", "type": "multiline",
              "default": DEFAULT_TEMPLATES["welcome_message"]},
             {"key": "confirmation_message", "label": "Шаблон: подтверждение", "type": "multiline",
@@ -697,6 +762,34 @@ class Plugin(StarvellPlugin):
         else:
             self._api_client.cfg = cfg
         return self._api_client
+
+    async def on_setting_change(self, key: str, value: Any) -> None:
+        if key in ("auth_mode", "api_key", "auth_token", "vexboost_login", "vexboost_password", "panel_url", "api_url"):
+            if self._api_client:
+                await self._api_client.close()
+            self._api_client = None
+
+    async def _starvell_send(self, chat_id: str, text: str) -> None:
+        api = self.core.get_api()
+        if not api or not chat_id:
+            return
+        await _starvell_pause(self.core)
+        await api.send_message(chat_id, text)
+
+    async def _check_low_balance(self, ctx: OrderContext, api: VexBoostAPI) -> None:
+        if not await self.get_cfg("notify_low_balance", True):
+            return
+        threshold = int(await self.get_cfg("low_balance_threshold", 50))
+        bal, cur, err = await api.balance()
+        if bal is None or bal >= threshold:
+            return
+        await ctx.notify(
+            f"⚠️ <b>VexBoost — низкий баланс</b>\n"
+            f"💰 {bal:.2f} {cur} (порог {threshold})\n"
+            f"📇 Заказ #{ctx.order_id}",
+            "notify_orders",
+            order_id=ctx.order_id,
+        )
 
     async def _enabled(self) -> bool:
         return bool(await self.get_cfg("enabled", True))
@@ -786,6 +879,7 @@ class Plugin(StarvellPlugin):
             if api:
                 bal, cur, err = await api.balance()
                 bal_txt = f"{bal:.2f} {cur}" if bal is not None else err
+                await self._check_low_balance(ctx, api)
             await ctx.notify(
                 f"📥 <b>VexBoost — новый заказ</b>\n\n"
                 f"🛒 {ctx.product_name}\n"
@@ -810,22 +904,30 @@ class Plugin(StarvellPlugin):
         if not text:
             return
 
+        if _dedup.is_duplicate(ctx.chat_id, ctx.message_id, text):
+            ctx.mark_handled()
+            return
+
         low = text.lower()
         if "вернул" in low and ("деньг" in low or "средств" in low):
-            self._clear_buyer_state(ctx.username, ctx.chat_id)
+            self._clear_buyer_state(ctx.username, ctx.chat_id, ctx.author_id)
+            ctx.mark_handled()
             return
 
         if low.startswith("#статус"):
             await self._cmd_status(ctx, text)
+            ctx.mark_handled()
             return
         if low.startswith("#рефилл") or low.startswith("#refill"):
             await self._cmd_refill(ctx, text)
+            ctx.mark_handled()
             return
 
         action = _confirm_action(text)
         pkey = self._pending_key(ctx)
         if action or pkey in self._pending:
             await self._handle_pending(ctx, text, action)
+            ctx.mark_handled()
             return
 
         waiting = _load_json("waiting.json", [])
@@ -837,16 +939,25 @@ class Plugin(StarvellPlugin):
         if not links:
             return
         await self._request_link_confirm(ctx, order, links[0])
+        ctx.mark_handled()
 
     def _pending_key(self, ctx: MessageContext) -> str:
-        return f"{ctx.chat_id}:{ctx.username}"
+        uid = ctx.author_id or ctx.username or ctx.chat_id
+        return f"{ctx.chat_id}:{uid}"
 
     def _find_waiting(self, waiting: list, ctx: MessageContext) -> dict | None:
+        author_id = ctx.author_id
+        username = (ctx.username or "").strip()
+        chat_id = str(ctx.chat_id)
         for o in waiting:
-            if o.get("buyer") == ctx.username:
+            if author_id and o.get("buyer_id") == author_id:
                 return o
+        if username:
+            for o in waiting:
+                if (o.get("buyer") or "").lower() == username.lower():
+                    return o
         for o in waiting:
-            if str(o.get("chat_id")) == str(ctx.chat_id):
+            if str(o.get("chat_id")) == chat_id:
                 return o
         return None
 
@@ -1012,11 +1123,21 @@ class Plugin(StarvellPlugin):
         waiting = [o for o in waiting if str(o.get("order_id")) != str(order_id)]
         _save_json("waiting.json", waiting)
 
-    def _clear_buyer_state(self, buyer: str, chat_id: str) -> None:
+    def _clear_buyer_state(self, buyer: str, chat_id: str, buyer_id: int | None = None) -> None:
         waiting = _load_json("waiting.json", [])
-        waiting = [o for o in waiting if o.get("buyer") != buyer]
+        waiting = [
+            o for o in waiting
+            if o.get("buyer") != buyer
+            and str(o.get("chat_id")) != str(chat_id)
+            and (buyer_id is None or o.get("buyer_id") != buyer_id)
+        ]
         _save_json("waiting.json", waiting)
-        self._pending = {k: v for k, v in self._pending.items() if v.get("buyer") != buyer}
+        self._pending = {
+            k: v for k, v in self._pending.items()
+            if v.get("buyer") != buyer
+            and str(v.get("chat_id")) != str(chat_id)
+            and (buyer_id is None or v.get("buyer_id") != buyer_id)
+        }
         _save_json("pending.json", self._pending)
 
     async def _cmd_status(self, ctx: MessageContext, text: str) -> None:
@@ -1112,6 +1233,7 @@ class Plugin(StarvellPlugin):
                 )
                 if chat_id and starvell_api:
                     try:
+                        await _starvell_pause(self.core)
                         await starvell_api.send_message(chat_id, msg)
                     except Exception as exc:
                         self.log("notify complete: %s", exc, level="warning")
@@ -1132,6 +1254,7 @@ class Plugin(StarvellPlugin):
             elif status in ("canceled", "cancelled"):
                 if chat_id and starvell_api:
                     try:
+                        await _starvell_pause(self.core)
                         await starvell_api.send_message(
                             chat_id,
                             await self._msg("order_canceled_message", order_id=starvell_id),
@@ -1140,6 +1263,7 @@ class Plugin(StarvellPlugin):
                         pass
                 if auto_refund and starvell_api:
                     try:
+                        await _starvell_pause(self.core)
                         await starvell_api.refund_order(starvell_id)
                         StatisticsManager.record_canceled(refunded=True)
                     except Exception as exc:
@@ -1161,6 +1285,7 @@ class Plugin(StarvellPlugin):
                             "status": "Pending", "partial_from": smm_id,
                         }
                         if chat_id and starvell_api:
+                            await _starvell_pause(self.core)
                             await starvell_api.send_message(
                                 chat_id,
                                 await self._msg(
@@ -1171,11 +1296,13 @@ class Plugin(StarvellPlugin):
                         del active[smm_id]
                     else:
                         if chat_id and starvell_api:
+                            await _starvell_pause(self.core)
                             await starvell_api.send_message(
                                 chat_id,
                                 await self._msg("partial_paused_message", order_id=starvell_id, remains=remains),
                             )
                 elif chat_id and starvell_api and not info.get("partial_notified"):
+                    await _starvell_pause(self.core)
                     await starvell_api.send_message(
                         chat_id,
                         await self._msg("partial_paused_message", order_id=starvell_id, remains=remains),
