@@ -39,7 +39,7 @@ from starvell_sdk import (
 )
 
 NAME = "VexBoost AutoSMM"
-VERSION = "3.2.0"
+VERSION = "3.3.0"
 DESCRIPTION = "Автонакрутка SMM через VexBoost для Starvell"
 CREDITS = "@xei1y"
 UUID = "a3f8c2e1-7b4d-4a9f-9e2c-1d5b8f6a0c3e"
@@ -141,9 +141,9 @@ DEFAULT_TEMPLATES: dict[str, str] = {
 
 logger = logging.getLogger("starvell.plugin.vexboost")
 
-# Starvell: ~40 req/min + delay 1.5s между запросами (см. config.py)
-STV_MIN_API_GAP = 1.5
-MESSAGE_DEDUP_TTL = 5.0
+# Starvell rate-limit уже в starvell_api._throttle; здесь только минимальный зазор.
+STV_MIN_API_GAP = 0.3
+MESSAGE_DEDUP_TTL = 60.0
 
 
 class _MessageDedup:
@@ -168,13 +168,23 @@ _dedup = _MessageDedup()
 
 
 async def _starvell_pause(core: Any, extra: float = 0.0) -> None:
-    """Пауза под rate-limit Starvell API."""
+    """Короткая пауза между несколькими подряд идущими send (throttle уже в API)."""
     delay = STV_MIN_API_GAP
     try:
-        delay = max(STV_MIN_API_GAP, float(getattr(core.settings, "api_delay_seconds", 1.5)))
+        delay = min(0.5, max(STV_MIN_API_GAP, float(getattr(core.settings, "api_delay_seconds", 0.8))))
     except (TypeError, ValueError):
         pass
-    await asyncio.sleep(delay + extra)
+    if delay + extra > 0:
+        await asyncio.sleep(delay + extra)
+
+
+def _same_id(a: Any, b: Any) -> bool:
+    if a is None or b is None:
+        return False
+    try:
+        return int(a) == int(b)
+    except (TypeError, ValueError):
+        return str(a).strip() == str(b).strip()
 
 
 # ── Утилиты ───────────────────────────────────────────────────────────────────
@@ -223,7 +233,22 @@ def _order_description(order: dict) -> str:
 
 
 def _extract_links(text: str) -> list[str]:
-    return LINK_RE.findall(text or "")
+    raw = text or ""
+    links = LINK_RE.findall(raw)
+    if links:
+        return links
+    bare = re.findall(
+        r"(?:t\.me|telegram\.me|vk\.com|instagram\.com|tiktok\.com|youtube\.com|youtu\.be|twitter\.com|x\.com)/[^\s]+",
+        raw,
+        re.IGNORECASE,
+    )
+    result: list[str] = []
+    for item in bare:
+        link = item.strip().rstrip(".,;)")
+        if not link.startswith(("http://", "https://")):
+            link = f"https://{link}"
+        result.append(link)
+    return result
 
 
 def _is_private_tg(link: str) -> bool:
@@ -718,7 +743,8 @@ class Plugin(StarvellPlugin):
             {"key": "auth_token", "label": "AuthToken", "type": "text", "default": ""},
             {"key": "api_url", "label": "API URL (key)", "type": "text", "default": "https://vexboost.ru/api/v2"},
             {"key": "api_key", "label": "API Key", "type": "text", "default": ""},
-            {"key": "status_interval", "label": "Интервал проверки (сек)", "type": "int", "default": 60, "min": 30, "max": 600},
+            {"key": "status_interval", "label": "Интервал проверки (сек)", "type": "int", "default": 30, "min": 15, "max": 600},
+            {"key": "require_link_confirm", "label": "Подтверждение ссылки (+/-)", "type": "bool", "default": False},
             {"key": "auto_refund_on_error", "label": "Авто-возврат при ошибке", "type": "bool", "default": True},
             {"key": "auto_refund_on_cancel", "label": "Авто-возврат при отмене SMM", "type": "bool", "default": True},
             {"key": "allow_private_tg", "label": "Приватные TG-ссылки", "type": "bool", "default": False},
@@ -773,7 +799,6 @@ class Plugin(StarvellPlugin):
         api = self.core.get_api()
         if not api or not chat_id:
             return
-        await _starvell_pause(self.core)
         await api.send_message(chat_id, text)
 
     async def _check_low_balance(self, ctx: OrderContext, api: VexBoostAPI) -> None:
@@ -852,7 +877,7 @@ class Plugin(StarvellPlugin):
             "service_id": service_id,
             "quantity": quantity,
             "buyer": ctx.buyer_username,
-            "buyer_id": ctx.buyer_id,
+            "buyer_id": int(ctx.buyer_id) if ctx.buyer_id else None,
             "chat_id": ctx.chat_id or "",
             "product": ctx.product_name,
             "price_rub": price_rub,
@@ -874,6 +899,18 @@ class Plugin(StarvellPlugin):
             await ctx.notify(f"⚠️ VexBoost #{order_id}: чат не найден", "notify_orders")
 
         if await self.get_cfg("notify_admin", True) and await self.get_cfg("notify_new_order", True):
+            asyncio.create_task(self._notify_admin_new_order(ctx, order_id, service_id, quantity, price_rub))
+        self.log("Новый заказ #%s service=%s qty=%s price=%s", order_id, service_id, quantity, price_rub)
+
+    async def _notify_admin_new_order(
+        self,
+        ctx: OrderContext,
+        order_id: str,
+        service_id: int,
+        quantity: int,
+        price_rub: float,
+    ) -> None:
+        try:
             api = await self._api()
             bal_txt = "н/д"
             if api:
@@ -892,7 +929,8 @@ class Plugin(StarvellPlugin):
                 "notify_orders",
                 order_id=order_id,
             )
-        self.log("Новый заказ #%s service=%s qty=%s price=%s", order_id, service_id, quantity, price_rub)
+        except Exception as exc:
+            self.log("notify_admin_new_order: %s", exc, level="warning")
 
     # ── @on_message — только чат покупателя ────────────────────────────────
 
@@ -938,7 +976,7 @@ class Plugin(StarvellPlugin):
         links = _extract_links(text)
         if not links:
             return
-        await self._request_link_confirm(ctx, order, links[0])
+        await self._handle_buyer_link(ctx, order, links[0])
         ctx.mark_handled()
 
     def _pending_key(self, ctx: MessageContext) -> str:
@@ -947,19 +985,74 @@ class Plugin(StarvellPlugin):
 
     def _find_waiting(self, waiting: list, ctx: MessageContext) -> dict | None:
         author_id = ctx.author_id
-        username = (ctx.username or "").strip()
+        username = (ctx.username or "").strip().lower()
         chat_id = str(ctx.chat_id)
+        matches: list[dict] = []
         for o in waiting:
-            if author_id and o.get("buyer_id") == author_id:
-                return o
-        if username:
-            for o in waiting:
-                if (o.get("buyer") or "").lower() == username.lower():
-                    return o
-        for o in waiting:
-            if str(o.get("chat_id")) == chat_id:
-                return o
-        return None
+            if author_id and _same_id(o.get("buyer_id"), author_id):
+                matches.append(o)
+                continue
+            if username and (o.get("buyer") or "").strip().lower() == username:
+                matches.append(o)
+                continue
+            if chat_id and str(o.get("chat_id") or "") == chat_id:
+                matches.append(o)
+        if not matches:
+            return None
+        return max(matches, key=lambda x: int(x.get("created_at") or 0))
+
+    def _persist_waiting_order(self, order: dict) -> None:
+        oid = str(order.get("order_id") or "")
+        if not oid:
+            return
+        waiting = _load_json("waiting.json", [])
+        updated = False
+        for idx, item in enumerate(waiting):
+            if str(item.get("order_id")) == oid:
+                waiting[idx] = {**item, **order}
+                updated = True
+                break
+        if updated:
+            _save_json("waiting.json", waiting)
+
+    async def _handle_buyer_link(self, ctx: MessageContext, order: dict, link: str) -> None:
+        allow_private = await self.get_cfg("allow_private_tg", False)
+        if not allow_private and _is_private_tg(link):
+            await ctx.reply(await self._msg("private_telegram_message"))
+            return
+        ok, err = OrderValidator.validate(link)
+        if not ok:
+            await ctx.reply(await self._msg("invalid_link_message", error=err))
+            return
+
+        order["link"] = link
+        order["chat_id"] = ctx.chat_id
+        if ctx.author_id:
+            order["buyer_id"] = int(ctx.author_id)
+        if ctx.username:
+            order["buyer"] = ctx.username
+        self._persist_waiting_order(order)
+
+        require_confirm = await self.get_cfg("require_link_confirm", False)
+        if require_confirm:
+            pkey = self._pending_key(ctx)
+            self._pending[pkey] = order
+            _save_json("pending.json", self._pending)
+            display_link = link.replace("https://", "").replace("http://", "")
+            await ctx.reply(await self._msg(
+                "confirmation_message",
+                lot=order.get("product", "товар"),
+                price=_format_rub(order.get("price_rub", 0)),
+                amount=order.get("quantity", 1),
+                link=display_link,
+            ))
+            return
+
+        await ctx.reply(await self._msg("creating_order_message"))
+        asyncio.create_task(
+            self._submit_order_async(dict(order), ctx.chat_id, ctx.account_name),
+            name=f"vexboost-submit-{order.get('order_id')}",
+        )
 
     async def _request_link_confirm(self, ctx: MessageContext, order: dict, link: str) -> None:
         allow_private = await self.get_cfg("allow_private_tg", False)
@@ -973,6 +1066,10 @@ class Plugin(StarvellPlugin):
 
         order["link"] = link
         order["chat_id"] = ctx.chat_id
+        if ctx.author_id:
+            order["buyer_id"] = ctx.author_id
+        if ctx.username:
+            order["buyer"] = ctx.username
         pkey = self._pending_key(ctx)
         self._pending[pkey] = order
         _save_json("pending.json", self._pending)
@@ -1004,7 +1101,11 @@ class Plugin(StarvellPlugin):
                 return
             self._pending.pop(pkey, None)
             _save_json("pending.json", self._pending)
-            await self._submit_order(ctx, order)
+            await ctx.reply(await self._msg("creating_order_message"))
+            asyncio.create_task(
+                self._submit_order_async(dict(order), ctx.chat_id, ctx.account_name),
+                name=f"vexboost-submit-{order.get('order_id')}",
+            )
             return
 
         if action == "-":
@@ -1023,84 +1124,164 @@ class Plugin(StarvellPlugin):
         await ctx.reply(await self._msg("pending_hint_message"))
 
     async def _submit_order(self, ctx: MessageContext, order: dict) -> None:
+        await self._submit_order_impl(order, ctx.chat_id, ctx.account_name, reply_ctx=ctx)
+
+    async def _submit_order_async(self, order: dict, chat_id: str, account_name: str = "default") -> None:
+        oid = str(order.get("order_id", ""))
+        try:
+            await self._submit_order_impl(order, chat_id, account_name, reply_ctx=None)
+        except Exception as exc:
+            self.log("_submit_order_async #%s: %s", oid, exc, level="error")
+            api = self.core.get_api(account_name)
+            if api and chat_id:
+                try:
+                    await api.send_message(
+                        chat_id,
+                        await self._msg("error_message", error="Не удалось создать заказ. Продавец уведомлён."),
+                    )
+                except Exception:
+                    pass
+        finally:
+            self._locks.discard(oid)
+
+    async def _submit_order_impl(
+        self,
+        order: dict,
+        chat_id: str,
+        account_name: str = "default",
+        reply_ctx: MessageContext | None = None,
+    ) -> None:
         oid = str(order.get("order_id", ""))
         if oid in self._locks:
+            msg = "⏳ Заказ уже создаётся, подождите..."
+            if reply_ctx:
+                await reply_ctx.reply(msg)
+            elif chat_id:
+                api = self.core.get_api(account_name)
+                if api:
+                    await api.send_message(chat_id, msg)
             return
         self._locks.add(oid)
+        try:
+            api = await self._api()
+            if not api:
+                text = "❌ API не настроен. Обратитесь к продавцу."
+                if reply_ctx:
+                    await reply_ctx.reply(text)
+                elif chat_id:
+                    starvell = self.core.get_api(account_name)
+                    if starvell:
+                        await starvell.send_message(chat_id, text)
+                return
 
-        api = await self._api()
-        if not api:
-            await ctx.reply("❌ API не настроен. Обратитесь к продавцу.")
+            submitted = _load_json("submitted.json", {})
+            if oid in submitted:
+                text = f"ℹ️ Заказ уже создан: SMM #{submitted[oid]}"
+                if reply_ctx:
+                    await reply_ctx.reply(text)
+                elif chat_id:
+                    starvell = self.core.get_api(account_name)
+                    if starvell:
+                        await starvell.send_message(chat_id, text)
+                return
+
+            result = await api.create_order(
+                int(order["service_id"]), str(order["link"]), int(order["quantity"]),
+            )
+
+            if isinstance(result, int):
+                smm_id = result
+                submitted[oid] = smm_id
+                _save_json("submitted.json", submitted)
+
+                active = _load_json("active.json", {})
+                active[str(smm_id)] = {
+                    **order,
+                    "chat_id": chat_id or order.get("chat_id", ""),
+                    "smm_id": smm_id,
+                    "status": "Pending",
+                    "cost": 0.0,
+                    "created_at": int(time.time()),
+                }
+                _save_json("active.json", active)
+                self._remove_waiting(oid)
+
+                created_msg = await self._msg("order_created_message", smm_id=smm_id, order_id=oid)
+                if reply_ctx:
+                    await reply_ctx.reply(created_msg)
+                elif chat_id:
+                    starvell = self.core.get_api(account_name)
+                    if starvell:
+                        await starvell.send_message(chat_id, created_msg)
+
+                asyncio.create_task(self._fill_order_cost(smm_id, oid, order, account_name))
+
+                if await self.get_cfg("notify_admin", True) and await self.get_cfg("notify_new_order", True):
+                    asyncio.create_task(self._notify_admin_order_created(oid, smm_id, order))
+            else:
+                err = _buyer_error(result)
+                err_msg = await self._msg("error_message", error=err)
+                if reply_ctx:
+                    await reply_ctx.reply(err_msg)
+                elif chat_id:
+                    starvell = self.core.get_api(account_name)
+                    if starvell:
+                        await starvell.send_message(chat_id, err_msg)
+                StatisticsManager.record_failed()
+                OrderHistory.add({
+                    "order_id": oid, "status": "Failed", "error": str(result),
+                    "buyer": order.get("buyer"), "service_id": order.get("service_id"),
+                })
+                if await self.get_cfg("notify_error", True):
+                    await self.core.notify(
+                        f"❌ <b>VexBoost ошибка</b>\n📇 #{oid}\n⚠️ <code>{result}</code>",
+                        "notify_orders", order_id=oid,
+                    )
+                if await self.get_cfg("auto_refund_on_error", True):
+                    refund_ctx = reply_ctx or OrderContext(core=self.core, account_name=account_name)
+                    await self._refund_starvell(refund_ctx, oid)
+        finally:
             self._locks.discard(oid)
-            return
 
-        submitted = _load_json("submitted.json", {})
-        if oid in submitted:
-            await ctx.reply(f"ℹ️ Заказ уже создан: SMM #{submitted[oid]}")
-            self._locks.discard(oid)
-            return
-
-        await ctx.reply(await self._msg("creating_order_message"))
-
-        result = await api.create_order(
-            int(order["service_id"]), str(order["link"]), int(order["quantity"]),
-        )
-
-        if isinstance(result, int):
-            smm_id = result
-            submitted[oid] = smm_id
-            _save_json("submitted.json", submitted)
-
+    async def _fill_order_cost(self, smm_id: int, oid: str, order: dict, account_name: str) -> None:
+        """Подтягивает charge в фоне — не блокирует ответ покупателю."""
+        try:
+            api = await self._api()
+            if not api:
+                return
             status_data = await api.status(smm_id) or {}
             cost = float(status_data.get("charge", 0) or 0)
-
             active = _load_json("active.json", {})
-            active[str(smm_id)] = {
-                **order,
-                "smm_id": smm_id,
-                "status": "Pending",
-                "cost": cost,
-                "created_at": int(time.time()),
-            }
-            _save_json("active.json", active)
-            self._remove_waiting(oid)
+            key = str(smm_id)
+            if key in active:
+                active[key]["cost"] = cost
+                _save_json("active.json", active)
+        except Exception as exc:
+            self.log("fill_order_cost #%s: %s", oid, exc, level="debug")
 
-            await ctx.reply(await self._msg(
-                "order_created_message", smm_id=smm_id, order_id=oid,
-            ))
-
-            if await self.get_cfg("notify_admin", True) and await self.get_cfg("notify_new_order", True):
-                commission = int(await self.get_cfg("commission_percent", 6))
-                revenue = float(order.get("price_rub", 0))
-                profit = revenue - cost
-                profit_net = profit * (1 - commission / 100)
-                await ctx.notify(
-                    f"✅ <b>SMM заказ создан</b>\n\n"
-                    f"📇 Starvell: <code>#{oid}</code>\n"
-                    f"🆔 VexBoost: <code>{smm_id}</code>\n"
-                    f"💵 Сумма: <b>{_format_rub(revenue)}</b>\n"
-                    f"💳 Расход: <b>{cost:.2f}</b>\n"
-                    f"💰 Прибыль: <b>{profit:.2f} ₽</b> (с комиссией {commission}%: <b>{profit_net:.2f} ₽</b>)",
-                    "notify_orders",
-                    order_id=oid,
-                )
-        else:
-            err = _buyer_error(result)
-            await ctx.reply(await self._msg("error_message", error=err))
-            StatisticsManager.record_failed()
-            OrderHistory.add({
-                "order_id": oid, "status": "Failed", "error": str(result),
-                "buyer": order.get("buyer"), "service_id": order.get("service_id"),
-            })
-            if await self.get_cfg("notify_error", True):
-                await ctx.notify(
-                    f"❌ <b>VexBoost ошибка</b>\n📇 #{oid}\n⚠️ <code>{result}</code>",
-                    "notify_orders", order_id=oid,
-                )
-            if await self.get_cfg("auto_refund_on_error", True):
-                await self._refund_starvell(ctx, oid)
-
-        self._locks.discard(oid)
+    async def _notify_admin_order_created(self, oid: str, smm_id: int, order: dict) -> None:
+        try:
+            api = await self._api()
+            cost = 0.0
+            if api:
+                status_data = await api.status(smm_id) or {}
+                cost = float(status_data.get("charge", 0) or 0)
+            commission = int(await self.get_cfg("commission_percent", 6))
+            revenue = float(order.get("price_rub", 0))
+            profit = revenue - cost
+            profit_net = profit * (1 - commission / 100)
+            await self.core.notify(
+                f"✅ <b>SMM заказ создан</b>\n\n"
+                f"📇 Starvell: <code>#{oid}</code>\n"
+                f"🆔 VexBoost: <code>{smm_id}</code>\n"
+                f"💵 Сумма: <b>{_format_rub(revenue)}</b>\n"
+                f"💳 Расход: <b>{cost:.2f}</b>\n"
+                f"💰 Прибыль: <b>{profit:.2f} ₽</b> (с комиссией {commission}%: <b>{profit_net:.2f} ₽</b>)",
+                "notify_orders",
+                order_id=oid,
+            )
+        except Exception as exc:
+            self.log("notify_admin_order_created: %s", exc, level="warning")
 
     async def _refund_starvell(self, ctx: MessageContext | OrderContext, order_id: str) -> bool:
         if not order_id:
@@ -1191,8 +1372,8 @@ class Plugin(StarvellPlugin):
     async def _status_loop(self) -> None:
         while True:
             try:
-                interval = int(await self.get_cfg("status_interval", 60))
-                await asyncio.sleep(max(30, interval))
+                interval = int(await self.get_cfg("status_interval", 30))
+                await asyncio.sleep(max(15, interval))
                 if await self._enabled():
                     await self._check_active_orders()
             except asyncio.CancelledError:
@@ -1233,7 +1414,6 @@ class Plugin(StarvellPlugin):
                 )
                 if chat_id and starvell_api:
                     try:
-                        await _starvell_pause(self.core)
                         await starvell_api.send_message(chat_id, msg)
                     except Exception as exc:
                         self.log("notify complete: %s", exc, level="warning")
@@ -1254,7 +1434,6 @@ class Plugin(StarvellPlugin):
             elif status in ("canceled", "cancelled"):
                 if chat_id and starvell_api:
                     try:
-                        await _starvell_pause(self.core)
                         await starvell_api.send_message(
                             chat_id,
                             await self._msg("order_canceled_message", order_id=starvell_id),
@@ -1263,7 +1442,6 @@ class Plugin(StarvellPlugin):
                         pass
                 if auto_refund and starvell_api:
                     try:
-                        await _starvell_pause(self.core)
                         await starvell_api.refund_order(starvell_id)
                         StatisticsManager.record_canceled(refunded=True)
                     except Exception as exc:
@@ -1285,7 +1463,6 @@ class Plugin(StarvellPlugin):
                             "status": "Pending", "partial_from": smm_id,
                         }
                         if chat_id and starvell_api:
-                            await _starvell_pause(self.core)
                             await starvell_api.send_message(
                                 chat_id,
                                 await self._msg(
@@ -1296,13 +1473,11 @@ class Plugin(StarvellPlugin):
                         del active[smm_id]
                     else:
                         if chat_id and starvell_api:
-                            await _starvell_pause(self.core)
                             await starvell_api.send_message(
                                 chat_id,
                                 await self._msg("partial_paused_message", order_id=starvell_id, remains=remains),
                             )
                 elif chat_id and starvell_api and not info.get("partial_notified"):
-                    await _starvell_pause(self.core)
                     await starvell_api.send_message(
                         chat_id,
                         await self._msg("partial_paused_message", order_id=starvell_id, remains=remains),

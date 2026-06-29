@@ -5,13 +5,14 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import random
 import time
 from typing import Any, Callable, Awaitable
 
 from ai_service import AIService
-from config import Settings, load_settings
+from config import BASE_DIR, Settings, load_settings
 from database import Database
 from handlers.builtin import BuiltinHandlers
 from core.delivery.templates import append_refund_disclaimer, render_delivery_template
@@ -28,6 +29,8 @@ from plugin_manager import PluginContext
 from starvell_api import StarvellAPI
 
 logger = logging.getLogger("starvell.automation")
+
+VEXBOOST_PLUGIN_UUID = "a3f8c2e1-7b4d-4a9f-9e2c-1d5b8f6a0c3e"
 
 
 def _message_id(msg: dict) -> str:
@@ -46,6 +49,32 @@ def _message_ts(msg: dict) -> int:
             ts = int(val)
             return ts // 1000 if ts > 10_000_000_000 else ts
     return 0
+
+
+def _vexboost_priority_chat_ids() -> set[str]:
+    """Чаты с ожидающими SMM-заказами — обрабатываем первыми."""
+    base = BASE_DIR / "storage" / "plugins" / VEXBOOST_PLUGIN_UUID
+    ids: set[str] = set()
+    for name in ("waiting.json", "pending.json"):
+        path = base / name
+        if not path.exists():
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            continue
+        if isinstance(data, list):
+            for item in data:
+                cid = str((item or {}).get("chat_id") or "").strip()
+                if cid:
+                    ids.add(cid)
+        elif isinstance(data, dict):
+            for item in data.values():
+                cid = str((item or {}).get("chat_id") or "").strip()
+                if cid:
+                    ids.add(cid)
+    return ids
 
 
 class AutomationEngine:
@@ -173,7 +202,7 @@ class AutomationEngine:
         """Мониторинг заказов: автовыдача и авто-отзывы."""
         while self._running:
             settings = self._get_settings()
-            interval = max(5.0, settings.orders_poll_interval)
+            interval = max(3.0, settings.orders_poll_interval)
             try:
                 await self._process_orders(account_name, api, settings)
             except Exception as exc:
@@ -474,7 +503,7 @@ class AutomationEngine:
         """Мониторинг чатов: приветствие и ИИ-ответы."""
         while self._running:
             settings = self._get_settings()
-            interval = max(3.0, settings.chat_poll_interval)
+            interval = max(2.0, settings.chat_poll_interval)
             try:
                 user_info = await api.fetch_homepage()
                 my_id = (user_info.get("user") or {}).get("id")
@@ -525,6 +554,12 @@ class AutomationEngine:
         my_user_id: int | None,
     ) -> None:
         chats = await api.fetch_chats()
+        priority = _vexboost_priority_chat_ids()
+        if priority:
+            chats = sorted(
+                chats,
+                key=lambda c: 0 if str(c.get("id") or "") in priority else 1,
+            )
         for chat in chats:
             chat_id = str(chat.get("id") or "")
             if not chat_id:
@@ -590,8 +625,6 @@ class AutomationEngine:
                     )
 
                 text = str(msg.get("content") or msg.get("text") or "").strip()
-                await self.db.set_last_notified_message(chat_id, mid, account_name)
-
                 handled = await self._handlers.on_chat_message(
                     text=text, chat_id=chat_id, api=api, account_name=account_name,
                     author_id=author_id, username=username, settings=settings,
@@ -629,6 +662,7 @@ class AutomationEngine:
                     "on_message", {"message": text, "chat_id": chat_id, "ctx": ctx}
                 )
                 await self.cardinal.dispatch_plugins("BIND_TO_NEW_MESSAGE", text, chat_id)
+                await self.db.set_last_notified_message(chat_id, mid, account_name)
 
     async def _maybe_ai_reply(
         self,
