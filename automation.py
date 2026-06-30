@@ -29,7 +29,7 @@ from core.lsb.events import NewMessageEvent, NewOrderEvent, OrderConfirmEvent, P
 from core.plugins.hooks import STV_BUMP, STV_MESSAGE, STV_ORDER_COMPLETED, STV_ORDER_PAID, STV_ORDER_STATUS, STV_POST_DELIVERY, STV_PRE_DELIVERY
 from core.security.payment_guard import PaymentGuard
 from plugin_manager import PluginContext
-from starvell_api import StarvellAPI
+from utils.starvell_format import format_hold_balance, format_rub_balance
 
 logger = logging.getLogger("starvell.automation")
 
@@ -815,11 +815,32 @@ class AutomationEngine:
                 user = info.get("user") or {}
                 entry["authorized"] = info.get("authorized", False)
                 entry["username"] = user.get("username")
-                entry["balance"] = user.get("balance")
+                wallet = await api.fetch_wallet_balance()
+                if wallet:
+                    entry["balance"] = wallet
+                    entry["balance_formatted"] = format_rub_balance(wallet)
+                    hold = format_hold_balance(wallet)
+                    if hold:
+                        entry["hold_formatted"] = hold
+                else:
+                    entry["balance"] = user.get("balance")
+                    entry["balance_formatted"] = format_rub_balance(user.get("balance"))
                 orders = await api.fetch_orders()
                 active = [o for o in orders if str(o.get("status")) in ("CREATED", "IN_PROGRESS", "PAID")]
                 entry["active_orders"] = len(active)
                 entry["total_orders"] = len(orders)
+                if hasattr(api, "fetch_user_lots") and user.get("id"):
+                    try:
+                        lots = await api.fetch_user_lots(int(user["id"]))
+                        entry["lots_count"] = len(lots)
+                    except Exception:
+                        entry["lots_count"] = 0
+                pe = self._plugin_engine()
+                if pe:
+                    entry["plugins_enabled"] = sum(
+                        1 for p in pe.plugins.values() if p.enabled
+                    )
+                    entry["plugins_total"] = len(pe.plugins)
             except Exception as exc:
                 entry["error"] = str(exc)
             result["accounts"].append(entry)

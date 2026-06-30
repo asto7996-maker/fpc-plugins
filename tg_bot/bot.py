@@ -20,9 +20,11 @@ from automation import AutomationEngine
 from config import VERSION, Settings, StarvellAccount, load_settings, save_settings
 from database import Database
 from plugin_manager import PluginManager
+from handlers.tg.profile_panel import build_profile_brief, build_status_text
+from keyboards.main import premium_main_text
 from tg_bot import cbt as CBT
 from tg_bot import keyboards as KB
-from utils.tools import check_github_update, create_backup, logs_zip, system_stats
+from utils.tools import check_github_update, create_backup, export_settings_snapshot, logs_zip, system_stats
 from validators import test_gemini_key, test_starvell_session
 
 logger = logging.getLogger("starvell.tg")
@@ -128,10 +130,15 @@ class TelegramBot:
         r = self.router
         r.message.register(self.cmd_start, CommandStart())
         r.message.register(self.cmd_menu, Command("menu"))
+        r.message.register(self.cmd_help, Command("help"))
         r.message.register(self.cmd_status, Command("status"))
         r.message.register(self.cmd_restart, Command("restart"))
         r.message.register(self.cmd_profile, Command("profile"))
+        r.message.register(self.cmd_session, Command("session"))
         r.message.register(self.cmd_plugins, Command("plugins"))
+        r.message.register(self.cmd_backup, Command("backup"))
+        r.message.register(self.cmd_upload, Command("upload"))
+        r.message.register(self.cmd_export, Command("export"))
         r.message.register(self.cmd_about, Command("about"))
         r.message.register(self.cmd_sys, Command("sys"))
         r.message.register(self.cmd_logs, Command("logs"))
@@ -174,13 +181,9 @@ class TelegramBot:
 
         r.callback_query.register(self.cb_main, F.data == CB["main"])
         r.callback_query.register(self.cb_back, F.data == CB["back"])
-        r.callback_query.register(self.cb_profile, F.data == CB["profile"])
-        r.callback_query.register(self.cb_status, F.data == CB["status"])
-        # sc:plugins — hub (premium router)
-        r.callback_query.register(self.cb_settings, F.data == CB["settings"])
-        r.callback_query.register(self.cb_adel, F.data == CB["adel"])
-        r.callback_query.register(self.cb_gemini, F.data == CB["gemini"])
         r.callback_query.register(self.cb_setup, F.data == CB["setup"])
+        r.callback_query.register(self.cb_settings, F.data == CB["settings"])
+        r.callback_query.register(self.cb_gemini, F.data == CB["gemini"])
         r.callback_query.register(self.cb_check_auth, F.data == CB["check_auth"])
         r.callback_query.register(self.cb_check_gemini, F.data == CB["check_gemini"])
         r.callback_query.register(self.cb_set_session, F.data == CB["set_session"])
@@ -211,16 +214,7 @@ class TelegramBot:
         return KB.setup_kb()
 
     async def _main_text(self) -> str:
-        s = load_settings()
-        starvell = "✅" if s.is_starvell_configured() else "❌"
-        gemini = "✅" if s.is_gemini_configured() else "❌"
-        user = s.starvell_username or "—"
-        return (
-            f"🤖 <b>Starvell Cardinal</b> v{VERSION}\n\n"
-            f"Starvell: {starvell} <code>{user}</code>\n"
-            f"Gemini: {gemini}\n\n"
-            f"<i>Управление как в FunPay Cardinal — всё через это меню.</i>"
-        )
+        return premium_main_text(VERSION)
 
     # ── Команды ───────────────────────────────────────────────────────────
 
@@ -255,12 +249,61 @@ class TelegramBot:
     async def cmd_status(self, message: Message) -> None:
         if not await self._has_access(message.from_user.id):
             return
-        await message.answer(await self._status_text(), parse_mode="HTML", reply_markup=self._back_kb())
+        text = await build_status_text(self)
+        await message.answer(text, parse_mode="HTML", reply_markup=KB.back_menu())
 
     async def cmd_profile(self, message: Message) -> None:
         if not await self._has_access(message.from_user.id):
             return
-        await message.answer(await self._profile_text(), parse_mode="HTML", reply_markup=self._profile_kb())
+        text, kb = await build_profile_brief(self)
+        await message.answer(text, parse_mode="HTML", reply_markup=kb)
+
+    async def cmd_session(self, message: Message, state: FSMContext) -> None:
+        if not await self._has_access(message.from_user.id):
+            return
+        await state.set_state(SetupStates.session)
+        await message.answer(
+            "🍪 <b>Session cookie Starvell</b>\n\n"
+            "1. Войдите на starvell.com\n"
+            "2. F12 → Application → Cookies → <code>session</code>\n"
+            "3. Отправьте значение сюда\n\n"
+            "Бот сразу проверит cookie.",
+            parse_mode="HTML",
+        )
+
+    async def cmd_help(self, message: Message) -> None:
+        if not await self._has_access(message.from_user.id):
+            return
+        from handlers.tg.help_panel import HELP_TEXT
+        await message.answer(HELP_TEXT, parse_mode="HTML", reply_markup=KB.back_menu())
+
+    async def cmd_backup(self, message: Message) -> None:
+        if not await self._has_access(message.from_user.id):
+            return
+        path = create_backup()
+        await message.answer_document(
+            open(path, "rb"),
+            caption="💾 Резервная копия config + storage",
+        )
+
+    async def cmd_upload(self, message: Message, state: FSMContext) -> None:
+        if not await self._has_access(message.from_user.id):
+            return
+        from handlers.tg.backup_panel import BackupStates
+        await state.set_state(BackupStates.waiting_file)
+        await message.answer(
+            "📥 Отправьте файл <b>.zip</b> с бэкапом:",
+            parse_mode="HTML",
+        )
+
+    async def cmd_export(self, message: Message) -> None:
+        if not await self._has_access(message.from_user.id):
+            return
+        path = export_settings_snapshot()
+        await message.answer_document(
+            open(path, "rb"),
+            caption="📋 Текущие настройки (секреты маскированы)",
+        )
 
     async def cmd_plugins(self, message: Message) -> None:
         if not await self._has_access(message.from_user.id):
@@ -331,34 +374,11 @@ class TelegramBot:
         await call.message.edit_reply_markup(reply_markup=self._main_kb())
 
     async def cb_status(self, call: CallbackQuery) -> None:
-        if not await self._has_access(call.from_user.id):
-            return
-        await call.message.edit_text(await self._status_text(), parse_mode="HTML", reply_markup=self._back_kb())
-        await call.answer()
+        """Legacy — обрабатывается profile_panel."""
+        pass
 
     async def _status_text(self) -> str:
-        status = await self.automation.get_status()
-        lines = ["📊 <b>Статистика</b>\n"]
-        for acc in status.get("accounts", []):
-            if acc.get("error"):
-                lines.append(f"❌ {acc.get('name')}: {acc['error']}")
-                continue
-            if acc.get("authorized"):
-                lines += [
-                    f"👤 <b>{acc.get('username', '?')}</b>",
-                    f"💰 Баланс: <b>{acc.get('balance', '?')} ₽</b>",
-                    f"📦 Активных заказов: {acc.get('active_orders', 0)}",
-                    f"📋 В ленте: {acc.get('total_orders', 0)}",
-                    "",
-                ]
-            else:
-                lines.append("❌ Starvell не авторизован — обновите session в профиле\n")
-        products = await self.db.list_autodelivery_products()
-        if products:
-            lines.append("<b>Склад:</b>")
-            for name, cnt in products:
-                lines.append(f"  • {name}: {cnt} шт.")
-        return "\n".join(lines)
+        return await build_status_text(self)
 
     def _profile_kb(self) -> InlineKeyboardMarkup:
         return InlineKeyboardMarkup(inline_keyboard=[
@@ -378,10 +398,8 @@ class TelegramBot:
         )
 
     async def cb_profile(self, call: CallbackQuery) -> None:
-        if not await self._has_access(call.from_user.id):
-            return
-        await call.message.edit_text(await self._profile_text(), parse_mode="HTML", reply_markup=self._profile_kb())
-        await call.answer()
+        """Legacy — обрабатывается profile_panel."""
+        pass
 
     async def cb_check_auth(self, call: CallbackQuery) -> None:
         if not await self._has_access(call.from_user.id):
@@ -490,19 +508,10 @@ class TelegramBot:
         await call.message.edit_reply_markup(reply_markup=kb)
 
     async def cb_adel(self, call: CallbackQuery) -> None:
-        if not await self._has_access(call.from_user.id):
-            return
-        products = await self.db.list_autodelivery_products()
-        lines = ["📦 <b>Автовыдача — склад</b>\n"]
-        for name, cnt in products:
-            lines.append(f"• <code>{name}</code> — {cnt} шт.")
-        if not products:
-            lines.append("<i>Пусто. Добавьте товары.</i>")
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="➕ Добавить", callback_data=CB["adel_add"])],
-            [InlineKeyboardButton(text="◀️ Меню", callback_data=CB["main"])],
-        ])
-        await call.message.edit_text("\n".join(lines), parse_mode="HTML", reply_markup=kb)
+        await call.message.edit_text(
+            "ℹ️ Раздел «Склад» удалён.\nИспользуйте 🔍 Парсер лотов в главном меню.",
+            reply_markup=KB.back_menu(),
+        )
         await call.answer()
 
     async def cb_adel_add(self, call: CallbackQuery, state: FSMContext) -> None:
@@ -774,8 +783,15 @@ class TelegramBot:
             await _render_ar_page(call, self, page=1)
             return
         elif cat == "ad":
-            await self.cb_adel(call)
-            return
+            await call.message.edit_text(
+                "ℹ️ Раздел «Склад» удалён.\n"
+                "Используйте <b>🔍 Парсер лотов</b> для копирования товаров с FunPay.",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="🔍 Парсер", callback_data=CBT.PARSER)],
+                    [InlineKeyboardButton(text="◀️", callback_data=CBT.MAIN2)],
+                ]),
+            )
         elif cat == "gr":
             await call.message.edit_text(
                 f"👋 Приветствие\n\n{s.welcome_text[:200]}…",
@@ -939,6 +955,25 @@ class TelegramBot:
                 logger.warning("notify %s: %s", uid, exc)
 
     async def start_polling(self) -> None:
+        commands = [
+            {"command": "start", "description": "Главное меню"},
+            {"command": "menu", "description": "Главное меню"},
+            {"command": "profile", "description": "Профиль и баланс"},
+            {"command": "status", "description": "Статистика"},
+            {"command": "session", "description": "Привязать Starvell"},
+            {"command": "plugins", "description": "Плагины"},
+            {"command": "backup", "description": "Создать бэкап"},
+            {"command": "upload", "description": "Загрузить бэкап"},
+            {"command": "export", "description": "Текущие данные"},
+            {"command": "parser", "description": "Парсер FunPay"},
+            {"command": "restart", "description": "Перезапуск бота"},
+            {"command": "help", "description": "Справка"},
+        ]
+        try:
+            from aiogram.types import BotCommand
+            await self.bot.set_my_commands([BotCommand(**c) for c in commands])
+        except Exception as exc:
+            logger.warning("set_my_commands: %s", exc)
         await self.dp.start_polling(self.bot)
 
     async def stop(self) -> None:

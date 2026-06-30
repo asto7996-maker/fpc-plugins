@@ -1,11 +1,11 @@
-"""Клавиатуры Telegram (аналог static_keyboards.py + keyboards.py FPC)."""
+"""Клавиатуры Telegram — Premium UI."""
 
 from __future__ import annotations
 
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
-from config import Settings, load_settings
-from tg_bot import cbt as CBT
+from config import load_settings
+from keyboards import cbt as CBT
 
 
 def flag(on: bool) -> str:
@@ -14,7 +14,74 @@ def flag(on: bool) -> str:
 
 def back_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="◀️ Меню", callback_data=CBT.MAIN)],
+        [InlineKeyboardButton(text="◀️ Главное меню", callback_data=CBT.MAIN)],
+    ])
+
+
+def main_menu() -> InlineKeyboardMarkup:
+    s = load_settings()
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="👤 Профиль", callback_data=CBT.PROFILE),
+            InlineKeyboardButton(text="📊 Статистика", callback_data=CBT.STATUS),
+        ],
+        [
+            InlineKeyboardButton(text=f"{flag(s.auto_delivery_enabled)} Выдача", callback_data=f"{CBT.SWITCH}auto_delivery"),
+            InlineKeyboardButton(text=f"{flag(s.auto_bump_enabled)} Бамп", callback_data=f"{CBT.SWITCH}auto_bump"),
+        ],
+        [
+            InlineKeyboardButton(text=f"{flag(s.auto_response_enabled)} Автоответ", callback_data=f"{CBT.SWITCH}auto_response"),
+            InlineKeyboardButton(text=f"{flag(s.ai_replies_enabled)} Gemini", callback_data=f"{CBT.SWITCH}ai_replies"),
+        ],
+        [
+            InlineKeyboardButton(text="🔍 Парсер лотов", callback_data=CBT.PARSER),
+            InlineKeyboardButton(text="🔌 Плагины", callback_data=CBT.PLUGINS),
+        ],
+        [
+            InlineKeyboardButton(text="💾 Бэкап", callback_data=CBT.BACKUP),
+            InlineKeyboardButton(text="⚙️ Настройки", callback_data=CBT.SETTINGS),
+        ],
+        [InlineKeyboardButton(text="❓ Справка", callback_data=CBT.HELP)],
+    ])
+
+
+def profile_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="📈 Подробная статистика", callback_data=CBT.PROFILE_DETAIL),
+            InlineKeyboardButton(text="📊 Краткая", callback_data=CBT.STATUS),
+        ],
+        [InlineKeyboardButton(text="🍪 Session / Авторизация", callback_data=CBT.SET_SESSION)],
+        [InlineKeyboardButton(text="✅ Проверить Starvell", callback_data=CBT.CHECK_AUTH)],
+        [InlineKeyboardButton(text="◀️ Главное меню", callback_data=CBT.MAIN)],
+    ])
+
+
+def parser_type_kb(is_smm_guess: bool) -> InlineKeyboardMarkup:
+    hint = " (рекомендуется)" if is_smm_guess else ""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"🚀 SMM / накрутка{hint}", callback_data=CBT.PARSER_SMM)],
+        [InlineKeyboardButton(text="📦 Обычный товар", callback_data=CBT.PARSER_REG)],
+        [InlineKeyboardButton(text="◀️ Отмена", callback_data=CBT.MAIN)],
+    ])
+
+
+def parser_autodelivery_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ Автовыдача — да", callback_data=CBT.PARSER_AD_ON),
+            InlineKeyboardButton(text="❌ Нет", callback_data=CBT.PARSER_AD_OFF),
+        ],
+        [InlineKeyboardButton(text="◀️ Отмена", callback_data=CBT.MAIN)],
+    ])
+
+
+def backup_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📤 Создать и скачать", callback_data=CBT.BACKUP_DL)],
+        [InlineKeyboardButton(text="📥 Загрузить бэкап", callback_data=CBT.BACKUP_UL)],
+        [InlineKeyboardButton(text="📋 Текущие данные (JSON)", callback_data=CBT.BACKUP_EXPORT)],
+        [InlineKeyboardButton(text="◀️ Главное меню", callback_data=CBT.MAIN)],
     ])
 
 
@@ -23,7 +90,6 @@ def settings_page1() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="🌐 Глобальные", callback_data=f"{CBT.CATEGORY}main")],
         [InlineKeyboardButton(text="🔔 Уведомления", callback_data=f"{CBT.CATEGORY}tg")],
         [InlineKeyboardButton(text="💬 Автоответчик", callback_data=f"{CBT.CATEGORY}ar")],
-        [InlineKeyboardButton(text="📦 Автовыдача", callback_data=f"{CBT.CATEGORY}ad")],
         [InlineKeyboardButton(text="🔌 Плагины", callback_data=CBT.PLUGINS)],
         [InlineKeyboardButton(text="📝 Шаблоны", callback_data=CBT.TMPLT_LIST)],
         [InlineKeyboardButton(text="▶️ Далее", callback_data=CBT.MAIN2)],
@@ -43,24 +109,7 @@ def settings_page2() -> InlineKeyboardMarkup:
     ])
 
 
-def main_menu() -> InlineKeyboardMarkup:
-    s = load_settings()
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📊 Статистика", callback_data=CBT.STATUS)],
-        [
-            InlineKeyboardButton(text=f"{flag(s.auto_delivery_enabled)} Выдача", callback_data=f"{CBT.SWITCH}auto_delivery"),
-            InlineKeyboardButton(text=f"{flag(s.auto_bump_enabled)} Бамп", callback_data=f"{CBT.SWITCH}auto_bump"),
-        ],
-        [
-            InlineKeyboardButton(text=f"{flag(s.auto_response_enabled)} Автоответ", callback_data=f"{CBT.SWITCH}auto_response"),
-            InlineKeyboardButton(text=f"{flag(s.ai_replies_enabled)} Gemini", callback_data=f"{CBT.SWITCH}ai_replies"),
-        ],
-        [InlineKeyboardButton(text="⚙️ Настройки", callback_data=CBT.SETTINGS)],
-        [InlineKeyboardButton(text="📦 Склад", callback_data=CBT.ADEL)],
-    ])
-
-
-def category_main(s: Settings) -> InlineKeyboardMarkup:
+def category_main(s) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=f"{flag(s.auto_delivery_enabled)} Автовыдача", callback_data=f"{CBT.SWITCH}auto_delivery")],
         [InlineKeyboardButton(text=f"{flag(s.auto_bump_enabled)} Автоподнятие", callback_data=f"{CBT.SWITCH}auto_bump")],
@@ -69,7 +118,7 @@ def category_main(s: Settings) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text=f"{flag(s.auto_review_enabled)} Отзывы", callback_data=f"{CBT.SWITCH}auto_review")],
         [InlineKeyboardButton(text=f"{flag(s.order_confirm_enabled)} Подтв. заказа", callback_data=f"{CBT.SWITCH}order_confirm")],
         [InlineKeyboardButton(text=f"{flag(s.ai_replies_enabled)} Gemini в чатах", callback_data=f"{CBT.SWITCH}ai_replies")],
-        [InlineKeyboardButton(text="◀️ Меню", callback_data=CBT.MAIN)],
+        [InlineKeyboardButton(text="◀️ Главное меню", callback_data=CBT.MAIN)],
     ])
 
 
@@ -93,8 +142,7 @@ def setup_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="1️⃣ Session Starvell", callback_data=CBT.SET_SESSION)],
         [InlineKeyboardButton(text="2️⃣ Gemini API", callback_data=CBT.SET_GEMINI)],
-        [InlineKeyboardButton(text="3️⃣ Склад автовыдачи", callback_data=CBT.ADEL_ADD)],
         [InlineKeyboardButton(text="✅ Проверить Starvell", callback_data=CBT.CHECK_AUTH)],
         [InlineKeyboardButton(text="✅ Проверить Gemini", callback_data=CBT.CHECK_GEMINI)],
-        [InlineKeyboardButton(text="◀️ Меню", callback_data=CBT.MAIN)],
+        [InlineKeyboardButton(text="◀️ Главное меню", callback_data=CBT.MAIN)],
     ])

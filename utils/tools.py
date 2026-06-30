@@ -50,6 +50,33 @@ def restore_backup(zip_path: Path) -> None:
         zf.extractall(BASE_DIR)
 
 
+def export_settings_snapshot() -> Path:
+    """JSON-снимок настроек (секреты маскируются) для «получить текущие данные»."""
+    from dataclasses import asdict
+    from config import load_settings
+
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    s = load_settings()
+    data = asdict(s) if hasattr(s, "__dataclass_fields__") else dict(getattr(s, "__dict__", {}))
+
+    def _mask(key: str, val: object) -> object:
+        if not isinstance(val, str) or not val:
+            return val
+        if key in ("session_cookie", "sid_cookie", "my_games_cookie", "gemini_api_key", "bot_token"):
+            if len(val) <= 8:
+                return "***"
+            return val[:4] + "…" + val[-4:]
+        return val
+
+    for k in list(data.keys()):
+        data[k] = _mask(k, data[k])
+
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = BACKUP_DIR / f"settings_{ts}.json"
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    return path
+
+
 def logs_zip() -> Path | None:
     if not LOGS_DIR.exists():
         return None

@@ -65,6 +65,19 @@ class AIService:
                 return w
         return None
 
+    async def translate_text(self, text: str, target_lang: str = "en") -> str:
+        if not text.strip():
+            return text
+        if not self.settings.gemini_api_key.strip():
+            return text
+        lang = "английский" if target_lang == "en" else target_lang
+        prompt = (
+            f"Переведи текст на {lang}. Сохрани форматирование, эмодзи и переносы строк.\n"
+            f"Верни только перевод без пояснений.\n\n{text}"
+        )
+        result = await self._gemini(prompt)
+        return result or text
+
     async def generate_review_text(self, order: dict[str, Any]) -> str:
         offer = order.get("offerDetails") or {}
         desc = (offer.get("descriptions") or {}).get("rus") or {}

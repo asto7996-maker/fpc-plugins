@@ -202,6 +202,19 @@ class StarvellAPI:
 
     async def get_balance(self) -> float | None:
         """Возвращает баланс аккаунта."""
+        wallet = await self.fetch_wallet_balance()
+        if wallet:
+            raw = wallet.get("withdrawableRubBalance")
+            if raw is None:
+                raw = wallet.get("rubBalance")
+            if raw is not None:
+                try:
+                    val = float(raw)
+                    if val >= 100 and abs(val - round(val)) < 1e-9:
+                        val = val / 100.0
+                    return val
+                except (TypeError, ValueError):
+                    pass
         info = await self.fetch_homepage()
         user = info.get("user") or {}
         balance = user.get("balance")
@@ -211,6 +224,21 @@ class StarvellAPI:
             return float(balance)
         except (TypeError, ValueError):
             return None
+
+    async def fetch_wallet_balance(self) -> dict[str, Any]:
+        """GET /api/wallet/balance (как Lumus LSB)."""
+        try:
+            resp = await self._request(
+                "GET",
+                f"{BASE_URL}/api/wallet/balance",
+                referer=f"{BASE_URL}/wallet",
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                return data if isinstance(data, dict) else {}
+        except Exception as exc:
+            logger.debug("fetch_wallet_balance: %s", exc)
+        return {}
 
     # ── Заказы ────────────────────────────────────────────────────────────
 

@@ -8,6 +8,7 @@ import httpx
 
 from config import DEFAULT_AI_SYSTEM_PROMPT
 from starvell_api import StarvellAPI
+from utils.starvell_format import format_rub_balance
 
 GEMINI_MODELS = ("gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro")
 
@@ -32,8 +33,8 @@ async def test_starvell_session(session_cookie: str) -> tuple[bool, str, dict]:
 
     user = info.get("user") or {}
     username = user.get("username") or user.get("id") or "?"
-    balance = user.get("balance", "?")
-    return True, f"Авторизован: {username} | Баланс: {balance} ₽", info
+    balance = format_rub_balance(user.get("balance"))
+    return True, f"Авторизован: {username} | Баланс: {balance}", info
 
 
 async def test_gemini_key(api_key: str, system_prompt: str = "") -> tuple[bool, str]:

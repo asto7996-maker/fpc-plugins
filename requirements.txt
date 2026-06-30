@@ -6,4 +6,4 @@ colorama>=0.4.6
 psutil>=6.0.0
 sqlalchemy[asyncio]>=2.0.0
 apscheduler>=3.10.0
-fluentogram>=1.1.0
+beautifulsoup4>=4.12.0
