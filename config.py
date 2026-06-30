@@ -143,6 +143,7 @@ class Settings:
     parser_default_category_id: int = 0
     parser_default_price: str = "10.00"
     parser_auto_delivery: bool = True
+    parser_funpay_category_map: dict[str, Any] = field(default_factory=dict)
 
     def get_active_accounts(self) -> list[StarvellAccount]:
         if self.accounts:

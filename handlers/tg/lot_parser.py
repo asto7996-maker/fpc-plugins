@@ -13,8 +13,9 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message
 
-from config import load_settings
+from config import load_settings, save_settings
 from keyboards import cbt as CBT
+from services.category_mapper import resolve_starvell_category, save_category_mapping
 from services.funpay_parser import ParsedLot, fetch_funpay_lot
 from services.starvell_lot_creator import create_lot_from_parsed, format_created_message
 from services.yandex_translate import parse_price_hint, translate_ru_to_en
@@ -26,8 +27,8 @@ logger = logging.getLogger("starvell.lot_parser")
 class ParserStates(StatesGroup):
     waiting_url = State()
     waiting_smm_id = State()
-    waiting_category_id = State()
     waiting_price = State()
+    waiting_category_fallback = State()
 
 
 def create_lot_parser_router(ctx: Any) -> Router:
@@ -44,11 +45,11 @@ def create_lot_parser_router(ctx: Any) -> Router:
             "🔍 <b>Парсер лотов FunPay</b>\n"
             "━━━━━━━━━━━━━━━━━━\n\n"
             "Отправьте ссылку на лот FunPay — бот:\n"
+            "• определит категорию FunPay и подберёт такую же на Starvell\n"
             "• скопирует краткое и подробное описание\n"
             "• переведёт на английский (Яндекс.Переводчик)\n"
-            "• создаст лот на Starvell (наличие 999999)\n"
-            "• для SMM — сообщение после оплаты и <code>ID:</code>\n"
-            "• включит автоматизированную доставку\n\n"
+            "• создаст лот (наличие 999999, автодоставка)\n"
+            "• для SMM — сообщение после оплаты и <code>ID:</code>\n\n"
             "Пример:\n"
             "<code>https://funpay.com/lots/offer?id=12345678</code>\n\n"
             "<i>/cancel или ◀️ Меню — выход</i>"
@@ -73,42 +74,25 @@ def create_lot_parser_router(ctx: Any) -> Router:
             lot.brief_en = lot.brief_ru
             lot.full_en = lot.full_ru
 
-    async def _load_categories(api) -> list[dict]:
-        try:
-            return await asyncio.wait_for(api.fetch_seller_categories(), timeout=20.0)
-        except Exception as exc:
-            logger.warning("fetch_seller_categories: %s", exc)
-            return []
-
-    async def _ask_category(message: Message, state: FSMContext, *, is_smm: bool) -> None:
+    async def _resolve_category(lot: ParsedLot):
         s = load_settings()
-        api = _api()
-        categories: list[dict] = []
-        if api and s.is_starvell_configured():
-            categories = await _load_categories(api)
-
-        await state.update_data(is_smm=is_smm)
-        if categories:
-            default_price = parse_price_hint(
-                (await state.get_data()).get("price_hint", "")
-            ) or s.parser_default_price
-            await message.answer(
-                "📁 <b>Выберите категорию Starvell</b>\n"
-                "Будут скопированы фильтры из вашего лота в этой категории.\n\n"
-                "Или отправьте <code>category_id цена</code>\n"
-                f"Пример: <code>{categories[0]['category_id']} {default_price}</code>",
-                parse_mode="HTML",
-                reply_markup=KB.parser_categories_kb(categories),
-            )
-            await state.set_state(ParserStates.waiting_category_id)
-            return
-
-        await message.answer(
-            "📁 Отправьте <b>ID категории Starvell</b> и цену через пробел:\n"
-            f"Пример: <code>{s.parser_default_category_id or 1} {s.parser_default_price}</code>",
-            parse_mode="HTML",
+        return await resolve_starvell_category(
+            lot.funpay_node_id,
+            lot.funpay_category_title,
+            settings_overrides=s.parser_funpay_category_map,
         )
-        await state.set_state(ParserStates.waiting_category_id)
+
+    async def _find_template_offer(category_id: int) -> str | int | None:
+        api = _api()
+        if not api:
+            return None
+        try:
+            for cat in await api.fetch_seller_categories():
+                if int(cat.get("category_id") or 0) == category_id:
+                    return cat.get("offer_id")
+        except Exception as exc:
+            logger.debug("template offer: %s", exc)
+        return None
 
     async def _create_and_reply(
         message: Message,
@@ -133,6 +117,9 @@ def create_lot_parser_router(ctx: Any) -> Router:
             await state.clear()
             return
 
+        if template_offer_id is None:
+            template_offer_id = await _find_template_offer(category_id)
+
         lot = ParsedLot(
             source_url=lot_data.get("source_url", ""),
             offer_id=lot_data.get("offer_id", ""),
@@ -141,6 +128,8 @@ def create_lot_parser_router(ctx: Any) -> Router:
             full_ru=lot_data.get("full_ru", ""),
             brief_en=lot_data.get("brief_en", ""),
             full_en=lot_data.get("full_en", ""),
+            funpay_node_id=int(lot_data.get("funpay_node_id") or 0),
+            funpay_category_title=lot_data.get("funpay_category_title", ""),
         )
 
         wait = await message.answer("⏳ Создаю лот на Starvell…")
@@ -167,6 +156,7 @@ def create_lot_parser_router(ctx: Any) -> Router:
             return
 
         await state.clear()
+        cat_title = lot_data.get("starvell_category_name") or lot_data.get("funpay_category_title") or ""
         text = format_created_message(
             title=lot.title,
             url=result.get("url", ""),
@@ -175,24 +165,35 @@ def create_lot_parser_router(ctx: Any) -> Router:
             is_smm=is_smm,
             service_id=service_id,
         )
+        if cat_title:
+            text += f"\n📁 Категория: <b>{cat_title}</b>"
         await wait.edit_text(text, parse_mode="HTML", reply_markup=KB.back_menu(), disable_web_page_preview=False)
 
-    def _parse_category_price(text: str) -> tuple[int | None, str | None]:
-        s = load_settings()
-        parts = (text or "").strip().split()
-        if not parts:
-            return None, None
-        cat_id: int | None = None
-        price: str | None = None
-        if parts[0].isdigit():
-            cat_id = int(parts[0])
-        if len(parts) >= 2:
-            price = parse_price_hint(parts[1]) or parts[1].replace(",", ".")
-        elif len(parts) == 1 and not parts[0].isdigit():
-            price = parse_price_hint(parts[0])
-        if cat_id and not price:
-            price = s.parser_default_price
-        return cat_id, price
+    async def _ask_price(message: Message, state: FSMContext) -> None:
+        data = await state.get_data()
+        price = data.get("price_hint") or load_settings().parser_default_price
+        cat_line = data.get("funpay_category_title") or "—"
+        sv_line = data.get("starvell_category_name") or "—"
+        await message.answer(
+            f"📁 FunPay: <b>{cat_line}</b>\n"
+            f"🎯 Starvell: <b>{sv_line}</b>\n\n"
+            f"Отправьте <b>цену</b> (₽ за 1 шт.) или нажмите кнопку:\n"
+            f"Подсказка: <code>{price}</code>",
+            parse_mode="HTML",
+            reply_markup=KB.parser_price_kb(price),
+        )
+        await state.set_state(ParserStates.waiting_price)
+
+    async def _ask_category_fallback(message: Message, state: FSMContext, lot: ParsedLot) -> None:
+        await message.answer(
+            "⚠️ <b>Не удалось автоматически определить категорию Starvell</b>\n\n"
+            f"FunPay: <b>{lot.funpay_category_title or '—'}</b>\n"
+            f"Node ID: <code>{lot.funpay_node_id or '—'}</code>\n\n"
+            "Отправьте <b>ID категории Starvell</b> (число).\n"
+            "Бот запомнит соответствие для этой категории FunPay.",
+            parse_mode="HTML",
+        )
+        await state.set_state(ParserStates.waiting_category_fallback)
 
     @router.message(Command("parser"))
     async def cmd_parser(message: Message, state: FSMContext) -> None:
@@ -221,7 +222,7 @@ def create_lot_parser_router(ctx: Any) -> Router:
 
         wait = await message.answer("⏳ Загружаю лот FunPay…")
         try:
-            lot = await asyncio.wait_for(fetch_funpay_lot(url), timeout=35.0)
+            lot = await asyncio.wait_for(fetch_funpay_lot(url), timeout=45.0)
         except asyncio.TimeoutError:
             await wait.edit_text("❌ FunPay не ответил вовремя. Попробуйте позже или /cancel")
             return
@@ -233,11 +234,21 @@ def create_lot_parser_router(ctx: Any) -> Router:
             await wait.edit_text("❌ " + "\n".join(lot.errors))
             return
 
+        if not lot.funpay_node_id:
+            await wait.edit_text(
+                "❌ Не удалось определить категорию FunPay.\n"
+                "Проверьте, что ссылка ведёт на лот, а не на список."
+            )
+            return
+
+        await wait.edit_text("⏳ Определяю категорию Starvell…")
+        match = await _resolve_category(lot)
+
         await wait.edit_text("⏳ Перевожу описание через Яндекс…")
         await _translate_lot(lot)
 
         price_hint = parse_price_hint(lot.price_hint) or load_settings().parser_default_price
-        await state.update_data(parsed_lot={
+        lot_payload = {
             "source_url": lot.source_url,
             "offer_id": lot.offer_id,
             "title": lot.title,
@@ -245,15 +256,30 @@ def create_lot_parser_router(ctx: Any) -> Router:
             "full_ru": lot.full_ru,
             "brief_en": lot.brief_en,
             "full_en": lot.full_en,
-        }, price_hint=price_hint)
+            "funpay_node_id": lot.funpay_node_id,
+            "funpay_category_title": lot.funpay_category_title,
+            "price_hint": price_hint,
+        }
 
+        if match:
+            lot_payload.update({
+                "category_id": match.category_id,
+                "starvell_category_name": f"{match.game_name} → {match.category_name}".strip(" →"),
+                "template_offer_id": await _find_template_offer(match.category_id),
+            })
+        await state.update_data(parsed_lot=lot_payload, price_hint=price_hint, is_smm=lot.is_smm_guess)
+
+        fp_cat = lot.funpay_category_title or f"node {lot.funpay_node_id}"
+        sv_cat = lot_payload.get("starvell_category_name") or "не найдена — укажете вручную"
         preview = (
             f"✅ <b>Лот распознан</b>\n\n"
             f"📌 {lot.title}\n"
             f"🆔 FunPay: <code>{lot.offer_id}</code>\n"
+            f"📁 FunPay: <b>{fp_cat}</b>\n"
+            f"🎯 Starvell: <b>{sv_cat}</b>\n"
             f"💰 Цена FunPay: {lot.price_hint or '—'}\n\n"
             f"<i>{(lot.brief_ru or '')[:100]}…</i>\n\n"
-            f"Выберите тип — бот создаст лот на Starvell:"
+            f"Выберите тип товара:"
         )
         await wait.edit_text(
             preview,
@@ -261,12 +287,25 @@ def create_lot_parser_router(ctx: Any) -> Router:
             reply_markup=KB.parser_type_kb(lot.is_smm_guess),
         )
 
+        if not match:
+            await state.update_data(pending_category_fallback=True)
+
     @router.callback_query(F.data == CBT.PARSER_REG)
     async def cb_parser_regular(call: CallbackQuery, state: FSMContext) -> None:
         if not await _access(call.from_user.id):
             return
         await call.answer()
-        await _ask_category(call.message, state, is_smm=False)
+        data = await state.get_data()
+        await state.update_data(is_smm=False, service_id=None)
+        if data.get("pending_category_fallback") or not data.get("parsed_lot", {}).get("category_id"):
+            lot = ParsedLot(
+                funpay_node_id=int(data.get("parsed_lot", {}).get("funpay_node_id") or 0),
+                funpay_category_title=data.get("parsed_lot", {}).get("funpay_category_title", ""),
+                source_url="", offer_id="",
+            )
+            await _ask_category_fallback(call.message, state, lot)
+            return
+        await _ask_price(call.message, state)
 
     @router.callback_query(F.data == CBT.PARSER_SMM)
     async def cb_parser_smm(call: CallbackQuery, state: FSMContext) -> None:
@@ -295,51 +334,63 @@ def create_lot_parser_router(ctx: Any) -> Router:
             await message.answer("❌ Отправьте числовой ID услуги")
             return
         await state.update_data(service_id=int(m.group()), is_smm=True)
-        await _ask_category(message, state, is_smm=True)
-
-    @router.callback_query(F.data.startswith(CBT.PARSER_CAT))
-    async def cb_parser_category(call: CallbackQuery, state: FSMContext) -> None:
-        if not await _access(call.from_user.id):
-            return
-        cat_raw = call.data.replace(CBT.PARSER_CAT, "", 1)
-        if not cat_raw.isdigit():
-            await call.answer("Неверная категория", show_alert=True)
-            return
-        category_id = int(cat_raw)
         data = await state.get_data()
-        price = data.get("price_hint") or load_settings().parser_default_price
+        if data.get("pending_category_fallback") or not data.get("parsed_lot", {}).get("category_id"):
+            lot = ParsedLot(
+                funpay_node_id=int(data.get("parsed_lot", {}).get("funpay_node_id") or 0),
+                funpay_category_title=data.get("parsed_lot", {}).get("funpay_category_title", ""),
+                source_url="", offer_id="",
+            )
+            await _ask_category_fallback(message, state, lot)
+            return
+        await _ask_price(message, state)
 
-        api = _api()
-        template_offer_id = None
-        if api:
-            for cat in await _load_categories(api):
-                if cat.get("category_id") == category_id:
-                    template_offer_id = cat.get("offer_id")
-                    if cat.get("price"):
-                        hint = parse_price_hint(str(cat.get("price")))
-                        if hint:
-                            price = hint
-                    break
+    @router.message(ParserStates.waiting_category_fallback)
+    async def on_category_fallback(message: Message, state: FSMContext) -> None:
+        if not await _access(message.from_user.id):
+            return
+        raw = (message.text or "").strip()
+        if raw.startswith("/"):
+            return
+        if not raw.isdigit():
+            await message.answer("❌ Отправьте числовой ID категории Starvell")
+            return
+        category_id = int(raw)
+        data = await state.get_data()
+        lot_data = dict(data.get("parsed_lot") or {})
+        node_id = int(lot_data.get("funpay_node_id") or 0)
+        lot_data["category_id"] = category_id
+        await state.update_data(parsed_lot=lot_data, pending_category_fallback=False)
 
-        await state.update_data(category_id=category_id, template_offer_id=template_offer_id)
-        await call.answer()
-        await call.message.edit_text(
-            f"📁 Категория: <code>{category_id}</code>\n\n"
-            f"Отправьте <b>цену</b> (₽ за 1 шт.) или нажмите кнопку ниже.\n"
-            f"Подсказка: <code>{price}</code>",
-            parse_mode="HTML",
-            reply_markup=KB.parser_price_kb(price),
-        )
-        await state.set_state(ParserStates.waiting_price)
+        if node_id:
+            from services.category_mapper import StarvellCategoryMatch
+            match = StarvellCategoryMatch(
+                category_id=category_id,
+                game_id=0,
+                game_name="",
+                category_name=str(category_id),
+                funpay_node_id=node_id,
+                funpay_title=lot_data.get("funpay_category_title", ""),
+                confidence=1.0,
+                source="manual",
+            )
+            save_category_mapping(node_id, match)
+            s = load_settings()
+            s.parser_funpay_category_map[str(node_id)] = {"category_id": category_id}
+            save_settings(s)
+
+        await message.answer(f"✅ Категория <code>{category_id}</code> сохранена для FunPay node {node_id}")
+        await _ask_price(message, state)
 
     @router.callback_query(F.data == CBT.PARSER_SKIP_PRICE)
     async def cb_parser_default_price(call: CallbackQuery, state: FSMContext) -> None:
         if not await _access(call.from_user.id):
             return
         data = await state.get_data()
-        category_id = data.get("category_id")
+        lot_data = data.get("parsed_lot") or {}
+        category_id = lot_data.get("category_id")
         if not category_id:
-            await call.answer("Сначала выберите категорию", show_alert=True)
+            await call.answer("Сначала укажите категорию", show_alert=True)
             return
         price = data.get("price_hint") or load_settings().parser_default_price
         await call.answer()
@@ -348,29 +399,8 @@ def create_lot_parser_router(ctx: Any) -> Router:
             state,
             category_id=int(category_id),
             price=str(price),
-            template_offer_id=data.get("template_offer_id"),
+            template_offer_id=lot_data.get("template_offer_id"),
         )
-
-    @router.message(ParserStates.waiting_category_id)
-    async def on_category_text(message: Message, state: FSMContext) -> None:
-        if not await _access(message.from_user.id):
-            return
-        raw = (message.text or "").strip()
-        if raw.startswith("/"):
-            return
-        cat_id, price = _parse_category_price(raw)
-        if not cat_id:
-            await message.answer("❌ Укажите числовой ID категории")
-            return
-        if not price:
-            await state.update_data(category_id=cat_id)
-            await state.set_state(ParserStates.waiting_price)
-            await message.answer(
-                f"📁 Категория: <code>{cat_id}</code>\n\nОтправьте цену (₽):",
-                parse_mode="HTML",
-            )
-            return
-        await _create_and_reply(message, state, category_id=cat_id, price=price)
 
     @router.message(ParserStates.waiting_price)
     async def on_price(message: Message, state: FSMContext) -> None:
@@ -384,24 +414,17 @@ def create_lot_parser_router(ctx: Any) -> Router:
             await message.answer("❌ Отправьте цену числом, например <code>15.00</code>", parse_mode="HTML")
             return
         data = await state.get_data()
-        category_id = data.get("category_id")
+        lot_data = data.get("parsed_lot") or {}
+        category_id = lot_data.get("category_id")
         if not category_id:
-            await message.answer("❌ Категория не выбрана. Начните с /parser")
+            await message.answer("❌ Категория не определена. Начните с /parser")
             return
         await _create_and_reply(
             message,
             state,
             category_id=int(category_id),
             price=price,
-            template_offer_id=data.get("template_offer_id"),
+            template_offer_id=lot_data.get("template_offer_id"),
         )
-
-    # Legacy callbacks — сразу создаём с автодоставкой
-    @router.callback_query(F.data.in_({CBT.PARSER_AD_ON, CBT.PARSER_AD_OFF}))
-    async def cb_parser_legacy_autodelivery(call: CallbackQuery, state: FSMContext) -> None:
-        if not await _access(call.from_user.id):
-            return
-        await call.answer("Выберите категорию для создания лота")
-        await _ask_category(call.message, state, is_smm=bool((await state.get_data()).get("is_smm")))
 
     return router

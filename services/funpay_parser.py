@@ -61,6 +61,9 @@ class ParsedLot:
     brief_en: str = ""
     full_en: str = ""
     price_hint: str = ""
+    funpay_node_id: int = 0
+    funpay_category_title: str = ""
+    funpay_category_kind: str = "lots"  # lots | chips
     is_smm_guess: bool = False
     raw_html_len: int = 0
     errors: list[str] = field(default_factory=list)
@@ -216,6 +219,8 @@ async def fetch_funpay_lot(url: str) -> ParsedLot:
 
     lot.raw_html_len = len(html)
     _parse_html(html, lot)
+    if lot.funpay_node_id:
+        await _enrich_funpay_category(lot)
     if not lot.title:
         lot.errors.append("Не удалось извлечь название — проверьте ссылку")
     combined = f"{lot.brief_ru}\n{lot.full_ru}"
@@ -223,7 +228,103 @@ async def fetch_funpay_lot(url: str) -> ParsedLot:
     return lot
 
 
+_CATEGORY_LINK_RE = re.compile(r"/(lots|chips)/(\d+)/?$", re.IGNORECASE)
+
+
+def _parse_offer_fields(soup) -> tuple[str, str]:
+    """Извлекает краткое/подробное описание из карточки лота FunPay."""
+    lot_brief = ""
+    lot_full = ""
+    for item in soup.select(".param-item"):
+        heading = item.find("h5")
+        if not heading:
+            continue
+        label = heading.get_text(strip=True).lower()
+        body = item.find("div")
+        if not body:
+            continue
+        text = body.get_text("\n", strip=True)
+        if not text:
+            continue
+        if "краткое описание" in label:
+            lot_brief = text
+        elif "подробное описание" in label:
+            lot_full = text
+    return lot_brief, lot_full
+
+
+def _parse_category_from_html(html: str, lot: ParsedLot) -> None:
+    for href, title in re.findall(
+        r'href="((?:https://funpay\.com)?/(?:lots|chips)/\d+/?)"[^>]*>([^<]+)</a>',
+        html,
+        re.IGNORECASE,
+    ):
+        path = href.replace("https://funpay.com", "")
+        m = _CATEGORY_LINK_RE.search(path)
+        if not m or "offer" in path.lower():
+            continue
+        kind, node_id = m.group(1).lower(), int(m.group(2))
+        name = re.sub(r"\s+", " ", title).strip()
+        if name and name.lower() not in ("funpay", "english", "войти"):
+            lot.funpay_category_kind = kind
+            lot.funpay_node_id = node_id
+            lot.funpay_category_title = name
+            return
+
+    try:
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(html, "html.parser")
+        for a in soup.select("a[href]"):
+            href = a.get("href") or ""
+            if "offer" in href:
+                continue
+            m = _CATEGORY_LINK_RE.search(href.replace("https://funpay.com", ""))
+            if not m:
+                continue
+            name = a.get_text(" ", strip=True)
+            if not name or len(name) < 2:
+                continue
+            lot.funpay_category_kind = m.group(1).lower()
+            lot.funpay_node_id = int(m.group(2))
+            lot.funpay_category_title = name
+            return
+        content = soup.select_one("#content")
+        if content and not lot.funpay_category_title:
+            h1 = content.find("h1")
+            if h1:
+                prev = h1.find_previous(string=True)
+                if prev and isinstance(prev, str):
+                    text = prev.strip()
+                    if text and text != h1.get_text(strip=True):
+                        lot.funpay_category_title = text
+    except Exception as exc:
+        logger.debug("category parse bs4: %s", exc)
+
+
+async def _enrich_funpay_category(lot: ParsedLot) -> None:
+    if not lot.funpay_node_id:
+        return
+    kind = lot.funpay_category_kind or "lots"
+    url = f"https://funpay.com/{kind}/{lot.funpay_node_id}/"
+    try:
+        async with httpx.AsyncClient(
+            headers=FUNPAY_HEADERS,
+            timeout=20.0,
+            follow_redirects=True,
+        ) as client:
+            resp = await client.get(url)
+            resp.raise_for_status()
+            html = resp.text
+    except Exception as exc:
+        logger.debug("funpay category page %s: %s", url, exc)
+        return
+    m = re.search(r"<h1[^>]*>([^<]+)</h1>", html, re.IGNORECASE)
+    if m:
+        lot.funpay_category_title = re.sub(r"\s+", " ", m.group(1)).strip()
+
+
 def _parse_html(html: str, lot: ParsedLot) -> None:
+    _parse_category_from_html(html, lot)
     # JSON bootstrap
     for pattern in (
         r"data-app-data=\"([^\"]+)\"",
@@ -238,23 +339,32 @@ def _parse_html(html: str, lot: ParsedLot) -> None:
             raw = raw.encode().decode("unicode_escape") if "\\u" in raw else raw
             data = json.loads(raw.replace("&quot;", '"'))
             _fill_from_json(data, lot)
-            if lot.title:
-                return
         except Exception:
             continue
 
     try:
         from bs4 import BeautifulSoup
         soup = BeautifulSoup(html, "html.parser")
+        brief, full = _parse_offer_fields(soup)
+        if brief:
+            lot.brief_ru = brief
+            if not lot.title or lot.title in ("Оформление заказа", "Offer", ""):
+                lot.title = brief[:100]
+        if full:
+            lot.full_ru = full
+        if not lot.brief_ru and lot.full_ru:
+            lot.brief_ru = lot.full_ru[:200] + ("…" if len(lot.full_ru) > 200 else "")
+
         h1 = soup.find("h1")
-        if h1:
+        if h1 and not brief:
             lot.title = h1.get_text(strip=True)
-        desc = soup.select_one(".desc, #offer-desc, .offer-desc-text, .page-content")
-        if desc:
-            text = desc.get_text("\n", strip=True)
-            lot.full_ru = text
-            lot.brief_ru = text[:200] + ("…" if len(text) > 200 else "")
-        price = soup.select_one(".price, .tc-price")
+        if not lot.full_ru:
+            desc = soup.select_one(".desc, #offer-desc, .offer-desc-text, .page-content")
+            if desc:
+                text = desc.get_text("\n", strip=True)
+                lot.full_ru = text
+                lot.brief_ru = text[:200] + ("…" if len(text) > 200 else "")
+        price = soup.select_one(".price, .tc-price, .payment-summary")
         if price:
             lot.price_hint = price.get_text(strip=True)
     except ImportError:
@@ -263,6 +373,9 @@ def _parse_html(html: str, lot: ParsedLot) -> None:
     except Exception as exc:
         logger.debug("bs4 parse: %s", exc)
         _parse_regex(html, lot)
+
+    if not lot.brief_ru and lot.full_ru:
+        lot.brief_ru = lot.full_ru[:200] + ("…" if len(lot.full_ru) > 200 else "")
 
 
 def _parse_regex(html: str, lot: ParsedLot) -> None:
