@@ -64,6 +64,7 @@ class ParsedLot:
     funpay_node_id: int = 0
     funpay_category_title: str = ""
     funpay_category_kind: str = "lots"  # lots | chips
+    funpay_service_type: str = ""
     is_smm_guess: bool = False
     raw_html_len: int = 0
     errors: list[str] = field(default_factory=list)
@@ -231,10 +232,11 @@ async def fetch_funpay_lot(url: str) -> ParsedLot:
 _CATEGORY_LINK_RE = re.compile(r"/(lots|chips)/(\d+)/?$", re.IGNORECASE)
 
 
-def _parse_offer_fields(soup) -> tuple[str, str]:
-    """Извлекает краткое/подробное описание из карточки лота FunPay."""
+def _parse_offer_fields(soup) -> tuple[str, str, str]:
+    """Извлекает краткое/подробное описание и тип услуги из карточки FunPay."""
     lot_brief = ""
     lot_full = ""
+    lot_service_type = ""
     for item in soup.select(".param-item"):
         heading = item.find("h5")
         if not heading:
@@ -250,7 +252,9 @@ def _parse_offer_fields(soup) -> tuple[str, str]:
             lot_brief = text
         elif "подробное описание" in label:
             lot_full = text
-    return lot_brief, lot_full
+        elif label in ("тип услуги", "тип товара", "тип"):
+            lot_service_type = text
+    return lot_brief, lot_full, lot_service_type
 
 
 def _parse_category_from_html(html: str, lot: ParsedLot) -> None:
@@ -375,13 +379,15 @@ def _parse_html(html: str, lot: ParsedLot) -> None:
     try:
         from bs4 import BeautifulSoup
         soup = BeautifulSoup(html, "html.parser")
-        brief, full = _parse_offer_fields(soup)
+        brief, full, service_type = _parse_offer_fields(soup)
         if brief:
             lot.brief_ru = brief
             if not lot.title or lot.title in ("Оформление заказа", "Offer", ""):
                 lot.title = brief[:100]
         if full:
             lot.full_ru = full
+        if service_type:
+            lot.funpay_service_type = service_type
         if not lot.brief_ru and lot.full_ru:
             lot.brief_ru = lot.full_ru[:200] + ("…" if len(lot.full_ru) > 200 else "")
 

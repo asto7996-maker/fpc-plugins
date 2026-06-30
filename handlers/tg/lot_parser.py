@@ -25,6 +25,7 @@ from services.price_utils import (
 )
 from services.starvell_lot_creator import create_lot_from_parsed, format_created_message
 from services.yandex_translate import translate_ru_to_en
+from starvell_api import StarvellAPIError
 from tg_bot import keyboards as KB
 
 logger = logging.getLogger("starvell.lot_parser")
@@ -127,11 +128,15 @@ def create_lot_parser_router(ctx: Any) -> Router:
             "full_en": lot.full_en,
             "funpay_node_id": lot.funpay_node_id,
             "funpay_category_title": lot.funpay_category_title,
+            "funpay_service_type": lot.funpay_service_type,
             "price_hint": price_hint,
         }
         if match:
             payload.update({
                 "category_id": match.category_id,
+                "game_id": match.game_id,
+                "game_slug": match.game_slug,
+                "category_slug": match.category_slug,
                 "starvell_category_name": f"{match.game_name} → {match.category_name}".strip(" →"),
                 "template_offer_id": await _find_template_offer(match.category_id),
             })
@@ -183,6 +188,7 @@ def create_lot_parser_router(ctx: Any) -> Router:
             full_en=lot_data.get("full_en", ""),
             funpay_node_id=int(lot_data.get("funpay_node_id") or 0),
             funpay_category_title=lot_data.get("funpay_category_title", ""),
+            funpay_service_type=lot_data.get("funpay_service_type", ""),
         )
 
         wait = await message.answer("⏳ Создаю лот на Starvell…")
@@ -195,11 +201,23 @@ def create_lot_parser_router(ctx: Any) -> Router:
                     service_id=service_id if is_smm else None,
                     price=normalized,
                     category_id=category_id,
+                    game_id=int(lot_data.get("game_id") or 0),
+                    game_slug=str(lot_data.get("game_slug") or ""),
+                    category_slug=str(lot_data.get("category_slug") or ""),
                     template_offer_id=template_offer_id,
                     auto_delivery=s.parser_auto_delivery,
                 ),
                 timeout=60.0,
             )
+        except StarvellAPIError as exc:
+            logger.warning("create_offer api error: %s", exc)
+            detail = str(exc)
+            if exc.body:
+                extra = exc.body.get("message") or exc.body.get("errors")
+                if extra and str(extra) not in detail:
+                    detail = f"{detail}\n{extra}"
+            await wait.edit_text(f"❌ Starvell отклонил лот:\n<code>{detail}</code>", parse_mode="HTML")
+            return
         except asyncio.TimeoutError:
             await wait.edit_text("❌ Starvell не ответил вовремя. Попробуйте позже.")
             return

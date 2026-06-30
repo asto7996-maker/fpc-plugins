@@ -43,6 +43,13 @@ def normalize_price_input(raw: str) -> str | None:
     return format_starvell_price(val)
 
 
+def format_starvell_api_price(price: str | float | Decimal) -> str:
+    """Формат цены для Starvell API (5 знаков, как в веб-форме)."""
+    normalized = normalize_price_input(str(price)) or "0.01000"
+    val = Decimal(normalized)
+    return f"{val:.5f}"
+
+
 def format_starvell_price(price: str | float | Decimal) -> str:
     """Форматирует цену для Starvell API (без лишних нулей, до 6 знаков)."""
     try:

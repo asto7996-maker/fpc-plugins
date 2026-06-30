@@ -25,6 +25,15 @@ USER_AGENT = (
 BASE_URL = "https://starvell.com"
 
 
+class StarvellAPIError(RuntimeError):
+    """Ошибка Starvell API с телом ответа."""
+
+    def __init__(self, status: int, message: str, body: dict | None = None) -> None:
+        self.status = status
+        self.body = body or {}
+        super().__init__(message or f"HTTP {status}")
+
+
 class RateLimiter:
     """Ограничитель частоты запросов к Starvell."""
 
@@ -391,8 +400,20 @@ class StarvellAPI:
                 })
         return lots
 
-    async def create_offer(self, payload: dict[str, Any], *, referer: str | None = None) -> dict[str, Any]:
+    async def create_offer(
+        self,
+        payload: dict[str, Any],
+        *,
+        referer: str | None = None,
+        category_id: int | None = None,
+        game_slug: str = "",
+        category_slug: str = "",
+    ) -> dict[str, Any]:
         """POST /api/offers/create — создание нового лота."""
+        if not referer and game_slug and category_slug:
+            referer = f"{BASE_URL}/{game_slug}/{category_slug}/sell"
+        elif not referer and category_id:
+            referer = f"{BASE_URL}/"
         resp = await self._request(
             "POST",
             f"{BASE_URL}/api/offers/create",
@@ -400,13 +421,22 @@ class StarvellAPI:
             json_body=payload,
         )
         result: dict[str, Any] = {"status": resp.status_code, "success": 200 <= resp.status_code < 300}
+        body: dict[str, Any] = {}
         try:
-            result["json"] = resp.json()
+            parsed = resp.json()
+            if isinstance(parsed, dict):
+                body = parsed
+            result["json"] = parsed
         except Exception:
             result["raw"] = resp.text[:2000]
         if resp.status_code >= 400:
-            logger.warning("create_offer HTTP %s: %s", resp.status_code, resp.text[:500])
-            resp.raise_for_status()
+            msg = ""
+            if isinstance(body, dict):
+                msg = str(body.get("message") or body.get("error") or body.get("detail") or "")
+            if not msg:
+                msg = resp.text[:500]
+            logger.warning("create_offer HTTP %s: %s", resp.status_code, msg)
+            raise StarvellAPIError(resp.status_code, msg, body if isinstance(body, dict) else {"raw": resp.text[:500]})
         return result.get("json") or result
 
     async def update_offer(

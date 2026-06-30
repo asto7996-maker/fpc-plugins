@@ -26,7 +26,13 @@ USER_AGENT = (
 
 # FunPay node_id → Starvell (проверенные соответствия)
 BUILTIN_FUNPAY_NODES: dict[int, dict[str, Any]] = {
-    703: {"category_id": 175, "game_id": 14, "title": "Услуги Telegram"},
+    703: {
+        "category_id": 175,
+        "game_id": 14,
+        "game_slug": "telegram",
+        "category_slug": "services",
+        "title": "Услуги Telegram",
+    },
 }
 
 SECTION_FIRST = {
@@ -58,6 +64,8 @@ class StarvellCategoryMatch:
     funpay_title: str
     confidence: float
     source: str
+    game_slug: str = ""
+    category_slug: str = ""
 
 
 def _norm(text: str) -> str:
@@ -205,12 +213,14 @@ async def resolve_starvell_category(
         return StarvellCategoryMatch(
             category_id=int(builtin["category_id"]),
             game_id=int(builtin.get("game_id") or 0),
-            game_name="",
+            game_name=str(builtin.get("game_name") or ""),
             category_name=str(builtin.get("title") or funpay_title),
             funpay_node_id=funpay_node_id,
             funpay_title=funpay_title,
             confidence=0.99,
             source="builtin",
+            game_slug=str(builtin.get("game_slug") or ""),
+            category_slug=str(builtin.get("category_slug") or ""),
         )
 
     section, game = split_funpay_category_title(funpay_title)
@@ -256,6 +266,8 @@ async def resolve_starvell_category(
                     funpay_title=funpay_title,
                     confidence=score,
                     source="search",
+                    game_slug=str(g.get("slug") or ""),
+                    category_slug=str(cat.get("slug") or ""),
                 )
                 if best is None or candidate.confidence > best.confidence:
                     best = candidate
