@@ -321,6 +321,36 @@ async def _enrich_funpay_category(lot: ParsedLot) -> None:
     m = re.search(r"<h1[^>]*>([^<]+)</h1>", html, re.IGNORECASE)
     if m:
         lot.funpay_category_title = re.sub(r"\s+", " ", m.group(1)).strip()
+    _parse_listing_price(html, lot)
+
+
+def _parse_listing_price(html: str, lot: ParsedLot) -> None:
+    """Цена лота из таблицы категории FunPay (атрибут data-s — полная точность)."""
+    if not lot.offer_id:
+        return
+    oid = re.escape(str(lot.offer_id))
+    pattern = rf'href="[^"]*offer\?id={oid}"[^>]*>.*?class="tc-price"[^>]*data-s="([\d.]+)"'
+    m = re.search(pattern, html, re.DOTALL | re.IGNORECASE)
+    if m:
+        lot.price_hint = m.group(1)
+        return
+    try:
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(html, "html.parser")
+        for a in soup.select(f'a[href*="offer?id={lot.offer_id}"]'):
+            price_el = a.select_one(".tc-price")
+            if not price_el:
+                continue
+            raw = price_el.get("data-s")
+            if raw:
+                lot.price_hint = str(raw).strip()
+                return
+            text = price_el.get_text(" ", strip=True)
+            if text:
+                lot.price_hint = text
+                return
+    except Exception as exc:
+        logger.debug("listing price bs4: %s", exc)
 
 
 def _parse_html(html: str, lot: ParsedLot) -> None:

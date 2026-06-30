@@ -13,6 +13,7 @@ from services.funpay_parser import (
     build_starvell_package,
     strip_service_id,
 )
+from services.price_utils import format_starvell_price, format_price_display
 from starvell_api import StarvellAPI, BASE_URL
 
 logger = logging.getLogger("starvell.lot_creator")
@@ -30,16 +31,6 @@ def _truncate(text: str, limit: int) -> str:
     if limit <= 1:
         return text[:limit]
     return text[: limit - 1].rstrip() + "…"
-
-
-def _format_price(price: str | float) -> str:
-    try:
-        val = float(str(price).replace(",", ".").strip())
-    except (TypeError, ValueError):
-        val = 1.0
-    if val <= 0:
-        val = 1.0
-    return f"{val:.2f}"
 
 
 def build_bilingual_full(ru: str, en: str) -> str:
@@ -116,7 +107,7 @@ def build_create_payload(
     payload: dict[str, Any] = {
         "type": offer_type,
         "categoryId": int(category_id),
-        "price": _format_price(price),
+        "price": format_starvell_price(price),
         "availability": AVAILABILITY_LOT,
         "isActive": True,
         "autoDelivery": bool(auto_delivery),
@@ -188,6 +179,7 @@ async def create_lot_from_parsed(
     }
 
 
+
 def format_created_message(
     *,
     title: str,
@@ -201,7 +193,7 @@ def format_created_message(
         "✅ <b>Лот создан на Starvell</b>",
         "━━━━━━━━━━━━━━━━━━",
         f"📌 {title}",
-        f"💰 Цена: <code>{price}</code> ₽",
+        f"💰 Цена: <code>{format_price_display(price)}</code> ₽",
         f"📦 Наличие: <code>{AVAILABILITY_LOT}</code>",
         f"📁 Категория: <code>{category_id}</code>",
     ]

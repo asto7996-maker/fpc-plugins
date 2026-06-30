@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import logging
-import re
 import uuid
 
 import httpx
+
+from services.price_utils import parse_price_hint  # re-export
+
+__all__ = ["translate_ru_to_en", "parse_price_hint"]
 
 logger = logging.getLogger("starvell.yandex_translate")
 
@@ -78,20 +81,3 @@ async def translate_ru_to_en(text: str) -> str:
                 translated.append(chunk)
 
     return "\n\n".join(translated).strip()
-
-
-def parse_price_hint(hint: str) -> str | None:
-    """Извлекает число из строки цены FunPay («10 ₽», «от 5.50»)."""
-    if not hint:
-        return None
-    m = re.search(r"(\d+(?:[.,]\d{1,2})?)", hint.replace("\xa0", " "))
-    if not m:
-        return None
-    val = m.group(1).replace(",", ".")
-    try:
-        num = float(val)
-    except ValueError:
-        return None
-    if num <= 0:
-        return None
-    return f"{num:.2f}"

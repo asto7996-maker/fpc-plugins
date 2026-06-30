@@ -57,6 +57,24 @@ def profile_kb() -> InlineKeyboardMarkup:
     ])
 
 
+def parser_preview_kb(is_smm_guess: bool, *, has_category: bool, price: str) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    if has_category and price:
+        rows.append([
+            InlineKeyboardButton(
+                text=f"⚡ SMM → создать ({price} ₽)",
+                callback_data=CBT.PARSER_QUICK_CREATE,
+            ),
+        ])
+    hint = " (рекомендуется)" if is_smm_guess else ""
+    rows += [
+        [InlineKeyboardButton(text=f"🚀 SMM / накрутка{hint}", callback_data=CBT.PARSER_SMM)],
+        [InlineKeyboardButton(text="📦 Обычный товар", callback_data=CBT.PARSER_REG)],
+        [InlineKeyboardButton(text="◀️ Отмена", callback_data=CBT.MAIN)],
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 def parser_type_kb(is_smm_guess: bool) -> InlineKeyboardMarkup:
     hint = " (рекомендуется)" if is_smm_guess else ""
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -66,29 +84,14 @@ def parser_type_kb(is_smm_guess: bool) -> InlineKeyboardMarkup:
     ])
 
 
-def parser_autodelivery_kb() -> InlineKeyboardMarkup:
+def parser_smm_kb(price: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="✅ Автовыдача — да", callback_data=CBT.PARSER_AD_ON),
-            InlineKeyboardButton(text="❌ Нет", callback_data=CBT.PARSER_AD_OFF),
-        ],
+        [InlineKeyboardButton(
+            text=f"⚡ Создать с ценой FunPay ({price} ₽)",
+            callback_data=CBT.PARSER_SKIP_PRICE,
+        )],
         [InlineKeyboardButton(text="◀️ Отмена", callback_data=CBT.MAIN)],
     ])
-
-
-def parser_categories_kb(categories: list[dict]) -> InlineKeyboardMarkup:
-    rows: list[list[InlineKeyboardButton]] = []
-    for cat in categories[:12]:
-        cid = cat.get("category_id")
-        title = str(cat.get("title") or f"#{cid}")[:40]
-        rows.append([
-            InlineKeyboardButton(
-                text=f"📁 {title}",
-                callback_data=f"{CBT.PARSER_CAT}{cid}",
-            ),
-        ])
-    rows.append([InlineKeyboardButton(text="◀️ Отмена", callback_data=CBT.MAIN)])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def parser_price_kb(default_price: str) -> InlineKeyboardMarkup:

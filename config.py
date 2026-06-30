@@ -141,7 +141,7 @@ class Settings:
 
     # Парсер FunPay → Starvell
     parser_default_category_id: int = 0
-    parser_default_price: str = "10.00"
+    parser_default_price: str = "0.01"
     parser_auto_delivery: bool = True
     parser_funpay_category_map: dict[str, Any] = field(default_factory=dict)
 
