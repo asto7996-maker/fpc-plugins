@@ -6,7 +6,7 @@ set -euo pipefail
 INSTALL_DIR="${INSTALL_DIR:-/opt/starvell-cardinal}"
 SERVICE_USER="${SERVICE_USER:-starvell}"
 REPO_URL="${REPO_URL:-https://github.com/asto7996-maker/fpc-plugins.git}"
-REPO_BRANCH="${REPO_BRANCH:-cursor/fpc-parity-280c}"
+REPO_BRANCH="${REPO_BRANCH:-cursor/fix-bot-hang-6ec3}"
 
 echo "=== Обновление Starvell Cardinal ==="
 

@@ -102,6 +102,8 @@ class AutomationEngine:
         self._ai = AIService(load_settings())
         self._handlers = BuiltinHandlers(cardinal)
         self._payment_guard = PaymentGuard()
+        self._status_cache: dict[str, Any] | None = None
+        self._status_cache_at: float = 0.0
 
     async def notify(self, text: str, notify_type: str = "notify_orders", **extra) -> None:
         if self.notify_cb:
@@ -803,9 +805,18 @@ class AutomationEngine:
         )
         await self._emit_starvell(STV_BUMP, bump_ctx)
 
-    async def get_status(self) -> dict[str, Any]:
+    async def get_status(self, *, force_refresh: bool = False) -> dict[str, Any]:
         """Сводка для Telegram-меню."""
         import asyncio
+        import time
+
+        now = time.time()
+        if (
+            not force_refresh
+            and self._status_cache
+            and now - self._status_cache_at < 45.0
+        ):
+            return self._status_cache
 
         settings = self._get_settings()
         result: dict[str, Any] = {"accounts": []}
@@ -813,16 +824,18 @@ class AutomationEngine:
             api = self._apis.get(account.name) or self._build_api(account)
             entry: dict[str, Any] = {"name": account.name}
             try:
-                info = await asyncio.wait_for(api.fetch_homepage(), timeout=20.0)
+                info = await asyncio.wait_for(api.fetch_homepage(), timeout=12.0)
                 user = info.get("user") or {}
                 entry["authorized"] = info.get("authorized", False)
                 entry["username"] = user.get("username")
 
-                wallet_coro = api.fetch_wallet_balance()
-                orders_coro = api.fetch_orders()
                 wallet, orders = await asyncio.wait_for(
-                    asyncio.gather(wallet_coro, orders_coro, return_exceptions=True),
-                    timeout=25.0,
+                    asyncio.gather(
+                        api.fetch_wallet_balance(),
+                        api.fetch_orders(),
+                        return_exceptions=True,
+                    ),
+                    timeout=15.0,
                 )
                 if isinstance(wallet, Exception):
                     wallet = {}
@@ -843,15 +856,6 @@ class AutomationEngine:
                 entry["active_orders"] = len(active)
                 entry["total_orders"] = len(orders)
 
-                if hasattr(api, "fetch_user_lots") and user.get("id"):
-                    try:
-                        lots = await asyncio.wait_for(
-                            api.fetch_user_lots(int(user["id"])),
-                            timeout=15.0,
-                        )
-                        entry["lots_count"] = len(lots)
-                    except Exception:
-                        entry["lots_count"] = 0
                 pe = self._plugin_engine()
                 if pe:
                     entry["plugins_enabled"] = sum(
@@ -863,4 +867,7 @@ class AutomationEngine:
             except Exception as exc:
                 entry["error"] = str(exc)
             result["accounts"].append(entry)
+
+        self._status_cache = result
+        self._status_cache_at = time.time()
         return result

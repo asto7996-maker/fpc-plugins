@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-from tg_bot import keyboards as KB
-
 
 def premium_main_menu():
+    from tg_bot import keyboards as KB
     return KB.main_menu()
 
 

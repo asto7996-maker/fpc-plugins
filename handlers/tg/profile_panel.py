@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import logging
+
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
 
 from config import VERSION, load_settings
@@ -11,6 +13,8 @@ from keyboards import cbt as CBT
 from tg_bot import keyboards as KB
 from utils.starvell_format import format_hold_balance, format_rub_balance
 from utils.tools import system_stats
+
+logger = logging.getLogger("starvell.profile")
 
 
 async def build_profile_brief(ctx: Any) -> tuple[str, InlineKeyboardMarkup]:
@@ -116,8 +120,16 @@ def create_profile_router(ctx: Any):
             await call.message.edit_text("⏳ Загружаю профиль…")
         except Exception:
             pass
-        text, kb = await build_profile_brief(ctx)
-        await call.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+        try:
+            text, kb = await build_profile_brief(ctx)
+            await call.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+        except Exception as exc:
+            logger.exception("profile: %s", exc)
+            await call.message.edit_text(
+                f"❌ Не удалось загрузить профиль.\n<code>{exc}</code>\n\nПопробуйте /ping или /start",
+                parse_mode="HTML",
+                reply_markup=KB.back_menu(),
+            )
 
     @router.callback_query(F.data == CBT.PROFILE_DETAIL)
     async def cb_profile_detail(call: CallbackQuery) -> None:

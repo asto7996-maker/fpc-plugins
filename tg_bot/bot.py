@@ -91,6 +91,12 @@ class TelegramBot:
         self.bot = Bot(token=settings.bot_token)
         self.dp = Dispatcher()
         self.router = Router()
+        try:
+            from handlers.tg.middleware import register_tg_middleware
+            register_tg_middleware(self.dp)
+        except Exception as exc:
+            logger.warning("TG middleware: %s", exc)
+        self._register_error_handler()
         self._register_handlers()
         # Навигация ПЕРВОЙ — сбрасывает FSM на /start /menu /cancel
         try:
@@ -132,9 +138,23 @@ class TelegramBot:
         else:
             await message_or_call.answer(text)
 
+    def _register_error_handler(self) -> None:
+        @self.dp.errors()
+        async def on_error(event) -> None:
+            logger.exception("Telegram handler error: %s", getattr(event, "exception", event))
+            upd = getattr(event, "update", None)
+            try:
+                if upd and upd.callback_query:
+                    await upd.callback_query.answer("❌ Ошибка. Попробуйте /start", show_alert=True)
+                elif upd and upd.message:
+                    await upd.message.answer("❌ Ошибка бота. Отправьте /start")
+            except Exception:
+                pass
+
     def _register_handlers(self) -> None:
         r = self.router
         r.message.register(self.cmd_start, CommandStart())
+        r.message.register(self.cmd_ping, Command("ping"))
         r.message.register(self.cmd_menu, Command("menu"))
         r.message.register(self.cmd_help, Command("help"))
         r.message.register(self.cmd_status, Command("status"))
@@ -246,6 +266,11 @@ class TelegramBot:
             return
 
         await message.answer(await self._main_text(), parse_mode="HTML", reply_markup=self._main_kb())
+
+    async def cmd_ping(self, message: Message) -> None:
+        if not await self._has_access(message.from_user.id):
+            return
+        await message.answer("🏓 Pong — бот онлайн")
 
     async def cmd_menu(self, message: Message) -> None:
         if not await self._has_access(message.from_user.id):
@@ -973,6 +998,7 @@ class TelegramBot:
             {"command": "export", "description": "Текущие данные"},
             {"command": "parser", "description": "Парсер FunPay"},
             {"command": "restart", "description": "Перезапуск бота"},
+            {"command": "ping", "description": "Проверка связи"},
             {"command": "cancel", "description": "Отмена / в меню"},
             {"command": "help", "description": "Справка"},
         ]
