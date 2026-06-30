@@ -39,7 +39,7 @@ from starvell_sdk import (
 )
 
 NAME = "VexBoost AutoSMM"
-VERSION = "4.1.0"
+VERSION = "5.0.0"
 DESCRIPTION = "Автонакрутка SMM через VexBoost для Starvell"
 CREDITS = "@xei1y"
 UUID = "a3f8c2e1-7b4d-4a9f-9e2c-1d5b8f6a0c3e"
@@ -244,6 +244,11 @@ def _order_description(order: dict) -> str:
         str(order.get("productName") or ""),
         str(order.get("title") or ""),
     ]
+    # Lumus pageProps может содержать описание в корне
+    for key in ("description", "briefDescription", "lotDescription"):
+        val = order.get(key)
+        if val:
+            parts.append(str(val))
     return "\n".join(p for p in parts if p)
 
 
@@ -1087,13 +1092,20 @@ class Plugin(StarvellPlugin):
                 return service_id, qty
 
         candidates: list[dict] = [order]
-        if order_id and hasattr(api, "fetch_order"):
-            try:
-                full = await api.fetch_order(order_id)
-                if full:
-                    candidates.append({**order, **full})
-            except Exception as exc:
-                self.log("_resolve_lot fetch_order #%s: %s", order_id, exc, level="warning")
+
+        if order_id:
+            fetch_fn = getattr(api, "fetch_order_details", None) or getattr(api, "fetch_order", None)
+            if fetch_fn:
+                try:
+                    details = await fetch_fn(order_id)
+                    if details:
+                        inner = details.get("order") or details.get("orderDetails") or {}
+                        if isinstance(inner, dict) and inner:
+                            candidates.append({**details, **inner})
+                        else:
+                            candidates.append(details)
+                except Exception as exc:
+                    self.log("_resolve_lot details #%s: %s", order_id, exc, level="warning")
 
         if offer_id and hasattr(api, "fetch_offer"):
             try:
@@ -1108,7 +1120,7 @@ class Plugin(StarvellPlugin):
             if parsed:
                 if offer_id:
                     mult = parsed[1] // max(1, int(order.get("quantity") or 1))
-                    self._lot_cache_set(offer_id, parsed[0], mult)
+                    self._lot_cache_set(offer_id, parsed[0], max(1, mult))
                 self.log("ID услуги найден для заказа #%s → %s", order_id or "?", parsed[0])
                 return parsed
 
@@ -1199,6 +1211,17 @@ class Plugin(StarvellPlugin):
             api = ctx.api()
             if api:
                 entry["chat_id"] = await api.find_chat_by_buyer(int(ctx.buyer_id)) or ""
+        if not entry["chat_id"] and ctx.order_id:
+            api = ctx.api() or self.core.get_api(ctx.account_name)
+            if api and hasattr(api, "fetch_order_details"):
+                try:
+                    details = await api.fetch_order_details(ctx.order_id)
+                    chat_block = details.get("chat") or {}
+                    cid = chat_block.get("id")
+                    if cid:
+                        entry["chat_id"] = str(cid)
+                except Exception as exc:
+                    self.log("chat from order details #%s: %s", ctx.order_id, exc, level="debug")
         waiting.append(entry)
         _save_json("waiting.json", waiting)
         StatisticsManager.record_created(service_id, float(price_rub))
@@ -1311,7 +1334,20 @@ class Plugin(StarvellPlugin):
     async def on_new_order(self, ctx: OrderContext) -> None:
         if not await self._enabled():
             return
-        parsed = await self._resolve_lot(ctx.order, ctx.account_name)
+        order = dict(ctx.order)
+        api = ctx.api() or self.core.get_api(ctx.account_name)
+        if api and hasattr(api, "fetch_order_details"):
+            try:
+                details = await api.fetch_order_details(ctx.order_id)
+                if details:
+                    inner = details.get("order") or details.get("orderDetails") or {}
+                    order = {**order, **details, **(inner if isinstance(inner, dict) else {})}
+                    chat_block = details.get("chat") or {}
+                    if chat_block.get("id") and not ctx.chat_id:
+                        ctx.chat_id = str(chat_block["id"])
+            except Exception as exc:
+                self.log("fetch_order_details #%s: %s", ctx.order_id, exc, level="warning")
+        parsed = await self._resolve_lot(order, ctx.account_name)
         if not parsed:
             self.log("Заказ #%s: ID: не найден в описании лота", ctx.order_id, level="warning")
             await ctx.notify(

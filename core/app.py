@@ -47,6 +47,7 @@ class Application:
         self.plugin_engine = PluginEngine(self.core)
         self.core.plugin_manager = self.plugin_engine
         self.plugin_engine.load_all()
+        await self.plugin_engine.dispatch_hook("BIND_TO_PRE_INIT", self.core)
 
         self.scheduler.start()
         self.automation = AutomationEngine(self.db, self.core)
@@ -87,6 +88,9 @@ class Application:
             for router in self.plugin_engine.get_tg_routers():
                 self.tg_bot.dp.include_router(router)
 
+        if self.plugin_engine:
+            await self.plugin_engine.dispatch_hook("BIND_TO_POST_INIT", self.core)
+
     async def start(self) -> None:
         assert self.automation and self.tg_bot and self.plugin_engine
         self._hot_reload_task = asyncio.create_task(self._watch_plugins())
@@ -100,8 +104,10 @@ class Application:
         """Автоматизация и плагины — в фоне, не блокируют Telegram."""
         assert self.automation and self.plugin_engine
         try:
+            await self.plugin_engine.dispatch_hook("BIND_TO_PRE_START", self.core)
             await self.automation.start()
             await self.plugin_engine.startup_starvell_plugins()
+            await self.plugin_engine.dispatch_hook("BIND_TO_POST_START", self.core)
             logger.info("Фоновые сервисы (automation + plugins) запущены")
         except Exception as exc:
             logger.exception("Ошибка фоновых сервисов: %s", exc)
@@ -136,6 +142,7 @@ class Application:
         if self.automation:
             await self.automation.stop()
         if self.plugin_engine:
+            await self.plugin_engine.dispatch_hook("BIND_TO_DELETE", self.core)
             await self.plugin_engine.shutdown_starvell_plugins()
             self.plugin_engine.unload_all()
         if self.tg_bot:

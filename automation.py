@@ -24,6 +24,8 @@ from core.plugins.context import (
     _resolve_order_price,
     format_rub,
 )
+from core.lsb.chats import extract_interlocutor, is_auto_message, message_author_id, message_text
+from core.lsb.events import NewMessageEvent, NewOrderEvent, OrderConfirmEvent, PaymentEvent
 from core.plugins.hooks import STV_BUMP, STV_MESSAGE, STV_ORDER_COMPLETED, STV_ORDER_PAID, STV_ORDER_STATUS, STV_POST_DELIVERY, STV_PRE_DELIVERY
 from core.security.payment_guard import PaymentGuard
 from plugin_manager import PluginContext
@@ -226,6 +228,7 @@ class AutomationEngine:
             status = str(order.get("status") or "")
             if not order_id:
                 continue
+            buyer = str((order.get("user") or {}).get("username") or "Покупатель")
 
             # Новый оплаченный заказ (CREATED)
             if status == "CREATED":
@@ -242,6 +245,14 @@ class AutomationEngine:
                 await self.db.set_order_status(order_id, status, account_name)
                 order_ctx = await self._build_order_ctx(account_name, order)
                 await self._emit_starvell(STV_ORDER_STATUS, order_ctx)
+                confirmed = status.lower() in {"completed", "confirmed", "done", "finished"}
+                prev_confirmed = (prev or "").lower() in {"completed", "confirmed", "done", "finished"}
+                if confirmed and not prev_confirmed:
+                    confirm_ev = OrderConfirmEvent(
+                        order_id=order_id, username=buyer,
+                        raw=order, account_name=account_name,
+                    )
+                    await self.cardinal.dispatch_plugins("BIND_TO_ORDER_CONFIRM", confirm_ev)
                 if status == "COMPLETED":
                     if await self.db.get_feature_flag("auto_review", settings.auto_review_enabled):
                         await self._handle_completed_order(account_name, api, settings, order)
@@ -273,7 +284,17 @@ class AutomationEngine:
             "notify_orders",
             order_id=order_id,
         )
-        await self.cardinal.dispatch_plugins("BIND_TO_NEW_ORDER", order)
+
+        payment_ev = PaymentEvent(
+            order_id=order_id, username=buyer, amount=float(price),
+            raw=order, account_name=account_name,
+        )
+        new_order_ev = NewOrderEvent(
+            order_id=order_id, username=buyer, lot_title=product_name,
+            price=float(price), raw=order, account_name=account_name,
+        )
+        await self.cardinal.dispatch_plugins("BIND_TO_PAYMENT", payment_ev)
+        await self.cardinal.dispatch_plugins("BIND_TO_NEW_ORDER", new_order_ev, order)
         await self.cardinal.events.emit("order:paid", {"order": order, "account": account_name})
 
         order_ctx = await self._build_order_ctx(account_name, order)
@@ -439,48 +460,28 @@ class AutomationEngine:
             logger.warning("bootstrap_orders %s: %s", account_name, exc)
 
     async def _bootstrap_chats(self, account_name: str, api: StarvellAPI, my_user_id: int | None) -> None:
-        """Фиксирует текущие сообщения как уже прочитанные — бот реагирует только на новые."""
+        """Фиксирует lastMessage каждого чата (как Lumus LSB baseline)."""
         try:
             chats = await api.fetch_chats()
             for chat in chats:
                 chat_id = str(chat.get("id") or "")
                 if not chat_id:
                     continue
-
-                participants = chat.get("participants") or []
-                interlocutor_id = None
-                for p in participants:
-                    pid = (p or {}).get("id")
-                    if my_user_id and pid != my_user_id:
-                        interlocutor_id = pid
-                        break
-
-                messages = await api.fetch_messages(chat_id, limit=30, interlocutor_id=interlocutor_id)
-                if not messages:
+                last_msg = chat.get("lastMessage")
+                if not isinstance(last_msg, dict):
                     continue
-
-                sorted_msgs = sorted(messages, key=_message_ts)
-                latest = sorted_msgs[-1]
-                latest_id = _message_id(latest)
+                latest_id = _message_id(last_msg)
                 if latest_id:
                     await self.db.set_last_notified_message(chat_id, latest_id, account_name)
-
-                last_buyer_ts = 0
-                for msg in reversed(sorted_msgs):
-                    author_id = msg.get("authorId") or msg.get("author")
-                    if my_user_id and author_id == my_user_id:
-                        continue
-                    text = str(msg.get("content") or msg.get("text") or "").strip()
-                    if not text:
-                        continue
-                    last_buyer_ts = _message_ts(msg) or int(time.time())
-                    break
-
-                if last_buyer_ts:
-                    await self.db.set_chat_last_user_message_at(chat_id, last_buyer_ts, account_name)
-
+                username, _ = extract_interlocutor(chat, my_user_id)
+                text = message_text(last_msg)
+                author_id = message_author_id(last_msg)
+                if text and (not my_user_id or author_id != my_user_id):
+                    await self.db.set_chat_last_user_message_at(
+                        chat_id, int(time.time()), account_name,
+                    )
             await self.db.set_chats_bootstrapped(account_name)
-            logger.info("[%s] Baseline чатов: %d шт. (старые сообщения игнорируются)", account_name, len(chats))
+            logger.info("[%s] Baseline чатов (Lumus): %d шт.", account_name, len(chats))
         except Exception as exc:
             logger.warning("bootstrap_chats %s: %s", account_name, exc)
 
@@ -541,6 +542,7 @@ class AutomationEngine:
                 await self._process_chats(account_name, api, settings, my_id)
             except Exception as exc:
                 logger.warning("chats_loop %s: %s", account_name, exc)
+            # Lumus LSB: requests_delay default 4s
             await asyncio.sleep(interval)
 
     def _iter_new_buyer_messages(
@@ -599,6 +601,7 @@ class AutomationEngine:
         settings: Settings,
         my_user_id: int | None,
     ) -> None:
+        """Мониторинг чатов через lastMessage (как Lumus Starvell Bot)."""
         chats = await api.fetch_chats()
         priority = _vexboost_priority_chat_ids()
         if priority:
@@ -606,121 +609,113 @@ class AutomationEngine:
                 chats,
                 key=lambda c: 0 if str(c.get("id") or "") in priority else 1,
             )
+
         for chat in chats:
             chat_id = str(chat.get("id") or "")
             if not chat_id:
                 continue
 
-            participants = chat.get("participants") or []
-            interlocutor_id = None
-            for p in participants:
-                pid = (p or {}).get("id")
-                if my_user_id and pid != my_user_id:
-                    interlocutor_id = pid
-                    break
+            last_msg = chat.get("lastMessage")
+            if not isinstance(last_msg, dict):
+                continue
 
-            messages = await api.fetch_messages(chat_id, limit=50, interlocutor_id=interlocutor_id)
+            mid = _message_id(last_msg)
+            if not mid:
+                continue
+
             last_notified = await self.db.get_last_notified_message(chat_id, account_name)
-            last_user_ts = await self.db.get_chat_last_user_message_at(chat_id, account_name)
-            batch_ids = {_message_id(m) for m in messages if _message_id(m)}
-            ts_fallback = (
-                last_user_ts
-                if last_notified and last_notified not in batch_ids
-                else None
+            if last_notified == mid:
+                continue
+
+            if is_auto_message(last_msg):
+                await self.db.set_last_notified_message(chat_id, mid, account_name)
+                continue
+
+            author_id = message_author_id(last_msg)
+            if my_user_id is not None and author_id is not None and author_id == my_user_id:
+                await self.db.set_last_notified_message(chat_id, mid, account_name)
+                continue
+
+            username, interlocutor_id = extract_interlocutor(chat, my_user_id)
+            text = message_text(last_msg)
+            if not text:
+                await self.db.set_last_notified_message(chat_id, mid, account_name)
+                continue
+
+            guard = self._payment_guard.inspect(text)
+            if guard.is_suspicious:
+                await self.notify(
+                    self._payment_guard.format_admin_alert(username, chat_id, text),
+                    "notify_chats",
+                    chat_id=chat_id,
+                )
+                await self.db.set_last_notified_message(chat_id, mid, account_name)
+                continue
+
+            prev_buyer_ts = await self.db.get_chat_last_user_message_at(chat_id, account_name)
+            msg_ts = _message_ts(last_msg) or int(time.time())
+            await self.db.set_chat_last_user_message_at(chat_id, msg_ts, account_name)
+
+            handled = await self._handlers.on_chat_message(
+                text=text, chat_id=chat_id, api=api, account_name=account_name,
+                author_id=author_id, username=username, settings=settings,
             )
 
-            if last_notified is None and await self.db.is_chats_bootstrapped(account_name):
-                boot_at = await self.db.get_chats_bootstrapped_at(account_name) or 0
-                has_old = any(
-                    boot_at and _message_ts(m) and _message_ts(m) <= boot_at
-                    for m in messages
-                )
-                if has_old:
-                    last_notified = await self._bootstrap_single_chat(
-                        account_name, api, chat_id, my_user_id, interlocutor_id, messages
-                    )
-                    if last_notified and not self._iter_new_buyer_messages(
-                        messages, last_notified, my_user_id, min_ts=ts_fallback,
-                    ):
-                        continue
+            msg_ctx = MessageContext(
+                core=self.cardinal,
+                account_name=account_name,
+                chat_id=chat_id,
+                text=text,
+                author_id=author_id,
+                username=username,
+                message_id=mid,
+                raw_message=last_msg,
+            )
+            await self._emit_starvell(STV_MESSAGE, msg_ctx)
+            plugin_handled = msg_ctx.handled
 
-            for msg in self._iter_new_buyer_messages(
-                messages, last_notified, my_user_id, min_ts=ts_fallback,
+            lsb_event = NewMessageEvent(
+                chat_id=chat_id,
+                username=username,
+                text=text,
+                interlocutor_id=interlocutor_id,
+                raw=chat,
+                message_id=mid,
+                account_name=account_name,
+            )
+            await self.cardinal.dispatch_plugins("BIND_TO_NEW_MESSAGE", lsb_event, text, chat_id)
+
+            if not await self.db.is_blacklisted(
+                username=username, starvell_user_id=author_id, check="block_notify"
             ):
-                mid = _message_id(msg)
-                author_id = msg.get("authorId") or msg.get("author")
-
-                username = ""
-                for p in participants:
-                    if (p or {}).get("id") == author_id:
-                        username = (p or {}).get("username") or ""
-                        break
-
-                text = str(msg.get("content") or msg.get("text") or "").strip()
-                guard = self._payment_guard.inspect(text)
-                if guard.is_suspicious:
-                    await self.notify(
-                        self._payment_guard.format_admin_alert(username, chat_id, text),
-                        "notify_chats",
-                        chat_id=chat_id,
-                    )
-                    await self.db.set_last_notified_message(chat_id, mid, account_name)
-                    continue
-
-                prev_buyer_ts = await self.db.get_chat_last_user_message_at(chat_id, account_name)
-                msg_ts = _message_ts(msg) or int(time.time())
-                await self.db.set_chat_last_user_message_at(chat_id, msg_ts, account_name)
-
-                text = str(msg.get("content") or msg.get("text") or "").strip()
-                handled = await self._handlers.on_chat_message(
-                    text=text, chat_id=chat_id, api=api, account_name=account_name,
-                    author_id=author_id, username=username, settings=settings,
-                )
-
-                msg_ctx = MessageContext(
-                    core=self.cardinal,
-                    account_name=account_name,
+                preview = text[:300]
+                asyncio.create_task(self.notify(
+                    f"💬 <b>Новое сообщение</b> от {username or 'покупателя'}\n"
+                    f"<i>{preview}</i>",
+                    "notify_chats",
                     chat_id=chat_id,
-                    text=text,
-                    author_id=author_id,
-                    username=username,
-                    message_id=mid or "",
-                    raw_message=msg,
+                ))
+
+            if not handled and not plugin_handled:
+                await self._handlers.on_welcome(
+                    chat_id=chat_id,
+                    api=api,
+                    settings=settings,
+                    account_name=account_name,
+                    previous_buyer_message_at=prev_buyer_ts,
                 )
-                await self._emit_starvell(STV_MESSAGE, msg_ctx)
-                plugin_handled = msg_ctx.handled
 
-                if not await self.db.is_blacklisted(
-                    username=username, starvell_user_id=author_id, check="block_notify"
-                ):
-                    preview = text[:300]
-                    asyncio.create_task(self.notify(
-                        f"💬 <b>Новое сообщение</b> от {username or 'покупателя'}\n"
-                        f"<i>{preview}</i>",
-                        "notify_chats",
-                        chat_id=chat_id,
-                    ))
+            if not plugin_handled and await self.db.get_feature_flag("ai_replies", settings.ai_replies_enabled):
+                history = await api.fetch_messages(chat_id, limit=20, interlocutor_id=interlocutor_id)
+                await self._maybe_ai_reply(account_name, api, settings, chat_id, text, history)
 
-                if not handled and not plugin_handled:
-                    await self._handlers.on_welcome(
-                        chat_id=chat_id,
-                        api=api,
-                        settings=settings,
-                        account_name=account_name,
-                        previous_buyer_message_at=prev_buyer_ts,
-                    )
-
-                if not plugin_handled and await self.db.get_feature_flag("ai_replies", settings.ai_replies_enabled):
-                    await self._maybe_ai_reply(account_name, api, settings, chat_id, text, messages)
-
-                ctx = PluginContext(api, self.db, settings, account_name)
-                ctx.chat_id = chat_id
-                ctx.message_author_id = author_id
-                await self.cardinal.event_manager.dispatch(
-                    "on_message", {"message": text, "chat_id": chat_id, "ctx": ctx}
-                )
-                await self.cardinal.dispatch_plugins("BIND_TO_NEW_MESSAGE", text, chat_id)
-                await self.db.set_last_notified_message(chat_id, mid, account_name)
+            ctx = PluginContext(api, self.db, settings, account_name)
+            ctx.chat_id = chat_id
+            ctx.message_author_id = author_id
+            await self.cardinal.event_manager.dispatch(
+                "on_message", {"message": text, "chat_id": chat_id, "ctx": ctx}
+            )
+            await self.db.set_last_notified_message(chat_id, mid, account_name)
 
     async def _maybe_ai_reply(
         self,

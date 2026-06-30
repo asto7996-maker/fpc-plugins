@@ -97,8 +97,8 @@ class Settings:
     review_use_gemini: bool = True
 
     # Тайминги
-    chat_poll_interval: float = 3.0
-    orders_poll_interval: float = 5.0
+    chat_poll_interval: float = 4.0
+    orders_poll_interval: float = 4.0
     bump_interval: float = 3600.0
     bump_jitter_min: int = -30
     bump_jitter_max: int = 45

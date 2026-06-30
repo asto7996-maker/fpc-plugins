@@ -9,6 +9,8 @@ import asyncio
 import json
 import logging
 import re
+import secrets
+import string
 import time
 from typing import Any
 
@@ -221,11 +223,25 @@ class StarvellAPI:
         return (data.get("pageProps") or {}).get("orders") or []
 
     async def fetch_order(self, order_id: str) -> dict[str, Any]:
-        """Полная карточка заказа (описание лота с ID: / #Quan:)."""
+        """Полная карточка заказа (pageProps как в Lumus LSB)."""
+        details = await self.fetch_order_details(order_id)
+        if not details:
+            return {}
+        order = details.get("order") or details.get("orderDetails") or {}
+        if isinstance(order, dict) and order:
+            merged = {**details, **order}
+            if details.get("offerDetails"):
+                merged["offerDetails"] = details["offerDetails"]
+            if details.get("offer"):
+                merged["offer"] = details["offer"]
+            return merged
+        return details
+
+    async def fetch_order_details(self, order_id: str) -> dict[str, Any]:
+        """pageProps страницы заказа (Lumus: Account.fetch_order_details)."""
         oid = str(order_id or "").strip()
         if not oid:
             return {}
-        merged: dict[str, Any] = {}
         for path, referer in (
             (f"order/{oid}.json", f"{BASE_URL}/order/{oid}"),
             (f"account/sells/{oid}.json", f"{BASE_URL}/account/sells"),
@@ -233,26 +249,15 @@ class StarvellAPI:
             try:
                 data = await self._next_data_get(path, referer)
                 props = data.get("pageProps") or {}
-                order = props.get("order") or props.get("orderDetails") or {}
-                if isinstance(order, dict) and order:
-                    merged = {**merged, **order}
-                for key in ("offerDetails", "offer", "bff"):
-                    val = props.get(key)
-                    if isinstance(val, dict) and val:
-                        if key == "bff" and isinstance(val.get("order"), dict):
-                            merged = {**merged, **val["order"]}
-                        elif key in ("offerDetails", "offer"):
-                            merged[key] = {**(merged.get(key) or {}), **val}
+                if isinstance(props, dict) and props:
+                    return props
             except Exception as exc:
-                logger.debug("fetch_order path %s #%s: %s", path, oid[:12], exc)
-        if merged:
-            return merged
+                logger.debug("fetch_order_details path %s #%s: %s", path, oid[:12], exc)
         try:
             data = await self._next_data_get(f"order/{oid}.json", f"{BASE_URL}/order/{oid}")
-            props = data.get("pageProps") or {}
-            return props if isinstance(props, dict) else {}
+            return data.get("pageProps") or {}
         except Exception as exc:
-            logger.warning("fetch_order %s: %s", oid[:12], exc)
+            logger.warning("fetch_order_details %s: %s", oid[:12], exc)
             return {}
 
     @staticmethod
@@ -409,17 +414,45 @@ class StarvellAPI:
                 return items
         return []
 
+    @staticmethod
+    def _client_socket_id() -> str:
+        alphabet = string.ascii_letters + string.digits
+        return "".join(secrets.choice(alphabet) for _ in range(20))
+
     async def send_message(self, chat_id: str, content: str) -> dict[str, Any]:
-        """Отправляет текстовое сообщение в чат Starvell."""
+        """Отправляет текстовое сообщение в чат Starvell (Lumus: clientSocketId обязателен)."""
         resp = await self._request(
             "POST",
             f"{BASE_URL}/api/messages/send",
             referer=f"{BASE_URL}/chat/{chat_id}",
-            json_body={"chatId": chat_id, "content": content},
+            json_body={
+                "chatId": chat_id,
+                "clientSocketId": self._client_socket_id(),
+                "content": content,
+            },
         )
         if resp.status_code >= 400:
             raise RuntimeError(f"HTTP {resp.status_code}: {resp.text}")
-        return resp.json()
+        try:
+            return resp.json()
+        except Exception:
+            return {"status": resp.status_code}
+
+    async def mark_seller_completed(self, order_id: str) -> bool:
+        """Отметить заказ выполненным продавцом (Lumus LSB)."""
+        oid = str(order_id or "").strip()
+        if not oid:
+            return False
+        resp = await self._request(
+            "POST",
+            f"{BASE_URL}/api/orders/{oid}/mark-seller-completed",
+            referer=f"{BASE_URL}/order/{oid}",
+            json_body={"id": oid},
+        )
+        ok = 200 <= resp.status_code < 300
+        if not ok:
+            logger.warning("mark_seller_completed #%s: HTTP %s %s", oid, resp.status_code, resp.text[:200])
+        return ok
 
     async def find_chat_by_buyer(self, buyer_id: int) -> str | None:
         """Находит chat_id по ID покупателя."""
