@@ -97,6 +97,8 @@ async def fetch_category_catalog(game_slug: str, category_slug: str) -> dict[str
         "autoDelivery": category.get("autoDelivery"),
         "game_slug": game_slug,
         "category_slug": category_slug,
+        "filters": category.get("filters") or [],
+        "numericFilters": category.get("numericFilters") or [],
         "subCategories": category.get("subCategories") or [],
     }
     _CATALOG_CACHE[cache_key] = (now, result)
@@ -151,113 +153,151 @@ def pick_subcategory(catalog: dict[str, Any], *hint_texts: str) -> dict[str, Any
 MAX_NUMERIC_ATTRIBUTES = 50
 
 
-def _template_attribute_map(template_offer: dict[str, Any] | None) -> dict[str, dict[str, Any]]:
-    if not template_offer:
-        return {}
-    result: dict[str, dict[str, Any]] = {}
-    for key in ("attributes", "basicAttributes", "numericAttributes"):
-        for attr in template_offer.get(key) or []:
-            if isinstance(attr, dict) and attr.get("id"):
-                result[str(attr["id"])] = attr
-    return result
+def resolve_option_filters(
+    catalog: dict[str, Any],
+    subcategory: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    """Option-фильтры: подкатегория, иначе категория (как на сайте Starvell)."""
+    if subcategory:
+        subs = [f for f in (subcategory.get("filters") or []) if isinstance(f, dict)]
+        if subs:
+            return subs
+    return [f for f in (catalog.get("filters") or []) if isinstance(f, dict)]
 
 
-def _option_filter_ids(subcategory: dict[str, Any] | None) -> set[str]:
-    if not subcategory:
-        return set()
-    return {
-        str(filt["id"])
-        for filt in (subcategory.get("filters") or [])
-        if isinstance(filt, dict) and filt.get("id")
-    }
+def resolve_numeric_filters(
+    catalog: dict[str, Any],
+    subcategory: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    """Числовые фильтры: подкатегория, иначе категория."""
+    if subcategory:
+        sub_nf = [f for f in (subcategory.get("numericFilters") or []) if isinstance(f, dict)]
+        if sub_nf:
+            return sub_nf
+    return [f for f in (catalog.get("numericFilters") or []) if isinstance(f, dict)]
+
+
+def _option_filter_ids(subcategory: dict[str, Any] | None, catalog: dict[str, Any] | None = None) -> set[str]:
+    filters = resolve_option_filters(catalog or {}, subcategory)
+    return {str(filt["id"]) for filt in filters if filt.get("id")}
+
+
+def _pick_option_for_filter(filt: dict[str, Any], hint_text: str) -> dict[str, Any] | None:
+    options = [
+        o for o in (filt.get("options") or [])
+        if isinstance(o, dict) and not o.get("redirectSlug") and not o.get("isHidden")
+    ]
+    if not options:
+        return None
+    chosen = options[-1]
+    for opt in options:
+        name = _norm(str(opt.get("nameRu") or ""))
+        if "обычн" in name or "regular" in name:
+            chosen = opt
+            break
+    text_l = _norm(hint_text)
+    if any(k in text_l for k in ("premium", "прем", "telegram premium", "тг прем")):
+        for opt in options:
+            name = _norm(str(opt.get("nameRu") or ""))
+            if "premium" in name or "прем" in name:
+                chosen = opt
+                break
+    else:
+        for opt in options:
+            name = _norm(str(opt.get("nameRu") or ""))
+            if name and name in text_l:
+                chosen = opt
+                break
+    return chosen
 
 
 def build_basic_attributes(
+    catalog: dict[str, Any],
     subcategory: dict[str, Any] | None,
     *,
-    template_offer: dict[str, Any] | None = None,
     hint_text: str = "",
 ) -> list[dict[str, Any]]:
-    allowed = _option_filter_ids(subcategory)
-    if template_offer and allowed:
-        attrs: list[dict[str, Any]] = []
-        for attr in template_offer.get("attributes") or template_offer.get("basicAttributes") or []:
-            if not isinstance(attr, dict):
-                continue
-            if str(attr.get("id") or "") not in allowed:
-                continue
-            if attr.get("optionId"):
-                attrs.append({"id": attr["id"], "optionId": attr["optionId"]})
-        if attrs:
-            return attrs
-
-    if not subcategory:
-        return []
-
-    text = _norm(hint_text)
+    """Option-атрибуты только из каталога Starvell (без шаблона лота)."""
     result: list[dict[str, Any]] = []
-    for filt in subcategory.get("filters") or []:
-        if not isinstance(filt, dict):
-            continue
-        options = [
-            o for o in (filt.get("options") or [])
-            if isinstance(o, dict) and not o.get("redirectSlug") and not o.get("isHidden")
-        ]
-        if not options:
-            continue
-        chosen = options[-1]
-        for opt in options:
-            name = _norm(str(opt.get("nameRu") or ""))
-            if "обычн" in name or "regular" in name:
-                chosen = opt
-                break
-        text_l = _norm(hint_text)
-        if any(k in text_l for k in ("premium", "прем", "telegram premium", "тг прем")):
-            for opt in options:
-                name = _norm(str(opt.get("nameRu") or ""))
-                if "premium" in name or "прем" in name:
-                    chosen = opt
-                    break
-        else:
-            for opt in options:
-                name = _norm(str(opt.get("nameRu") or ""))
-                if name and name in text_l:
-                    chosen = opt
-                    break
-        result.append({"id": filt["id"], "optionId": chosen["id"]})
+    for filt in resolve_option_filters(catalog, subcategory):
+        chosen = _pick_option_for_filter(filt, hint_text)
+        if chosen and filt.get("id"):
+            result.append({"id": filt["id"], "optionId": chosen["id"]})
     return result
 
 
 def build_numeric_attributes(
+    catalog: dict[str, Any],
     subcategory: dict[str, Any] | None,
-    *,
-    template_offer: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
-    """Числовые атрибуты только для numericFilters текущей подкатегории."""
-    if not subcategory:
-        return []
-
-    filters = [
-        filt for filt in (subcategory.get("numericFilters") or [])
-        if isinstance(filt, dict) and filt.get("id")
-    ]
+    """Числовые атрибуты только из numericFilters каталога."""
+    filters = resolve_numeric_filters(catalog, subcategory)
     if not filters:
         return []
 
-    attr_map = _template_attribute_map(template_offer)
     result: list[dict[str, Any]] = []
     for filt in filters[:MAX_NUMERIC_ATTRIBUTES]:
         filt_id = str(filt["id"])
-        raw_value = None
-        if filt_id in attr_map:
-            raw_value = attr_map[filt_id].get("numericValue")
-        if raw_value is None:
-            raw_value = (filt.get("range") or {}).get("min", 1)
+        raw_value = (filt.get("range") or {}).get("min", 1)
         try:
             result.append({"id": filt_id, "numericValue": float(raw_value)})
         except (TypeError, ValueError):
             continue
     return result
+
+
+def sanitize_create_attributes(
+    payload: dict[str, Any],
+    catalog: dict[str, Any],
+    subcategory: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """
+    Жёсткая очистка атрибутов перед POST /api/offers/create.
+    Starvell отклоняет >50 числовых — убираем всё лишнее из шаблона/мусора.
+    """
+    allowed_option = _option_filter_ids(subcategory, catalog)
+    allowed_numeric = {
+        str(f["id"]) for f in resolve_numeric_filters(catalog, subcategory) if f.get("id")
+    }
+
+    basic: list[dict[str, Any]] = []
+    seen_option: set[str] = set()
+    for item in payload.get("basicAttributes") or []:
+        if not isinstance(item, dict):
+            continue
+        aid = str(item.get("id") or "")
+        if aid not in allowed_option or not item.get("optionId") or "numericValue" in item:
+            continue
+        if aid in seen_option:
+            continue
+        seen_option.add(aid)
+        basic.append({"id": aid, "optionId": item["optionId"]})
+
+    numeric: list[dict[str, Any]] = []
+    seen_numeric: set[str] = set()
+    for source_key in ("attributes", "numericAttributes"):
+        for item in payload.get(source_key) or []:
+            if not isinstance(item, dict):
+                continue
+            aid = str(item.get("id") or "")
+            if aid not in allowed_numeric or item.get("numericValue") is None:
+                continue
+            if aid in seen_numeric:
+                continue
+            try:
+                seen_numeric.add(aid)
+                numeric.append({"id": aid, "numericValue": float(item["numericValue"])})
+            except (TypeError, ValueError):
+                continue
+
+    cleaned = dict(payload)
+    cleaned["basicAttributes"] = basic
+    cleaned.pop("numericAttributes", None)
+    if numeric:
+        cleaned["attributes"] = numeric[:MAX_NUMERIC_ATTRIBUTES]
+    else:
+        cleaned.pop("attributes", None)
+    return cleaned
 
 
 async def resolve_slugs_for_category(category_id: int, game_id: int = 0) -> tuple[str, str]:

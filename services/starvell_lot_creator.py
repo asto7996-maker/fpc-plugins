@@ -19,6 +19,7 @@ from services.starvell_catalog import (
     fetch_category_catalog,
     pick_subcategory,
     resolve_slugs_for_category,
+    sanitize_create_attributes,
 )
 from starvell_api import StarvellAPI, BASE_URL, StarvellAPIError
 
@@ -100,24 +101,25 @@ async def build_create_payload(
     offer_type = str(catalog.get("offerType") or "LOT")
 
     sub_category_id = None
-    if template_offer:
-        sub_category_id = template_offer.get("subCategoryId") or (
-            (template_offer.get("subCategory") or {}).get("id")
-        )
-
     subcategory = None
     subs = catalog.get("subCategories") or []
     if subs:
-        if sub_category_id:
-            subcategory = next((s for s in subs if int(s.get("id") or 0) == int(sub_category_id)), None)
-        if not subcategory:
-            subcategory = pick_subcategory(
-                catalog,
-                lot.funpay_service_type,
-                lot.title,
-                lot.brief_ru,
-                lot.funpay_category_title,
+        subcategory = pick_subcategory(
+            catalog,
+            lot.funpay_service_type,
+            lot.title,
+            lot.brief_ru,
+            lot.funpay_category_title,
+        )
+        if not subcategory and template_offer:
+            template_sub_id = template_offer.get("subCategoryId") or (
+                (template_offer.get("subCategory") or {}).get("id")
             )
+            if template_sub_id:
+                subcategory = next(
+                    (s for s in subs if int(s.get("id") or 0) == int(template_sub_id)),
+                    None,
+                )
         if subcategory:
             sub_category_id = subcategory.get("id")
         elif len(subs) == 1:
@@ -133,14 +135,11 @@ async def build_create_payload(
         )
 
     basic_attributes = build_basic_attributes(
+        catalog,
         subcategory,
-        template_offer=template_offer,
         hint_text=_hint_blob(lot),
     )
-    numeric_attributes = build_numeric_attributes(
-        subcategory,
-        template_offer=template_offer,
-    )
+    numeric_attributes = build_numeric_attributes(catalog, subcategory)
 
     brief_enabled = catalog.get("isBriefDescriptionEnabled", True)
     descriptions: dict[str, Any] = {
@@ -166,9 +165,17 @@ async def build_create_payload(
     if sub_category_id:
         payload["subCategoryId"] = int(sub_category_id)
     if numeric_attributes:
-        payload["numericAttributes"] = numeric_attributes
+        payload["attributes"] = numeric_attributes
     if is_smm:
         payload["postPaymentMessage"] = DEFAULT_SMM_AFTER_PAYMENT
+
+    payload = sanitize_create_attributes(payload, catalog, subcategory)
+    logger.info(
+        "create payload attrs: basic=%d numeric=%d sub=%s",
+        len(payload.get("basicAttributes") or []),
+        len(payload.get("attributes") or []),
+        sub_category_id,
+    )
 
     return payload
 

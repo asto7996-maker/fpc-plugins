@@ -12,6 +12,10 @@ REPO_URL="${REPO_URL:-https://github.com/asto7996-maker/fpc-plugins.git}"
 REPO_BRANCH="${REPO_BRANCH:-${1:-cursor/parser-auto-create-6ec3}}"
 
 echo "=== Обновление Starvell Cardinal (ветка: $REPO_BRANCH) ==="
+COMMIT_HINT="$(git ls-remote "$REPO_URL" "refs/heads/$REPO_BRANCH" 2>/dev/null | awk '{print $1}' | head -1)"
+if [ -n "$COMMIT_HINT" ]; then
+  echo "Коммит на GitHub: ${COMMIT_HINT:0:12}"
+fi
 
 if [ "$EUID" -ne 0 ]; then
   echo "Запустите: sudo bash update_starvell_cardinal.sh [ветка]"
@@ -50,6 +54,12 @@ rsync -a \
   --exclude='.git' --exclude='venv' --exclude='__pycache__' \
   --exclude='storage' --exclude='logs' --exclude='config/settings.json' \
   "$TMP/" "$INSTALL_DIR/"
+
+if grep -q 'sanitize_create_attributes' "$INSTALL_DIR/services/starvell_lot_creator.py" 2>/dev/null; then
+  echo "✅ Патч numeric attributes установлен"
+else
+  echo "⚠️  В коде нет sanitize_create_attributes — проверьте ветку $REPO_BRANCH"
+fi
 
 mkdir -p "$INSTALL_DIR"/{config,storage/plugins,logs,plugins}
 chown -R "$SERVICE_USER:$SERVICE_USER" "$INSTALL_DIR"

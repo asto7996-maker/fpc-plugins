@@ -417,6 +417,8 @@ class StarvellAPI:
         category_slug: str = "",
     ) -> dict[str, Any]:
         """POST /api/offers/create — создание нового лота."""
+        clean_payload = dict(payload)
+        clean_payload.pop("numericAttributes", None)
         if not referer and game_slug and category_slug:
             referer = f"{BASE_URL}/{game_slug}/{category_slug}/sell"
         elif not referer and category_id:
@@ -425,7 +427,7 @@ class StarvellAPI:
             "POST",
             f"{BASE_URL}/api/offers/create",
             referer=referer or f"{BASE_URL}/",
-            json_body=payload,
+            json_body=clean_payload,
         )
         result: dict[str, Any] = {"status": resp.status_code, "success": 200 <= resp.status_code < 300}
         body: dict[str, Any] = {}
