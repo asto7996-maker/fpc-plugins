@@ -97,6 +97,10 @@ ExecStart=$INSTALL_DIR/venv/bin/python $INSTALL_DIR/main.py
 Restart=always
 RestartSec=10
 Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=-$INSTALL_DIR/config/env
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=starvell-cardinal
 
 [Install]
 WantedBy=multi-user.target
@@ -105,7 +109,17 @@ EOF
 systemctl daemon-reload
 systemctl enable starvell-cardinal.service 2>/dev/null || true
 systemctl restart starvell-cardinal.service
-sleep 3
+sleep 5
+
+echo ""
+echo "=== Проверка BOT_TOKEN ==="
+if sudo -u "$SERVICE_USER" "$INSTALL_DIR/venv/bin/python" "$INSTALL_DIR/scripts/check_telegram_token.py"; then
+  echo "✅ Токен Telegram валиден"
+else
+  echo "❌ Проблема с BOT_TOKEN — см. выше"
+  echo "   Файл: $INSTALL_DIR/config/settings.json  (поле bot_token)"
+  echo "   Или:  $INSTALL_DIR/config/env  (строка BOT_TOKEN=...)"
+fi
 
 if systemctl is-active --quiet starvell-cardinal.service; then
   echo "✅ Сервис запущен"

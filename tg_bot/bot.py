@@ -5,11 +5,13 @@ Telegram-интерфейс Starvell Cardinal (стиль FunPay Cardinal).
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from typing import Any
 
 from aiogram import Bot, Dispatcher, F, Router
+from aiogram.exceptions import TelegramConflictError, TelegramUnauthorizedError
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -986,6 +988,7 @@ class TelegramBot:
                 logger.warning("notify %s: %s", uid, exc)
 
     async def start_polling(self) -> None:
+        """Запуск long-polling с проверкой токена и автоперезапуском."""
         commands = [
             {"command": "start", "description": "Главное меню"},
             {"command": "menu", "description": "Главное меню"},
@@ -1002,12 +1005,56 @@ class TelegramBot:
             {"command": "cancel", "description": "Отмена / в меню"},
             {"command": "help", "description": "Справка"},
         ]
-        try:
-            from aiogram.types import BotCommand
-            await self.bot.set_my_commands([BotCommand(**c) for c in commands])
-        except Exception as exc:
-            logger.warning("set_my_commands: %s", exc)
-        await self.dp.start_polling(self.bot)
+        retry_delay = 15
+        while True:
+            try:
+                me = await self.bot.get_me()
+                logger.info("Telegram OK: @%s (id=%s)", me.username, me.id)
+            except TelegramUnauthorizedError:
+                logger.error(
+                    "BOT_TOKEN неверный или отозван! "
+                    "Проверьте /opt/starvell-cardinal/config/settings.json "
+                    "или переменную BOT_TOKEN в systemd."
+                )
+                await asyncio.sleep(30)
+                continue
+            except Exception as exc:
+                logger.error("Telegram get_me: %s — повтор через %ss", exc, retry_delay)
+                await asyncio.sleep(retry_delay)
+                continue
+
+            try:
+                await self.bot.delete_webhook(drop_pending_updates=True)
+            except Exception as exc:
+                logger.warning("delete_webhook: %s", exc)
+
+            try:
+                from aiogram.types import BotCommand
+                await self.bot.set_my_commands([BotCommand(**c) for c in commands])
+            except Exception as exc:
+                logger.warning("set_my_commands: %s", exc)
+
+            logger.info("Запуск polling…")
+            try:
+                await self.dp.start_polling(self.bot, handle_signals=True)
+            except TelegramConflictError:
+                logger.error(
+                    "Conflict: другой процесс уже опрашивает этого бота! "
+                    "Выполните: pgrep -af 'main.py' и остановите дубликаты."
+                )
+                await asyncio.sleep(20)
+                continue
+            except TelegramUnauthorizedError:
+                logger.error("BOT_TOKEN отклонён Telegram при polling")
+                await asyncio.sleep(30)
+                continue
+            except Exception as exc:
+                logger.exception("Polling упал: %s", exc)
+                await asyncio.sleep(retry_delay)
+                continue
+
+            logger.warning("Polling остановился — перезапуск через %ss", retry_delay)
+            await asyncio.sleep(retry_delay)
 
     async def stop(self) -> None:
         await self.bot.session.close()
