@@ -14,6 +14,7 @@ from services.funpay_parser import (
 )
 from services.price_utils import format_price_display, format_starvell_api_price
 from services.starvell_catalog import (
+    BUILTIN_TELEGRAM_SUBSCRIBERS,
     PARSER_BUILD,
     apply_builtin_category_defaults,
     build_offer_attributes,
@@ -23,6 +24,7 @@ from services.starvell_catalog import (
     pick_subcategory,
     resolve_slugs_for_category,
     sanitize_create_attributes,
+    strip_all_attributes,
 )
 from starvell_api import StarvellAPI, BASE_URL, StarvellAPIError
 
@@ -132,7 +134,7 @@ async def build_create_payload(
             {},
         )
 
-    offer_attributes = build_offer_attributes(
+    basic_attributes, numeric_attributes = build_offer_attributes(
         catalog,
         subcategory,
         hint_text=_hint_blob(lot),
@@ -158,8 +160,10 @@ async def build_create_payload(
         "descriptions": descriptions,
         "goods": [],
     }
-    if offer_attributes:
-        payload["attributes"] = offer_attributes
+    if basic_attributes:
+        payload["basicAttributes"] = basic_attributes
+    if numeric_attributes:
+        payload["numericAttributes"] = numeric_attributes
     if sub_category_id:
         payload["subCategoryId"] = int(sub_category_id)
     if is_smm:
@@ -182,6 +186,33 @@ def offer_admin_url(offer_id: str | int, public_id: str | None = None) -> str:
     if not oid:
         return f"{BASE_URL}/"
     return f"{BASE_URL}/offers/{oid}"
+
+
+def _is_attribute_error(message: str) -> bool:
+    text = (message or "").lower()
+    return "атрибут" in text
+
+
+def _telegram_retry_payloads(base: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+    """Дополнительные варианты payload при ошибках атрибутов."""
+    attempts: list[tuple[str, dict[str, Any]]] = [
+        ("no-attrs", strip_all_attributes(base)),
+    ]
+    attempts.append(("builtin-basic", finalize_create_payload({
+        "type": base.get("type") or "LOT",
+        "categoryId": 175,
+        "subCategoryId": int(BUILTIN_TELEGRAM_SUBSCRIBERS["sub_category_id"]),
+        "price": base.get("price"),
+        "availability": base.get("availability", AVAILABILITY_LOT),
+        "isActive": True,
+        "autoDelivery": base.get("autoDelivery", True),
+        "instantDelivery": False,
+        "descriptions": base.get("descriptions") or {},
+        "goods": [],
+        "basicAttributes": list(BUILTIN_TELEGRAM_SUBSCRIBERS["basic_attributes"]),
+        **({"postPaymentMessage": base["postPaymentMessage"]} if base.get("postPaymentMessage") else {}),
+    })))
+    return attempts
 
 
 async def create_lot_from_parsed(
@@ -223,47 +254,45 @@ async def create_lot_from_parsed(
             category_slug=category_slug,
         )
 
-    try:
-        result = await _send(payload)
-    except StarvellAPIError as exc:
-        err_text = str(exc)
-        if int(category_id) == 175 and "Числовых" in err_text:
-            from services.starvell_catalog import BUILTIN_TELEGRAM_SUBSCRIBERS
+    attempts: list[tuple[str, dict[str, Any]]] = [("primary", payload)]
+    if int(category_id) == 175:
+        seen: set[str] = set()
+        for name, body in _telegram_retry_payloads(payload):
+            key = payload_attribute_stats(body)
+            if key in seen:
+                continue
+            seen.add(key)
+            if name != "primary":
+                attempts.append((name, body))
 
-            retry_payload = finalize_create_payload({
-                "type": payload.get("type") or "LOT",
-                "categoryId": 175,
-                "subCategoryId": int(BUILTIN_TELEGRAM_SUBSCRIBERS["sub_category_id"]),
-                "price": payload.get("price"),
-                "availability": payload.get("availability", AVAILABILITY_LOT),
-                "isActive": True,
-                "autoDelivery": payload.get("autoDelivery", True),
-                "instantDelivery": False,
-                "descriptions": payload.get("descriptions") or {},
-                "goods": [],
-                "attributes": list(BUILTIN_TELEGRAM_SUBSCRIBERS["attributes"]),
-                **({"postPaymentMessage": payload["postPaymentMessage"]} if payload.get("postPaymentMessage") else {}),
-            })
-            retry_stats = payload_attribute_stats(retry_payload)
-            logger.warning("create_offer retry minimal telegram (%s): was %s", retry_stats, stats)
-            try:
-                result = await _send(retry_payload)
-                payload = retry_payload
-                stats = retry_stats
-            except StarvellAPIError as retry_exc:
-                logger.warning("create_offer retry failed (%s): %s", retry_stats, retry_exc)
+    errors: list[str] = []
+    result: dict[str, Any] | None = None
+    for name, body in attempts:
+        stats = payload_attribute_stats(body)
+        try:
+            result = await _send(body)
+            payload = body
+            if name != "primary":
+                logger.info("create_offer succeeded on retry %s (%s)", name, stats)
+            break
+        except StarvellAPIError as exc:
+            err_line = f"{name}: {stats} → {exc}"
+            errors.append(err_line)
+            logger.warning("create_offer attempt failed: %s", err_line)
+            if not _is_attribute_error(str(exc)):
                 raise StarvellAPIError(
-                    retry_exc.status,
-                    f"{retry_exc}\n\n📊 Первая попытка: {stats}\n📊 Retry: {retry_stats}",
-                    retry_exc.body,
-                ) from retry_exc
-        else:
-            logger.warning("create_offer rejected (%s): %s", stats, exc)
-            raise StarvellAPIError(
-                exc.status,
-                f"{exc}\n\n📊 Отправлено: {stats}",
-                exc.body,
-            ) from exc
+                    exc.status,
+                    f"{exc}\n\n📊 Отправлено: {stats}",
+                    exc.body,
+                ) from exc
+
+    if result is None:
+        last_stats = payload_attribute_stats(attempts[-1][1]) if attempts else stats
+        raise StarvellAPIError(
+            400,
+            f"Starvell отклонил все варианты payload.\n\n📊 Последняя попытка: {last_stats}\n\n" + "\n".join(errors[-3:]),
+            {},
+        )
     offer_id = result.get("id") or result.get("offerId")
     public_id = result.get("publicId")
     return {
