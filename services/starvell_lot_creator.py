@@ -15,6 +15,7 @@ from services.funpay_parser import (
 from services.price_utils import format_price_display, format_starvell_api_price
 from services.starvell_catalog import (
     build_basic_attributes,
+    build_numeric_attributes,
     fetch_category_catalog,
     pick_subcategory,
     resolve_slugs_for_category,
@@ -136,17 +137,10 @@ async def build_create_payload(
         template_offer=template_offer,
         hint_text=_hint_blob(lot),
     )
-    numeric_attributes: list[dict[str, Any]] = []
-    if template_offer:
-        for attr in template_offer.get("numericAttributes") or []:
-            if isinstance(attr, dict) and attr.get("numericValue") is not None:
-                try:
-                    numeric_attributes.append({
-                        "id": attr.get("id"),
-                        "numericValue": float(attr.get("numericValue")),
-                    })
-                except (TypeError, ValueError):
-                    pass
+    numeric_attributes = build_numeric_attributes(
+        subcategory,
+        template_offer=template_offer,
+    )
 
     brief_enabled = catalog.get("isBriefDescriptionEnabled", True)
     descriptions: dict[str, Any] = {

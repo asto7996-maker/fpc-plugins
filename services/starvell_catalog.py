@@ -148,21 +148,46 @@ def pick_subcategory(catalog: dict[str, Any], *hint_texts: str) -> dict[str, Any
     return subs[0] if len(subs) == 1 else None
 
 
+MAX_NUMERIC_ATTRIBUTES = 50
+
+
+def _template_attribute_map(template_offer: dict[str, Any] | None) -> dict[str, dict[str, Any]]:
+    if not template_offer:
+        return {}
+    result: dict[str, dict[str, Any]] = {}
+    for key in ("attributes", "basicAttributes", "numericAttributes"):
+        for attr in template_offer.get(key) or []:
+            if isinstance(attr, dict) and attr.get("id"):
+                result[str(attr["id"])] = attr
+    return result
+
+
+def _option_filter_ids(subcategory: dict[str, Any] | None) -> set[str]:
+    if not subcategory:
+        return set()
+    return {
+        str(filt["id"])
+        for filt in (subcategory.get("filters") or [])
+        if isinstance(filt, dict) and filt.get("id")
+    }
+
+
 def build_basic_attributes(
     subcategory: dict[str, Any] | None,
     *,
     template_offer: dict[str, Any] | None = None,
     hint_text: str = "",
 ) -> list[dict[str, Any]]:
-    if template_offer:
+    allowed = _option_filter_ids(subcategory)
+    if template_offer and allowed:
         attrs: list[dict[str, Any]] = []
         for attr in template_offer.get("attributes") or template_offer.get("basicAttributes") or []:
             if not isinstance(attr, dict):
                 continue
+            if str(attr.get("id") or "") not in allowed:
+                continue
             if attr.get("optionId"):
                 attrs.append({"id": attr["id"], "optionId": attr["optionId"]})
-            elif attr.get("numericValue") is not None:
-                attrs.append({"id": attr["id"], "numericValue": attr["numericValue"]})
         if attrs:
             return attrs
 
@@ -200,6 +225,38 @@ def build_basic_attributes(
                     chosen = opt
                     break
         result.append({"id": filt["id"], "optionId": chosen["id"]})
+    return result
+
+
+def build_numeric_attributes(
+    subcategory: dict[str, Any] | None,
+    *,
+    template_offer: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Числовые атрибуты только для numericFilters текущей подкатегории."""
+    if not subcategory:
+        return []
+
+    filters = [
+        filt for filt in (subcategory.get("numericFilters") or [])
+        if isinstance(filt, dict) and filt.get("id")
+    ]
+    if not filters:
+        return []
+
+    attr_map = _template_attribute_map(template_offer)
+    result: list[dict[str, Any]] = []
+    for filt in filters[:MAX_NUMERIC_ATTRIBUTES]:
+        filt_id = str(filt["id"])
+        raw_value = None
+        if filt_id in attr_map:
+            raw_value = attr_map[filt_id].get("numericValue")
+        if raw_value is None:
+            raw_value = (filt.get("range") or {}).get("min", 1)
+        try:
+            result.append({"id": filt_id, "numericValue": float(raw_value)})
+        except (TypeError, ValueError):
+            continue
     return result
 
 

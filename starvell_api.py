@@ -314,6 +314,14 @@ class StarvellAPI:
                     return str(val).strip()
         return ""
 
+    @staticmethod
+    def _looks_like_offer(data: dict[str, Any]) -> bool:
+        if not isinstance(data, dict) or not data or data.get("offerNotFound"):
+            return False
+        if not (data.get("id") or data.get("publicId")):
+            return False
+        return any(key in data for key in ("categoryId", "descriptions", "type", "price"))
+
     async def fetch_offer(self, offer_id: str) -> dict[str, Any]:
         """Описание лота — для поиска ID: / #Quan: в тексте."""
         oid = str(offer_id or "").strip()
@@ -326,11 +334,10 @@ class StarvellAPI:
             try:
                 data = await self._next_data_get(path, referer)
                 props = data.get("pageProps") or {}
-                offer = props.get("offer") or props.get("offerDetails") or props.get("lot") or {}
-                if isinstance(offer, dict) and offer:
-                    return offer
-                if isinstance(props, dict) and props:
-                    return props
+                for key in ("offer", "offerDetails", "lot"):
+                    offer = props.get(key) or {}
+                    if self._looks_like_offer(offer):
+                        return offer
             except Exception as exc:
                 logger.debug("fetch_offer path %s: %s", path, exc)
         return {}
