@@ -420,6 +420,10 @@ class StarvellAPI:
         from services.starvell_catalog import finalize_create_payload
 
         clean_payload = finalize_create_payload(payload)
+        logger.debug(
+            "create_offer send: %s",
+            {k: (len(v) if isinstance(v, list) else type(v).__name__) for k, v in clean_payload.items()},
+        )
         if not referer and game_slug and category_slug:
             referer = f"{BASE_URL}/{game_slug}/{category_slug}/sell"
         elif not referer and category_id:

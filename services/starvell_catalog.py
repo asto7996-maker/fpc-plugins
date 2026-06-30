@@ -161,7 +161,7 @@ def pick_subcategory(catalog: dict[str, Any], *hint_texts: str) -> dict[str, Any
 
 
 MAX_NUMERIC_ATTRIBUTES = 50
-PARSER_BUILD = "attrs-v3"
+PARSER_BUILD = "attrs-v4"
 
 # FunPay Telegram «Подписчики» → Starvell category 175 / sub 634 (fallback без каталога)
 BUILTIN_TELEGRAM_SUBSCRIBERS: dict[str, Any] = {
@@ -169,7 +169,7 @@ BUILTIN_TELEGRAM_SUBSCRIBERS: dict[str, Any] = {
     "sub_category_id": 634,
     "game_slug": "telegram",
     "category_slug": "services",
-    "basic_attributes": [
+    "attributes": [
         {
             "id": "e07ea24f-a7f4-4d2f-b0b6-cf54f4523590",
             "optionId": "c3d131de-d283-485b-95ae-faff681d67b1",
@@ -271,55 +271,63 @@ def build_numeric_attributes(
     return result
 
 
+def build_offer_attributes(
+    catalog: dict[str, Any],
+    subcategory: dict[str, Any] | None,
+    *,
+    hint_text: str = "",
+) -> list[dict[str, Any]]:
+    """Единый массив attributes для Starvell (optionId + numericValue)."""
+    return [
+        *build_basic_attributes(catalog, subcategory, hint_text=hint_text),
+        *build_numeric_attributes(catalog, subcategory),
+    ]
+
+
 def sanitize_create_attributes(
     payload: dict[str, Any],
     catalog: dict[str, Any],
     subcategory: dict[str, Any] | None,
 ) -> dict[str, Any]:
     """
-    Жёсткая очистка атрибутов перед POST /api/offers/create.
-    Starvell отклоняет >50 числовых — убираем всё лишнее из шаблона/мусора.
+    Жёсткая очистка: один массив attributes, без basicAttributes/numericAttributes.
     """
     allowed_option = _option_filter_ids(subcategory, catalog)
     allowed_numeric = {
         str(f["id"]) for f in resolve_numeric_filters(catalog, subcategory) if f.get("id")
     }
 
-    basic: list[dict[str, Any]] = []
-    seen_option: set[str] = set()
-    for item in payload.get("basicAttributes") or []:
-        if not isinstance(item, dict):
-            continue
-        aid = str(item.get("id") or "")
-        if aid not in allowed_option or not item.get("optionId") or "numericValue" in item:
-            continue
-        if aid in seen_option:
-            continue
-        seen_option.add(aid)
-        basic.append({"id": aid, "optionId": item["optionId"]})
+    unified: list[dict[str, Any]] = []
+    seen: set[str] = set()
 
-    numeric: list[dict[str, Any]] = []
-    seen_numeric: set[str] = set()
-    for source_key in ("attributes", "numericAttributes"):
-        for item in payload.get(source_key) or []:
+    def _collect(items: Any) -> None:
+        if not isinstance(items, list):
+            return
+        for item in items:
             if not isinstance(item, dict):
                 continue
             aid = str(item.get("id") or "")
-            if aid not in allowed_numeric or item.get("numericValue") is None:
+            if not aid or aid in seen:
                 continue
-            if aid in seen_numeric:
-                continue
-            try:
-                seen_numeric.add(aid)
-                numeric.append({"id": aid, "numericValue": float(item["numericValue"])})
-            except (TypeError, ValueError):
-                continue
+            if item.get("optionId") and aid in allowed_option and "numericValue" not in item:
+                seen.add(aid)
+                unified.append({"id": aid, "optionId": str(item["optionId"])})
+            elif item.get("numericValue") is not None and aid in allowed_numeric:
+                try:
+                    seen.add(aid)
+                    unified.append({"id": aid, "numericValue": float(item["numericValue"])})
+                except (TypeError, ValueError):
+                    pass
+
+    _collect(payload.get("attributes"))
+    _collect(payload.get("basicAttributes"))
+    _collect(payload.get("numericAttributes"))
 
     cleaned = dict(payload)
-    cleaned["basicAttributes"] = basic
+    cleaned.pop("basicAttributes", None)
     cleaned.pop("numericAttributes", None)
-    if numeric:
-        cleaned["attributes"] = numeric[:MAX_NUMERIC_ATTRIBUTES]
+    if unified:
+        cleaned["attributes"] = unified[:MAX_NUMERIC_ATTRIBUTES]
     else:
         cleaned.pop("attributes", None)
     return cleaned
@@ -327,8 +335,7 @@ def sanitize_create_attributes(
 
 def finalize_create_payload(payload: dict[str, Any]) -> dict[str, Any]:
     """
-    Последняя линия защиты: только разрешённые поля, без attributes/numericAttributes.
-    basicAttributes — только {id, optionId}, без numericValue.
+    Финальный payload: только attributes (как на сайте Starvell), без legacy-полей.
     """
     allowed_keys = (
         "type",
@@ -341,39 +348,60 @@ def finalize_create_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "instantDelivery",
         "descriptions",
         "goods",
-        "basicAttributes",
+        "attributes",
         "postPaymentMessage",
     )
     out: dict[str, Any] = {k: payload[k] for k in allowed_keys if k in payload}
 
-    basic: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    for item in out.get("basicAttributes") or []:
-        if not isinstance(item, dict):
-            continue
-        aid = str(item.get("id") or "")
-        oid = item.get("optionId")
-        if not aid or not oid or "numericValue" in item or aid in seen:
-            continue
-        seen.add(aid)
-        basic.append({"id": aid, "optionId": str(oid)})
-    out["basicAttributes"] = basic[:MAX_NUMERIC_ATTRIBUTES]
-
+    option_attrs: list[dict[str, Any]] = []
     numeric_attrs: list[dict[str, Any]] = []
-    seen_num: set[str] = set()
-    for item in payload.get("attributes") or []:
-        if not isinstance(item, dict):
-            continue
-        aid = str(item.get("id") or "")
-        if not aid or item.get("numericValue") is None or item.get("optionId") or aid in seen_num:
-            continue
-        try:
-            seen_num.add(aid)
-            numeric_attrs.append({"id": aid, "numericValue": float(item["numericValue"])})
-        except (TypeError, ValueError):
-            continue
-    if numeric_attrs and len(numeric_attrs) <= 10:
-        out["attributes"] = numeric_attrs[:MAX_NUMERIC_ATTRIBUTES]
+    seen_option: set[str] = set()
+    seen_numeric: set[str] = set()
+
+    def _take_option(items: Any) -> None:
+        if not isinstance(items, list):
+            return
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            aid = str(item.get("id") or "")
+            if not aid or aid in seen_option:
+                continue
+            if item.get("optionId") and "numericValue" not in item:
+                seen_option.add(aid)
+                option_attrs.append({"id": aid, "optionId": str(item["optionId"])})
+
+    def _take_numeric(items: Any) -> None:
+        if not isinstance(items, list):
+            return
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            aid = str(item.get("id") or "")
+            if not aid or aid in seen_numeric or item.get("optionId"):
+                continue
+            if item.get("numericValue") is None:
+                continue
+            try:
+                seen_numeric.add(aid)
+                numeric_attrs.append({"id": aid, "numericValue": float(item["numericValue"])})
+            except (TypeError, ValueError):
+                pass
+
+    _take_option(out.get("attributes"))
+    _take_option(payload.get("attributes"))
+    _take_option(payload.get("basicAttributes"))
+    _take_numeric(out.get("attributes"))
+    _take_numeric(payload.get("attributes"))
+    # legacy numericAttributes / numericValue в basicAttributes — игнорируем
+
+    out.pop("basicAttributes", None)
+    out.pop("numericAttributes", None)
+    unified = option_attrs + numeric_attrs[:10]
+    if unified:
+        out["attributes"] = unified
+    else:
+        out.pop("attributes", None)
 
     if not out.get("goods"):
         out["goods"] = []
@@ -393,19 +421,28 @@ def apply_builtin_category_defaults(
         return payload
     if sub_category_id and int(sub_category_id) != int(builtin["sub_category_id"]):
         return payload
-    if payload.get("basicAttributes"):
+    if payload.get("attributes"):
         return payload
     result = dict(payload)
+    result.pop("basicAttributes", None)
+    result.pop("numericAttributes", None)
     result["subCategoryId"] = int(builtin["sub_category_id"])
-    result["basicAttributes"] = list(builtin["basic_attributes"])
+    result["attributes"] = list(builtin["attributes"])
     return result
 
 
 def payload_attribute_stats(payload: dict[str, Any]) -> str:
-    basic = len(payload.get("basicAttributes") or [])
-    attrs = len(payload.get("attributes") or [])
-    numeric_legacy = len(payload.get("numericAttributes") or [])
-    return f"basic={basic} attributes={attrs} numericLegacy={numeric_legacy} build={PARSER_BUILD}"
+    attrs = payload.get("attributes") or []
+    option_count = sum(1 for a in attrs if isinstance(a, dict) and a.get("optionId"))
+    numeric_count = sum(1 for a in attrs if isinstance(a, dict) and a.get("numericValue") is not None)
+    legacy_basic = len(payload.get("basicAttributes") or [])
+    legacy_numeric = len(payload.get("numericAttributes") or [])
+    keys = ",".join(sorted(payload.keys()))
+    return (
+        f"option={option_count} numeric={numeric_count} "
+        f"legacyBasic={legacy_basic} legacyNumeric={legacy_numeric} "
+        f"keys=[{keys}] build={PARSER_BUILD}"
+    )
 
 
 async def resolve_slugs_for_category(category_id: int, game_id: int = 0) -> tuple[str, str]:

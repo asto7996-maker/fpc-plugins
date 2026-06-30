@@ -16,8 +16,7 @@ from services.price_utils import format_price_display, format_starvell_api_price
 from services.starvell_catalog import (
     PARSER_BUILD,
     apply_builtin_category_defaults,
-    build_basic_attributes,
-    build_numeric_attributes,
+    build_offer_attributes,
     fetch_category_catalog,
     finalize_create_payload,
     payload_attribute_stats,
@@ -73,7 +72,6 @@ async def build_create_payload(
     game_id: int = 0,
     game_slug: str = "",
     category_slug: str = "",
-    template_offer: dict[str, Any] | None = None,
     auto_delivery: bool = True,
 ) -> dict[str, Any]:
     """Формирует тело POST /api/offers/create по схеме Starvell."""
@@ -115,15 +113,6 @@ async def build_create_payload(
             lot.brief_ru,
             lot.funpay_category_title,
         )
-        if not subcategory and template_offer:
-            template_sub_id = template_offer.get("subCategoryId") or (
-                (template_offer.get("subCategory") or {}).get("id")
-            )
-            if template_sub_id:
-                subcategory = next(
-                    (s for s in subs if int(s.get("id") or 0) == int(template_sub_id)),
-                    None,
-                )
         if not subcategory and int(category_id) == 175:
             subcategory = next(
                 (s for s in subs if int(s.get("id") or 0) == 634),
@@ -143,12 +132,11 @@ async def build_create_payload(
             {},
         )
 
-    basic_attributes = build_basic_attributes(
+    offer_attributes = build_offer_attributes(
         catalog,
         subcategory,
         hint_text=_hint_blob(lot),
     )
-    numeric_attributes = build_numeric_attributes(catalog, subcategory)
 
     brief_enabled = catalog.get("isBriefDescriptionEnabled", True)
     descriptions: dict[str, Any] = {
@@ -169,12 +157,11 @@ async def build_create_payload(
         "instantDelivery": False,
         "descriptions": descriptions,
         "goods": [],
-        "basicAttributes": basic_attributes,
     }
+    if offer_attributes:
+        payload["attributes"] = offer_attributes
     if sub_category_id:
         payload["subCategoryId"] = int(sub_category_id)
-    if numeric_attributes:
-        payload["attributes"] = numeric_attributes
     if is_smm:
         payload["postPaymentMessage"] = DEFAULT_SMM_AFTER_PAYMENT
 
@@ -212,12 +199,7 @@ async def create_lot_from_parsed(
     auto_delivery: bool = True,
 ) -> dict[str, Any]:
     """Создаёт лот на Starvell и возвращает ответ API + ссылку."""
-    template_offer: dict[str, Any] | None = None
-    if template_offer_id:
-        try:
-            template_offer = await api.fetch_offer(str(template_offer_id))
-        except Exception as exc:
-            logger.warning("template offer %s: %s", template_offer_id, exc)
+    _ = template_offer_id  # шаблон больше не используется — только каталог Starvell
 
     payload = await build_create_payload(
         lot,
@@ -228,20 +210,60 @@ async def create_lot_from_parsed(
         game_id=game_id,
         game_slug=game_slug,
         category_slug=category_slug,
-        template_offer=template_offer,
         auto_delivery=auto_delivery,
     )
     logger.debug("create_offer payload: %s", payload)
+    stats = payload_attribute_stats(payload)
+
+    async def _send(body: dict[str, Any]) -> dict[str, Any]:
+        return await api.create_offer(
+            body,
+            category_id=category_id,
+            game_slug=game_slug,
+            category_slug=category_slug,
+        )
+
     try:
-        result = await api.create_offer(payload, category_id=category_id, game_slug=game_slug, category_slug=category_slug)
+        result = await _send(payload)
     except StarvellAPIError as exc:
-        stats = payload_attribute_stats(payload)
-        logger.warning("create_offer rejected (%s): %s", stats, exc)
-        raise StarvellAPIError(
-            exc.status,
-            f"{exc}\n\n📊 Отправлено: {stats}",
-            exc.body,
-        ) from exc
+        err_text = str(exc)
+        if int(category_id) == 175 and "Числовых" in err_text:
+            from services.starvell_catalog import BUILTIN_TELEGRAM_SUBSCRIBERS
+
+            retry_payload = finalize_create_payload({
+                "type": payload.get("type") or "LOT",
+                "categoryId": 175,
+                "subCategoryId": int(BUILTIN_TELEGRAM_SUBSCRIBERS["sub_category_id"]),
+                "price": payload.get("price"),
+                "availability": payload.get("availability", AVAILABILITY_LOT),
+                "isActive": True,
+                "autoDelivery": payload.get("autoDelivery", True),
+                "instantDelivery": False,
+                "descriptions": payload.get("descriptions") or {},
+                "goods": [],
+                "attributes": list(BUILTIN_TELEGRAM_SUBSCRIBERS["attributes"]),
+                **({"postPaymentMessage": payload["postPaymentMessage"]} if payload.get("postPaymentMessage") else {}),
+            })
+            retry_stats = payload_attribute_stats(retry_payload)
+            logger.warning("create_offer retry minimal telegram (%s): was %s", retry_stats, stats)
+            try:
+                result = await _send(retry_payload)
+                payload = retry_payload
+                stats = retry_stats
+            except StarvellAPIError as retry_exc:
+                logger.warning("create_offer retry failed (%s): %s", retry_stats, retry_exc)
+                raise StarvellAPIError(
+                    retry_exc.status,
+                    f"{retry_exc}\n\n📊 Первая попытка: {stats}\n📊 Retry: {retry_stats}",
+                    retry_exc.body,
+                ) from retry_exc
+        else:
+            logger.warning("create_offer rejected (%s): %s", stats, exc)
+            raise StarvellAPIError(
+                exc.status,
+                f"{exc}\n\n📊 Отправлено: {stats}",
+                exc.body,
+            ) from exc
     offer_id = result.get("id") or result.get("offerId")
     public_id = result.get("publicId")
     return {
