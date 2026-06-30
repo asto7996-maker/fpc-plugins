@@ -14,9 +14,13 @@ from services.funpay_parser import (
 )
 from services.price_utils import format_price_display, format_starvell_api_price
 from services.starvell_catalog import (
+    PARSER_BUILD,
+    apply_builtin_category_defaults,
     build_basic_attributes,
     build_numeric_attributes,
     fetch_category_catalog,
+    finalize_create_payload,
+    payload_attribute_stats,
     pick_subcategory,
     resolve_slugs_for_category,
     sanitize_create_attributes,
@@ -120,6 +124,11 @@ async def build_create_payload(
                     (s for s in subs if int(s.get("id") or 0) == int(template_sub_id)),
                     None,
                 )
+        if not subcategory and int(category_id) == 175:
+            subcategory = next(
+                (s for s in subs if int(s.get("id") or 0) == 634),
+                None,
+            )
         if subcategory:
             sub_category_id = subcategory.get("id")
         elif len(subs) == 1:
@@ -170,12 +179,13 @@ async def build_create_payload(
         payload["postPaymentMessage"] = DEFAULT_SMM_AFTER_PAYMENT
 
     payload = sanitize_create_attributes(payload, catalog, subcategory)
-    logger.info(
-        "create payload attrs: basic=%d numeric=%d sub=%s",
-        len(payload.get("basicAttributes") or []),
-        len(payload.get("attributes") or []),
-        sub_category_id,
+    payload = apply_builtin_category_defaults(
+        payload,
+        category_id=int(category_id),
+        sub_category_id=int(sub_category_id) if sub_category_id else None,
     )
+    payload = finalize_create_payload(payload)
+    logger.info("create payload attrs: %s sub=%s", payload_attribute_stats(payload), sub_category_id)
 
     return payload
 
@@ -222,7 +232,16 @@ async def create_lot_from_parsed(
         auto_delivery=auto_delivery,
     )
     logger.debug("create_offer payload: %s", payload)
-    result = await api.create_offer(payload, category_id=category_id, game_slug=game_slug, category_slug=category_slug)
+    try:
+        result = await api.create_offer(payload, category_id=category_id, game_slug=game_slug, category_slug=category_slug)
+    except StarvellAPIError as exc:
+        stats = payload_attribute_stats(payload)
+        logger.warning("create_offer rejected (%s): %s", stats, exc)
+        raise StarvellAPIError(
+            exc.status,
+            f"{exc}\n\n📊 Отправлено: {stats}",
+            exc.body,
+        ) from exc
     offer_id = result.get("id") or result.get("offerId")
     public_id = result.get("publicId")
     return {

@@ -134,6 +134,16 @@ def pick_subcategory(catalog: dict[str, Any], *hint_texts: str) -> dict[str, Any
     subs = catalog.get("subCategories") or []
     if not subs:
         return None
+
+    service_type = _norm(hint_texts[0] if hint_texts else "")
+    if service_type:
+        for sub in subs:
+            if not isinstance(sub, dict):
+                continue
+            name_n = _norm(str(sub.get("name") or ""))
+            if name_n and (name_n in service_type or service_type in name_n):
+                return sub
+
     hints = collect_subcategory_hints(*hint_texts)
     best: dict[str, Any] | None = None
     best_score = 0.0
@@ -151,6 +161,21 @@ def pick_subcategory(catalog: dict[str, Any], *hint_texts: str) -> dict[str, Any
 
 
 MAX_NUMERIC_ATTRIBUTES = 50
+PARSER_BUILD = "attrs-v3"
+
+# FunPay Telegram «Подписчики» → Starvell category 175 / sub 634 (fallback без каталога)
+BUILTIN_TELEGRAM_SUBSCRIBERS: dict[str, Any] = {
+    "category_id": 175,
+    "sub_category_id": 634,
+    "game_slug": "telegram",
+    "category_slug": "services",
+    "basic_attributes": [
+        {
+            "id": "e07ea24f-a7f4-4d2f-b0b6-cf54f4523590",
+            "optionId": "c3d131de-d283-485b-95ae-faff681d67b1",
+        },
+    ],
+}
 
 
 def resolve_option_filters(
@@ -298,6 +323,89 @@ def sanitize_create_attributes(
     else:
         cleaned.pop("attributes", None)
     return cleaned
+
+
+def finalize_create_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """
+    Последняя линия защиты: только разрешённые поля, без attributes/numericAttributes.
+    basicAttributes — только {id, optionId}, без numericValue.
+    """
+    allowed_keys = (
+        "type",
+        "categoryId",
+        "subCategoryId",
+        "price",
+        "availability",
+        "isActive",
+        "autoDelivery",
+        "instantDelivery",
+        "descriptions",
+        "goods",
+        "basicAttributes",
+        "postPaymentMessage",
+    )
+    out: dict[str, Any] = {k: payload[k] for k in allowed_keys if k in payload}
+
+    basic: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in out.get("basicAttributes") or []:
+        if not isinstance(item, dict):
+            continue
+        aid = str(item.get("id") or "")
+        oid = item.get("optionId")
+        if not aid or not oid or "numericValue" in item or aid in seen:
+            continue
+        seen.add(aid)
+        basic.append({"id": aid, "optionId": str(oid)})
+    out["basicAttributes"] = basic[:MAX_NUMERIC_ATTRIBUTES]
+
+    numeric_attrs: list[dict[str, Any]] = []
+    seen_num: set[str] = set()
+    for item in payload.get("attributes") or []:
+        if not isinstance(item, dict):
+            continue
+        aid = str(item.get("id") or "")
+        if not aid or item.get("numericValue") is None or item.get("optionId") or aid in seen_num:
+            continue
+        try:
+            seen_num.add(aid)
+            numeric_attrs.append({"id": aid, "numericValue": float(item["numericValue"])})
+        except (TypeError, ValueError):
+            continue
+    if numeric_attrs and len(numeric_attrs) <= 10:
+        out["attributes"] = numeric_attrs[:MAX_NUMERIC_ATTRIBUTES]
+
+    if not out.get("goods"):
+        out["goods"] = []
+
+    return out
+
+
+def apply_builtin_category_defaults(
+    payload: dict[str, Any],
+    *,
+    category_id: int,
+    sub_category_id: int | None,
+) -> dict[str, Any]:
+    """Жёсткий fallback для Telegram SMM, если каталог недоступен."""
+    builtin = BUILTIN_TELEGRAM_SUBSCRIBERS
+    if int(category_id) != int(builtin["category_id"]):
+        return payload
+    if sub_category_id and int(sub_category_id) != int(builtin["sub_category_id"]):
+        return payload
+    if payload.get("basicAttributes"):
+        return payload
+    result = dict(payload)
+    result["subCategoryId"] = int(builtin["sub_category_id"])
+    result["basicAttributes"] = list(builtin["basic_attributes"])
+    return result
+
+
+def payload_attribute_stats(payload: dict[str, Any]) -> str:
+    basic = len(payload.get("basicAttributes") or [])
+    attrs = len(payload.get("attributes") or [])
+    numeric_legacy = len(payload.get("numericAttributes") or [])
+    return f"basic={basic} attributes={attrs} numericLegacy={numeric_legacy} build={PARSER_BUILD}"
 
 
 async def resolve_slugs_for_category(category_id: int, game_id: int = 0) -> tuple[str, str]:

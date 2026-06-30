@@ -417,8 +417,9 @@ class StarvellAPI:
         category_slug: str = "",
     ) -> dict[str, Any]:
         """POST /api/offers/create — создание нового лота."""
-        clean_payload = dict(payload)
-        clean_payload.pop("numericAttributes", None)
+        from services.starvell_catalog import finalize_create_payload
+
+        clean_payload = finalize_create_payload(payload)
         if not referer and game_slug and category_slug:
             referer = f"{BASE_URL}/{game_slug}/{category_slug}/sell"
         elif not referer and category_id:

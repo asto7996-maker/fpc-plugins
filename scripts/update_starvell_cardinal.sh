@@ -55,10 +55,10 @@ rsync -a \
   --exclude='storage' --exclude='logs' --exclude='config/settings.json' \
   "$TMP/" "$INSTALL_DIR/"
 
-if grep -q 'sanitize_create_attributes' "$INSTALL_DIR/services/starvell_lot_creator.py" 2>/dev/null; then
-  echo "✅ Патч numeric attributes установлен"
+if grep -q 'PARSER_BUILD = "attrs-v3"' "$INSTALL_DIR/services/starvell_catalog.py" 2>/dev/null; then
+  echo "✅ Патч numeric attributes v3 установлен"
 else
-  echo "⚠️  В коде нет sanitize_create_attributes — проверьте ветку $REPO_BRANCH"
+  echo "⚠️  Старый код парсера — обновите ветку $REPO_BRANCH"
 fi
 
 mkdir -p "$INSTALL_DIR"/{config,storage/plugins,logs,plugins}
