@@ -21,9 +21,10 @@ from services.starvell_catalog import (
     build_minimal_create_payload,
     build_offer_attributes,
     build_offer_update_payload,
+    compact_option_attributes,
     draft_attribute_count,
     fetch_category_catalog,
-    finalize_create_payload,
+    finalize_frontend_create_payload,
     payload_attribute_stats,
     pick_subcategory,
     resolve_slugs_for_category,
@@ -79,12 +80,13 @@ async def build_create_payload(
     category_slug: str = "",
     auto_delivery: bool = True,
 ) -> dict[str, Any]:
-    """Формирует полный payload (описание + атрибуты) для create/update."""
+    """Полный payload для partial-update после create (описание, postPayment, атрибуты)."""
+    _ = auto_delivery  # SMM-бот через postPaymentMessage, не Starvell autoDelivery
     sections = build_starvell_package(
         lot,
         is_smm=is_smm,
         service_id=service_id,
-        auto_delivery=auto_delivery,
+        auto_delivery=False,
     )
     brief_ru = _truncate(strip_service_id(sections.get("brief_ru") or lot.title), BRIEF_MAX)
     full_ru = strip_service_id(sections.get("full_ru") or brief_ru)
@@ -106,6 +108,7 @@ async def build_create_payload(
 
     catalog = await fetch_category_catalog(game_slug, category_slug) if game_slug and category_slug else {}
     offer_type = str(catalog.get("offerType") or "LOT")
+    brief_enabled = bool(catalog.get("isBriefDescriptionEnabled", True))
 
     sub_category_id = None
     subcategory = None
@@ -137,13 +140,12 @@ async def build_create_payload(
             {},
         )
 
-    basic_attributes, numeric_attributes = build_offer_attributes(
+    basic_attributes, _numeric_attributes = build_offer_attributes(
         catalog,
         subcategory,
         hint_text=_hint_blob(lot),
     )
 
-    brief_enabled = catalog.get("isBriefDescriptionEnabled", True)
     descriptions: dict[str, Any] = {
         "rus": {
             "description": full_description,
@@ -162,7 +164,7 @@ async def build_create_payload(
         "price": format_starvell_api_price(price),
         "availability": AVAILABILITY_LOT,
         "isActive": True,
-        "autoDelivery": bool(auto_delivery),
+        "autoDelivery": False,
         "instantDelivery": False,
         "deliveryTime": DEFAULT_DELIVERY_TIME,
         "descriptions": descriptions,
@@ -171,8 +173,6 @@ async def build_create_payload(
         payload["gameId"] = resolved_game_id
     if basic_attributes:
         payload["basicAttributes"] = basic_attributes
-    if numeric_attributes:
-        payload["numericAttributes"] = numeric_attributes
     if sub_category_id:
         payload["subCategoryId"] = int(sub_category_id)
     if is_smm:
@@ -184,9 +184,11 @@ async def build_create_payload(
         category_id=int(category_id),
         sub_category_id=int(sub_category_id) if sub_category_id else None,
     )
-    payload = finalize_create_payload(payload)
     logger.info("full payload attrs: %s sub=%s", payload_attribute_stats(payload), sub_category_id)
 
+    payload["_catalog"] = catalog
+    payload["_subcategory"] = subcategory
+    payload["_brief_enabled"] = brief_enabled
     return payload
 
 
@@ -202,82 +204,114 @@ def _is_attribute_error(message: str) -> bool:
     return "атрибут" in text
 
 
+async def _resolve_template_attributes(
+    api: StarvellAPI,
+    *,
+    category_id: int,
+    template_offer_id: str | int | None,
+) -> list[dict[str, str]] | None:
+    offer_id = template_offer_id
+    if not offer_id:
+        for cat in await api.fetch_seller_categories():
+            if int(cat.get("category_id") or 0) == int(category_id) and cat.get("offer_id"):
+                offer_id = cat["offer_id"]
+                break
+    if not offer_id:
+        return None
+    offer = await api.fetch_offer(str(offer_id))
+    attrs = compact_option_attributes(offer.get("attributes"))
+    return attrs or None
+
+
 def _create_attempts(
     full_payload: dict[str, Any],
     *,
     brief_ru: str,
     game_id: int,
     category_id: int,
-) -> list[tuple[str, dict[str, Any], str]]:
-    """Варианты минимального create: (name, body, finalize_mode)."""
-    attempts: list[tuple[str, dict[str, Any], str]] = [
+    catalog: dict[str, Any],
+    subcategory: dict[str, Any] | None,
+    brief_enabled: bool,
+    template_attrs: list[dict[str, str]] | None,
+) -> list[tuple[str, dict[str, Any]]]:
+    """Варианты create по схеме веб-формы Starvell."""
+    common = dict(
+        brief_ru=brief_ru,
+        game_id=game_id,
+        auto_delivery=False,
+        catalog=catalog,
+        subcategory=subcategory,
+        brief_enabled=brief_enabled,
+    )
+
+    attempts: list[tuple[str, dict[str, Any]]] = [
         (
-            "minimal-unified",
-            build_minimal_create_payload(
-                full_payload,
-                brief_ru=brief_ru,
-                game_id=game_id,
-                attr_mode="unified",
-            ),
-            "unified",
+            "frontend-basic",
+            build_minimal_create_payload(full_payload, include_attributes=True, **common),
         ),
         (
-            "minimal-basic",
+            "frontend-no-delivery",
             build_minimal_create_payload(
                 full_payload,
-                brief_ru=brief_ru,
-                game_id=game_id,
-                attr_mode="basic",
+                include_attributes=True,
+                delivery_time=None,
+                **common,
             ),
-            "basic",
         ),
         (
-            "minimal-no-attrs",
+            "frontend-no-attrs",
             build_minimal_create_payload(
                 full_payload,
-                brief_ru=brief_ru,
-                game_id=game_id,
                 include_attributes=False,
-                attr_mode="none",
+                **common,
             ),
-            "none",
-        ),
-        (
-            "minimal-empty",
-            build_minimal_create_payload(
-                full_payload,
-                brief_ru=brief_ru,
-                game_id=game_id,
-                include_attributes=False,
-                explicit_empty_attrs=True,
-                attr_mode="basic",
-            ),
-            "basic",
         ),
     ]
 
-    if int(category_id) == 175:
-        builtin_body = build_minimal_create_payload(
-            {
-                **full_payload,
-                "categoryId": 175,
-                "subCategoryId": int(BUILTIN_TELEGRAM_SUBSCRIBERS["sub_category_id"]),
-                "basicAttributes": list(BUILTIN_TELEGRAM_SUBSCRIBERS["basic_attributes"]),
-            },
-            brief_ru=brief_ru,
-            game_id=game_id or 14,
-            attr_mode="basic",
+    if template_attrs:
+        template_base = {
+            **full_payload,
+            "basicAttributes": [{"id": a["id"], "optionId": a["optionId"]} for a in template_attrs],
+        }
+        attempts.insert(
+            0,
+            (
+                "frontend-template",
+                build_minimal_create_payload(template_base, include_attributes=True, **common),
+            ),
         )
-        attempts.append(("minimal-builtin", builtin_body, "basic"))
+
+    if int(category_id) == 175:
+        builtin_base = {
+            **full_payload,
+            "categoryId": 175,
+            "subCategoryId": int(BUILTIN_TELEGRAM_SUBSCRIBERS["sub_category_id"]),
+            "basicAttributes": list(BUILTIN_TELEGRAM_SUBSCRIBERS["basic_attributes"]),
+        }
+        attempts.append(
+            (
+                "frontend-builtin",
+                build_minimal_create_payload(
+                    builtin_base,
+                    include_attributes=True,
+                    game_id=game_id or 14,
+                    auto_delivery=False,
+                    catalog=catalog,
+                    subcategory=subcategory,
+                    brief_enabled=brief_enabled,
+                    brief_ru=brief_ru,
+                ),
+            ),
+        )
 
     seen: set[str] = set()
-    unique: list[tuple[str, dict[str, Any], str]] = []
-    for name, body, mode in attempts:
-        key = payload_attribute_stats(body) + f"|{mode}"
+    unique: list[tuple[str, dict[str, Any]]] = []
+    for name, body in attempts:
+        key = payload_attribute_stats(body)
         if key in seen:
             continue
         seen.add(key)
-        unique.append((name, body, mode))
+        unique.append((name, body))
     return unique
 
 
@@ -313,8 +347,8 @@ async def create_lot_from_parsed(
     template_offer_id: str | int | None = None,
     auto_delivery: bool = True,
 ) -> dict[str, Any]:
-    """Создаёт лот на Starvell (минимальный create → partial-update) и возвращает ответ."""
-    _ = template_offer_id
+    """Создаёт лот на Starvell (frontend create → partial-update)."""
+    _ = auto_delivery
 
     full_payload = await build_create_payload(
         lot,
@@ -325,8 +359,11 @@ async def create_lot_from_parsed(
         game_id=game_id,
         game_slug=game_slug,
         category_slug=category_slug,
-        auto_delivery=auto_delivery,
     )
+
+    catalog = full_payload.pop("_catalog", {}) or {}
+    subcategory = full_payload.pop("_subcategory", None)
+    brief_enabled = bool(full_payload.pop("_brief_enabled", True))
 
     brief_ru = (
         ((full_payload.get("descriptions") or {}).get("rus") or {}).get("briefDescription")
@@ -336,6 +373,7 @@ async def create_lot_from_parsed(
     resolved_game_id = int(game_id or full_payload.get("gameId") or 0)
     sub_category_id = full_payload.get("subCategoryId")
 
+    draft_note = ""
     try:
         draft = await api.fetch_offer_draft(
             category_id,
@@ -344,23 +382,25 @@ async def create_lot_from_parsed(
             category_slug=category_slug,
         )
         draft_count = draft_attribute_count(draft)
-        if draft_count > 5:
-            logger.warning(
-                "offer draft has %s attrs (category=%s sub=%s) — using minimal create",
-                draft_count,
-                category_id,
-                sub_category_id,
-            )
+        if draft_count > 0:
+            draft_note = f"draft_attrs={draft_count}"
+            logger.info("offer draft attrs=%s cat=%s sub=%s", draft_count, category_id, sub_category_id)
     except Exception as exc:
         logger.debug("fetch_offer_draft: %s", exc)
 
-    async def _send(body: dict[str, Any], finalize_mode: str) -> dict[str, Any]:
+    template_attrs = await _resolve_template_attributes(
+        api,
+        category_id=category_id,
+        template_offer_id=template_offer_id,
+    )
+
+    async def _send(body: dict[str, Any]) -> dict[str, Any]:
         return await api.create_offer(
             body,
             category_id=category_id,
             game_slug=game_slug,
             category_slug=category_slug,
-            finalize_mode=finalize_mode,
+            finalize_mode="frontend",
         )
 
     attempts = _create_attempts(
@@ -368,6 +408,10 @@ async def create_lot_from_parsed(
         brief_ru=str(brief_ru),
         game_id=resolved_game_id,
         category_id=category_id,
+        catalog=catalog,
+        subcategory=subcategory,
+        brief_enabled=brief_enabled,
+        template_attrs=template_attrs,
     )
 
     errors: list[str] = []
@@ -375,10 +419,10 @@ async def create_lot_from_parsed(
     winning_body: dict[str, Any] = attempts[0][1]
     winning_name = attempts[0][0]
 
-    for name, body, mode in attempts:
+    for name, body in attempts:
         stats = payload_attribute_stats(body)
         try:
-            result = await _send(body, mode)
+            result = await _send(body)
             winning_body = body
             winning_name = name
             if name != attempts[0][0]:
@@ -397,10 +441,11 @@ async def create_lot_from_parsed(
 
     if result is None:
         last_stats = payload_attribute_stats(attempts[-1][1]) if attempts else ""
+        extra = f"\n{draft_note}" if draft_note else ""
         raise StarvellAPIError(
             400,
             (
-                f"Starvell отклонил все варианты payload ({PARSER_BUILD}).\n\n"
+                f"Starvell отклонил все варианты payload ({PARSER_BUILD}).{extra}\n\n"
                 f"📊 Последняя попытка: {last_stats}\n\n"
                 + "\n".join(errors[-5:])
             ),
@@ -409,7 +454,7 @@ async def create_lot_from_parsed(
 
     offer_id = result.get("id") or result.get("offerId")
     public_id = result.get("publicId")
-    if offer_id and winning_name.startswith("minimal"):
+    if offer_id:
         try:
             await _apply_full_content(api, offer_id, full_payload)
         except Exception as exc:
@@ -444,7 +489,7 @@ def format_created_message(
     if is_smm and service_id:
         lines.append(f"🆔 VexBoost ID: <code>{service_id}</code>")
     lines += [
-        "🤖 Автоматизированная доставка: включена",
+        "🤖 SMM-бот: сообщение после оплаты настроено",
         "🇷🇺 + 🇬🇧 Описание: RU и EN в одном поле",
         "",
         f'🔗 <a href="{url}">Открыть лот на Starvell</a>',

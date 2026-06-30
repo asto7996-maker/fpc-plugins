@@ -161,7 +161,7 @@ def pick_subcategory(catalog: dict[str, Any], *hint_texts: str) -> dict[str, Any
 
 
 MAX_NUMERIC_ATTRIBUTES = 50
-PARSER_BUILD = "attrs-v6"
+PARSER_BUILD = "attrs-v7"
 
 DEFAULT_DELIVERY_TIME: dict[str, Any] = {
     "from": {"unit": "MINUTES", "value": "5"},
@@ -417,6 +417,113 @@ def _create_base_fields(payload: dict[str, Any]) -> dict[str, Any]:
     return {k: payload[k] for k in allowed_keys if k in payload}
 
 
+def _delivery_time_for_create(raw: Any) -> dict[str, Any] | None:
+    """Как на сайте: null если from/to пустые, иначе объект deliveryTime."""
+    if not isinstance(raw, dict):
+        return None
+    from_block = raw.get("from") if isinstance(raw.get("from"), dict) else {}
+    to_block = raw.get("to") if isinstance(raw.get("to"), dict) else {}
+    from_val = str(from_block.get("value") or "").strip()
+    to_val = str(to_block.get("value") or "").strip()
+    if not from_val or not to_val:
+        return None
+    return raw
+
+
+def _filter_basic_attributes(
+    basic: list[dict[str, Any]],
+    catalog: dict[str, Any] | None,
+    subcategory: dict[str, Any] | None,
+) -> list[dict[str, str]]:
+    """Option-атрибуты с проверкой id/optionId по каталогу (как submit на Starvell)."""
+    allowed_option = _option_filter_ids(subcategory, catalog or {})
+    option_map: dict[str, set[str]] = {}
+    for filt in resolve_option_filters(catalog or {}, subcategory):
+        fid = str(filt.get("id") or "")
+        if not fid:
+            continue
+        option_map[fid] = {
+            str(opt["id"])
+            for opt in (filt.get("options") or [])
+            if isinstance(opt, dict) and opt.get("id") and not opt.get("redirectSlug") and not opt.get("isHidden")
+        }
+
+    result: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for item in basic:
+        if not isinstance(item, dict):
+            continue
+        aid = str(item.get("id") or "")
+        oid = item.get("optionId")
+        if not aid or not oid or aid in seen:
+            continue
+        if allowed_option and aid not in allowed_option:
+            continue
+        if option_map and aid in option_map and str(oid) not in option_map[aid]:
+            continue
+        seen.add(aid)
+        result.append({"id": aid, "optionId": str(oid)})
+    return result
+
+
+def finalize_frontend_create_payload(
+    payload: dict[str, Any],
+    *,
+    catalog: dict[str, Any] | None = None,
+    subcategory: dict[str, Any] | None = None,
+    brief_enabled: bool = True,
+    force_empty_numeric: bool = True,
+) -> dict[str, Any]:
+    """
+    POST /offers/create — как submit формы Starvell (chunk 5661):
+    basicAttributes + numericAttributes: [], goods: [], без attributes.
+    autoDelivery=false для SMM (true включает goods-режим с десятками numeric attrs).
+    """
+    basic, numeric = _collect_create_option_numeric(payload)
+    basic = _filter_basic_attributes(basic, catalog, subcategory)
+
+    desc_rus = ((payload.get("descriptions") or {}).get("rus") or {})
+    descriptions: dict[str, Any] = {
+        "rus": {
+            "description": desc_rus.get("description") or "",
+        },
+    }
+    if brief_enabled and desc_rus.get("briefDescription"):
+        descriptions["rus"]["briefDescription"] = desc_rus["briefDescription"]
+
+    price_raw = payload.get("price")
+    if price_raw is not None:
+        price = str(price_raw).replace(",", ".")
+    else:
+        price = "0"
+
+    out: dict[str, Any] = {
+        "type": payload.get("type") or "LOT",
+        "categoryId": payload.get("categoryId"),
+        "price": price,
+        "availability": payload.get("availability"),
+        "isActive": payload.get("isActive", True),
+        "autoDelivery": bool(payload.get("autoDelivery", False)),
+        "instantDelivery": False,
+        "goods": [],
+        "descriptions": descriptions,
+        "deliveryTime": _delivery_time_for_create(payload.get("deliveryTime")),
+    }
+    if payload.get("gameId"):
+        out["gameId"] = int(payload["gameId"])
+    if payload.get("subCategoryId"):
+        out["subCategoryId"] = int(payload["subCategoryId"])
+    if payload.get("postPaymentMessage"):
+        out["postPaymentMessage"] = payload["postPaymentMessage"]
+
+    if basic:
+        out["basicAttributes"] = basic[:20]
+
+    if force_empty_numeric or numeric:
+        out["numericAttributes"] = numeric[:10] if numeric and not force_empty_numeric else []
+    return out
+
+
 def finalize_create_payload(payload: dict[str, Any]) -> dict[str, Any]:
     """POST /offers/create: basicAttributes (+ numericAttributes при необходимости)."""
     out = _create_base_fields(payload)
@@ -456,14 +563,13 @@ def build_minimal_create_payload(
     game_id: int = 0,
     include_post_payment: bool = False,
     include_attributes: bool = True,
-    explicit_empty_attrs: bool = False,
-    attr_mode: str = "basic",
+    auto_delivery: bool = False,
+    delivery_time: dict[str, Any] | None = DEFAULT_DELIVERY_TIME,
+    catalog: dict[str, Any] | None = None,
+    subcategory: dict[str, Any] | None = None,
+    brief_enabled: bool = True,
 ) -> dict[str, Any]:
-    """
-    Минимальный create: короткое описание, без postPayment (добавим через update).
-    Длинный bilingual-текст Starvell может парсить как десятки «атрибутов».
-    attr_mode: basic | unified | none
-    """
+    """Минимальный create по схеме веб-формы Starvell (короткое описание, без postPayment)."""
     brief = (brief_ru or "Лот").strip()[:100]
     raw: dict[str, Any] = {
         "type": base.get("type") or "LOT",
@@ -472,9 +578,9 @@ def build_minimal_create_payload(
         "price": base.get("price"),
         "availability": base.get("availability", 999999),
         "isActive": base.get("isActive", True),
-        "autoDelivery": base.get("autoDelivery", True),
+        "autoDelivery": auto_delivery,
         "instantDelivery": False,
-        "deliveryTime": DEFAULT_DELIVERY_TIME,
+        "deliveryTime": delivery_time,
         "descriptions": {
             "rus": {
                 "briefDescription": brief,
@@ -487,35 +593,19 @@ def build_minimal_create_payload(
     elif base.get("gameId"):
         raw["gameId"] = int(base["gameId"])
 
-    if include_attributes and not explicit_empty_attrs:
-        if base.get("basicAttributes"):
-            raw["basicAttributes"] = list(base["basicAttributes"])
-        if base.get("attributes"):
-            raw["attributes"] = list(base["attributes"])
-        if base.get("numericAttributes"):
-            raw["numericAttributes"] = list(base["numericAttributes"])
+    if include_attributes and base.get("basicAttributes"):
+        raw["basicAttributes"] = list(base["basicAttributes"])
 
     if include_post_payment and base.get("postPaymentMessage"):
         raw["postPaymentMessage"] = base["postPaymentMessage"]
 
-    mode = (attr_mode or "basic").lower()
-    if mode == "unified":
-        minimal = finalize_unified_create_payload(raw)
-    elif mode == "none" or not include_attributes:
-        minimal = finalize_create_payload(raw)
-        minimal.pop("basicAttributes", None)
-        minimal.pop("numericAttributes", None)
-        minimal.pop("attributes", None)
-    else:
-        minimal = finalize_create_payload(raw)
-
-    if explicit_empty_attrs:
-        if mode == "unified":
-            minimal["attributes"] = []
-        else:
-            minimal["basicAttributes"] = []
-            minimal["numericAttributes"] = []
-    return minimal
+    return finalize_frontend_create_payload(
+        raw,
+        catalog=catalog,
+        subcategory=subcategory,
+        brief_enabled=brief_enabled,
+        force_empty_numeric=True,
+    )
 
 
 def build_offer_update_payload(full: dict[str, Any]) -> dict[str, Any]:
@@ -571,7 +661,12 @@ def payload_attribute_stats(payload: dict[str, Any]) -> str:
     desc = ((payload.get("descriptions") or {}).get("rus") or {}).get("description") or ""
     desc_len = len(str(desc))
     keys = ",".join(sorted(k for k in payload.keys() if not k.startswith("_")))
+    cat = payload.get("categoryId")
+    sub = payload.get("subCategoryId")
+    ad = payload.get("autoDelivery")
+    goods = len(payload.get("goods") or [])
     return (
+        f"cat={cat} sub={sub} autoDel={ad} goods={goods} "
         f"basic={basic} numeric={numeric} attributes={attrs} desc={desc_len} "
         f"keys=[{keys}] build={PARSER_BUILD}"
     )

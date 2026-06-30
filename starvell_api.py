@@ -415,23 +415,28 @@ class StarvellAPI:
         category_id: int | None = None,
         game_slug: str = "",
         category_slug: str = "",
-        finalize_mode: str = "basic",
+        finalize_mode: str = "frontend",
     ) -> dict[str, Any]:
         """POST /api/offers/create — создание нового лота."""
         from services.starvell_catalog import (
             finalize_create_payload,
+            finalize_frontend_create_payload,
             finalize_unified_create_payload,
             payload_attribute_stats,
             strip_all_attributes,
         )
 
-        mode = (finalize_mode or "basic").lower()
-        if mode == "unified":
+        mode = (finalize_mode or "frontend").lower()
+        if mode == "frontend":
+            clean_payload = finalize_frontend_create_payload(payload)
+        elif mode == "unified":
             clean_payload = finalize_unified_create_payload(payload)
+        elif mode == "basic":
+            clean_payload = finalize_create_payload(payload)
         elif mode == "none":
             clean_payload = strip_all_attributes(finalize_create_payload(payload))
         else:
-            clean_payload = finalize_create_payload(payload)
+            clean_payload = finalize_frontend_create_payload(payload)
 
         logger.info("create_offer %s", payload_attribute_stats(clean_payload))
         logger.debug("create_offer body: %s", json.dumps(clean_payload, ensure_ascii=False)[:4000])

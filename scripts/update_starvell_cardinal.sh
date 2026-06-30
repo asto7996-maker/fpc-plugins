@@ -55,14 +55,14 @@ rsync -a \
   --exclude='storage' --exclude='logs' --exclude='config/settings.json' \
   "$TMP/" "$INSTALL_DIR/"
 
-if grep -q 'PARSER_BUILD = "attrs-v6"' "$INSTALL_DIR/services/starvell_catalog.py" 2>/dev/null; then
-  echo "✅ Патч attrs-v6 установлен (minimal create + partial-update)"
-elif grep -q 'PARSER_BUILD = "attrs-v5"' "$INSTALL_DIR/services/starvell_catalog.py" 2>/dev/null; then
-  echo "⚠️  attrs-v5 — обновите до attrs-v6"
+if grep -q 'PARSER_BUILD = "attrs-v7"' "$INSTALL_DIR/services/starvell_catalog.py" 2>/dev/null; then
+  echo "✅ Патч attrs-v7 установлен (frontend create, autoDelivery=false, numericAttributes=[])"
+elif grep -q 'PARSER_BUILD = "attrs-v6"' "$INSTALL_DIR/services/starvell_catalog.py" 2>/dev/null; then
+  echo "⚠️  attrs-v6 — обновите до attrs-v7"
 else
   echo "⚠️  Старый код парсера — обновите ветку $REPO_BRANCH"
 fi
-echo "attrs-v6" > "$INSTALL_DIR/PARSER_BUILD.txt" 2>/dev/null || true
+echo "attrs-v7" > "$INSTALL_DIR/PARSER_BUILD.txt" 2>/dev/null || true
 
 mkdir -p "$INSTALL_DIR"/{config,storage/plugins,logs,plugins}
 chown -R "$SERVICE_USER:$SERVICE_USER" "$INSTALL_DIR"
