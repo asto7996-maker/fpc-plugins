@@ -15,16 +15,19 @@ from services.funpay_parser import (
 from services.price_utils import format_price_display, format_starvell_api_price
 from services.starvell_catalog import (
     BUILTIN_TELEGRAM_SUBSCRIBERS,
+    DEFAULT_DELIVERY_TIME,
     PARSER_BUILD,
     apply_builtin_category_defaults,
+    build_minimal_create_payload,
     build_offer_attributes,
+    build_offer_update_payload,
+    draft_attribute_count,
     fetch_category_catalog,
     finalize_create_payload,
     payload_attribute_stats,
     pick_subcategory,
     resolve_slugs_for_category,
     sanitize_create_attributes,
-    strip_all_attributes,
 )
 from starvell_api import StarvellAPI, BASE_URL, StarvellAPIError
 
@@ -76,7 +79,7 @@ async def build_create_payload(
     category_slug: str = "",
     auto_delivery: bool = True,
 ) -> dict[str, Any]:
-    """Формирует тело POST /api/offers/create по схеме Starvell."""
+    """Формирует полный payload (описание + атрибуты) для create/update."""
     sections = build_starvell_package(
         lot,
         is_smm=is_smm,
@@ -149,6 +152,10 @@ async def build_create_payload(
     if brief_enabled and brief_ru:
         descriptions["rus"]["briefDescription"] = brief_ru
 
+    resolved_game_id = int(game_id) if game_id else 0
+    if not resolved_game_id and int(category_id) == 175:
+        resolved_game_id = 14
+
     payload: dict[str, Any] = {
         "type": offer_type,
         "categoryId": int(category_id),
@@ -157,9 +164,11 @@ async def build_create_payload(
         "isActive": True,
         "autoDelivery": bool(auto_delivery),
         "instantDelivery": False,
+        "deliveryTime": DEFAULT_DELIVERY_TIME,
         "descriptions": descriptions,
-        "goods": [],
     }
+    if resolved_game_id:
+        payload["gameId"] = resolved_game_id
     if basic_attributes:
         payload["basicAttributes"] = basic_attributes
     if numeric_attributes:
@@ -176,7 +185,7 @@ async def build_create_payload(
         sub_category_id=int(sub_category_id) if sub_category_id else None,
     )
     payload = finalize_create_payload(payload)
-    logger.info("create payload attrs: %s sub=%s", payload_attribute_stats(payload), sub_category_id)
+    logger.info("full payload attrs: %s sub=%s", payload_attribute_stats(payload), sub_category_id)
 
     return payload
 
@@ -193,26 +202,101 @@ def _is_attribute_error(message: str) -> bool:
     return "атрибут" in text
 
 
-def _telegram_retry_payloads(base: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
-    """Дополнительные варианты payload при ошибках атрибутов."""
-    attempts: list[tuple[str, dict[str, Any]]] = [
-        ("no-attrs", strip_all_attributes(base)),
+def _create_attempts(
+    full_payload: dict[str, Any],
+    *,
+    brief_ru: str,
+    game_id: int,
+    category_id: int,
+) -> list[tuple[str, dict[str, Any], str]]:
+    """Варианты минимального create: (name, body, finalize_mode)."""
+    attempts: list[tuple[str, dict[str, Any], str]] = [
+        (
+            "minimal-unified",
+            build_minimal_create_payload(
+                full_payload,
+                brief_ru=brief_ru,
+                game_id=game_id,
+                attr_mode="unified",
+            ),
+            "unified",
+        ),
+        (
+            "minimal-basic",
+            build_minimal_create_payload(
+                full_payload,
+                brief_ru=brief_ru,
+                game_id=game_id,
+                attr_mode="basic",
+            ),
+            "basic",
+        ),
+        (
+            "minimal-no-attrs",
+            build_minimal_create_payload(
+                full_payload,
+                brief_ru=brief_ru,
+                game_id=game_id,
+                include_attributes=False,
+                attr_mode="none",
+            ),
+            "none",
+        ),
+        (
+            "minimal-empty",
+            build_minimal_create_payload(
+                full_payload,
+                brief_ru=brief_ru,
+                game_id=game_id,
+                include_attributes=False,
+                explicit_empty_attrs=True,
+                attr_mode="basic",
+            ),
+            "basic",
+        ),
     ]
-    attempts.append(("builtin-basic", finalize_create_payload({
-        "type": base.get("type") or "LOT",
-        "categoryId": 175,
-        "subCategoryId": int(BUILTIN_TELEGRAM_SUBSCRIBERS["sub_category_id"]),
-        "price": base.get("price"),
-        "availability": base.get("availability", AVAILABILITY_LOT),
-        "isActive": True,
-        "autoDelivery": base.get("autoDelivery", True),
-        "instantDelivery": False,
-        "descriptions": base.get("descriptions") or {},
-        "goods": [],
-        "basicAttributes": list(BUILTIN_TELEGRAM_SUBSCRIBERS["basic_attributes"]),
-        **({"postPaymentMessage": base["postPaymentMessage"]} if base.get("postPaymentMessage") else {}),
-    })))
-    return attempts
+
+    if int(category_id) == 175:
+        builtin_body = build_minimal_create_payload(
+            {
+                **full_payload,
+                "categoryId": 175,
+                "subCategoryId": int(BUILTIN_TELEGRAM_SUBSCRIBERS["sub_category_id"]),
+                "basicAttributes": list(BUILTIN_TELEGRAM_SUBSCRIBERS["basic_attributes"]),
+            },
+            brief_ru=brief_ru,
+            game_id=game_id or 14,
+            attr_mode="basic",
+        )
+        attempts.append(("minimal-builtin", builtin_body, "basic"))
+
+    seen: set[str] = set()
+    unique: list[tuple[str, dict[str, Any], str]] = []
+    for name, body, mode in attempts:
+        key = payload_attribute_stats(body) + f"|{mode}"
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append((name, body, mode))
+    return unique
+
+
+async def _apply_full_content(
+    api: StarvellAPI,
+    offer_id: str | int,
+    full_payload: dict[str, Any],
+) -> None:
+    """Фаза 2: полное описание и postPayment через partial-update."""
+    update_body = build_offer_update_payload(full_payload)
+    if not update_body:
+        return
+    oid = str(offer_id)
+    try:
+        await api.partial_update_offer(oid, update_body)
+        logger.info("partial_update applied for offer %s", oid[:12])
+    except StarvellAPIError as exc:
+        logger.warning("partial_update failed (%s), trying full update", exc)
+        await api.update_offer(oid, {**full_payload, **update_body})
 
 
 async def create_lot_from_parsed(
@@ -229,10 +313,10 @@ async def create_lot_from_parsed(
     template_offer_id: str | int | None = None,
     auto_delivery: bool = True,
 ) -> dict[str, Any]:
-    """Создаёт лот на Starvell и возвращает ответ API + ссылку."""
-    _ = template_offer_id  # шаблон больше не используется — только каталог Starvell
+    """Создаёт лот на Starvell (минимальный create → partial-update) и возвращает ответ."""
+    _ = template_offer_id
 
-    payload = await build_create_payload(
+    full_payload = await build_create_payload(
         lot,
         is_smm=is_smm,
         service_id=service_id,
@@ -243,36 +327,61 @@ async def create_lot_from_parsed(
         category_slug=category_slug,
         auto_delivery=auto_delivery,
     )
-    logger.debug("create_offer payload: %s", payload)
-    stats = payload_attribute_stats(payload)
 
-    async def _send(body: dict[str, Any]) -> dict[str, Any]:
+    brief_ru = (
+        ((full_payload.get("descriptions") or {}).get("rus") or {}).get("briefDescription")
+        or lot.title
+        or "Лот"
+    )
+    resolved_game_id = int(game_id or full_payload.get("gameId") or 0)
+    sub_category_id = full_payload.get("subCategoryId")
+
+    try:
+        draft = await api.fetch_offer_draft(
+            category_id,
+            sub_category_id=int(sub_category_id) if sub_category_id else None,
+            game_slug=game_slug,
+            category_slug=category_slug,
+        )
+        draft_count = draft_attribute_count(draft)
+        if draft_count > 5:
+            logger.warning(
+                "offer draft has %s attrs (category=%s sub=%s) — using minimal create",
+                draft_count,
+                category_id,
+                sub_category_id,
+            )
+    except Exception as exc:
+        logger.debug("fetch_offer_draft: %s", exc)
+
+    async def _send(body: dict[str, Any], finalize_mode: str) -> dict[str, Any]:
         return await api.create_offer(
             body,
             category_id=category_id,
             game_slug=game_slug,
             category_slug=category_slug,
+            finalize_mode=finalize_mode,
         )
 
-    attempts: list[tuple[str, dict[str, Any]]] = [("primary", payload)]
-    if int(category_id) == 175:
-        seen: set[str] = set()
-        for name, body in _telegram_retry_payloads(payload):
-            key = payload_attribute_stats(body)
-            if key in seen:
-                continue
-            seen.add(key)
-            if name != "primary":
-                attempts.append((name, body))
+    attempts = _create_attempts(
+        full_payload,
+        brief_ru=str(brief_ru),
+        game_id=resolved_game_id,
+        category_id=category_id,
+    )
 
     errors: list[str] = []
     result: dict[str, Any] | None = None
-    for name, body in attempts:
+    winning_body: dict[str, Any] = attempts[0][1]
+    winning_name = attempts[0][0]
+
+    for name, body, mode in attempts:
         stats = payload_attribute_stats(body)
         try:
-            result = await _send(body)
-            payload = body
-            if name != "primary":
+            result = await _send(body, mode)
+            winning_body = body
+            winning_name = name
+            if name != attempts[0][0]:
                 logger.info("create_offer succeeded on retry %s (%s)", name, stats)
             break
         except StarvellAPIError as exc:
@@ -287,19 +396,30 @@ async def create_lot_from_parsed(
                 ) from exc
 
     if result is None:
-        last_stats = payload_attribute_stats(attempts[-1][1]) if attempts else stats
+        last_stats = payload_attribute_stats(attempts[-1][1]) if attempts else ""
         raise StarvellAPIError(
             400,
-            f"Starvell отклонил все варианты payload.\n\n📊 Последняя попытка: {last_stats}\n\n" + "\n".join(errors[-3:]),
+            (
+                f"Starvell отклонил все варианты payload ({PARSER_BUILD}).\n\n"
+                f"📊 Последняя попытка: {last_stats}\n\n"
+                + "\n".join(errors[-5:])
+            ),
             {},
         )
+
     offer_id = result.get("id") or result.get("offerId")
     public_id = result.get("publicId")
+    if offer_id and winning_name.startswith("minimal"):
+        try:
+            await _apply_full_content(api, offer_id, full_payload)
+        except Exception as exc:
+            logger.warning("post-create content update failed for %s: %s", offer_id, exc)
+
     return {
         "offer_id": offer_id,
         "public_id": public_id,
         "url": offer_admin_url(offer_id or "", public_id),
-        "payload": payload,
+        "payload": winning_body,
         "raw": result,
     }
 

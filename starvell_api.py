@@ -415,15 +415,26 @@ class StarvellAPI:
         category_id: int | None = None,
         game_slug: str = "",
         category_slug: str = "",
+        finalize_mode: str = "basic",
     ) -> dict[str, Any]:
         """POST /api/offers/create — создание нового лота."""
-        from services.starvell_catalog import finalize_create_payload
-
-        clean_payload = finalize_create_payload(payload)
-        logger.debug(
-            "create_offer send: %s",
-            {k: (len(v) if isinstance(v, list) else type(v).__name__) for k, v in clean_payload.items()},
+        from services.starvell_catalog import (
+            finalize_create_payload,
+            finalize_unified_create_payload,
+            payload_attribute_stats,
+            strip_all_attributes,
         )
+
+        mode = (finalize_mode or "basic").lower()
+        if mode == "unified":
+            clean_payload = finalize_unified_create_payload(payload)
+        elif mode == "none":
+            clean_payload = strip_all_attributes(finalize_create_payload(payload))
+        else:
+            clean_payload = finalize_create_payload(payload)
+
+        logger.info("create_offer %s", payload_attribute_stats(clean_payload))
+        logger.debug("create_offer body: %s", json.dumps(clean_payload, ensure_ascii=False)[:4000])
         if not referer and game_slug and category_slug:
             referer = f"{BASE_URL}/{game_slug}/{category_slug}/sell"
         elif not referer and category_id:
@@ -449,8 +460,72 @@ class StarvellAPI:
                 msg = str(body.get("message") or body.get("error") or body.get("detail") or "")
             if not msg:
                 msg = resp.text[:500]
-            logger.warning("create_offer HTTP %s: %s", resp.status_code, msg)
+            logger.warning(
+                "create_offer HTTP %s: %s | payload=%s",
+                resp.status_code,
+                msg,
+                json.dumps(clean_payload, ensure_ascii=False)[:2000],
+            )
             raise StarvellAPIError(resp.status_code, msg, body if isinstance(body, dict) else {"raw": resp.text[:500]})
+        return result.get("json") or result
+
+    async def fetch_offer_draft(
+        self,
+        category_id: int,
+        *,
+        sub_category_id: int | None = None,
+        referer: str | None = None,
+        game_slug: str = "",
+        category_slug: str = "",
+    ) -> dict[str, Any]:
+        """GET /api/offers/draft — черновик формы продажи (может содержать bloated attrs)."""
+        query = f"categoryId={int(category_id)}"
+        if sub_category_id:
+            query += f"&subCategoryId={int(sub_category_id)}"
+        if not referer and game_slug and category_slug:
+            referer = f"{BASE_URL}/{game_slug}/{category_slug}/trade"
+        resp = await self._request(
+            "GET",
+            f"{BASE_URL}/api/offers/draft?{query}",
+            referer=referer or f"{BASE_URL}/",
+        )
+        if resp.status_code == 404:
+            return {}
+        if resp.status_code >= 400:
+            logger.debug("fetch_offer_draft HTTP %s: %s", resp.status_code, resp.text[:300])
+            return {}
+        try:
+            data = resp.json()
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    async def partial_update_offer(
+        self,
+        offer_id: str,
+        payload: dict[str, Any],
+        *,
+        referer: str | None = None,
+    ) -> dict[str, Any]:
+        """POST /api/offers/{id}/partial-update — частичное обновление лота."""
+        oid = str(offer_id or "").strip()
+        resp = await self._request(
+            "POST",
+            f"{BASE_URL}/api/offers/{oid}/partial-update",
+            referer=referer or f"{BASE_URL}/offers/{oid}",
+            json_body=payload,
+        )
+        result: dict[str, Any] = {"status": resp.status_code, "success": 200 <= resp.status_code < 300}
+        try:
+            result["json"] = resp.json()
+        except Exception:
+            result["raw"] = resp.text[:2000]
+        if resp.status_code >= 400:
+            msg = resp.text[:500]
+            if isinstance(result.get("json"), dict):
+                msg = str(result["json"].get("message") or msg)
+            logger.warning("partial_update_offer HTTP %s: %s", resp.status_code, msg)
+            raise StarvellAPIError(resp.status_code, msg, result.get("json") if isinstance(result.get("json"), dict) else {})
         return result.get("json") or result
 
     async def update_offer(

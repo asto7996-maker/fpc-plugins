@@ -212,7 +212,7 @@ def create_lot_parser_router(ctx: Any) -> Router:
         except StarvellAPIError as exc:
             logger.warning("create_offer api error: %s", exc)
             detail = str(exc)
-            if "build=attrs-v5" not in detail and "build=attrs-v4" not in detail and "build=attrs-v3" not in detail:
+            if "build=attrs-v6" not in detail and "build=attrs-v5" not in detail and "build=attrs-v4" not in detail:
                 detail = (
                     f"{detail}\n\n⚠️ На сервере старый код парсера. "
                     "Обновите: curl -fsSL …/update_starvell_cardinal.sh | sudo bash -s -- cursor/parser-auto-create-6ec3"

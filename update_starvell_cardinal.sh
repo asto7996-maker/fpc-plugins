@@ -53,12 +53,14 @@ rsync -a \
   --exclude='storage' --exclude='logs' --exclude='config/settings.json' \
   "$TMP/" "$INSTALL_DIR/"
 
-if grep -q 'PARSER_BUILD = "attrs-v5"' "$INSTALL_DIR/services/starvell_catalog.py" 2>/dev/null; then
-  echo "✅ Патч attrs-v5 установлен (basicAttributes, без attributes)"
+if grep -q 'PARSER_BUILD = "attrs-v6"' "$INSTALL_DIR/services/starvell_catalog.py" 2>/dev/null; then
+  echo "✅ Патч attrs-v6 установлен (minimal create + partial-update)"
+elif grep -q 'PARSER_BUILD = "attrs-v5"' "$INSTALL_DIR/services/starvell_catalog.py" 2>/dev/null; then
+  echo "⚠️  attrs-v5 — обновите до attrs-v6"
 else
   echo "⚠️  Старый код парсера — обновите ветку $REPO_BRANCH"
 fi
-echo "attrs-v5" > "$INSTALL_DIR/PARSER_BUILD.txt" 2>/dev/null || true
+echo "attrs-v6" > "$INSTALL_DIR/PARSER_BUILD.txt" 2>/dev/null || true
 
 # Каталоги данных и права (иначе systemd: status=200/CHDIR)
 mkdir -p "$INSTALL_DIR"/{config,storage/plugins,logs,plugins}

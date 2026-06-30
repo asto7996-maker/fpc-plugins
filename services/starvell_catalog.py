@@ -161,7 +161,12 @@ def pick_subcategory(catalog: dict[str, Any], *hint_texts: str) -> dict[str, Any
 
 
 MAX_NUMERIC_ATTRIBUTES = 50
-PARSER_BUILD = "attrs-v5"
+PARSER_BUILD = "attrs-v6"
+
+DEFAULT_DELIVERY_TIME: dict[str, Any] = {
+    "from": {"unit": "MINUTES", "value": "5"},
+    "to": {"unit": "DAYS", "value": "2"},
+}
 
 # FunPay Telegram «Подписчики» → Starvell category 175 / sub 634 (fallback без каталога)
 BUILTIN_TELEGRAM_SUBSCRIBERS: dict[str, Any] = {
@@ -338,34 +343,31 @@ def sanitize_create_attributes(
     return cleaned
 
 
-def finalize_create_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    """
-    POST /offers/create: basicAttributes (+ numericAttributes при необходимости).
-    Поле attributes на create не отправляем — Starvell считает его как все фильтры категории.
-    """
-    allowed_keys = (
-        "type",
-        "categoryId",
-        "subCategoryId",
-        "price",
-        "availability",
-        "isActive",
-        "autoDelivery",
-        "instantDelivery",
-        "descriptions",
-        "goods",
-        "basicAttributes",
-        "numericAttributes",
-        "postPaymentMessage",
-    )
-    out: dict[str, Any] = {k: payload[k] for k in allowed_keys if k in payload}
+def compact_option_attributes(items: Any) -> list[dict[str, str]]:
+    """Option-атрибуты в минимальном формате {id, optionId} (как на публичных лотах)."""
+    result: list[dict[str, str]] = []
+    seen: set[str] = set()
+    if not isinstance(items, list):
+        return result
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        aid = str(item.get("id") or "")
+        oid = item.get("optionId")
+        if not aid or not oid or aid in seen or item.get("numericValue") is not None:
+            continue
+        seen.add(aid)
+        result.append({"id": aid, "optionId": str(oid)})
+    return result
 
+
+def _collect_create_option_numeric(payload: dict[str, Any]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     basic: list[dict[str, Any]] = []
     numeric: list[dict[str, Any]] = []
     seen_option: set[str] = set()
     seen_numeric: set[str] = set()
 
-    for source in (out.get("basicAttributes"), payload.get("basicAttributes"), payload.get("attributes")):
+    for source in (payload.get("basicAttributes"), payload.get("attributes")):
         if not isinstance(source, list):
             continue
         for item in source:
@@ -378,7 +380,7 @@ def finalize_create_payload(payload: dict[str, Any]) -> dict[str, Any]:
                 seen_option.add(aid)
                 basic.append({"id": aid, "optionId": str(item["optionId"])})
 
-    for source in (out.get("numericAttributes"), payload.get("numericAttributes"), payload.get("attributes")):
+    for source in (payload.get("numericAttributes"), payload.get("attributes")):
         if not isinstance(source, list):
             continue
         for item in source:
@@ -394,6 +396,31 @@ def finalize_create_payload(payload: dict[str, Any]) -> dict[str, Any]:
                 numeric.append({"id": aid, "numericValue": float(item["numericValue"])})
             except (TypeError, ValueError):
                 pass
+    return basic, numeric
+
+
+def _create_base_fields(payload: dict[str, Any]) -> dict[str, Any]:
+    allowed_keys = (
+        "type",
+        "categoryId",
+        "gameId",
+        "subCategoryId",
+        "price",
+        "availability",
+        "isActive",
+        "autoDelivery",
+        "instantDelivery",
+        "descriptions",
+        "deliveryTime",
+        "postPaymentMessage",
+    )
+    return {k: payload[k] for k in allowed_keys if k in payload}
+
+
+def finalize_create_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """POST /offers/create: basicAttributes (+ numericAttributes при необходимости)."""
+    out = _create_base_fields(payload)
+    basic, numeric = _collect_create_option_numeric(payload)
 
     out.pop("attributes", None)
     if basic:
@@ -404,10 +431,105 @@ def finalize_create_payload(payload: dict[str, Any]) -> dict[str, Any]:
         out["numericAttributes"] = numeric[:10]
     else:
         out.pop("numericAttributes", None)
+    return out
 
-    if not out.get("goods"):
-        out["goods"] = []
 
+def finalize_unified_create_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """POST /offers/create: единый массив attributes (id + optionId), без legacy-полей."""
+    out = _create_base_fields(payload)
+    unified = compact_option_attributes(payload.get("attributes"))
+    if not unified:
+        unified = compact_option_attributes(payload.get("basicAttributes"))
+    out.pop("basicAttributes", None)
+    out.pop("numericAttributes", None)
+    if unified:
+        out["attributes"] = unified[:20]
+    else:
+        out.pop("attributes", None)
+    return out
+
+
+def build_minimal_create_payload(
+    base: dict[str, Any],
+    *,
+    brief_ru: str,
+    game_id: int = 0,
+    include_post_payment: bool = False,
+    include_attributes: bool = True,
+    explicit_empty_attrs: bool = False,
+    attr_mode: str = "basic",
+) -> dict[str, Any]:
+    """
+    Минимальный create: короткое описание, без postPayment (добавим через update).
+    Длинный bilingual-текст Starvell может парсить как десятки «атрибутов».
+    attr_mode: basic | unified | none
+    """
+    brief = (brief_ru or "Лот").strip()[:100]
+    raw: dict[str, Any] = {
+        "type": base.get("type") or "LOT",
+        "categoryId": base.get("categoryId"),
+        "subCategoryId": base.get("subCategoryId"),
+        "price": base.get("price"),
+        "availability": base.get("availability", 999999),
+        "isActive": base.get("isActive", True),
+        "autoDelivery": base.get("autoDelivery", True),
+        "instantDelivery": False,
+        "deliveryTime": DEFAULT_DELIVERY_TIME,
+        "descriptions": {
+            "rus": {
+                "briefDescription": brief,
+                "description": brief,
+            },
+        },
+    }
+    if game_id:
+        raw["gameId"] = int(game_id)
+    elif base.get("gameId"):
+        raw["gameId"] = int(base["gameId"])
+
+    if include_attributes and not explicit_empty_attrs:
+        if base.get("basicAttributes"):
+            raw["basicAttributes"] = list(base["basicAttributes"])
+        if base.get("attributes"):
+            raw["attributes"] = list(base["attributes"])
+        if base.get("numericAttributes"):
+            raw["numericAttributes"] = list(base["numericAttributes"])
+
+    if include_post_payment and base.get("postPaymentMessage"):
+        raw["postPaymentMessage"] = base["postPaymentMessage"]
+
+    mode = (attr_mode or "basic").lower()
+    if mode == "unified":
+        minimal = finalize_unified_create_payload(raw)
+    elif mode == "none" or not include_attributes:
+        minimal = finalize_create_payload(raw)
+        minimal.pop("basicAttributes", None)
+        minimal.pop("numericAttributes", None)
+        minimal.pop("attributes", None)
+    else:
+        minimal = finalize_create_payload(raw)
+
+    if explicit_empty_attrs:
+        if mode == "unified":
+            minimal["attributes"] = []
+        else:
+            minimal["basicAttributes"] = []
+            minimal["numericAttributes"] = []
+    return minimal
+
+
+def build_offer_update_payload(full: dict[str, Any]) -> dict[str, Any]:
+    """Тело partial-update после успешного create: полное описание и SMM-сообщение."""
+    out: dict[str, Any] = {}
+    if full.get("descriptions"):
+        out["descriptions"] = full["descriptions"]
+    if full.get("postPaymentMessage"):
+        out["postPaymentMessage"] = full["postPaymentMessage"]
+    unified = compact_option_attributes(full.get("attributes"))
+    if not unified:
+        unified = compact_option_attributes(full.get("basicAttributes"))
+    if unified:
+        out["attributes"] = unified
     return out
 
 
@@ -446,11 +568,26 @@ def payload_attribute_stats(payload: dict[str, Any]) -> str:
     basic = len(payload.get("basicAttributes") or [])
     numeric = len(payload.get("numericAttributes") or [])
     attrs = len(payload.get("attributes") or [])
-    keys = ",".join(sorted(payload.keys()))
+    desc = ((payload.get("descriptions") or {}).get("rus") or {}).get("description") or ""
+    desc_len = len(str(desc))
+    keys = ",".join(sorted(k for k in payload.keys() if not k.startswith("_")))
     return (
-        f"basic={basic} numeric={numeric} attributes={attrs} "
+        f"basic={basic} numeric={numeric} attributes={attrs} desc={desc_len} "
         f"keys=[{keys}] build={PARSER_BUILD}"
     )
+
+
+def draft_attribute_count(draft: dict[str, Any]) -> int:
+    if not isinstance(draft, dict):
+        return 0
+    for key in ("attributes", "basicAttributes", "numericAttributes"):
+        items = draft.get(key)
+        if isinstance(items, list) and items:
+            return len(items)
+    offer = draft.get("offer") or draft.get("draft") or {}
+    if isinstance(offer, dict):
+        return draft_attribute_count(offer)
+    return 0
 
 
 async def resolve_slugs_for_category(category_id: int, game_id: int = 0) -> tuple[str, str]:
