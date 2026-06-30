@@ -111,28 +111,40 @@ def create_profile_router(ctx: Any):
             await ctx._deny(call)
             return
         await state.clear()
+        await call.answer()
+        try:
+            await call.message.edit_text("⏳ Загружаю профиль…")
+        except Exception:
+            pass
         text, kb = await build_profile_brief(ctx)
         await call.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
-        await call.answer()
 
     @router.callback_query(F.data == CBT.PROFILE_DETAIL)
     async def cb_profile_detail(call: CallbackQuery) -> None:
         if not await _access(call.from_user.id):
             return
+        await call.answer()
+        try:
+            await call.message.edit_text("⏳ Загружаю статистику…")
+        except Exception:
+            pass
         text = await build_profile_detail(ctx)
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="◀️ Профиль", callback_data=CBT.PROFILE)],
             [InlineKeyboardButton(text="🏠 Меню", callback_data=CBT.MAIN)],
         ])
         await call.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
-        await call.answer()
 
     @router.callback_query(F.data == CBT.STATUS)
     async def cb_status(call: CallbackQuery) -> None:
         if not await _access(call.from_user.id):
             return
+        await call.answer()
+        try:
+            await call.message.edit_text("⏳ Загружаю статистику…")
+        except Exception:
+            pass
         text = await build_status_text(ctx)
         await call.message.edit_text(text, parse_mode="HTML", reply_markup=KB.back_menu())
-        await call.answer()
 
     return router

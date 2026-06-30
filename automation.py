@@ -805,17 +805,30 @@ class AutomationEngine:
 
     async def get_status(self) -> dict[str, Any]:
         """Сводка для Telegram-меню."""
+        import asyncio
+
         settings = self._get_settings()
         result: dict[str, Any] = {"accounts": []}
         for account in settings.get_active_accounts():
             api = self._apis.get(account.name) or self._build_api(account)
             entry: dict[str, Any] = {"name": account.name}
             try:
-                info = await api.fetch_homepage()
+                info = await asyncio.wait_for(api.fetch_homepage(), timeout=20.0)
                 user = info.get("user") or {}
                 entry["authorized"] = info.get("authorized", False)
                 entry["username"] = user.get("username")
-                wallet = await api.fetch_wallet_balance()
+
+                wallet_coro = api.fetch_wallet_balance()
+                orders_coro = api.fetch_orders()
+                wallet, orders = await asyncio.wait_for(
+                    asyncio.gather(wallet_coro, orders_coro, return_exceptions=True),
+                    timeout=25.0,
+                )
+                if isinstance(wallet, Exception):
+                    wallet = {}
+                if isinstance(orders, Exception):
+                    orders = []
+
                 if wallet:
                     entry["balance"] = wallet
                     entry["balance_formatted"] = format_rub_balance(wallet)
@@ -825,13 +838,17 @@ class AutomationEngine:
                 else:
                     entry["balance"] = user.get("balance")
                     entry["balance_formatted"] = format_rub_balance(user.get("balance"))
-                orders = await api.fetch_orders()
+
                 active = [o for o in orders if str(o.get("status")) in ("CREATED", "IN_PROGRESS", "PAID")]
                 entry["active_orders"] = len(active)
                 entry["total_orders"] = len(orders)
+
                 if hasattr(api, "fetch_user_lots") and user.get("id"):
                     try:
-                        lots = await api.fetch_user_lots(int(user["id"]))
+                        lots = await asyncio.wait_for(
+                            api.fetch_user_lots(int(user["id"])),
+                            timeout=15.0,
+                        )
                         entry["lots_count"] = len(lots)
                     except Exception:
                         entry["lots_count"] = 0
@@ -841,6 +858,8 @@ class AutomationEngine:
                         1 for p in pe.plugins.values() if p.enabled
                     )
                     entry["plugins_total"] = len(pe.plugins)
+            except asyncio.TimeoutError:
+                entry["error"] = "Таймаут Starvell API — попробуйте позже"
             except Exception as exc:
                 entry["error"] = str(exc)
             result["accounts"].append(entry)

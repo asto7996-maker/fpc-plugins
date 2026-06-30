@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import re
 from typing import Any
 
@@ -17,7 +18,7 @@ from keyboards import cbt as CBT
 from services.funpay_parser import (
     build_starvell_package,
     fetch_funpay_lot,
-    format_copy_message,
+    send_copy_sections,
 )
 from tg_bot import keyboards as KB
 
@@ -42,7 +43,8 @@ def create_lot_parser_router(ctx: Any) -> Router:
             "• перевод на английский (Gemini)\n"
             "• для SMM — сообщение после оплаты и <code>ID: ваш_id</code>\n\n"
             "Пример ссылки:\n"
-            "<code>https://funpay.com/lots/offer?id=12345678</code>"
+            "<code>https://funpay.com/lots/offer?id=12345678</code>\n\n"
+            "<i>Для выхода: /cancel или ◀️ Меню</i>"
         )
 
     @router.message(Command("parser"))
@@ -67,10 +69,19 @@ def create_lot_parser_router(ctx: Any) -> Router:
         if not await _access(message.from_user.id):
             return
         url = (message.text or "").strip()
-        if not url or url.startswith("/"):
+        if not url:
+            return
+        if url.startswith("/"):
             return
         wait = await message.answer("⏳ Загружаю лот FunPay…")
-        lot = await fetch_funpay_lot(url)
+        try:
+            lot = await asyncio.wait_for(fetch_funpay_lot(url), timeout=35.0)
+        except asyncio.TimeoutError:
+            await wait.edit_text("❌ FunPay не ответил вовремя. Попробуйте позже или /cancel")
+            return
+        except Exception as exc:
+            await wait.edit_text(f"❌ Ошибка загрузки: {exc}")
+            return
         if lot.errors and not lot.title:
             await wait.edit_text("❌ " + "\n".join(lot.errors))
             return
@@ -79,8 +90,18 @@ def create_lot_parser_router(ctx: Any) -> Router:
         ai = AIService(s)
         if s.is_gemini_configured():
             await wait.edit_text("⏳ Перевожу описание на английский…")
-            lot.brief_en = await ai.translate_text(lot.brief_ru or lot.title)
-            lot.full_en = await ai.translate_text(lot.full_ru or lot.brief_ru or lot.title)
+            try:
+                lot.brief_en, lot.full_en = await asyncio.wait_for(
+                    asyncio.gather(
+                        ai.translate_text(lot.brief_ru or lot.title),
+                        ai.translate_text(lot.full_ru or lot.brief_ru or lot.title),
+                    ),
+                    timeout=90.0,
+                )
+            except asyncio.TimeoutError:
+                lot.brief_en = lot.brief_ru
+                lot.full_en = lot.full_ru
+                await wait.edit_text("⚠️ Перевод занял слишком долго — показываю только RU…")
         else:
             lot.brief_en = lot.brief_ru
             lot.full_en = lot.full_ru
@@ -125,13 +146,19 @@ def create_lot_parser_router(ctx: Any) -> Router:
             full_en=lot_data.get("full_en", ""),
         )
         sections = build_starvell_package(lot, is_smm=False)
-        await call.message.edit_text(
-            format_copy_message(sections),
-            parse_mode="HTML",
-            reply_markup=KB.back_menu(),
-        )
         await state.clear()
         await call.answer()
+        try:
+            from services.funpay_parser import format_copy_message
+            preview = format_copy_message(sections)
+            if len(preview) <= 4000:
+                await call.message.edit_text(preview, parse_mode="HTML", reply_markup=KB.back_menu())
+            else:
+                await call.message.edit_text("✅ Лот готов — отправляю частями…", reply_markup=KB.back_menu())
+                await send_copy_sections(call.message, sections)
+        except Exception:
+            await call.message.edit_text("✅ Лот готов — отправляю частями…", reply_markup=KB.back_menu())
+            await send_copy_sections(call.message, sections)
 
     @router.callback_query(F.data == CBT.PARSER_SMM)
     async def cb_parser_smm(call: CallbackQuery, state: FSMContext) -> None:
@@ -152,6 +179,8 @@ def create_lot_parser_router(ctx: Any) -> Router:
         if not await _access(message.from_user.id):
             return
         raw = (message.text or "").strip()
+        if raw.startswith("/"):
+            return
         m = re.search(r"\d+", raw)
         if not m:
             await message.answer("❌ Отправьте числовой ID услуги")
@@ -186,12 +215,18 @@ def create_lot_parser_router(ctx: Any) -> Router:
         sections = build_starvell_package(
             lot, is_smm=True, service_id=service_id, auto_delivery=auto_ad,
         )
-        await call.message.edit_text(
-            format_copy_message(sections),
-            parse_mode="HTML",
-            reply_markup=KB.back_menu(),
-        )
         await state.clear()
         await call.answer("✅ Готово")
+        try:
+            from services.funpay_parser import format_copy_message
+            preview = format_copy_message(sections)
+            if len(preview) <= 4000:
+                await call.message.edit_text(preview, parse_mode="HTML", reply_markup=KB.back_menu())
+            else:
+                await call.message.edit_text("✅ Лот готов — отправляю частями…", reply_markup=KB.back_menu())
+                await send_copy_sections(call.message, sections)
+        except Exception:
+            await call.message.edit_text("✅ Лот готов — отправляю частями…", reply_markup=KB.back_menu())
+            await send_copy_sections(call.message, sections)
 
     return router

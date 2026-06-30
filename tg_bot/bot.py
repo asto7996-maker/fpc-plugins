@@ -92,6 +92,12 @@ class TelegramBot:
         self.dp = Dispatcher()
         self.router = Router()
         self._register_handlers()
+        # Навигация ПЕРВОЙ — сбрасывает FSM на /start /menu /cancel
+        try:
+            from handlers.tg.nav_escape import create_nav_router
+            self.dp.include_router(create_nav_router(self))
+        except Exception as exc:
+            logger.warning("Nav escape router: %s", exc)
         # Hub (плагины FPC) — регистрируем ПЕРВЫМ, чтобы перехватывал sc:plug*
         try:
             from handlers.tg.hub import create_hub_router
@@ -967,6 +973,7 @@ class TelegramBot:
             {"command": "export", "description": "Текущие данные"},
             {"command": "parser", "description": "Парсер FunPay"},
             {"command": "restart", "description": "Перезапуск бота"},
+            {"command": "cancel", "description": "Отмена / в меню"},
             {"command": "help", "description": "Справка"},
         ]
         try:

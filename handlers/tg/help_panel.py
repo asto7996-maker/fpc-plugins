@@ -22,6 +22,7 @@ HELP_TEXT = (
     "/status — краткая статистика\n"
     "/session — привязать Starvell cookie\n"
     "/restart — перезапуск бота\n"
+    "/cancel — выход из режима в меню\n"
     "/plugins — список плагинов\n"
     "/backup — создать бэкап\n"
     "/upload — загрузить бэкап\n"

@@ -158,6 +158,37 @@ def format_copy_message(sections: dict[str, str]) -> str:
     return "\n".join(lines)
 
 
+def split_telegram_messages(text: str, limit: int = 4000) -> list[str]:
+    """Разбивает длинный HTML-текст на части для Telegram."""
+    if len(text) <= limit:
+        return [text]
+    chunks: list[str] = []
+    rest = text
+    while rest:
+        if len(rest) <= limit:
+            chunks.append(rest)
+            break
+        cut = rest.rfind("\n\n", 0, limit)
+        if cut < limit // 2:
+            cut = limit
+        chunks.append(rest[:cut].rstrip())
+        rest = rest[cut:].lstrip()
+    return chunks
+
+
+async def send_copy_sections(message, sections: dict[str, str], *, reply_markup=None) -> None:
+    """Отправляет результат парсера (несколько сообщений при необходимости)."""
+    full = format_copy_message(sections)
+    parts = split_telegram_messages(full)
+    for i, part in enumerate(parts):
+        is_last = i == len(parts) - 1
+        await message.answer(
+            part,
+            parse_mode="HTML",
+            reply_markup=reply_markup if is_last else None,
+        )
+
+
 def _esc(text: str) -> str:
     return (text or "").replace("<", "&lt;").replace(">", "&gt;")
 
