@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 # Обновление Starvell Cardinal до последней версии с GitHub.
+# Использование:
+#   curl -fsSL .../scripts/update_starvell_cardinal.sh | sudo bash -s -- cursor/parser-auto-create-6ec3
+#   REPO_BRANCH=cursor/parser-auto-create-6ec3 sudo bash update_starvell_cardinal.sh
 
 set -euo pipefail
 
@@ -11,11 +14,10 @@ REPO_BRANCH="${REPO_BRANCH:-${1:-cursor/parser-auto-create-6ec3}}"
 echo "=== Обновление Starvell Cardinal (ветка: $REPO_BRANCH) ==="
 
 if [ "$EUID" -ne 0 ]; then
-  echo "Запустите: sudo bash update_starvell_cardinal.sh"
+  echo "Запустите: sudo bash update_starvell_cardinal.sh [ветка]"
   exit 1
 fi
 
-# Пользователь и Python
 id "$SERVICE_USER" &>/dev/null || useradd -r -m -s /bin/bash "$SERVICE_USER"
 if command -v python3 >/dev/null 2>&1; then
   PYTHON_BIN="python3"
@@ -49,12 +51,10 @@ rsync -a \
   --exclude='storage' --exclude='logs' --exclude='config/settings.json' \
   "$TMP/" "$INSTALL_DIR/"
 
-# Каталоги данных и права (иначе systemd: status=200/CHDIR)
 mkdir -p "$INSTALL_DIR"/{config,storage/plugins,logs,plugins}
 chown -R "$SERVICE_USER:$SERVICE_USER" "$INSTALL_DIR"
 chmod 755 "$INSTALL_DIR"
 chmod 755 "$INSTALL_DIR"/{config,storage,logs,plugins} 2>/dev/null || true
-# Пользователь starvell должен иметь доступ к /opt
 if [ -d /opt ] && ! sudo -u "$SERVICE_USER" test -x /opt; then
   chmod o+x /opt
 fi
@@ -64,7 +64,6 @@ if ! sudo -u "$SERVICE_USER" test -x "$INSTALL_DIR"; then
   exit 1
 fi
 
-# Виртуальное окружение
 if [ ! -f "$INSTALL_DIR/venv/bin/pip" ]; then
   echo "Создаю venv …"
   sudo -u "$SERVICE_USER" "$PYTHON_BIN" -m venv "$INSTALL_DIR/venv"
@@ -72,7 +71,6 @@ fi
 sudo -u "$SERVICE_USER" "$INSTALL_DIR/venv/bin/pip" install --upgrade pip -q
 sudo -u "$SERVICE_USER" "$INSTALL_DIR/venv/bin/pip" install -r "$INSTALL_DIR/requirements.txt" -q
 
-# settings.json если отсутствует
 if [ ! -f "$INSTALL_DIR/config/settings.json" ]; then
   if [ -f "$INSTALL_DIR/config/settings.json.example" ]; then
     cp "$INSTALL_DIR/config/settings.json.example" "$INSTALL_DIR/config/settings.json"
@@ -82,7 +80,6 @@ if [ ! -f "$INSTALL_DIR/config/settings.json" ]; then
   fi
 fi
 
-# Systemd unit (создать или обновить)
 cat > /etc/systemd/system/starvell-cardinal.service <<EOF
 [Unit]
 Description=Starvell Cardinal Telegram Bot
