@@ -391,6 +391,84 @@ class StarvellAPI:
                 })
         return lots
 
+    async def create_offer(self, payload: dict[str, Any], *, referer: str | None = None) -> dict[str, Any]:
+        """POST /api/offers/create — создание нового лота."""
+        resp = await self._request(
+            "POST",
+            f"{BASE_URL}/api/offers/create",
+            referer=referer or f"{BASE_URL}/",
+            json_body=payload,
+        )
+        result: dict[str, Any] = {"status": resp.status_code, "success": 200 <= resp.status_code < 300}
+        try:
+            result["json"] = resp.json()
+        except Exception:
+            result["raw"] = resp.text[:2000]
+        if resp.status_code >= 400:
+            logger.warning("create_offer HTTP %s: %s", resp.status_code, resp.text[:500])
+            resp.raise_for_status()
+        return result.get("json") or result
+
+    async def update_offer(
+        self,
+        offer_id: str,
+        payload: dict[str, Any],
+        *,
+        referer: str | None = None,
+    ) -> dict[str, Any]:
+        """POST /api/offers/{id}/update — полное обновление лота."""
+        oid = str(offer_id or "").strip()
+        resp = await self._request(
+            "POST",
+            f"{BASE_URL}/api/offers/{oid}/update",
+            referer=referer or f"{BASE_URL}/offers/{oid}",
+            json_body=payload,
+        )
+        result: dict[str, Any] = {"status": resp.status_code, "success": 200 <= resp.status_code < 300}
+        try:
+            result["json"] = resp.json()
+        except Exception:
+            result["raw"] = resp.text[:2000]
+        if resp.status_code >= 400:
+            logger.warning("update_offer HTTP %s: %s", resp.status_code, resp.text[:500])
+            resp.raise_for_status()
+        return result.get("json") or result
+
+    async def fetch_seller_categories(self, user_id: int | None = None) -> list[dict[str, Any]]:
+        """
+        Категории продавца для создания лота — из уже выставленных предложений.
+        Возвращает список {category_id, title, offer_id, game_id, price}.
+        """
+        if user_id is None:
+            info = await self.fetch_homepage()
+            user = info.get("user") or {}
+            user_id = user.get("id")
+        if not user_id:
+            return []
+
+        lots = await self.fetch_user_lots(int(user_id))
+        seen: set[int] = set()
+        categories: list[dict[str, Any]] = []
+        for lot in lots:
+            cat_id = lot.get("category_id")
+            if cat_id is None:
+                continue
+            try:
+                cid = int(cat_id)
+            except (TypeError, ValueError):
+                continue
+            if cid in seen:
+                continue
+            seen.add(cid)
+            categories.append({
+                "category_id": cid,
+                "title": str(lot.get("title") or f"Категория #{cid}")[:80],
+                "offer_id": lot.get("id"),
+                "game_id": lot.get("game_id"),
+                "price": lot.get("price"),
+            })
+        return categories
+
     async def bump_offers(self, game_id: int, category_ids: list[int], referer: str | None = None) -> dict[str, Any]:
         """Поднимает лоты в указанных категориях."""
         resp = await self._request(

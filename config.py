@@ -139,6 +139,11 @@ class Settings:
     watermark_text: str = "[Starvell Cardinal]"
     debug: bool = False
 
+    # Парсер FunPay → Starvell
+    parser_default_category_id: int = 0
+    parser_default_price: str = "10.00"
+    parser_auto_delivery: bool = True
+
     def get_active_accounts(self) -> list[StarvellAccount]:
         if self.accounts:
             return [a for a in self.accounts if a.enabled and a.session_cookie]

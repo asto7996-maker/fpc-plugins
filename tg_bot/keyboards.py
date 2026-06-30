@@ -76,6 +76,31 @@ def parser_autodelivery_kb() -> InlineKeyboardMarkup:
     ])
 
 
+def parser_categories_kb(categories: list[dict]) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for cat in categories[:12]:
+        cid = cat.get("category_id")
+        title = str(cat.get("title") or f"#{cid}")[:40]
+        rows.append([
+            InlineKeyboardButton(
+                text=f"📁 {title}",
+                callback_data=f"{CBT.PARSER_CAT}{cid}",
+            ),
+        ])
+    rows.append([InlineKeyboardButton(text="◀️ Отмена", callback_data=CBT.MAIN)])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def parser_price_kb(default_price: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text=f"✅ Создать с ценой {default_price} ₽",
+            callback_data=CBT.PARSER_SKIP_PRICE,
+        )],
+        [InlineKeyboardButton(text="◀️ Отмена", callback_data=CBT.MAIN)],
+    ])
+
+
 def backup_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📤 Создать и скачать", callback_data=CBT.BACKUP_DL)],
