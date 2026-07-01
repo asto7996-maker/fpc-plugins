@@ -430,9 +430,11 @@ class StarvellAPI:
         cat_slug = category.get("slug")
         return {
             "id": offer.get("id") or offer.get("publicId"),
+            "public_id": offer.get("publicId"),
             "title": str(title).strip(),
             "price": offer.get("price"),
             "availability": offer.get("availability"),
+            "is_active": offer.get("isActive", True),
             "category_id": cat_id,
             "game_id": game_id,
             "category_url": f"{BASE_URL}/{game_slug}/{cat_slug}/trade" if game_slug and cat_slug else None,
@@ -621,9 +623,85 @@ class StarvellAPI:
         except Exception:
             result["raw"] = resp.text[:2000]
         if resp.status_code >= 400:
-            logger.warning("update_offer HTTP %s: %s", resp.status_code, resp.text[:500])
-            resp.raise_for_status()
+            msg = resp.text[:500]
+            if isinstance(result.get("json"), dict):
+                msg = str(result["json"].get("message") or msg)
+            logger.warning("update_offer HTTP %s: %s", resp.status_code, msg)
+            raise StarvellAPIError(
+                resp.status_code,
+                msg,
+                result.get("json") if isinstance(result.get("json"), dict) else {},
+            )
         return result.get("json") or result
+
+    async def delete_offer(
+        self,
+        offer_id: str,
+        *,
+        referer: str | None = None,
+    ) -> dict[str, Any]:
+        """POST /api/offers/{id}/delete — удаление лота."""
+        oid = str(offer_id or "").strip()
+        resp = await self._request(
+            "POST",
+            f"{BASE_URL}/api/offers/{oid}/delete",
+            referer=referer or f"{BASE_URL}/offers/{oid}",
+        )
+        if resp.status_code >= 400:
+            msg = resp.text[:500]
+            try:
+                body = resp.json()
+                if isinstance(body, dict):
+                    msg = str(body.get("message") or msg)
+            except Exception:
+                body = {}
+            raise StarvellAPIError(resp.status_code, msg, body if isinstance(body, dict) else {})
+        try:
+            return resp.json()
+        except Exception:
+            return {"success": True}
+
+    async def deactivate_offer(
+        self,
+        offer_id: str | int,
+        *,
+        public_id: str | None = None,
+    ) -> dict[str, Any]:
+        """POST /api/offers/deactivate — отключить лот."""
+        body: dict[str, Any] = {}
+        if public_id:
+            body["publicId"] = str(public_id)
+        else:
+            body["id"] = int(offer_id) if str(offer_id).isdigit() else offer_id
+        resp = await self._request(
+            "POST",
+            f"{BASE_URL}/api/offers/deactivate",
+            referer=f"{BASE_URL}/account/sells",
+            json_body=body,
+        )
+        if resp.status_code >= 400:
+            msg = resp.text[:500]
+            try:
+                parsed = resp.json()
+                if isinstance(parsed, dict):
+                    msg = str(parsed.get("message") or msg)
+            except Exception:
+                parsed = {}
+            raise StarvellAPIError(resp.status_code, msg, parsed if isinstance(parsed, dict) else {})
+        try:
+            return resp.json()
+        except Exception:
+            return {"success": True}
+
+    async def activate_offer(
+        self,
+        offer_id: str,
+        *,
+        public_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Включить лот (partial-update isActive=true)."""
+        oid = str(public_id or offer_id).strip()
+        return await self.partial_update_offer(oid, {"isActive": True})
 
     async def fetch_seller_categories(self, user_id: int | None = None) -> list[dict[str, Any]]:
         """

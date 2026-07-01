@@ -202,7 +202,7 @@ def pick_subcategory(catalog: dict[str, Any], *hint_texts: str) -> dict[str, Any
 
 
 MAX_NUMERIC_ATTRIBUTES = 50
-PARSER_BUILD = "attrs-v7.6"
+PARSER_BUILD = "attrs-v7.7"
 
 MIN_DELIVERY_FROM_MINUTES = 10
 
@@ -682,6 +682,7 @@ def build_minimal_create_payload(
     base: dict[str, Any],
     *,
     brief_ru: str,
+    full_description: str | None = None,
     game_id: int = 0,
     include_post_payment: bool = False,
     include_attributes: bool = True,
@@ -692,8 +693,11 @@ def build_minimal_create_payload(
     subcategory: dict[str, Any] | None = None,
     brief_enabled: bool = True,
 ) -> dict[str, Any]:
-    """Минимальный create по схеме веб-формы Starvell (короткое описание, без postPayment)."""
+    """Минимальный create по схеме веб-формы Starvell."""
     brief = (brief_ru or "Лот").strip()[:100]
+    full = (full_description or brief).strip()
+    if len(full) > 4800:
+        full = full[:4799].rstrip() + "…"
     if delivery_time is None:
         delivery_time = DEFAULT_DELIVERY_TIME
     raw: dict[str, Any] = {
@@ -709,10 +713,12 @@ def build_minimal_create_payload(
         "descriptions": {
             "rus": {
                 "briefDescription": brief,
-                "description": brief,
+                "description": full,
             },
         },
     }
+    if base.get("minOrderCurrencyAmount") is not None:
+        raw["minOrderCurrencyAmount"] = base["minOrderCurrencyAmount"]
     if game_id:
         raw["gameId"] = int(game_id)
     elif base.get("gameId"):
@@ -734,22 +740,11 @@ def build_minimal_create_payload(
     )
 
 
-def build_offer_update_payload(full: dict[str, Any]) -> dict[str, Any]:
-    """Тело partial-update после успешного create: полное описание и SMM-сообщение."""
+def build_offer_partial_update_payload(full: dict[str, Any]) -> dict[str, Any]:
+    """POST /offers/{id}/partial-update — только цена, наличие, min, isActive."""
     out: dict[str, Any] = {}
-    if full.get("descriptions"):
-        out["descriptions"] = full["descriptions"]
-    if full.get("postPaymentMessage"):
-        out["postPaymentMessage"] = full["postPaymentMessage"]
-    if subcategory_supports_delivery_time(full.get("categoryId"), full.get("subCategoryId")):
-        out["deliveryTime"] = normalize_delivery_time(full.get("deliveryTime"))
-    if full.get("minOrderCurrencyAmount") is not None:
-        try:
-            min_val = int(float(str(full["minOrderCurrencyAmount"]).replace(",", ".")))
-            if min_val > 0:
-                out["minOrderCurrencyAmount"] = min_val
-        except (TypeError, ValueError):
-            pass
+    if full.get("price") is not None:
+        out["price"] = str(full["price"]).replace(",", ".")
     if full.get("availability") is not None:
         try:
             avail = int(float(str(full["availability"]).replace(",", ".")))
@@ -757,12 +752,60 @@ def build_offer_update_payload(full: dict[str, Any]) -> dict[str, Any]:
                 out["availability"] = avail
         except (TypeError, ValueError):
             pass
-    unified = compact_option_attributes(full.get("attributes"))
-    if not unified:
-        unified = compact_option_attributes(full.get("basicAttributes"))
-    if unified:
-        out["attributes"] = unified
+    if full.get("minOrderCurrencyAmount") is not None:
+        try:
+            min_val = int(float(str(full["minOrderCurrencyAmount"]).replace(",", ".")))
+            if min_val > 0:
+                out["minOrderCurrencyAmount"] = min_val
+        except (TypeError, ValueError):
+            pass
+    if "isActive" in full:
+        out["isActive"] = bool(full["isActive"])
     return out
+
+
+def build_offer_content_update_payload(
+    full: dict[str, Any],
+    *,
+    catalog: dict[str, Any] | None = None,
+    subcategory: dict[str, Any] | None = None,
+    brief_enabled: bool = True,
+) -> dict[str, Any]:
+    """POST /offers/{id}/update — описание, postPayment, delivery (не partial-update)."""
+    cat_id = full.get("categoryId")
+    sub_id = full.get("subCategoryId")
+    include_dt = subcategory_supports_delivery_time(cat_id, sub_id)
+    raw: dict[str, Any] = {
+        "type": full.get("type") or "LOT",
+        "categoryId": cat_id,
+        "subCategoryId": sub_id,
+        "gameId": full.get("gameId"),
+        "price": full.get("price"),
+        "availability": full.get("availability"),
+        "isActive": full.get("isActive", True),
+        "autoDelivery": bool(full.get("autoDelivery", False)),
+        "instantDelivery": False,
+        "descriptions": full.get("descriptions"),
+        "postPaymentMessage": full.get("postPaymentMessage"),
+        "basicAttributes": full.get("basicAttributes"),
+    }
+    if full.get("minOrderCurrencyAmount") is not None:
+        raw["minOrderCurrencyAmount"] = full["minOrderCurrencyAmount"]
+    if include_dt and full.get("deliveryTime"):
+        raw["deliveryTime"] = normalize_delivery_time(full.get("deliveryTime"))
+    return finalize_frontend_create_payload(
+        raw,
+        catalog=catalog,
+        subcategory=subcategory,
+        brief_enabled=brief_enabled,
+        force_empty_numeric=True,
+        include_delivery_time=include_dt,
+    )
+
+
+def build_offer_update_payload(full: dict[str, Any]) -> dict[str, Any]:
+    """Legacy alias — полное обновление контента лота."""
+    return build_offer_content_update_payload(full)
 
 
 def strip_all_attributes(payload: dict[str, Any]) -> dict[str, Any]:

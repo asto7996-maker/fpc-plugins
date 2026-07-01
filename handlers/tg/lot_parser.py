@@ -23,6 +23,7 @@ from services.price_utils import (
     parse_price_hint,
     parse_smm_reply,
 )
+from handlers.tg.lot_manager import lot_actions_kb
 from services.starvell_lot_creator import create_lot_from_parsed, format_created_message
 from services.vexboost_service import VexBoostServiceError, VexBoostServiceInfo, fetch_vexboost_service
 from services.yandex_translate import translate_ru_to_en
@@ -272,7 +273,14 @@ def create_lot_parser_router(ctx: Any) -> Router:
         )
         if cat_title:
             text += f"\n📁 Категория: <b>{cat_title}</b>"
-        await wait.edit_text(text, parse_mode="HTML", reply_markup=KB.back_menu(), disable_web_page_preview=False)
+        if is_smm and not result.get("content_applied", True):
+            text += (
+                "\n\n⚠️ <b>Описание могло не примениться</b> — обновите бота (attrs-v7.7+) "
+                "и пересоздайте лот."
+            )
+        offer_ref = str(result.get("public_id") or result.get("offer_id") or "")
+        kb = lot_actions_kb(offer_ref) if offer_ref else KB.back_menu()
+        await wait.edit_text(text, parse_mode="HTML", reply_markup=kb, disable_web_page_preview=False)
 
     async def _ask_price(message: Message, state: FSMContext) -> None:
         data = await state.get_data()

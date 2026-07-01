@@ -20,7 +20,8 @@ from services.starvell_catalog import (
     apply_builtin_category_defaults,
     build_minimal_create_payload,
     build_offer_attributes,
-    build_offer_update_payload,
+    build_offer_content_update_payload,
+    build_offer_partial_update_payload,
     compact_option_attributes,
     draft_attribute_count,
     fetch_category_catalog,
@@ -289,8 +290,10 @@ def _create_attempts(
     template_attrs: list[dict[str, str]] | None,
 ) -> list[tuple[str, dict[str, Any]]]:
     """Варианты create по схеме веб-формы Starvell."""
+    full_desc = _extract_full_description(full_payload)
     common = dict(
         brief_ru=brief_ru,
+        full_description=full_desc,
         game_id=game_id,
         auto_delivery=False,
         catalog=catalog,
@@ -383,22 +386,67 @@ def _create_attempts(
     return unique
 
 
+def _extract_full_description(full_payload: dict[str, Any]) -> str:
+    return str(
+        ((full_payload.get("descriptions") or {}).get("rus") or {}).get("description") or ""
+    ).strip()
+
+
 async def _apply_full_content(
     api: StarvellAPI,
     offer_id: str | int,
+    public_id: str | int | None,
     full_payload: dict[str, Any],
-) -> None:
-    """Фаза 2: полное описание и postPayment через partial-update."""
-    update_body = build_offer_update_payload(full_payload)
+    *,
+    catalog: dict[str, Any] | None = None,
+    subcategory: dict[str, Any] | None = None,
+    brief_enabled: bool = True,
+) -> bool:
+    """Фаза 2: описание/postPayment через POST /offers/{id}/update (partial-update их не принимает)."""
+    expected = _extract_full_description(full_payload)
+    if not expected:
+        return True
+
+    update_body = build_offer_content_update_payload(
+        full_payload,
+        catalog=catalog,
+        subcategory=subcategory,
+        brief_enabled=brief_enabled,
+    )
     if not update_body:
-        return
-    oid = str(offer_id)
-    try:
-        await api.partial_update_offer(oid, update_body)
-        logger.info("partial_update applied for offer %s", oid[:12])
-    except StarvellAPIError as exc:
-        logger.warning("partial_update failed (%s), trying full update", exc)
-        await api.update_offer(oid, {**full_payload, **update_body})
+        return False
+
+    ids_to_try = []
+    for candidate in (public_id, offer_id):
+        text = str(candidate or "").strip()
+        if text and text not in ids_to_try:
+            ids_to_try.append(text)
+
+    errors: list[str] = []
+    for oid in ids_to_try:
+        try:
+            await api.update_offer(oid, update_body)
+            logger.info("update_offer content applied for %s", oid[:16])
+            offer = await api.fetch_offer(oid)
+            got = str(
+                ((offer.get("descriptions") or {}).get("rus") or {}).get("description") or ""
+            )
+            marker = "ID:" if "ID:" in expected else expected[:40]
+            if marker and marker in got:
+                return True
+            partial = build_offer_partial_update_payload(full_payload)
+            if partial:
+                await api.partial_update_offer(oid, partial)
+            if marker in got or len(got) >= len(expected) * 0.5:
+                return True
+            errors.append(f"{oid}: описание не совпало ({len(got)} vs {len(expected)} chars)")
+        except StarvellAPIError as exc:
+            errors.append(f"{oid}: {exc}")
+            logger.warning("update_offer content failed for %s: %s", oid, exc)
+
+    if errors:
+        logger.error("post-create content update failed: %s", "; ".join(errors[-3:]))
+    return not errors
 
 
 async def create_lot_from_parsed(
@@ -528,11 +576,17 @@ async def create_lot_from_parsed(
 
     offer_id = result.get("id") or result.get("offerId")
     public_id = result.get("publicId")
+    content_ok = True
     if offer_id:
-        try:
-            await _apply_full_content(api, offer_id, full_payload)
-        except Exception as exc:
-            logger.warning("post-create content update failed for %s: %s", offer_id, exc)
+        content_ok = await _apply_full_content(
+            api,
+            offer_id,
+            public_id,
+            full_payload,
+            catalog=catalog,
+            subcategory=subcategory,
+            brief_enabled=brief_enabled,
+        )
 
     return {
         "offer_id": offer_id,
@@ -541,6 +595,7 @@ async def create_lot_from_parsed(
         "payload": winning_body,
         "raw": result,
         "vexboost_info": vexboost_info,
+        "content_applied": content_ok,
     }
 
 

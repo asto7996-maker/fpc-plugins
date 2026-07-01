@@ -260,6 +260,13 @@ def compose_starvell_descriptions(
         if service_id:
             full_ru = apply_service_id(full_ru, int(service_id))
         brief_ru = strip_service_id(strip_smm_meta_lines(brief_ru))
+        if _norm_compare(full_ru) == _norm_compare(brief_ru):
+            full_ru = "\n\n".join(filter(None, [
+                DEFAULT_AUTO_DELIVERY_DESC if include_auto_delivery else "",
+                format_quantity_limits(min_qty, max_qty) if min_qty and max_qty else "",
+                DEFAULT_EXECUTION_TIME,
+                f"ID: {service_id}" if service_id else "",
+            ])).strip()
 
     raw_brief_en = strip_smm_meta_lines(strip_service_id((lot.brief_en or "").strip()))
     raw_full_en = strip_smm_meta_lines(strip_service_id((lot.full_en or "").strip()))
