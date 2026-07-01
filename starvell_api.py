@@ -126,16 +126,22 @@ class StarvellAPI:
         next_data: bool = False,
     ) -> httpx.Response:
         await self._throttle()
+        use_json = json_body is not None
         async with httpx.AsyncClient(
             cookies=self._cookies(),
-            headers=self._headers(referer or f"{BASE_URL}/", json_request=not next_data and method != "GET"),
+            headers=self._headers(
+                referer or f"{BASE_URL}/",
+                json_request=use_json and not next_data and method != "GET",
+            ),
             timeout=30.0,
             follow_redirects=True,
         ) as client:
             if method == "GET":
                 resp = await client.get(url)
-            else:
+            elif use_json:
                 resp = await client.post(url, json=json_body)
+            else:
+                resp = await client.post(url)
             return resp
 
     async def get_build_id(self) -> str:
@@ -414,7 +420,7 @@ class StarvellAPI:
             if not isinstance(offer, dict):
                 continue
             lots.append(self._normalize_seller_offer_row(offer))
-        return [lot for lot in lots if lot.get("id")]
+        return [lot for lot in lots if lot.get("id") or lot.get("public_id")]
 
     @staticmethod
     def _normalize_seller_offer_row(offer: dict[str, Any]) -> dict[str, Any]:
@@ -429,7 +435,7 @@ class StarvellAPI:
         game_slug = game.get("slug") or (category.get("game") or {}).get("slug")
         cat_slug = category.get("slug")
         return {
-            "id": offer.get("id") or offer.get("publicId"),
+            "id": offer.get("id"),
             "public_id": offer.get("publicId"),
             "title": str(title).strip(),
             "price": offer.get("price"),
@@ -634,32 +640,71 @@ class StarvellAPI:
             )
         return result.get("json") or result
 
+    @staticmethod
+    def _build_offer_ref_body(
+        offer_id: str | int | None = None,
+        *,
+        public_id: str | None = None,
+    ) -> dict[str, Any]:
+        pid = str(public_id or "").strip()
+        oid = str(offer_id or "").strip()
+        if pid:
+            return {"publicId": pid}
+        if oid.isdigit():
+            return {"id": int(oid)}
+        if oid and re.fullmatch(r"[0-9a-f-]{8,}", oid, re.IGNORECASE):
+            return {"publicId": oid}
+        if oid:
+            return {"id": oid}
+        raise ValueError("offer id required")
+
+    @staticmethod
+    def _offer_id_candidates(
+        offer_id: str | int | None = None,
+        *,
+        public_id: str | None = None,
+    ) -> list[str]:
+        out: list[str] = []
+        for candidate in (offer_id, public_id):
+            text = str(candidate or "").strip()
+            if text and text not in out:
+                out.append(text)
+        return out
+
     async def delete_offer(
         self,
-        offer_id: str,
+        offer_id: str | int,
         *,
+        public_id: str | None = None,
         referer: str | None = None,
     ) -> dict[str, Any]:
         """POST /api/offers/{id}/delete — удаление лота."""
-        oid = str(offer_id or "").strip()
-        resp = await self._request(
-            "POST",
-            f"{BASE_URL}/api/offers/{oid}/delete",
-            referer=referer or f"{BASE_URL}/offers/{oid}",
-        )
-        if resp.status_code >= 400:
+        last_exc: StarvellAPIError | None = None
+        for oid in self._offer_id_candidates(offer_id, public_id=public_id):
+            resp = await self._request(
+                "POST",
+                f"{BASE_URL}/api/offers/{oid}/delete",
+                referer=referer or f"{BASE_URL}/offers/{oid}",
+                json_body={},
+            )
+            if resp.status_code < 400:
+                try:
+                    return resp.json()
+                except Exception:
+                    return {"success": True}
             msg = resp.text[:500]
+            body: dict[str, Any] = {}
             try:
-                body = resp.json()
-                if isinstance(body, dict):
-                    msg = str(body.get("message") or msg)
+                parsed = resp.json()
+                if isinstance(parsed, dict):
+                    body = parsed
+                    msg = str(parsed.get("message") or msg)
             except Exception:
-                body = {}
-            raise StarvellAPIError(resp.status_code, msg, body if isinstance(body, dict) else {})
-        try:
-            return resp.json()
-        except Exception:
-            return {"success": True}
+                pass
+            last_exc = StarvellAPIError(resp.status_code, msg, body)
+        if last_exc:
+            raise last_exc
+        raise StarvellAPIError(400, "offer id required", {})
 
     async def deactivate_offer(
         self,
@@ -668,11 +713,7 @@ class StarvellAPI:
         public_id: str | None = None,
     ) -> dict[str, Any]:
         """POST /api/offers/deactivate — отключить лот."""
-        body: dict[str, Any] = {}
-        if public_id:
-            body["publicId"] = str(public_id)
-        else:
-            body["id"] = int(offer_id) if str(offer_id).isdigit() else offer_id
+        body = self._build_offer_ref_body(offer_id, public_id=public_id)
         resp = await self._request(
             "POST",
             f"{BASE_URL}/api/offers/deactivate",
@@ -695,13 +736,20 @@ class StarvellAPI:
 
     async def activate_offer(
         self,
-        offer_id: str,
+        offer_id: str | int,
         *,
         public_id: str | None = None,
     ) -> dict[str, Any]:
         """Включить лот (partial-update isActive=true)."""
-        oid = str(public_id or offer_id).strip()
-        return await self.partial_update_offer(oid, {"isActive": True})
+        last_exc: StarvellAPIError | None = None
+        for oid in self._offer_id_candidates(offer_id, public_id=public_id):
+            try:
+                return await self.partial_update_offer(oid, {"isActive": True})
+            except StarvellAPIError as exc:
+                last_exc = exc
+        if last_exc:
+            raise last_exc
+        raise StarvellAPIError(400, "offer id required", {})
 
     async def fetch_seller_categories(self, user_id: int | None = None) -> list[dict[str, Any]]:
         """

@@ -45,6 +45,27 @@ def _offer_ref(offer: dict[str, Any]) -> str:
     return str(offer.get("public_id") or offer.get("publicId") or offer.get("id") or "")
 
 
+def _offer_ids(offer: dict[str, Any] | None, token: str) -> tuple[str, str | None, str | None]:
+    """ref для UI, numeric id, publicId."""
+    token = (token or "").strip()
+    numeric_id: str | None = None
+    public_id: str | None = None
+    if isinstance(offer, dict):
+        raw_id = offer.get("id")
+        if raw_id is not None:
+            numeric_id = str(raw_id).strip() or None
+        public_id = str(offer.get("public_id") or offer.get("publicId") or "").strip() or None
+        if numeric_id and public_id and numeric_id == public_id:
+            if _LOT_ID_RE.match(numeric_id):
+                numeric_id = None
+    if _LOT_ID_RE.match(token) and not public_id:
+        public_id = token
+    elif token.isdigit() and not numeric_id:
+        numeric_id = token
+    ref = public_id or numeric_id or token
+    return ref, numeric_id, public_id
+
+
 async def _resolve_offer(api, token: str) -> tuple[str, dict[str, Any] | None]:
     """Находит лот по numeric id или publicId."""
     token = (token or "").strip()
@@ -120,22 +141,19 @@ def create_lot_manager_router(ctx: Any) -> Router:
             await message.answer("❌ Starvell не настроен.", reply_markup=KB.back_menu())
             return
         ref, offer = await _resolve_offer(api, token)
-        if not offer and not _LOT_ID_RE.match(token) and not token.isdigit():
+        ref, numeric_id, public_id = _offer_ids(offer, ref)
+        if not offer and not numeric_id and not public_id and not _LOT_ID_RE.match(token) and not token.isdigit():
             await message.answer(f"❌ Лот <code>{token}</code> не найден.", parse_mode="HTML")
             return
         try:
             if action == "off":
-                oid = offer.get("id") if isinstance(offer, dict) else token
-                pid = None
-                if isinstance(offer, dict):
-                    pid = offer.get("public_id") or offer.get("publicId")
-                await api.deactivate_offer(oid or token, public_id=pid)
+                await api.deactivate_offer(numeric_id or public_id or token, public_id=public_id)
                 await message.answer(f"⏸ Лот <code>{ref}</code> отключён.", parse_mode="HTML")
             elif action == "on":
-                await api.activate_offer(ref)
+                await api.activate_offer(numeric_id or token, public_id=public_id)
                 await message.answer(f"▶️ Лот <code>{ref}</code> включён.", parse_mode="HTML")
             elif action == "del":
-                await api.delete_offer(ref)
+                await api.delete_offer(numeric_id or token, public_id=public_id)
                 await message.answer(f"🗑 Лот <code>{ref}</code> удалён.", parse_mode="HTML")
         except StarvellAPIError as exc:
             await message.answer(f"❌ Starvell: <code>{exc}</code>", parse_mode="HTML")
