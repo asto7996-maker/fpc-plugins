@@ -58,7 +58,13 @@ async def _resolve_offer(api, token: str) -> tuple[str, dict[str, Any] | None]:
             return _offer_ref(offer) or token, offer
     fetched = await api.fetch_offer(token)
     if fetched:
-        return str(fetched.get("publicId") or fetched.get("id") or token), fetched
+        normalized = {
+            "id": fetched.get("id"),
+            "public_id": fetched.get("publicId"),
+            "title": ((fetched.get("descriptions") or {}).get("rus") or {}).get("briefDescription", ""),
+            "is_active": fetched.get("isActive", True),
+        }
+        return str(fetched.get("publicId") or fetched.get("id") or token), normalized
     return token, None
 
 

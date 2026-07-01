@@ -772,16 +772,16 @@ class AutomationEngine:
             await asyncio.sleep(interval)
 
     async def _do_bump(self, account_name: str, api: StarvellAPI, settings: Settings) -> None:
-        info = await api.fetch_homepage()
-        user = info.get("user") or {}
-        user_id = user.get("id")
-        if not user_id:
+        lots = await api.fetch_my_offers(limit=200)
+        if not lots:
+            logger.debug("Auto bump [%s]: нет активных лотов (list-my)", account_name)
             return
 
-        lots = await api.fetch_user_lots(int(user_id))
         game_categories: dict[int, set[int]] = {}
         referer = None
         for lot in lots:
+            if lot.get("is_active") is False:
+                continue
             gid = lot.get("game_id")
             cid = lot.get("category_id")
             if isinstance(gid, int) and isinstance(cid, int):
@@ -789,14 +789,30 @@ class AutomationEngine:
             if not referer and lot.get("category_url"):
                 referer = lot["category_url"]
 
+        if not game_categories:
+            logger.debug("Auto bump [%s]: лоты без game_id/category_id", account_name)
+            return
+
         bumped = 0
         for game_id, cat_ids in game_categories.items():
             result = await api.bump_offers(game_id, list(cat_ids), referer=referer)
             if result.get("success"):
                 bumped += len(cat_ids)
+            else:
+                logger.warning(
+                    "Auto bump [%s] game=%s cats=%s: HTTP %s",
+                    account_name,
+                    game_id,
+                    cat_ids,
+                    result.get("status"),
+                )
 
-        if bumped and settings.notify_bump:
-            await self.notify(f"📈 [{account_name}] Лоты подняты ({bumped} категорий)", "notify_bump")
+        if bumped:
+            logger.info("Auto bump [%s]: поднято категорий: %s", account_name, bumped)
+            if settings.notify_bump:
+                await self.notify(f"📈 [{account_name}] Лоты подняты ({bumped} категорий)", "notify_bump")
+        else:
+            logger.debug("Auto bump [%s]: bump API не вернул success", account_name)
 
         bump_ctx = BumpContext(
             core=self.cardinal,

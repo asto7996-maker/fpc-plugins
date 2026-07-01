@@ -378,33 +378,47 @@ class TelegramBot:
         )
         await call.answer()
 
-    async def cb_toggle(self, call: CallbackQuery) -> None:
-        if not await self._has_access(call.from_user.id):
-            return
-        key = call.data.replace(CB["toggle"], "")
-        new_val = await self.db.toggle_feature_flag(key)
-        s = load_settings()
+    async def toggle_feature(self, call: CallbackQuery, key: str) -> None:
+        """Переключить функцию из главного меню (без мутации call.data — aiogram 3)."""
         mapping = {
             "auto_delivery": "auto_delivery_enabled",
             "auto_bump": "auto_bump_enabled",
             "auto_welcome": "auto_welcome_enabled",
             "auto_review": "auto_review_enabled",
             "ai_replies": "ai_replies_enabled",
+            "auto_response": "auto_response_enabled",
+            "order_confirm": "order_confirm_enabled",
         }
-        if key in mapping:
-            setattr(s, mapping[key], new_val)
-            save_settings(s)
-            if key == "auto_bump":
-                await self.automation.reload()
         labels = {
             "auto_delivery": "Автовыдача",
             "auto_bump": "Автобамп",
             "auto_welcome": "Приветствие",
             "auto_review": "Авто-отзывы",
             "ai_replies": "Gemini в чатах",
+            "auto_response": "Автоответ",
+            "order_confirm": "Подтверждение заказа",
         }
-        await call.answer(f"{labels.get(key, key)}: {'вкл' if new_val else 'выкл'}")
-        await call.message.edit_reply_markup(reply_markup=self._main_kb())
+        if key not in mapping:
+            await call.answer("Неизвестная функция", show_alert=True)
+            return
+        new_val = await self.db.toggle_feature_flag(key)
+        s = load_settings()
+        setattr(s, mapping[key], new_val)
+        save_settings(s)
+        if key == "auto_bump":
+            await self.automation.reload()
+        await call.answer(f"{labels[key]}: {'вкл' if new_val else 'выкл'}")
+        try:
+            await call.message.edit_reply_markup(reply_markup=self._main_kb())
+        except Exception:
+            pass
+
+    async def cb_toggle(self, call: CallbackQuery) -> None:
+        if not await self._has_access(call.from_user.id):
+            await self._deny(call)
+            return
+        key = call.data.replace(CB["toggle"], "")
+        await self.toggle_feature(call, key)
 
     async def cb_status(self, call: CallbackQuery) -> None:
         """Legacy — обрабатывается profile_panel."""
@@ -848,9 +862,11 @@ class TelegramBot:
         await call.answer()
 
     async def cb_switch(self, call: CallbackQuery) -> None:
+        if not await self._has_access(call.from_user.id):
+            await self._deny(call)
+            return
         key = call.data.replace(CBT.SWITCH, "")
-        call.data = f"{CB['toggle']}{key}"
-        await self.cb_toggle(call)
+        await self.toggle_feature(call, key)
 
     async def cb_reply_chat(self, call: CallbackQuery, state: FSMContext) -> None:
         chat_id = call.data.replace(CBT.REPLY_CHAT, "")
