@@ -161,13 +161,18 @@ def pick_subcategory(catalog: dict[str, Any], *hint_texts: str) -> dict[str, Any
 
 
 MAX_NUMERIC_ATTRIBUTES = 50
-PARSER_BUILD = "attrs-v7.2"
+PARSER_BUILD = "attrs-v7.3"
 
 MIN_DELIVERY_FROM_MINUTES = 10
 
+# Подкатегории Telegram (175), где на лотах есть deliveryTime (634 — Подписчики).
+DELIVERY_TIME_SUBCATEGORY_IDS: dict[int, set[int]] = {
+    175: {634},
+}
+
 DEFAULT_DELIVERY_TIME: dict[str, Any] = {
-    "from": {"unit": "MINUTES", "value": str(MIN_DELIVERY_FROM_MINUTES)},
-    "to": {"unit": "DAYS", "value": "2"},
+    "from": {"unit": "MINUTES", "value": MIN_DELIVERY_FROM_MINUTES},
+    "to": {"unit": "HOURS", "value": 6},
 }
 
 # FunPay Telegram «Подписчики» → Starvell category 175 / sub 634 (fallback без каталога)
@@ -419,19 +424,22 @@ def _create_base_fields(payload: dict[str, Any]) -> dict[str, Any]:
     return {k: payload[k] for k in allowed_keys if k in payload}
 
 
-def _delivery_time_for_create(raw: Any) -> dict[str, Any]:
-    """
-    Нормализует deliveryTime для create.
-    Starvell: «Время доставки не может быть меньше одного» — value >= 1, from >= 10 мин.
-    """
-    if not isinstance(raw, dict):
-        raw = DEFAULT_DELIVERY_TIME
+def subcategory_supports_delivery_time(category_id: int | None, sub_category_id: int | None) -> bool:
+    """Публичные лоты sub 632/633 без deliveryTime; sub 634 — с deliveryTime."""
+    if not category_id or not sub_category_id:
+        return False
+    allowed = DELIVERY_TIME_SUBCATEGORY_IDS.get(int(category_id))
+    return bool(allowed and int(sub_category_id) in allowed)
 
-    from_block = dict(raw.get("from") or DEFAULT_DELIVERY_TIME["from"])
-    to_block = dict(raw.get("to") or DEFAULT_DELIVERY_TIME["to"])
+
+def normalize_delivery_time(raw: dict[str, Any] | None = None) -> dict[str, Any]:
+    """from ≥10 мин, to ≥1; value — числа (как в API Starvell)."""
+    base = raw if isinstance(raw, dict) else DEFAULT_DELIVERY_TIME
+    from_block = dict(base.get("from") or DEFAULT_DELIVERY_TIME["from"])
+    to_block = dict(base.get("to") or DEFAULT_DELIVERY_TIME["to"])
 
     from_unit = str(from_block.get("unit") or "MINUTES").upper()
-    to_unit = str(to_block.get("unit") or "DAYS").upper()
+    to_unit = str(to_block.get("unit") or "HOURS").upper()
 
     try:
         from_num = int(float(str(from_block.get("value") or "0").replace(",", ".")))
@@ -446,14 +454,33 @@ def _delivery_time_for_create(raw: Any) -> dict[str, Any]:
         from_num = MIN_DELIVERY_FROM_MINUTES
     elif from_num < 1:
         from_num = 1
-
     if to_num < 1:
         to_num = 1
 
     return {
-        "from": {"unit": from_unit, "value": str(from_num)},
-        "to": {"unit": to_unit, "value": str(to_num)},
+        "from": {"unit": from_unit, "value": from_num},
+        "to": {"unit": to_unit, "value": to_num},
     }
+
+
+def _delivery_time_for_create(
+    raw: Any,
+    *,
+    category_id: int | None = None,
+    sub_category_id: int | None = None,
+    include: bool = False,
+) -> dict[str, Any] | None:
+    """
+    deliveryTime на create — только если include и подкатегория поддерживает (634).
+    Для 633 (Просмотры) и др. поле не отправляем (на сайте null).
+    """
+    if not include:
+        return None
+    if not subcategory_supports_delivery_time(category_id, sub_category_id):
+        return None
+    if not isinstance(raw, dict):
+        raw = DEFAULT_DELIVERY_TIME
+    return normalize_delivery_time(raw)
 
 
 def _filter_basic_attributes(
@@ -499,6 +526,7 @@ def finalize_frontend_create_payload(
     subcategory: dict[str, Any] | None = None,
     brief_enabled: bool = True,
     force_empty_numeric: bool = True,
+    include_delivery_time: bool = False,
 ) -> dict[str, Any]:
     """
     POST /offers/create — как submit формы Starvell (chunk 5661):
@@ -533,8 +561,15 @@ def finalize_frontend_create_payload(
         "instantDelivery": False,
         "goods": [],
         "descriptions": descriptions,
-        "deliveryTime": _delivery_time_for_create(payload.get("deliveryTime")),
     }
+    delivery = _delivery_time_for_create(
+        payload.get("deliveryTime"),
+        category_id=payload.get("categoryId"),
+        sub_category_id=payload.get("subCategoryId"),
+        include=include_delivery_time,
+    )
+    if delivery is not None:
+        out["deliveryTime"] = delivery
     if payload.get("gameId"):
         out["gameId"] = int(payload["gameId"])
     if payload.get("subCategoryId"):
@@ -591,6 +626,7 @@ def build_minimal_create_payload(
     include_attributes: bool = True,
     auto_delivery: bool = False,
     delivery_time: dict[str, Any] | None = None,
+    include_delivery_time: bool = False,
     catalog: dict[str, Any] | None = None,
     subcategory: dict[str, Any] | None = None,
     brief_enabled: bool = True,
@@ -633,6 +669,7 @@ def build_minimal_create_payload(
         subcategory=subcategory,
         brief_enabled=brief_enabled,
         force_empty_numeric=True,
+        include_delivery_time=include_delivery_time,
     )
 
 
@@ -643,6 +680,8 @@ def build_offer_update_payload(full: dict[str, Any]) -> dict[str, Any]:
         out["descriptions"] = full["descriptions"]
     if full.get("postPaymentMessage"):
         out["postPaymentMessage"] = full["postPaymentMessage"]
+    if subcategory_supports_delivery_time(full.get("categoryId"), full.get("subCategoryId")):
+        out["deliveryTime"] = normalize_delivery_time(full.get("deliveryTime"))
     unified = compact_option_attributes(full.get("attributes"))
     if not unified:
         unified = compact_option_attributes(full.get("basicAttributes"))
@@ -693,8 +732,10 @@ def payload_attribute_stats(payload: dict[str, Any]) -> str:
     sub = payload.get("subCategoryId")
     ad = payload.get("autoDelivery")
     goods = len(payload.get("goods") or [])
+    dt = payload.get("deliveryTime")
+    dt_flag = "yes" if dt else "no"
     return (
-        f"cat={cat} sub={sub} autoDel={ad} goods={goods} "
+        f"cat={cat} sub={sub} autoDel={ad} dt={dt_flag} goods={goods} "
         f"basic={basic} numeric={numeric} attributes={attrs} desc={desc_len} "
         f"keys=[{keys}] build={PARSER_BUILD}"
     )

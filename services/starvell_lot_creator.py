@@ -24,11 +24,11 @@ from services.starvell_catalog import (
     compact_option_attributes,
     draft_attribute_count,
     fetch_category_catalog,
-    finalize_frontend_create_payload,
     payload_attribute_stats,
     pick_subcategory,
     resolve_slugs_for_category,
     sanitize_create_attributes,
+    subcategory_supports_delivery_time,
 )
 from starvell_api import StarvellAPI, BASE_URL, StarvellAPIError
 
@@ -249,20 +249,43 @@ def _create_attempts(
         brief_enabled=brief_enabled,
     )
 
+    sub_id = full_payload.get("subCategoryId")
+    supports_dt = subcategory_supports_delivery_time(category_id, sub_id)
+
     attempts: list[tuple[str, dict[str, Any]]] = [
         (
             "frontend-basic",
-            build_minimal_create_payload(full_payload, include_attributes=True, **common),
+            build_minimal_create_payload(
+                full_payload,
+                include_attributes=True,
+                include_delivery_time=False,
+                **common,
+            ),
         ),
         (
             "frontend-no-attrs",
             build_minimal_create_payload(
                 full_payload,
                 include_attributes=False,
+                include_delivery_time=False,
                 **common,
             ),
         ),
     ]
+
+    if supports_dt:
+        attempts.insert(
+            1,
+            (
+                "frontend-with-delivery",
+                build_minimal_create_payload(
+                    full_payload,
+                    include_attributes=True,
+                    include_delivery_time=True,
+                    **common,
+                ),
+            ),
+        )
 
     if template_attrs:
         template_base = {
