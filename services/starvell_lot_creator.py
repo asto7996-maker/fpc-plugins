@@ -210,17 +210,22 @@ async def _resolve_template_attributes(
     category_id: int,
     template_offer_id: str | int | None,
 ) -> list[dict[str, str]] | None:
-    offer_id = template_offer_id
-    if not offer_id:
-        for cat in await api.fetch_seller_categories():
-            if int(cat.get("category_id") or 0) == int(category_id) and cat.get("offer_id"):
-                offer_id = cat["offer_id"]
-                break
-    if not offer_id:
+    """Атрибуты из шаблонного лота; ошибки API не блокируют create."""
+    try:
+        offer_id = template_offer_id
+        if not offer_id:
+            for cat in await api.fetch_seller_categories():
+                if int(cat.get("category_id") or 0) == int(category_id) and cat.get("offer_id"):
+                    offer_id = cat["offer_id"]
+                    break
+        if not offer_id:
+            return None
+        offer = await api.fetch_offer(str(offer_id))
+        attrs = compact_option_attributes(offer.get("attributes"))
+        return attrs or None
+    except Exception as exc:
+        logger.warning("template attrs skipped (cat=%s): %s", category_id, exc)
         return None
-    offer = await api.fetch_offer(str(offer_id))
-    attrs = compact_option_attributes(offer.get("attributes"))
-    return attrs or None
 
 
 def _create_attempts(

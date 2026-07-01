@@ -161,7 +161,7 @@ def pick_subcategory(catalog: dict[str, Any], *hint_texts: str) -> dict[str, Any
 
 
 MAX_NUMERIC_ATTRIBUTES = 50
-PARSER_BUILD = "attrs-v7"
+PARSER_BUILD = "attrs-v7.1"
 
 DEFAULT_DELIVERY_TIME: dict[str, Any] = {
     "from": {"unit": "MINUTES", "value": "5"},

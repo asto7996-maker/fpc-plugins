@@ -373,12 +373,82 @@ class StarvellAPI:
 
     # ── Лоты и бамп ───────────────────────────────────────────────────────
 
+    async def fetch_my_offers(
+        self,
+        *,
+        category_id: int | None = None,
+        limit: int = 200,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        """POST /api/offers/list-my — лоты текущего продавца (без _next/data)."""
+        body: dict[str, Any] = {"limit": max(1, limit), "offset": max(0, offset)}
+        if category_id is not None:
+            body["categoryId"] = int(category_id)
+        try:
+            resp = await self._request(
+                "POST",
+                f"{BASE_URL}/api/offers/list-my",
+                referer=f"{BASE_URL}/account/sells",
+                json_body=body,
+            )
+            if resp.status_code >= 400:
+                logger.debug("fetch_my_offers HTTP %s: %s", resp.status_code, resp.text[:300])
+                return []
+            data = resp.json()
+        except Exception as exc:
+            logger.debug("fetch_my_offers: %s", exc)
+            return []
+
+        items: list[Any] = []
+        if isinstance(data, list):
+            items = data
+        elif isinstance(data, dict):
+            for key in ("offers", "items", "data", "results"):
+                val = data.get(key)
+                if isinstance(val, list):
+                    items = val
+                    break
+
+        lots: list[dict[str, Any]] = []
+        for offer in items:
+            if not isinstance(offer, dict):
+                continue
+            lots.append(self._normalize_seller_offer_row(offer))
+        return [lot for lot in lots if lot.get("id")]
+
+    @staticmethod
+    def _normalize_seller_offer_row(offer: dict[str, Any]) -> dict[str, Any]:
+        category = offer.get("category") if isinstance(offer.get("category"), dict) else {}
+        game = offer.get("game") if isinstance(offer.get("game"), dict) else {}
+        if not game and isinstance(category.get("game"), dict):
+            game = category["game"]
+        desc = (offer.get("descriptions") or {}).get("rus") or {}
+        title = desc.get("briefDescription") or desc.get("description") or ""
+        cat_id = offer.get("categoryId") or category.get("id")
+        game_id = offer.get("gameId") or category.get("gameId") or game.get("id")
+        game_slug = game.get("slug") or (category.get("game") or {}).get("slug")
+        cat_slug = category.get("slug")
+        return {
+            "id": offer.get("id") or offer.get("publicId"),
+            "title": str(title).strip(),
+            "price": offer.get("price"),
+            "availability": offer.get("availability"),
+            "category_id": cat_id,
+            "game_id": game_id,
+            "category_url": f"{BASE_URL}/{game_slug}/{cat_slug}/trade" if game_slug and cat_slug else None,
+        }
+
     async def fetch_user_lots(self, user_id: int) -> list[dict[str, Any]]:
-        """Получает лоты пользователя с категориями для бампа."""
-        data = await self._next_data_get(
-            f"users/{user_id}.json?user_id={user_id}",
-            f"{BASE_URL}/users/{user_id}",
-        )
+        """Получает лоты пользователя с категориями (fallback через _next/data)."""
+        try:
+            data = await self._next_data_get(
+                f"users/{user_id}.json?user_id={user_id}",
+                f"{BASE_URL}/users/{user_id}",
+            )
+        except Exception as exc:
+            logger.warning("fetch_user_lots %s: %s", user_id, exc)
+            return []
+
         props = data.get("pageProps", {})
         offers_block = props.get("userProfileOffers") or (props.get("bff") or {}).get("userProfileOffers")
         categories = offers_block or props.get("categoriesWithOffers") or []
@@ -394,17 +464,14 @@ class StarvellAPI:
             for offer in category.get("offers") or []:
                 if not isinstance(offer, dict):
                     continue
-                desc = (offer.get("descriptions") or {}).get("rus") or {}
-                title = desc.get("briefDescription") or desc.get("description") or ""
-                lots.append({
-                    "id": offer.get("id"),
-                    "title": str(title).strip(),
-                    "price": offer.get("price"),
-                    "availability": offer.get("availability"),
-                    "category_id": cat_id,
-                    "game_id": game_id,
-                    "category_url": f"{BASE_URL}/{game_slug}/{cat_slug}/trade" if game_slug and cat_slug else None,
+                row = self._normalize_seller_offer_row({
+                    **offer,
+                    "categoryId": cat_id,
+                    "gameId": game_id,
+                    "category": category,
                 })
+                if row.get("id"):
+                    lots.append(row)
         return lots
 
     async def create_offer(
@@ -563,14 +630,19 @@ class StarvellAPI:
         Категории продавца для создания лота — из уже выставленных предложений.
         Возвращает список {category_id, title, offer_id, game_id, price}.
         """
-        if user_id is None:
-            info = await self.fetch_homepage()
-            user = info.get("user") or {}
-            user_id = user.get("id")
-        if not user_id:
-            return []
+        lots = await self.fetch_my_offers(limit=200)
+        if not lots:
+            if user_id is None:
+                try:
+                    info = await self.fetch_homepage()
+                    user = info.get("user") or {}
+                    user_id = user.get("id")
+                except Exception as exc:
+                    logger.debug("fetch_seller_categories homepage: %s", exc)
+                    user_id = None
+            if user_id:
+                lots = await self.fetch_user_lots(int(user_id))
 
-        lots = await self.fetch_user_lots(int(user_id))
         seen: set[int] = set()
         categories: list[dict[str, Any]] = []
         for lot in lots:
