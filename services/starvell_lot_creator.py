@@ -10,7 +10,7 @@ from services.funpay_parser import (
     DEFAULT_SMM_AFTER_PAYMENT,
     ParsedLot,
     build_starvell_package,
-    strip_service_id,
+    compose_starvell_descriptions,
 )
 from services.price_utils import format_price_display, format_starvell_api_price
 from services.starvell_catalog import (
@@ -88,15 +88,10 @@ async def build_create_payload(
         service_id=service_id,
         auto_delivery=False,
     )
-    brief_ru = _truncate(strip_service_id(sections.get("brief_ru") or lot.title), BRIEF_MAX)
-    full_ru = strip_service_id(sections.get("full_ru") or brief_ru)
-    full_en = strip_service_id(sections.get("full_en") or lot.full_en or "")
-    if is_smm and service_id:
-        id_line = f"ID: {service_id}"
-        if id_line not in full_ru:
-            full_ru = f"{full_ru.rstrip()}\n\n{id_line}".strip()
-        if full_en and id_line not in full_en:
-            full_en = f"{full_en.rstrip()}\n\n{id_line}".strip()
+    desc = compose_starvell_descriptions(lot, is_smm=is_smm, service_id=service_id)
+    brief_ru = _truncate(desc["brief_ru"] or sections.get("brief_ru") or lot.title, BRIEF_MAX)
+    full_ru = desc["full_ru"] or sections.get("full_ru") or ""
+    full_en = desc["full_en"] or sections.get("full_en") or ""
 
     full_description = build_bilingual_full(full_ru, full_en)
     if DEFAULT_EXECUTION_TIME not in full_description:

@@ -15,7 +15,7 @@ from aiogram.types import CallbackQuery, Message
 from config import load_settings, save_settings
 from keyboards import cbt as CBT
 from services.category_mapper import resolve_starvell_category, save_category_mapping
-from services.funpay_parser import ParsedLot, fetch_funpay_lot
+from services.funpay_parser import ParsedLot, dedupe_brief_from_full, fetch_funpay_lot, strip_service_id
 from services.price_utils import (
     format_price_display,
     normalize_price_input,
@@ -66,8 +66,11 @@ def create_lot_parser_router(ctx: Any) -> Router:
 
     async def _translate_lot(lot: ParsedLot) -> None:
         try:
-            brief_src = lot.brief_ru or lot.title
-            full_src = lot.full_ru or brief_src
+            brief_src = strip_service_id(lot.brief_ru or lot.title)
+            raw_full = strip_service_id(lot.full_ru or "")
+            full_src = dedupe_brief_from_full(brief_src, raw_full)
+            if not full_src and raw_full:
+                full_src = raw_full
             lot.brief_en, lot.full_en = await asyncio.wait_for(
                 asyncio.gather(
                     translate_ru_to_en(brief_src),

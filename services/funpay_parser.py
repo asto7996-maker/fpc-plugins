@@ -27,6 +27,19 @@ OFFER_ID_RE = re.compile(
     re.IGNORECASE,
 )
 SERVICE_ID_RE = re.compile(r"^\s*ID\s*[:=\-]\s*\d+\s*$", re.IGNORECASE | re.MULTILINE)
+SERVICE_ID_LINE_RE = re.compile(
+    r"^\s*(?:🆔\s*)?(?:ID|Service\s*ID|VexBoost\s*ID)\s*[:=\-\s#]+\s*\d+\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+QUAN_LINE_RE = re.compile(
+    r"^\s*#?\s*Quan(?:tity)?\s*[:=\-\s#]+\s*\d+\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+INLINE_ID_RE = re.compile(
+    r"(?:🆔\s*)?(?:ID|Service\s*ID|VexBoost\s*ID)\s*[:=\-\s#]+\s*\d+",
+    re.IGNORECASE,
+)
+INLINE_QUAN_RE = re.compile(r"#?\s*Quan(?:tity)?\s*[:=\-\s#]+\s*\d+", re.IGNORECASE)
 
 SMM_KEYWORDS = (
     "накрут", "подписчик", "лайк", "просмотр", "реакци", "smm", "boost",
@@ -90,14 +103,116 @@ def extract_offer_id(url: str) -> str | None:
 
 
 def strip_service_id(text: str) -> str:
-    lines = []
-    for line in (text or "").splitlines():
-        if SERVICE_ID_RE.match(line.strip()):
+    """Удаляет строки и вхождения VexBoost ID / #Quan из текста."""
+    if not text:
+        return ""
+    lines: list[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            lines.append("")
             continue
-        if re.search(r"\bID\s*[:=\-]\s*\d+", line, re.IGNORECASE):
+        if SERVICE_ID_LINE_RE.match(stripped) or SERVICE_ID_RE.match(stripped):
             continue
-        lines.append(line)
-    return "\n".join(lines).strip()
+        if QUAN_LINE_RE.match(stripped):
+            continue
+        cleaned = INLINE_QUAN_RE.sub("", INLINE_ID_RE.sub("", line))
+        cleaned = re.sub(r"[ \t]{2,}", " ", cleaned).strip()
+        if cleaned:
+            lines.append(cleaned)
+    result = "\n".join(lines)
+    result = re.sub(r"\n{3,}", "\n\n", result).strip()
+    return result
+
+
+def _norm_compare(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "").lower().replace("ё", "е")).strip()
+
+
+def dedupe_brief_from_full(brief: str, full: str) -> str:
+    """Убирает краткое описание из начала подробного (FunPay часто дублирует)."""
+    brief = (brief or "").strip()
+    full = (full or "").strip()
+    if not full:
+        return ""
+    if not brief:
+        return full
+    if _norm_compare(full) == _norm_compare(brief):
+        return ""
+    if full.startswith(brief):
+        rest = full[len(brief):].lstrip(" \n\r\t:—–-")
+        return rest.strip()
+    brief_first_line = brief.split("\n", 1)[0].strip()
+    if brief_first_line and full.startswith(brief_first_line):
+        rest = full[len(brief_first_line):].lstrip(" \n\r\t:—–-")
+        if rest.strip() and _norm_compare(rest) != _norm_compare(brief):
+            return rest.strip()
+    return full
+
+
+def apply_service_id(text: str, service_id: int) -> str:
+    """Удаляет старые ID и добавляет актуальный VexBoost ID в конец."""
+    cleaned = strip_service_id(text or "")
+    id_line = f"ID: {service_id}"
+    if cleaned and id_line in cleaned:
+        return cleaned
+    if cleaned:
+        return f"{cleaned.rstrip()}\n\n{id_line}".strip()
+    return id_line
+
+
+def _truncate_text(text: str, limit: int) -> str:
+    text = (text or "").strip()
+    if len(text) <= limit:
+        return text
+    if limit <= 1:
+        return text[:limit]
+    return text[: limit - 1].rstrip() + "…"
+
+
+def compose_starvell_descriptions(
+    lot: ParsedLot,
+    *,
+    is_smm: bool = False,
+    service_id: int | None = None,
+    brief_max: int = 100,
+    full_max: int = 4800,
+) -> dict[str, str]:
+    """
+    Краткое и подробное описание для Starvell:
+    - краткое ≠ подробное (без дубля в начале full)
+    - старый ID удаляется, новый service_id добавляется в full
+    """
+    raw_brief = strip_service_id((lot.brief_ru or lot.title or "").strip())
+    raw_full = strip_service_id((lot.full_ru or "").strip())
+
+    full_ru = dedupe_brief_from_full(raw_brief, raw_full)
+    if not full_ru and raw_full and _norm_compare(raw_full) != _norm_compare(raw_brief):
+        full_ru = raw_full
+
+    brief_ru = _truncate_text(raw_brief, brief_max)
+    full_ru = dedupe_brief_from_full(brief_ru, full_ru)
+
+    if is_smm and service_id:
+        full_ru = apply_service_id(full_ru, int(service_id))
+        brief_ru = strip_service_id(brief_ru)
+
+    raw_brief_en = strip_service_id((lot.brief_en or "").strip())
+    raw_full_en = strip_service_id((lot.full_en or "").strip())
+    full_en = dedupe_brief_from_full(raw_brief_en or brief_ru, raw_full_en)
+    if not full_en and raw_full_en and _norm_compare(raw_full_en) != _norm_compare(raw_brief_en or brief_ru):
+        full_en = raw_full_en
+    brief_en = _truncate_text(raw_brief_en or brief_ru, brief_max)
+    full_en = dedupe_brief_from_full(brief_en, full_en)
+    if is_smm and service_id and full_en:
+        full_en = apply_service_id(full_en, int(service_id))
+
+    return {
+        "brief_ru": brief_ru,
+        "full_ru": _truncate_text(full_ru, full_max),
+        "brief_en": brief_en,
+        "full_en": _truncate_text(full_en, full_max),
+    }
 
 
 def guess_smm(title: str, description: str) -> bool:
@@ -112,17 +227,13 @@ def build_starvell_package(
     service_id: int | None = None,
     auto_delivery: bool = False,
 ) -> dict[str, str]:
-    brief = strip_service_id(lot.brief_ru or lot.title)
-    full = strip_service_id(lot.full_ru or brief)
-    if is_smm and service_id:
-        id_line = f"ID: {service_id}"
-        full = f"{full.rstrip()}\n\n{id_line}".strip()
+    desc = compose_starvell_descriptions(lot, is_smm=is_smm, service_id=service_id)
     sections: dict[str, str] = {
         "title": lot.title,
-        "brief_ru": brief,
-        "full_ru": full,
-        "brief_en": lot.brief_en or brief,
-        "full_en": lot.full_en or full,
+        "brief_ru": desc["brief_ru"],
+        "full_ru": desc["full_ru"],
+        "brief_en": desc["brief_en"],
+        "full_en": desc["full_en"],
     }
     if is_smm:
         sections["after_payment"] = DEFAULT_SMM_AFTER_PAYMENT

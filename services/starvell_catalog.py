@@ -105,14 +105,41 @@ async def fetch_category_catalog(game_slug: str, category_slug: str) -> dict[str
     return result
 
 
+SUBCATEGORY_HINT_WEIGHTS: dict[str, int] = {
+    "подписчик": 100,
+    "subscriber": 100,
+    "followers": 95,
+    "просмотр": 80,
+    "views": 80,
+    "реакци": 70,
+    "reaction": 70,
+    "репост": 65,
+    "repost": 65,
+    "реферал": 60,
+    "referral": 60,
+    "коммент": 55,
+    "comment": 55,
+    "голос": 50,
+    "vote": 50,
+    "буст": 45,
+    "boost": 45,
+    "реклам": 40,
+    "дизайн": 30,
+}
+
+
 def _score_subcategory(name: str, hints: set[str]) -> float:
     name_n = _norm(name)
-    if not name_n:
+    if not name_n or not hints:
         return 0.0
+    best = 0.0
     for hint in hints:
         if hint in name_n or name_n in hint:
-            return 1.0
-    return 0.0
+            weight = SUBCATEGORY_HINT_WEIGHTS.get(hint, 50)
+            if name_n == hint or name_n.startswith(hint) or hint.startswith(name_n):
+                weight += 20
+            best = max(best, float(weight))
+    return best
 
 
 def collect_subcategory_hints(*texts: str) -> set[str]:
@@ -137,12 +164,26 @@ def pick_subcategory(catalog: dict[str, Any], *hint_texts: str) -> dict[str, Any
 
     service_type = _norm(hint_texts[0] if hint_texts else "")
     if service_type:
+        exact: list[dict[str, Any]] = []
+        partial: list[dict[str, Any]] = []
         for sub in subs:
             if not isinstance(sub, dict):
                 continue
             name_n = _norm(str(sub.get("name") or ""))
-            if name_n and (name_n in service_type or service_type in name_n):
-                return sub
+            if not name_n:
+                continue
+            if name_n == service_type:
+                exact.append(sub)
+            elif name_n in service_type or service_type in name_n:
+                partial.append(sub)
+        if exact:
+            return exact[0]
+        if partial:
+            partial.sort(
+                key=lambda s: len(_norm(str(s.get("name") or ""))),
+                reverse=True,
+            )
+            return partial[0]
 
     hints = collect_subcategory_hints(*hint_texts)
     best: dict[str, Any] | None = None
@@ -155,13 +196,13 @@ def pick_subcategory(catalog: dict[str, Any], *hint_texts: str) -> dict[str, Any
         if score > best_score:
             best_score = score
             best = sub
-    if best:
+    if best and best_score > 0:
         return best
     return subs[0] if len(subs) == 1 else None
 
 
 MAX_NUMERIC_ATTRIBUTES = 50
-PARSER_BUILD = "attrs-v7.3"
+PARSER_BUILD = "attrs-v7.4"
 
 MIN_DELIVERY_FROM_MINUTES = 10
 
