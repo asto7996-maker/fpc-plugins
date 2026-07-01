@@ -15,7 +15,7 @@ from aiogram.types import CallbackQuery, Message
 from config import load_settings, save_settings
 from keyboards import cbt as CBT
 from services.category_mapper import resolve_starvell_category, save_category_mapping
-from services.funpay_parser import ParsedLot, dedupe_brief_from_full, fetch_funpay_lot, strip_service_id
+from services.funpay_parser import ParsedLot, fetch_funpay_lot
 from services.price_utils import (
     format_price_display,
     normalize_price_input,
@@ -26,7 +26,6 @@ from services.price_utils import (
 from handlers.tg.lot_manager import lot_actions_kb
 from services.starvell_lot_creator import create_lot_from_parsed, format_created_message
 from services.vexboost_service import VexBoostServiceError, VexBoostServiceInfo, fetch_vexboost_service
-from services.yandex_translate import translate_ru_to_en
 from starvell_api import StarvellAPIError
 from tg_bot import keyboards as KB
 
@@ -55,7 +54,7 @@ def create_lot_parser_router(ctx: Any) -> Router:
             "━━━━━━━━━━━━━━━━━━\n\n"
             "Отправьте ссылку на лот FunPay — бот сам:\n"
             "• определит категорию Starvell (как на FunPay)\n"
-            "• скопирует описание + перевод (Яндекс)\n"
+            "• скопирует описание с FunPay\n"
             "• подставит цену с FunPay (в т.ч. <code>0.001</code>)\n"
             "• создаст лот (999999 шт., автодоставка)\n\n"
             "<b>Быстрый ввод (SMM):</b>\n"
@@ -65,26 +64,6 @@ def create_lot_parser_router(ctx: Any) -> Router:
             "<code>https://funpay.com/… 1634 0.001</code>\n\n"
             "<i>/cancel — выход</i>"
         )
-
-    async def _translate_lot(lot: ParsedLot) -> None:
-        try:
-            brief_src = strip_service_id(lot.brief_ru or lot.title)
-            raw_full = strip_service_id(lot.full_ru or "")
-            full_src = dedupe_brief_from_full(brief_src, raw_full)
-            if not full_src and raw_full:
-                full_src = raw_full
-            lot.brief_en, lot.full_en = await asyncio.wait_for(
-                asyncio.gather(
-                    translate_ru_to_en(brief_src),
-                    translate_ru_to_en(full_src),
-                ),
-                timeout=90.0,
-            )
-        except asyncio.TimeoutError:
-            lot.brief_en, lot.full_en = lot.brief_ru, lot.full_ru
-        except Exception as exc:
-            logger.warning("Yandex translate: %s", exc)
-            lot.brief_en, lot.full_en = lot.brief_ru, lot.full_ru
 
     async def _resolve_category(lot: ParsedLot):
         s = load_settings()
@@ -129,8 +108,6 @@ def create_lot_parser_router(ctx: Any) -> Router:
             "title": lot.title,
             "brief_ru": lot.brief_ru,
             "full_ru": lot.full_ru,
-            "brief_en": lot.brief_en,
-            "full_en": lot.full_en,
             "funpay_node_id": lot.funpay_node_id,
             "funpay_category_title": lot.funpay_category_title,
             "funpay_service_type": lot.funpay_service_type,
@@ -204,8 +181,6 @@ def create_lot_parser_router(ctx: Any) -> Router:
             title=lot_data.get("title", ""),
             brief_ru=lot_data.get("brief_ru", ""),
             full_ru=lot_data.get("full_ru", ""),
-            brief_en=lot_data.get("brief_en", ""),
-            full_en=lot_data.get("full_en", ""),
             funpay_node_id=int(lot_data.get("funpay_node_id") or 0),
             funpay_category_title=lot_data.get("funpay_category_title", ""),
             funpay_service_type=lot_data.get("funpay_service_type", ""),
@@ -409,11 +384,8 @@ def create_lot_parser_router(ctx: Any) -> Router:
             await wait.edit_text("❌ Не удалось определить категорию FunPay.")
             return
 
-        await wait.edit_text("⏳ Категория + перевод…")
-        match, _ = await asyncio.gather(
-            _resolve_category(lot),
-            _translate_lot(lot),
-        )
+        await wait.edit_text("⏳ Определяю категорию…")
+        match = await _resolve_category(lot)
 
         price_hint = _resolve_price(lot, preset_price)
         lot_payload = await _build_lot_payload(lot, match, price_override=preset_price)

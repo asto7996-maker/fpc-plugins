@@ -89,8 +89,6 @@ class ParsedLot:
     title: str = ""
     brief_ru: str = ""
     full_ru: str = ""
-    brief_en: str = ""
-    full_en: str = ""
     price_hint: str = ""
     funpay_node_id: int = 0
     funpay_category_title: str = ""
@@ -268,27 +266,9 @@ def compose_starvell_descriptions(
                 f"ID: {service_id}" if service_id else "",
             ])).strip()
 
-    raw_brief_en = strip_smm_meta_lines(strip_service_id((lot.brief_en or "").strip()))
-    raw_full_en = strip_smm_meta_lines(strip_service_id((lot.full_en or "").strip()))
-    full_en = dedupe_brief_from_full(raw_brief_en or brief_ru, raw_full_en)
-    if not full_en and raw_full_en and _norm_compare(raw_full_en) != _norm_compare(raw_brief_en or brief_ru):
-        full_en = raw_full_en
-    brief_en = _truncate_text(raw_brief_en or brief_ru, brief_max)
-    full_en = dedupe_brief_from_full(brief_en, full_en)
-    if is_smm and full_en:
-        if include_auto_delivery:
-            full_en = _append_unique_block(full_en, DEFAULT_AUTO_DELIVERY_DESC)
-        if min_qty and max_qty:
-            full_en = _append_unique_block(full_en, format_quantity_limits(min_qty, max_qty))
-        full_en = _append_unique_block(full_en, DEFAULT_EXECUTION_TIME)
-        if service_id:
-            full_en = apply_service_id(full_en, int(service_id))
-
     return {
         "brief_ru": brief_ru,
         "full_ru": _truncate_text(full_ru, full_max),
-        "brief_en": brief_en,
-        "full_en": _truncate_text(full_en, full_max),
     }
 
 
@@ -309,8 +289,6 @@ def build_starvell_package(
         "title": lot.title,
         "brief_ru": desc["brief_ru"],
         "full_ru": desc["full_ru"],
-        "brief_en": desc["brief_en"],
-        "full_en": desc["full_en"],
     }
     if is_smm:
         sections["after_payment"] = DEFAULT_SMM_AFTER_PAYMENT
@@ -332,12 +310,6 @@ def format_copy_message(sections: dict[str, str]) -> str:
         "",
         "🇷🇺 <b>Подробное описание:</b>",
         f"<code>{_esc(sections.get('full_ru', ''))}</code>",
-        "",
-        "🇬🇧 <b>Краткое (EN):</b>",
-        f"<code>{_esc(sections.get('brief_en', ''))}</code>",
-        "",
-        "🇬🇧 <b>Подробное (EN):</b>",
-        f"<code>{_esc(sections.get('full_en', ''))}</code>",
     ]
     if sections.get("after_payment"):
         lines += ["", "💬 <b>Сообщение после оплаты:</b>", sections["after_payment"]]

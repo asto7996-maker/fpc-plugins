@@ -39,7 +39,6 @@ logger = logging.getLogger("starvell.lot_creator")
 
 AVAILABILITY_LOT = 999999
 AVAILABILITY_CAP = 999999
-EN_SEPARATOR = "\n\n━━━━━━━━━━━━━━━━━━\n🇬🇧 English\n\n"
 BRIEF_MAX = 100
 FULL_MAX = 4800
 
@@ -53,13 +52,10 @@ def _truncate(text: str, limit: int) -> str:
     return text[: limit - 1].rstrip() + "…"
 
 
-def build_bilingual_full(ru: str, en: str) -> str:
-    ru = (ru or "").strip()
-    en = (en or "").strip()
-    if not en or en == ru:
-        return _truncate(ru, FULL_MAX)
-    combined = f"{ru}{EN_SEPARATOR}{en}"
-    return _truncate(combined, FULL_MAX)
+def build_bilingual_full(ru: str, en: str = "") -> str:
+    """Подробное описание — только русский текст."""
+    _ = en
+    return _truncate((ru or "").strip(), FULL_MAX)
 
 
 def _hint_blob(lot: ParsedLot) -> str:
@@ -141,9 +137,8 @@ async def build_create_payload(
     )
     brief_ru = _truncate(desc["brief_ru"] or lot.title, BRIEF_MAX)
     full_ru = desc["full_ru"] or ""
-    full_en = desc["full_en"] or ""
 
-    full_description = build_bilingual_full(full_ru, full_en)
+    full_description = build_bilingual_full(full_ru)
     if DEFAULT_EXECUTION_TIME not in full_description:
         full_description = f"{full_description.rstrip()}\n\n{DEFAULT_EXECUTION_TIME}".strip()
         full_description = _truncate(full_description, FULL_MAX)
@@ -625,7 +620,7 @@ def format_created_message(
     lines += [
         "🤖 SMM-бот: сообщение после оплаты настроено",
         "🤖 Авто-доставка: описание + postPaymentMessage",
-        "🇷🇺 + 🇬🇧 Описание: RU и EN в одном поле",
+        "🇷🇺 Описание: только русский текст",
         "",
         f'🔗 <a href="{url}">Открыть лот на Starvell</a>',
     ]
