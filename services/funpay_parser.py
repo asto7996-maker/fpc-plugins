@@ -61,7 +61,25 @@ DEFAULT_SMM_AFTER_PAYMENT = (
     "Ожидайте уведомления!"
 )
 
-DEFAULT_EXECUTION_TIME = "⏱ Срок выполнения: от 10 минут до 2 суток."
+DEFAULT_EXECUTION_TIME = "⏱ Время доставки: от 10 минут до двух дней."
+
+DEFAULT_AUTO_DELIVERY_DESC = (
+    "🤖 Автоматическая доставка через SMM-бот VexBoost: "
+    "после оплаты отправьте ссылку — робот выполнит заказ автоматически."
+)
+
+QUANTITY_LINE_RE = re.compile(
+    r"^\s*(?:📦\s*)?(?:Мин\.?\s*заказ|Min\.?\s*order|Количество|Quantity)\s*[:.\-].*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+AUTO_DELIVERY_LINE_RE = re.compile(
+    r"^\s*🤖\s*Автоматическая доставка.*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+EXECUTION_TIME_LINE_RE = re.compile(
+    r"^\s*⏱\s*(?:Время доставки|Срок выполнения).*$",
+    re.IGNORECASE | re.MULTILINE,
+)
 
 
 @dataclass
@@ -150,6 +168,42 @@ def dedupe_brief_from_full(brief: str, full: str) -> str:
     return full
 
 
+def format_quantity_limits(min_qty: int, max_qty: int) -> str:
+    """Строка min/max для описания лота."""
+    min_qty = max(1, int(min_qty))
+    max_qty = max(min_qty, int(max_qty))
+    return f"📦 Количество: от {min_qty} до {max_qty} шт."
+
+
+def strip_smm_meta_lines(text: str) -> str:
+    """Удаляет старые строки авто-доставки, сроков и min/max из описания."""
+    if not text:
+        return ""
+    lines: list[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            lines.append("")
+            continue
+        if (
+            QUANTITY_LINE_RE.match(stripped)
+            or AUTO_DELIVERY_LINE_RE.match(stripped)
+            or EXECUTION_TIME_LINE_RE.match(stripped)
+        ):
+            continue
+        lines.append(line)
+    result = "\n".join(lines)
+    return re.sub(r"\n{3,}", "\n\n", result).strip()
+
+
+def _append_unique_block(text: str, block: str) -> str:
+    block = (block or "").strip()
+    if not block or block in text:
+        return text
+    base = (text or "").rstrip()
+    return f"{base}\n\n{block}".strip() if base else block
+
+
 def apply_service_id(text: str, service_id: int) -> str:
     """Удаляет старые ID и добавляет актуальный VexBoost ID в конец."""
     cleaned = strip_service_id(text or "")
@@ -175,6 +229,9 @@ def compose_starvell_descriptions(
     *,
     is_smm: bool = False,
     service_id: int | None = None,
+    min_qty: int | None = None,
+    max_qty: int | None = None,
+    include_auto_delivery: bool = True,
     brief_max: int = 100,
     full_max: int = 4800,
 ) -> dict[str, str]:
@@ -182,9 +239,10 @@ def compose_starvell_descriptions(
     Краткое и подробное описание для Starvell:
     - краткое ≠ подробное (без дубля в начале full)
     - старый ID удаляется, новый service_id добавляется в full
+    - SMM: авто-доставка (бот), min/max, срок доставки
     """
-    raw_brief = strip_service_id((lot.brief_ru or lot.title or "").strip())
-    raw_full = strip_service_id((lot.full_ru or "").strip())
+    raw_brief = strip_smm_meta_lines(strip_service_id((lot.brief_ru or lot.title or "").strip()))
+    raw_full = strip_smm_meta_lines(strip_service_id((lot.full_ru or "").strip()))
 
     full_ru = dedupe_brief_from_full(raw_brief, raw_full)
     if not full_ru and raw_full and _norm_compare(raw_full) != _norm_compare(raw_brief):
@@ -193,19 +251,31 @@ def compose_starvell_descriptions(
     brief_ru = _truncate_text(raw_brief, brief_max)
     full_ru = dedupe_brief_from_full(brief_ru, full_ru)
 
-    if is_smm and service_id:
-        full_ru = apply_service_id(full_ru, int(service_id))
-        brief_ru = strip_service_id(brief_ru)
+    if is_smm:
+        if include_auto_delivery:
+            full_ru = _append_unique_block(full_ru, DEFAULT_AUTO_DELIVERY_DESC)
+        if min_qty and max_qty:
+            full_ru = _append_unique_block(full_ru, format_quantity_limits(min_qty, max_qty))
+        full_ru = _append_unique_block(full_ru, DEFAULT_EXECUTION_TIME)
+        if service_id:
+            full_ru = apply_service_id(full_ru, int(service_id))
+        brief_ru = strip_service_id(strip_smm_meta_lines(brief_ru))
 
-    raw_brief_en = strip_service_id((lot.brief_en or "").strip())
-    raw_full_en = strip_service_id((lot.full_en or "").strip())
+    raw_brief_en = strip_smm_meta_lines(strip_service_id((lot.brief_en or "").strip()))
+    raw_full_en = strip_smm_meta_lines(strip_service_id((lot.full_en or "").strip()))
     full_en = dedupe_brief_from_full(raw_brief_en or brief_ru, raw_full_en)
     if not full_en and raw_full_en and _norm_compare(raw_full_en) != _norm_compare(raw_brief_en or brief_ru):
         full_en = raw_full_en
     brief_en = _truncate_text(raw_brief_en or brief_ru, brief_max)
     full_en = dedupe_brief_from_full(brief_en, full_en)
-    if is_smm and service_id and full_en:
-        full_en = apply_service_id(full_en, int(service_id))
+    if is_smm and full_en:
+        if include_auto_delivery:
+            full_en = _append_unique_block(full_en, DEFAULT_AUTO_DELIVERY_DESC)
+        if min_qty and max_qty:
+            full_en = _append_unique_block(full_en, format_quantity_limits(min_qty, max_qty))
+        full_en = _append_unique_block(full_en, DEFAULT_EXECUTION_TIME)
+        if service_id:
+            full_en = apply_service_id(full_en, int(service_id))
 
     return {
         "brief_ru": brief_ru,
@@ -238,10 +308,9 @@ def build_starvell_package(
     if is_smm:
         sections["after_payment"] = DEFAULT_SMM_AFTER_PAYMENT
         sections["execution_time"] = DEFAULT_EXECUTION_TIME
-    if auto_delivery:
-        sections["auto_delivery_note"] = (
-            "✅ Включите «Автоматическая выдача» в настройках лота на Starvell."
-        )
+        sections["auto_delivery_note"] = DEFAULT_AUTO_DELIVERY_DESC
+    elif auto_delivery:
+        sections["auto_delivery_note"] = DEFAULT_AUTO_DELIVERY_DESC
     return sections
 
 

@@ -29,12 +29,15 @@ from services.starvell_catalog import (
     resolve_slugs_for_category,
     sanitize_create_attributes,
     subcategory_supports_delivery_time,
+    subcategory_supports_min_order,
 )
+from services.vexboost_service import VexBoostServiceError, VexBoostServiceInfo, fetch_vexboost_service
 from starvell_api import StarvellAPI, BASE_URL, StarvellAPIError
 
 logger = logging.getLogger("starvell.lot_creator")
 
 AVAILABILITY_LOT = 999999
+AVAILABILITY_CAP = 999999
 EN_SEPARATOR = "\n\n━━━━━━━━━━━━━━━━━━\n🇬🇧 English\n\n"
 BRIEF_MAX = 100
 FULL_MAX = 4800
@@ -68,6 +71,31 @@ def _hint_blob(lot: ParsedLot) -> str:
     ]))
 
 
+def _resolve_availability(max_qty: int | None) -> int:
+    if not max_qty or max_qty < 1:
+        return AVAILABILITY_LOT
+    return min(int(max_qty), AVAILABILITY_CAP)
+
+
+def _coerce_vexboost_info(raw: Any) -> VexBoostServiceInfo | None:
+    if raw is None:
+        return None
+    if isinstance(raw, VexBoostServiceInfo):
+        return raw
+    if isinstance(raw, dict) and raw.get("service_id"):
+        min_qty = max(1, int(raw.get("min_qty") or 1))
+        max_qty = max(min_qty, int(raw.get("max_qty") or min_qty))
+        return VexBoostServiceInfo(
+            service_id=int(raw["service_id"]),
+            name=str(raw.get("name") or ""),
+            min_qty=min_qty,
+            max_qty=max_qty,
+            rate=str(raw.get("rate") or ""),
+            category=str(raw.get("category") or ""),
+        )
+    return None
+
+
 async def build_create_payload(
     lot: ParsedLot,
     *,
@@ -79,19 +107,40 @@ async def build_create_payload(
     game_slug: str = "",
     category_slug: str = "",
     auto_delivery: bool = True,
+    vexboost_info: VexBoostServiceInfo | None = None,
+    db: Any | None = None,
 ) -> dict[str, Any]:
     """Полный payload для partial-update после create (описание, postPayment, атрибуты)."""
-    _ = auto_delivery  # SMM-бот через postPaymentMessage, не Starvell autoDelivery
-    sections = build_starvell_package(
+    _ = auto_delivery
+    vexboost_info = _coerce_vexboost_info(vexboost_info)
+    min_qty = vexboost_info.min_qty if vexboost_info else None
+    max_qty = vexboost_info.max_qty if vexboost_info else None
+
+    if is_smm and service_id and not vexboost_info:
+        try:
+            vexboost_info = await fetch_vexboost_service(service_id, db=db)
+            min_qty = vexboost_info.min_qty
+            max_qty = vexboost_info.max_qty
+        except VexBoostServiceError as exc:
+            raise StarvellAPIError(400, str(exc), {}) from exc
+
+    build_starvell_package(
         lot,
         is_smm=is_smm,
         service_id=service_id,
-        auto_delivery=False,
+        auto_delivery=is_smm,
     )
-    desc = compose_starvell_descriptions(lot, is_smm=is_smm, service_id=service_id)
-    brief_ru = _truncate(desc["brief_ru"] or sections.get("brief_ru") or lot.title, BRIEF_MAX)
-    full_ru = desc["full_ru"] or sections.get("full_ru") or ""
-    full_en = desc["full_en"] or sections.get("full_en") or ""
+    desc = compose_starvell_descriptions(
+        lot,
+        is_smm=is_smm,
+        service_id=service_id,
+        min_qty=min_qty,
+        max_qty=max_qty,
+        include_auto_delivery=is_smm,
+    )
+    brief_ru = _truncate(desc["brief_ru"] or lot.title, BRIEF_MAX)
+    full_ru = desc["full_ru"] or ""
+    full_en = desc["full_en"] or ""
 
     full_description = build_bilingual_full(full_ru, full_en)
     if DEFAULT_EXECUTION_TIME not in full_description:
@@ -153,17 +202,21 @@ async def build_create_payload(
     if not resolved_game_id and int(category_id) == 175:
         resolved_game_id = 14
 
+    availability = _resolve_availability(max_qty)
+
     payload: dict[str, Any] = {
         "type": offer_type,
         "categoryId": int(category_id),
         "price": format_starvell_api_price(price),
-        "availability": AVAILABILITY_LOT,
+        "availability": availability,
         "isActive": True,
         "autoDelivery": False,
         "instantDelivery": False,
         "deliveryTime": DEFAULT_DELIVERY_TIME,
         "descriptions": descriptions,
     }
+    if is_smm and min_qty and subcategory_supports_min_order(catalog, subcategory):
+        payload["minOrderCurrencyAmount"] = int(min_qty)
     if resolved_game_id:
         payload["gameId"] = resolved_game_id
     if basic_attributes:
@@ -184,6 +237,7 @@ async def build_create_payload(
     payload["_catalog"] = catalog
     payload["_subcategory"] = subcategory
     payload["_brief_enabled"] = brief_enabled
+    payload["_vexboost_info"] = vexboost_info
     return payload
 
 
@@ -360,6 +414,8 @@ async def create_lot_from_parsed(
     category_slug: str = "",
     template_offer_id: str | int | None = None,
     auto_delivery: bool = True,
+    vexboost_info: VexBoostServiceInfo | None = None,
+    db: Any | None = None,
 ) -> dict[str, Any]:
     """Создаёт лот на Starvell (frontend create → partial-update)."""
     _ = auto_delivery
@@ -373,11 +429,15 @@ async def create_lot_from_parsed(
         game_id=game_id,
         game_slug=game_slug,
         category_slug=category_slug,
+        auto_delivery=auto_delivery,
+        vexboost_info=vexboost_info,
+        db=db,
     )
 
     catalog = full_payload.pop("_catalog", {}) or {}
     subcategory = full_payload.pop("_subcategory", None)
     brief_enabled = bool(full_payload.pop("_brief_enabled", True))
+    vexboost_info = full_payload.pop("_vexboost_info", None) or vexboost_info
 
     brief_ru = (
         ((full_payload.get("descriptions") or {}).get("rus") or {}).get("briefDescription")
@@ -480,6 +540,7 @@ async def create_lot_from_parsed(
         "url": offer_admin_url(offer_id or "", public_id),
         "payload": winning_body,
         "raw": result,
+        "vexboost_info": vexboost_info,
     }
 
 
@@ -491,19 +552,24 @@ def format_created_message(
     category_id: int,
     is_smm: bool,
     service_id: int | None,
+    min_qty: int | None = None,
+    max_qty: int | None = None,
 ) -> str:
     lines = [
         "✅ <b>Лот создан на Starvell</b>",
         "━━━━━━━━━━━━━━━━━━",
         f"📌 {title}",
         f"💰 Цена: <code>{format_price_display(price)}</code> ₽",
-        f"📦 Наличие: <code>{AVAILABILITY_LOT}</code>",
+        f"📦 Наличие: <code>{max_qty or AVAILABILITY_LOT}</code>",
         f"📁 Категория: <code>{category_id}</code>",
     ]
     if is_smm and service_id:
         lines.append(f"🆔 VexBoost ID: <code>{service_id}</code>")
+    if is_smm and min_qty and max_qty:
+        lines.append(f"📦 Кол-во: <code>{min_qty}</code> — <code>{max_qty}</code> шт.")
     lines += [
         "🤖 SMM-бот: сообщение после оплаты настроено",
+        "🤖 Авто-доставка: описание + postPaymentMessage",
         "🇷🇺 + 🇬🇧 Описание: RU и EN в одном поле",
         "",
         f'🔗 <a href="{url}">Открыть лот на Starvell</a>',

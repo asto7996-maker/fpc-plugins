@@ -24,6 +24,7 @@ from services.price_utils import (
     parse_smm_reply,
 )
 from services.starvell_lot_creator import create_lot_from_parsed, format_created_message
+from services.vexboost_service import VexBoostServiceError, VexBoostServiceInfo, fetch_vexboost_service
 from services.yandex_translate import translate_ru_to_en
 from starvell_api import StarvellAPIError
 from tg_bot import keyboards as KB
@@ -145,6 +146,20 @@ def create_lot_parser_router(ctx: Any) -> Router:
             })
         return payload
 
+    def _coerce_vexboost_info(raw: Any) -> VexBoostServiceInfo | None:
+        if raw is None:
+            return None
+        if isinstance(raw, VexBoostServiceInfo):
+            return raw
+        if isinstance(raw, dict) and raw.get("service_id"):
+            return VexBoostServiceInfo(
+                service_id=int(raw["service_id"]),
+                name=str(raw.get("name") or ""),
+                min_qty=max(1, int(raw.get("min_qty") or 1)),
+                max_qty=max(1, int(raw.get("max_qty") or 1)),
+            )
+        return None
+
     async def _create_and_reply(
         message: Message,
         state: FSMContext,
@@ -157,6 +172,7 @@ def create_lot_parser_router(ctx: Any) -> Router:
         lot_data = data.get("parsed_lot") or {}
         is_smm = bool(data.get("is_smm"))
         service_id = int(data.get("service_id") or 0) or None
+        vexboost_info = _coerce_vexboost_info(data.get("vexboost_info"))
         s = load_settings()
         api = _api()
 
@@ -196,6 +212,11 @@ def create_lot_parser_router(ctx: Any) -> Router:
 
         wait = await message.answer("⏳ Создаю лот на Starvell…")
         try:
+            if is_smm and service_id and not vexboost_info:
+                await wait.edit_text("⏳ Проверяю услугу VexBoost…")
+                vexboost_info = await fetch_vexboost_service(service_id, db=getattr(ctx, "db", None))
+                await wait.edit_text("⏳ Создаю лот на Starvell…")
+
             result = await asyncio.wait_for(
                 create_lot_from_parsed(
                     api,
@@ -209,13 +230,15 @@ def create_lot_parser_router(ctx: Any) -> Router:
                     category_slug=str(lot_data.get("category_slug") or ""),
                     template_offer_id=template_offer_id,
                     auto_delivery=s.parser_auto_delivery,
+                    vexboost_info=vexboost_info,
+                    db=getattr(ctx, "db", None),
                 ),
-                timeout=60.0,
+                timeout=90.0,
             )
         except StarvellAPIError as exc:
             logger.warning("create_offer api error: %s", exc)
             detail = str(exc)
-            if "build=attrs-v7" not in detail and "build=attrs-v6" not in detail and "build=attrs-v5" not in detail:
+            if "build=attrs-v7" not in detail and "attrs-v7.5" not in detail:
                 detail = (
                     f"{detail}\n\n⚠️ На сервере старый код парсера. "
                     "Обновите: curl -fsSL …/update_starvell_cardinal.sh | sudo bash -s -- cursor/parser-auto-create-6ec3"
@@ -236,6 +259,7 @@ def create_lot_parser_router(ctx: Any) -> Router:
 
         await state.clear()
         cat_title = lot_data.get("starvell_category_name") or lot_data.get("funpay_category_title") or ""
+        vb_info = result.get("vexboost_info") or vexboost_info
         text = format_created_message(
             title=lot.title,
             url=result.get("url", ""),
@@ -243,6 +267,8 @@ def create_lot_parser_router(ctx: Any) -> Router:
             category_id=category_id,
             is_smm=is_smm,
             service_id=service_id,
+            min_qty=getattr(vb_info, "min_qty", None),
+            max_qty=getattr(vb_info, "max_qty", None),
         )
         if cat_title:
             text += f"\n📁 Категория: <b>{cat_title}</b>"
@@ -299,8 +325,27 @@ def create_lot_parser_router(ctx: Any) -> Router:
         if not category_id:
             await state.update_data(service_id=service_id, is_smm=is_smm, pending_category_fallback=True)
             return False
+
+        try:
+            vb_info = await fetch_vexboost_service(service_id, db=getattr(ctx, "db", None))
+        except VexBoostServiceError as exc:
+            if hasattr(message, "edit_text"):
+                await message.edit_text(f"❌ VexBoost: {exc}", parse_mode="HTML")
+            else:
+                await message.answer(f"❌ VexBoost: {exc}", parse_mode="HTML")
+            return True
+
+        await state.update_data(
+            service_id=service_id,
+            is_smm=is_smm,
+            vexboost_info={
+                "service_id": vb_info.service_id,
+                "name": vb_info.name,
+                "min_qty": vb_info.min_qty,
+                "max_qty": vb_info.max_qty,
+            },
+        )
         final_price = price or lot_data.get("price_hint") or load_settings().parser_default_price
-        await state.update_data(service_id=service_id, is_smm=is_smm)
         await _create_and_reply(
             message,
             state,
@@ -470,9 +515,32 @@ def create_lot_parser_router(ctx: Any) -> Router:
             )
             return
 
+        check = await message.answer("⏳ Проверяю ID VexBoost…")
+        try:
+            vb_info = await fetch_vexboost_service(service_id, db=getattr(ctx, "db", None))
+        except VexBoostServiceError as exc:
+            await check.edit_text(f"❌ VexBoost: {exc}", parse_mode="HTML")
+            return
+
+        await check.edit_text(
+            f"✅ VexBoost <code>{service_id}</code>: {vb_info.name}\n"
+            f"📦 Кол-во: <code>{vb_info.min_qty}</code> — <code>{vb_info.max_qty}</code> шт.",
+            parse_mode="HTML",
+        )
+
         data = await state.get_data()
+        await state.update_data(
+            service_id=service_id,
+            is_smm=True,
+            vexboost_info={
+                "service_id": vb_info.service_id,
+                "name": vb_info.name,
+                "min_qty": vb_info.min_qty,
+                "max_qty": vb_info.max_qty,
+            },
+        )
+
         if data.get("pending_category_fallback"):
-            await state.update_data(service_id=service_id, is_smm=True)
             lot = ParsedLot(
                 funpay_node_id=int(data.get("parsed_lot", {}).get("funpay_node_id") or 0),
                 funpay_category_title=data.get("parsed_lot", {}).get("funpay_category_title", ""),

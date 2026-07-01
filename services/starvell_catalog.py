@@ -202,7 +202,7 @@ def pick_subcategory(catalog: dict[str, Any], *hint_texts: str) -> dict[str, Any
 
 
 MAX_NUMERIC_ATTRIBUTES = 50
-PARSER_BUILD = "attrs-v7.4"
+PARSER_BUILD = "attrs-v7.5"
 
 MIN_DELIVERY_FROM_MINUTES = 10
 
@@ -213,7 +213,7 @@ DELIVERY_TIME_SUBCATEGORY_IDS: dict[int, set[int]] = {
 
 DEFAULT_DELIVERY_TIME: dict[str, Any] = {
     "from": {"unit": "MINUTES", "value": MIN_DELIVERY_FROM_MINUTES},
-    "to": {"unit": "HOURS", "value": 6},
+    "to": {"unit": "DAYS", "value": 2},
 }
 
 # FunPay Telegram «Подписчики» → Starvell category 175 / sub 634 (fallback без каталога)
@@ -461,8 +461,21 @@ def _create_base_fields(payload: dict[str, Any]) -> dict[str, Any]:
         "descriptions",
         "deliveryTime",
         "postPaymentMessage",
+        "minOrderCurrencyAmount",
     )
     return {k: payload[k] for k in allowed_keys if k in payload}
+
+
+def subcategory_supports_min_order(
+    catalog: dict[str, Any] | None,
+    subcategory: dict[str, Any] | None,
+) -> bool:
+    """Мин. кол-во заказа (minOrderCurrencyAmount) — на подкатегориях Telegram SMM."""
+    if subcategory and subcategory.get("isMinOrderSupported") is not None:
+        return bool(subcategory.get("isMinOrderSupported"))
+    if catalog and catalog.get("isMinOrderSupported") is not None:
+        return bool(catalog.get("isMinOrderSupported"))
+    return False
 
 
 def subcategory_supports_delivery_time(category_id: int | None, sub_category_id: int | None) -> bool:
@@ -617,6 +630,13 @@ def finalize_frontend_create_payload(
         out["subCategoryId"] = int(payload["subCategoryId"])
     if payload.get("postPaymentMessage"):
         out["postPaymentMessage"] = payload["postPaymentMessage"]
+    if payload.get("minOrderCurrencyAmount") is not None:
+        try:
+            min_val = int(float(str(payload["minOrderCurrencyAmount"]).replace(",", ".")))
+            if min_val > 0:
+                out["minOrderCurrencyAmount"] = min_val
+        except (TypeError, ValueError):
+            pass
 
     if basic:
         out["basicAttributes"] = basic[:20]
@@ -723,6 +743,20 @@ def build_offer_update_payload(full: dict[str, Any]) -> dict[str, Any]:
         out["postPaymentMessage"] = full["postPaymentMessage"]
     if subcategory_supports_delivery_time(full.get("categoryId"), full.get("subCategoryId")):
         out["deliveryTime"] = normalize_delivery_time(full.get("deliveryTime"))
+    if full.get("minOrderCurrencyAmount") is not None:
+        try:
+            min_val = int(float(str(full["minOrderCurrencyAmount"]).replace(",", ".")))
+            if min_val > 0:
+                out["minOrderCurrencyAmount"] = min_val
+        except (TypeError, ValueError):
+            pass
+    if full.get("availability") is not None:
+        try:
+            avail = int(float(str(full["availability"]).replace(",", ".")))
+            if avail > 0:
+                out["availability"] = avail
+        except (TypeError, ValueError):
+            pass
     unified = compact_option_attributes(full.get("attributes"))
     if not unified:
         unified = compact_option_attributes(full.get("basicAttributes"))
