@@ -54,11 +54,11 @@ rsync -a \
   "$TMP/" "$INSTALL_DIR/"
 
 if grep -q 'PARSER_BUILD = "attrs-v7' "$INSTALL_DIR/services/starvell_catalog.py" 2>/dev/null; then
-  echo "✅ Патч attrs-v7+ установлен (frontend create, list-my API)"
+  echo "✅ Патч attrs-v7+ установлен (delivery from 10 min)"
 else
   echo "⚠️  Старый код парсера — обновите ветку $REPO_BRANCH"
 fi
-echo "attrs-v7.1" > "$INSTALL_DIR/PARSER_BUILD.txt" 2>/dev/null || true
+echo "attrs-v7.2" > "$INSTALL_DIR/PARSER_BUILD.txt" 2>/dev/null || true
 
 # Каталоги данных и права (иначе systemd: status=200/CHDIR)
 mkdir -p "$INSTALL_DIR"/{config,storage/plugins,logs,plugins}

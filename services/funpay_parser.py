@@ -48,7 +48,7 @@ DEFAULT_SMM_AFTER_PAYMENT = (
     "Ожидайте уведомления!"
 )
 
-DEFAULT_EXECUTION_TIME = "⏱ Срок выполнения: от 5 минут до 2 суток."
+DEFAULT_EXECUTION_TIME = "⏱ Срок выполнения: от 10 минут до 2 суток."
 
 
 @dataclass

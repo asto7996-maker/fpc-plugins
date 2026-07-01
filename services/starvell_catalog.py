@@ -161,10 +161,12 @@ def pick_subcategory(catalog: dict[str, Any], *hint_texts: str) -> dict[str, Any
 
 
 MAX_NUMERIC_ATTRIBUTES = 50
-PARSER_BUILD = "attrs-v7.1"
+PARSER_BUILD = "attrs-v7.2"
+
+MIN_DELIVERY_FROM_MINUTES = 10
 
 DEFAULT_DELIVERY_TIME: dict[str, Any] = {
-    "from": {"unit": "MINUTES", "value": "5"},
+    "from": {"unit": "MINUTES", "value": str(MIN_DELIVERY_FROM_MINUTES)},
     "to": {"unit": "DAYS", "value": "2"},
 }
 
@@ -417,17 +419,41 @@ def _create_base_fields(payload: dict[str, Any]) -> dict[str, Any]:
     return {k: payload[k] for k in allowed_keys if k in payload}
 
 
-def _delivery_time_for_create(raw: Any) -> dict[str, Any] | None:
-    """Как на сайте: null если from/to пустые, иначе объект deliveryTime."""
+def _delivery_time_for_create(raw: Any) -> dict[str, Any]:
+    """
+    Нормализует deliveryTime для create.
+    Starvell: «Время доставки не может быть меньше одного» — value >= 1, from >= 10 мин.
+    """
     if not isinstance(raw, dict):
-        return None
-    from_block = raw.get("from") if isinstance(raw.get("from"), dict) else {}
-    to_block = raw.get("to") if isinstance(raw.get("to"), dict) else {}
-    from_val = str(from_block.get("value") or "").strip()
-    to_val = str(to_block.get("value") or "").strip()
-    if not from_val or not to_val:
-        return None
-    return raw
+        raw = DEFAULT_DELIVERY_TIME
+
+    from_block = dict(raw.get("from") or DEFAULT_DELIVERY_TIME["from"])
+    to_block = dict(raw.get("to") or DEFAULT_DELIVERY_TIME["to"])
+
+    from_unit = str(from_block.get("unit") or "MINUTES").upper()
+    to_unit = str(to_block.get("unit") or "DAYS").upper()
+
+    try:
+        from_num = int(float(str(from_block.get("value") or "0").replace(",", ".")))
+    except (TypeError, ValueError):
+        from_num = 0
+    try:
+        to_num = int(float(str(to_block.get("value") or "0").replace(",", ".")))
+    except (TypeError, ValueError):
+        to_num = 0
+
+    if from_unit == "MINUTES" and from_num < MIN_DELIVERY_FROM_MINUTES:
+        from_num = MIN_DELIVERY_FROM_MINUTES
+    elif from_num < 1:
+        from_num = 1
+
+    if to_num < 1:
+        to_num = 1
+
+    return {
+        "from": {"unit": from_unit, "value": str(from_num)},
+        "to": {"unit": to_unit, "value": str(to_num)},
+    }
 
 
 def _filter_basic_attributes(
@@ -564,13 +590,15 @@ def build_minimal_create_payload(
     include_post_payment: bool = False,
     include_attributes: bool = True,
     auto_delivery: bool = False,
-    delivery_time: dict[str, Any] | None = DEFAULT_DELIVERY_TIME,
+    delivery_time: dict[str, Any] | None = None,
     catalog: dict[str, Any] | None = None,
     subcategory: dict[str, Any] | None = None,
     brief_enabled: bool = True,
 ) -> dict[str, Any]:
     """Минимальный create по схеме веб-формы Starvell (короткое описание, без postPayment)."""
     brief = (brief_ru or "Лот").strip()[:100]
+    if delivery_time is None:
+        delivery_time = DEFAULT_DELIVERY_TIME
     raw: dict[str, Any] = {
         "type": base.get("type") or "LOT",
         "categoryId": base.get("categoryId"),

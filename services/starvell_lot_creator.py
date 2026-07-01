@@ -255,15 +255,6 @@ def _create_attempts(
             build_minimal_create_payload(full_payload, include_attributes=True, **common),
         ),
         (
-            "frontend-no-delivery",
-            build_minimal_create_payload(
-                full_payload,
-                include_attributes=True,
-                delivery_time=None,
-                **common,
-            ),
-        ),
-        (
             "frontend-no-attrs",
             build_minimal_create_payload(
                 full_payload,
