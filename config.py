@@ -144,6 +144,8 @@ class Settings:
     parser_default_price: str = "0.01"
     parser_auto_delivery: bool = True
     parser_funpay_category_map: dict[str, Any] = field(default_factory=dict)
+    parser_vexboost_api_key: str = ""
+    parser_vexboost_api_url: str = ""
 
     def get_active_accounts(self) -> list[StarvellAccount]:
         if self.accounts:

@@ -202,7 +202,7 @@ def pick_subcategory(catalog: dict[str, Any], *hint_texts: str) -> dict[str, Any
 
 
 MAX_NUMERIC_ATTRIBUTES = 50
-PARSER_BUILD = "attrs-v7.5"
+PARSER_BUILD = "attrs-v7.6"
 
 MIN_DELIVERY_FROM_MINUTES = 10
 

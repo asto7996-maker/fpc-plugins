@@ -61,7 +61,7 @@ DEFAULT_SMM_AFTER_PAYMENT = (
     "Ожидайте уведомления!"
 )
 
-DEFAULT_EXECUTION_TIME = "⏱ Время доставки: от 10 минут до двух дней."
+DEFAULT_EXECUTION_TIME = "Время доставки: от 10 минут до двух дней."
 
 DEFAULT_AUTO_DELIVERY_DESC = (
     "🤖 Автоматическая доставка через SMM-бот VexBoost: "
@@ -77,7 +77,7 @@ AUTO_DELIVERY_LINE_RE = re.compile(
     re.IGNORECASE | re.MULTILINE,
 )
 EXECUTION_TIME_LINE_RE = re.compile(
-    r"^\s*⏱\s*(?:Время доставки|Срок выполнения).*$",
+    r"^\s*(?:⏱\s*)?(?:Время доставки|Срок выполнения).*$",
     re.IGNORECASE | re.MULTILINE,
 )
 

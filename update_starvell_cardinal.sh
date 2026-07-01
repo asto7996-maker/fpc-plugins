@@ -54,11 +54,13 @@ rsync -a \
   "$TMP/" "$INSTALL_DIR/"
 
 if grep -q 'PARSER_BUILD = "attrs-v7' "$INSTALL_DIR/services/starvell_catalog.py" 2>/dev/null; then
-  echo "✅ Патч attrs-v7+ установлен (delivery from 10 min)"
+  BUILD_TAG="$(grep -o 'PARSER_BUILD = "[^"]*"' "$INSTALL_DIR/services/starvell_catalog.py" | head -1 | cut -d'"' -f2)"
+  echo "✅ Патч $BUILD_TAG установлен (VexBoost min/max, delivery 2 days)"
 else
   echo "⚠️  Старый код парсера — обновите ветку $REPO_BRANCH"
+  BUILD_TAG="unknown"
 fi
-echo "attrs-v7.3" > "$INSTALL_DIR/PARSER_BUILD.txt" 2>/dev/null || true
+echo "$BUILD_TAG" > "$INSTALL_DIR/PARSER_BUILD.txt" 2>/dev/null || true
 
 # Каталоги данных и права (иначе systemd: status=200/CHDIR)
 mkdir -p "$INSTALL_DIR"/{config,storage/plugins,logs,plugins}

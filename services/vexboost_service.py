@@ -46,11 +46,21 @@ def _parse_int(value: Any, default: int = 0) -> int:
 
 
 async def load_vexboost_api_config(db: Any | None = None) -> dict[str, str]:
-    """API key из настроек плагина VexBoost или переменных окружения."""
+    """API key: env → settings.json → плагин VexBoost в SQLite."""
     cfg = {
         "api_url": os.getenv("VEXBOOST_API_URL", DEFAULT_API_URL).rstrip("/"),
         "api_key": os.getenv("VEXBOOST_API_KEY", "").strip(),
     }
+    try:
+        from config import load_settings
+
+        s = load_settings()
+        if s.parser_vexboost_api_key.strip():
+            cfg["api_key"] = s.parser_vexboost_api_key.strip()
+        if s.parser_vexboost_api_url.strip():
+            cfg["api_url"] = s.parser_vexboost_api_url.strip().rstrip("/")
+    except Exception as exc:
+        logger.debug("load_vexboost_api_config from settings: %s", exc)
     if db is not None:
         try:
             from core.plugins.settings_store import PluginSettingsStore
@@ -154,7 +164,9 @@ async def fetch_vexboost_service(
     api_url = str(cfg.get("api_url") or DEFAULT_API_URL).rstrip("/")
     if not api_key:
         raise VexBoostServiceError(
-            "API Key VexBoost не настроен. Укажите его в Плагины → VexBoost AutoSMM → Настройки"
+            "API Key VexBoost не настроен. Укажите ключ в "
+            "Плагины → VexBoost AutoSMM → Настройки "
+            "или добавьте parser_vexboost_api_key в config/settings.json"
         )
 
     services = await _fetch_services_list(api_url, api_key)
@@ -165,4 +177,4 @@ async def fetch_vexboost_service(
         if info:
             return info
 
-    raise VexBoostServiceError(f"Услуга VexBoost с ID <code>{sid}</code> не найдена в каталоге")
+    raise VexBoostServiceError(f"Услуга VexBoost с ID {sid} не найдена в каталоге")
