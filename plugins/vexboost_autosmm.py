@@ -2,7 +2,7 @@ from __future__ import annotations
 
 # === ОБЯЗАТЕЛЬНЫЕ ПОЛЯ FunPay Cardinal (НЕ УДАЛЯТЬ) ===
 NAME = "VexBoost AutoSMM"
-VERSION = "2.4.8"
+VERSION = "2.4.9"
 DESCRIPTION = "Автонакрутка SMM-услуг для FunPay Cardinal"
 CREDITS = "@xei1y"
 UUID = "a3f8c2e1-7b4d-4a9f-9e2c-1d5b8f6a0c3e"
@@ -325,27 +325,44 @@ def set_pending(order: Dict[str, Any]) -> None:
         pending_by_buyer[order["buyer"]] = order
 
 
+def get_pending_for_chat(chat_id: Any) -> Optional[Dict[str, Any]]:
+    """Ожидающий подтверждения заказ только для указанного чата."""
+    return pending_confirmations.get(_normalize_chat_id(chat_id))
+
+
 def get_pending(chat_id: Any, buyer: str = "") -> Optional[Dict[str, Any]]:
-    cid = _normalize_chat_id(chat_id)
-    if cid in pending_confirmations:
-        return pending_confirmations[cid]
+    order = get_pending_for_chat(chat_id)
+    if order is not None:
+        return order
     if buyer and buyer in pending_by_buyer:
-        return pending_by_buyer[buyer]
+        order = pending_by_buyer[buyer]
+        if _normalize_chat_id(order.get("chat_id")) == _normalize_chat_id(chat_id):
+            return order
     return None
 
 
-def pop_pending(chat_id: Any, buyer: str = "") -> Optional[Dict[str, Any]]:
-    order = get_pending(chat_id, buyer)
-    if not order:
-        return None
-    cid = _normalize_chat_id(order.get("chat_id"))
-    pending_confirmations.pop(cid, None)
-    pending_by_buyer.pop(order.get("buyer", ""), None)
+def pop_pending_for_chat(chat_id: Any) -> Optional[Dict[str, Any]]:
+    cid = _normalize_chat_id(chat_id)
+    order = pending_confirmations.pop(cid, None)
+    if order and order.get("buyer"):
+        stored = pending_by_buyer.get(order["buyer"])
+        if stored and _normalize_chat_id(stored.get("chat_id")) == cid:
+            pending_by_buyer.pop(order["buyer"], None)
     return order
 
 
+def pop_pending(chat_id: Any, buyer: str = "") -> Optional[Dict[str, Any]]:
+    order = pop_pending_for_chat(chat_id)
+    if order:
+        return order
+    pending = get_pending(chat_id, buyer)
+    if not pending:
+        return None
+    return pop_pending_for_chat(pending.get("chat_id", chat_id))
+
+
 def clear_pending(chat_id: Any, buyer: str = "") -> None:
-    pop_pending(chat_id, buyer)
+    pop_pending_for_chat(chat_id)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Утилиты хранения (потокобезопасные)
@@ -579,6 +596,26 @@ def find_order_by_buyer(orders: List[Dict[str, Any]], buyer: str) -> Optional[Di
         if order.get("buyer") == buyer:
             return order
     return None
+
+
+def find_order_in_chat(
+    orders: List[Dict[str, Any]], buyer: str, chat_id: Any,
+) -> Optional[Dict[str, Any]]:
+    """Заказ VexBoost, привязанный к конкретному чату FunPay."""
+    cid = _normalize_chat_id(chat_id)
+    for order in orders:
+        if order.get("buyer") != buyer:
+            continue
+        if _normalize_chat_id(order.get("chat_id", -1)) == cid:
+            return order
+    return None
+
+
+def _chat_has_vexboost_order(chat_id: Any, buyer: str) -> bool:
+    """Есть ли у плагина незавершённый заказ в этом чате."""
+    if get_pending_for_chat(chat_id):
+        return True
+    return find_order_in_chat(load_payorders(), buyer, chat_id) is not None
 
 
 def _fp_order_exists_in_active(fp_id: str) -> bool:
@@ -1752,7 +1789,7 @@ def request_confirmation(c: "Cardinal", order: Dict[str, Any], link: str) -> Non
 
 
 def confirm_order(c: "Cardinal", chat_id: Any, text: str, buyer: str = "") -> None:
-    order = pop_pending(chat_id, buyer)
+    order = pop_pending_for_chat(chat_id)
     if not order:
         logger.warning(
             "%s: подтверждение без заказа chat=%s buyer=%s text=%r",
@@ -1885,9 +1922,11 @@ def _process_buyer_message(
         return
 
     confirm_action = _is_confirm_message(message_text)
-    pending = get_pending(cid, msgname)
+    pending = get_pending_for_chat(cid)
 
     if confirm_action:
+        if not _chat_has_vexboost_order(cid, msgname):
+            return
         logger.info(
             "%s: получено подтверждение %r от %s chat=%s pending=%s",
             LOGGER_PREFIX, message_text, msgname, cid, pending is not None,
@@ -1895,7 +1934,12 @@ def _process_buyer_message(
         if pending:
             confirm_order(c, cid, confirm_action, msgname)
             return
-        send_fp(c, cid, _format_buyer_template("send_link_first_message"))
+        pay_orders = load_payorders()
+        order = find_order_in_chat(pay_orders, msgname, cid)
+        if order and order.get("url"):
+            order["chat_id"] = cid
+            set_pending(order)
+            confirm_order(c, cid, confirm_action, msgname)
         return
 
     if pending:
@@ -1911,7 +1955,7 @@ def _process_buyer_message(
         return
 
     pay_orders = load_payorders()
-    order = find_order_by_buyer(pay_orders, msgname)
+    order = find_order_in_chat(pay_orders, msgname, cid)
     if order:
         links = extract_links(message_text)
         if links:
@@ -1965,13 +2009,14 @@ def last_chat_msg_hook(c: "Cardinal", e: Any) -> None:
 def _handle_pending_message(
     c: "Cardinal", chat_id: Any, message_text: str, buyer: str = "",
 ) -> None:
+    order = get_pending_for_chat(chat_id)
+    if not order:
+        return
     if "http" in message_text:
-        order = get_pending(chat_id, buyer)
-        if order:
-            order["chat_id"] = _normalize_chat_id(chat_id)
-            links = extract_links(message_text)
-            if links:
-                request_confirmation(c, order, links[0])
+        order["chat_id"] = _normalize_chat_id(chat_id)
+        links = extract_links(message_text)
+        if links:
+            request_confirmation(c, order, links[0])
         return
     send_fp(c, chat_id, _format_buyer_template("pending_hint_message"))
 
