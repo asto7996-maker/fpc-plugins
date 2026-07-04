@@ -12,7 +12,7 @@ import time
 from typing import Any, Callable, Awaitable
 
 from ai_service import AIService
-from config import BASE_DIR, Settings, load_settings
+from config import BASE_DIR, Settings, compute_bump_check_interval, load_settings
 from database import Database
 from handlers.builtin import BuiltinHandlers
 from core.delivery.templates import append_refund_disclaimer, render_delivery_template
@@ -755,27 +755,37 @@ class AutomationEngine:
             logger.warning("ai reply failed: %s", exc)
 
     async def _bump_loop(self, account_name: str, api: StarvellAPI) -> None:
-        """Циклическое поднятие лотов."""
+        """Проверка автобампа каждые 20–30 мин; поднимает, если Starvell разрешает."""
         while self._running:
             settings = self._get_settings()
             if not settings.auto_bump_enabled:
                 await asyncio.sleep(60)
                 continue
-            interval = max(300.0, settings.bump_interval)
-            jitter = random.randint(settings.bump_jitter_min, settings.bump_jitter_max)
-            interval = max(60.0, interval + jitter)
             try:
                 await self._do_bump(account_name, api, settings)
             except Exception as exc:
                 logger.warning("bump_loop %s: %s", account_name, exc)
+            interval = compute_bump_check_interval(settings)
+            logger.debug(
+                "Auto bump [%s]: следующая проверка через %.0f сек (%.1f мин)",
+                account_name,
+                interval,
+                interval / 60,
+            )
             await asyncio.sleep(interval)
 
     async def _do_bump(self, account_name: str, api: StarvellAPI, settings: Settings) -> None:
-        bumped, errors = await api.bump_all_offers(limit=200)
+        bumped, errors, waiting = await api.bump_all_offers(limit=200)
         if bumped:
             logger.info("Auto bump [%s]: поднято категорий: %s", account_name, bumped)
             if settings.notify_bump:
                 await self.notify(f"📈 [{account_name}] Лоты подняты ({bumped} категорий)", "notify_bump")
+        elif waiting:
+            logger.info(
+                "Auto bump [%s]: пока нельзя поднять — %s",
+                account_name,
+                waiting[0][:120],
+            )
         elif errors:
             logger.warning("Auto bump [%s]: %s", account_name, "; ".join(errors[:3]))
         else:

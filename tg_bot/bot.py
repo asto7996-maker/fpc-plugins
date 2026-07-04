@@ -284,15 +284,17 @@ class TelegramBot:
             return
         wait = await message.answer("⏳ Поднимаю лоты…")
         try:
-            bumped, errors = await api.bump_all_offers(limit=200)
+            bumped, errors, waiting = await api.bump_all_offers(limit=200)
         except Exception as exc:
             await wait.edit_text(f"❌ Ошибка бампа: <code>{exc}</code>", parse_mode="HTML")
             return
         if bumped:
             text = f"✅ Поднято категорий: <b>{bumped}</b>"
+        elif waiting:
+            text = f"⏳ Пока нельзя поднять:\n<code>{waiting[0][:300]}</code>"
         else:
             text = "⚠️ Не удалось поднять лоты"
-        if errors:
+        if errors and not bumped:
             text += f"\n\n<code>{errors[0][:300]}</code>"
         await wait.edit_text(text, parse_mode="HTML")
 
@@ -618,7 +620,12 @@ class TelegramBot:
     async def cb_edit_bump(self, call: CallbackQuery, state: FSMContext) -> None:
         await state.set_state(SetupStates.bump_interval)
         s = load_settings()
-        await call.message.answer(f"Текущий интервал бампа: {int(s.bump_interval)} сек.\nВведите новый (мин. 300):")
+        from config import BUMP_CHECK_MIN_SECONDS, BUMP_CHECK_MAX_SECONDS
+        await call.message.answer(
+            f"Текущая база интервала: {int(s.bump_interval)} сек "
+            f"(проверка каждые {int(BUMP_CHECK_MIN_SECONDS / 60)}–{int(BUMP_CHECK_MAX_SECONDS / 60)} мин).\n"
+            f"Введите новую базу в секундах (рекомендуется 1200–1800):",
+        )
         await call.answer()
 
     async def cb_edit_delivery(self, call: CallbackQuery, state: FSMContext) -> None:
@@ -683,9 +690,10 @@ class TelegramBot:
         await message.answer("✅ Текст приветствия сохранён.", reply_markup=self._back_kb())
 
     async def on_bump(self, message: Message, state: FSMContext) -> None:
+        from config import BUMP_CHECK_MIN_SECONDS, BUMP_CHECK_MAX_SECONDS
         try:
             val = int((message.text or "").strip())
-            val = max(300, val)
+            val = max(int(BUMP_CHECK_MIN_SECONDS), min(int(BUMP_CHECK_MAX_SECONDS), val))
         except ValueError:
             await message.answer("❌ Введите число секунд")
             return
@@ -694,7 +702,11 @@ class TelegramBot:
         save_settings(s)
         await self.automation.reload()
         await state.clear()
-        await message.answer(f"✅ Интервал бампа: {val} сек.", reply_markup=self._back_kb())
+        await message.answer(
+            f"✅ База интервала бампа: {val} сек. "
+            f"Проверка каждые {int(BUMP_CHECK_MIN_SECONDS / 60)}–{int(BUMP_CHECK_MAX_SECONDS / 60)} мин.",
+            reply_markup=self._back_kb(),
+        )
 
     async def on_delivery(self, message: Message, state: FSMContext) -> None:
         text = (message.text or "").strip()

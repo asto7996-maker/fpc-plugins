@@ -79,7 +79,7 @@ python main.py
 | `owner_id` | Заполняется автоматически при первом `/start` |
 | `session_cookie` | Cookie Starvell — лучше задать через бота |
 | `gemini_api_key` | Ключ Gemini — задать через бота |
-| `bump_interval` | Интервал автобампа в секундах (по умолчанию 3600) |
+| `bump_interval` | База интервала проверки автобампа (по умолчанию 1500 сек; фактически каждые 20–30 мин) |
 | `api_delay_seconds` | Задержка между запросами к Starvell (антифлуд) |
 
 ### Как получить SESSION_COOKIE

@@ -99,9 +99,9 @@ class Settings:
     # Тайминги
     chat_poll_interval: float = 4.0
     orders_poll_interval: float = 4.0
-    bump_interval: float = 3600.0
-    bump_jitter_min: int = -30
-    bump_jitter_max: int = 45
+    bump_interval: float = 1500.0  # 25 мин — центр окна проверки 20–30 мин
+    bump_jitter_min: int = -300
+    bump_jitter_max: int = 300
     api_delay_seconds: float = 0.8
     api_max_per_minute: int = 40
 
@@ -184,6 +184,18 @@ def _account_from_dict(data: dict[str, Any]) -> StarvellAccount:
 
 def _account_to_dict(acc: StarvellAccount) -> dict[str, Any]:
     return asdict(acc)
+
+
+BUMP_CHECK_MIN_SECONDS = 1200.0   # 20 мин
+BUMP_CHECK_MAX_SECONDS = 1800.0   # 30 мин
+
+
+def compute_bump_check_interval(settings: Settings) -> float:
+    """Случайный интервал проверки автобампа в окне 20–30 минут."""
+    import random
+    jitter = random.randint(settings.bump_jitter_min, settings.bump_jitter_max)
+    interval = float(settings.bump_interval) + jitter
+    return max(BUMP_CHECK_MIN_SECONDS, min(BUMP_CHECK_MAX_SECONDS, interval))
 
 
 def load_settings() -> Settings:

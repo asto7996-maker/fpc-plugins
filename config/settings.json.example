@@ -14,7 +14,7 @@
   "ai_replies_enabled": false,
   "chat_poll_interval": 5.0,
   "orders_poll_interval": 10.0,
-  "bump_interval": 3600.0,
+  "bump_interval": 1500.0,
   "api_delay_seconds": 1.5,
   "api_max_per_minute": 40,
   "welcome_text": "Здравствуйте! 👋 Рады видеть вас в нашем магазине на Starvell. Напишите, чем можем помочь!",

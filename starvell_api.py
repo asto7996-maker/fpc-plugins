@@ -836,14 +836,33 @@ class StarvellAPI:
         )
         return self._parse_bump_response(resp)
 
-    async def bump_all_offers(self, limit: int = 200) -> tuple[int, list[str]]:
-        """Поднять все категории продавца. Возвращает (число категорий, ошибки)."""
+    @staticmethod
+    def _bump_error_message(result: dict[str, Any]) -> str:
+        payload = result.get("json")
+        if isinstance(payload, dict):
+            return str(payload.get("message") or payload.get("error") or "")
+        return str(result.get("raw") or result.get("status") or "unknown")
+
+    @staticmethod
+    def _is_bump_cooldown(message: str) -> bool:
+        low = (message or "").lower()
+        markers = (
+            "cooldown", "wait", "timer", "too early", "not available",
+            "not yet", "try again", "later",
+            "подожд", "рано", "недоступ", "через", "минут", "повтор",
+            "лимит", "ожида", "нельзя", "cool down",
+        )
+        return any(marker in low for marker in markers)
+
+    async def bump_all_offers(self, limit: int = 200) -> tuple[int, list[str], list[str]]:
+        """Поднять все категории продавца. Возвращает (поднято, ошибки, ожидание/cooldown)."""
         targets = await self.collect_bump_targets(limit=limit)
         if not targets:
-            return 0, ["нет лотов с game_id/category_id"]
+            return 0, [], []
 
         bumped = 0
         errors: list[str] = []
+        waiting: list[str] = []
         for target in targets:
             game_id = int(target["game_id"])
             cat_ids = list(target["category_ids"])
@@ -858,16 +877,15 @@ class StarvellAPI:
                 if single.get("success"):
                     bumped += 1
                 else:
-                    msg = ""
-                    payload = single.get("json")
-                    if isinstance(payload, dict):
-                        msg = str(payload.get("message") or payload.get("error") or "")
-                    if not msg:
-                        msg = str(single.get("raw") or single.get("status") or "unknown")
-                    errors.append(f"game={game_id} cat={cat_id}: {msg[:120]}")
+                    msg = self._bump_error_message(single)
+                    entry = f"game={game_id} cat={cat_id}: {msg[:120]}"
+                    if self._is_bump_cooldown(msg):
+                        waiting.append(entry)
+                    else:
+                        errors.append(entry)
                 await asyncio.sleep(1.5)
             await asyncio.sleep(1.5)
-        return bumped, errors
+        return bumped, errors, waiting
 
     # ── Чаты и сообщения ──────────────────────────────────────────────────
 
