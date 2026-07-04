@@ -51,11 +51,12 @@ class StarvellClient(StarvellAPI):
         for attempt in range(self._max_retries):
             try:
                 await self._throttle()
+                use_json = json_body is not None
                 async with httpx.AsyncClient(
                     cookies=self._cookies(),
                     headers=self._headers(
                         referer or f"https://starvell.com/",
-                        json_request=not next_data and method != "GET",
+                        json_request=use_json and not next_data and method != "GET",
                     ),
                     timeout=30.0,
                     follow_redirects=True,
@@ -63,8 +64,10 @@ class StarvellClient(StarvellAPI):
                 ) as client:
                     if method == "GET":
                         resp = await client.get(url)
-                    else:
+                    elif use_json:
                         resp = await client.post(url, json=json_body)
+                    else:
+                        resp = await client.post(url)
 
                 if resp.status_code == 429:
                     retry_after = float(resp.headers.get("Retry-After", backoff.next_delay()))

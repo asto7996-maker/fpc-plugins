@@ -157,6 +157,7 @@ class TelegramBot:
         r = self.router
         r.message.register(self.cmd_start, CommandStart())
         r.message.register(self.cmd_ping, Command("ping"))
+        r.message.register(self.cmd_bump, Command("bump"))
         r.message.register(self.cmd_menu, Command("menu"))
         r.message.register(self.cmd_help, Command("help"))
         r.message.register(self.cmd_status, Command("status"))
@@ -273,6 +274,27 @@ class TelegramBot:
         if not await self._has_access(message.from_user.id):
             return
         await message.answer("🏓 Pong — бот онлайн")
+
+    async def cmd_bump(self, message: Message) -> None:
+        if not await self._has_access(message.from_user.id):
+            return
+        api = self.cardinal.get_api()
+        if not api:
+            await message.answer("❌ Starvell не настроен.")
+            return
+        wait = await message.answer("⏳ Поднимаю лоты…")
+        try:
+            bumped, errors = await api.bump_all_offers(limit=200)
+        except Exception as exc:
+            await wait.edit_text(f"❌ Ошибка бампа: <code>{exc}</code>", parse_mode="HTML")
+            return
+        if bumped:
+            text = f"✅ Поднято категорий: <b>{bumped}</b>"
+        else:
+            text = "⚠️ Не удалось поднять лоты"
+        if errors:
+            text += f"\n\n<code>{errors[0][:300]}</code>"
+        await wait.edit_text(text, parse_mode="HTML")
 
     async def cmd_menu(self, message: Message) -> None:
         if not await self._has_access(message.from_user.id):

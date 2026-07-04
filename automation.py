@@ -172,8 +172,7 @@ class AutomationEngine:
             self._tasks.append(asyncio.create_task(self._auth_loop(account.name, api)))
             self._tasks.append(asyncio.create_task(self._orders_loop(account.name, api)))
             self._tasks.append(asyncio.create_task(self._chats_loop(account.name, api)))
-            if settings.auto_bump_enabled:
-                self._tasks.append(asyncio.create_task(self._bump_loop(account.name, api)))
+            self._tasks.append(asyncio.create_task(self._bump_loop(account.name, api)))
 
         logger.info("Автоматизация запущена для %d аккаунт(ов)", len(accounts))
 
@@ -759,7 +758,7 @@ class AutomationEngine:
         """Циклическое поднятие лотов."""
         while self._running:
             settings = self._get_settings()
-            if not await self.db.get_feature_flag("auto_bump", settings.auto_bump_enabled):
+            if not settings.auto_bump_enabled:
                 await asyncio.sleep(60)
                 continue
             interval = max(300.0, settings.bump_interval)
@@ -772,47 +771,15 @@ class AutomationEngine:
             await asyncio.sleep(interval)
 
     async def _do_bump(self, account_name: str, api: StarvellAPI, settings: Settings) -> None:
-        lots = await api.fetch_my_offers(limit=200)
-        if not lots:
-            logger.debug("Auto bump [%s]: нет активных лотов (list-my)", account_name)
-            return
-
-        game_categories: dict[int, set[int]] = {}
-        referer = None
-        for lot in lots:
-            if lot.get("is_active") is False:
-                continue
-            gid = lot.get("game_id")
-            cid = lot.get("category_id")
-            if isinstance(gid, int) and isinstance(cid, int):
-                game_categories.setdefault(gid, set()).add(cid)
-            if not referer and lot.get("category_url"):
-                referer = lot["category_url"]
-
-        if not game_categories:
-            logger.debug("Auto bump [%s]: лоты без game_id/category_id", account_name)
-            return
-
-        bumped = 0
-        for game_id, cat_ids in game_categories.items():
-            result = await api.bump_offers(game_id, list(cat_ids), referer=referer)
-            if result.get("success"):
-                bumped += len(cat_ids)
-            else:
-                logger.warning(
-                    "Auto bump [%s] game=%s cats=%s: HTTP %s",
-                    account_name,
-                    game_id,
-                    cat_ids,
-                    result.get("status"),
-                )
-
+        bumped, errors = await api.bump_all_offers(limit=200)
         if bumped:
             logger.info("Auto bump [%s]: поднято категорий: %s", account_name, bumped)
             if settings.notify_bump:
                 await self.notify(f"📈 [{account_name}] Лоты подняты ({bumped} категорий)", "notify_bump")
+        elif errors:
+            logger.warning("Auto bump [%s]: %s", account_name, "; ".join(errors[:3]))
         else:
-            logger.debug("Auto bump [%s]: bump API не вернул success", account_name)
+            logger.info("Auto bump [%s]: нет категорий для поднятия", account_name)
 
         bump_ctx = BumpContext(
             core=self.cardinal,

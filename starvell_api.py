@@ -126,16 +126,22 @@ class StarvellAPI:
         next_data: bool = False,
     ) -> httpx.Response:
         await self._throttle()
+        use_json = json_body is not None
         async with httpx.AsyncClient(
             cookies=self._cookies(),
-            headers=self._headers(referer or f"{BASE_URL}/", json_request=not next_data and method != "GET"),
+            headers=self._headers(
+                referer or f"{BASE_URL}/",
+                json_request=use_json and not next_data and method != "GET",
+            ),
             timeout=30.0,
             follow_redirects=True,
         ) as client:
             if method == "GET":
                 resp = await client.get(url)
-            else:
+            elif use_json:
                 resp = await client.post(url, json=json_body)
+            else:
+                resp = await client.post(url)
             return resp
 
     async def get_build_id(self) -> str:
@@ -414,7 +420,16 @@ class StarvellAPI:
             if not isinstance(offer, dict):
                 continue
             lots.append(self._normalize_seller_offer_row(offer))
-        return [lot for lot in lots if lot.get("id")]
+        return [lot for lot in lots if lot.get("id") or lot.get("public_id")]
+
+    @staticmethod
+    def _coerce_int(value: Any) -> int | None:
+        if value is None or isinstance(value, bool):
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
 
     @staticmethod
     def _normalize_seller_offer_row(offer: dict[str, Any]) -> dict[str, Any]:
@@ -424,8 +439,15 @@ class StarvellAPI:
             game = category["game"]
         desc = (offer.get("descriptions") or {}).get("rus") or {}
         title = desc.get("briefDescription") or desc.get("description") or ""
-        cat_id = offer.get("categoryId") or category.get("id")
-        game_id = offer.get("gameId") or category.get("gameId") or game.get("id")
+        cat_id = StarvellAPI._coerce_int(
+            offer.get("categoryId") or offer.get("category_id") or category.get("id")
+        )
+        game_id = StarvellAPI._coerce_int(
+            offer.get("gameId")
+            or offer.get("game_id")
+            or category.get("gameId")
+            or game.get("id")
+        )
         game_slug = game.get("slug") or (category.get("game") or {}).get("slug")
         cat_slug = category.get("slug")
         return {
@@ -743,20 +765,109 @@ class StarvellAPI:
             })
         return categories
 
+    async def collect_bump_targets(self, limit: int = 200) -> list[dict[str, Any]]:
+        """Категории для автобампа: list-my + fallback через профиль продавца."""
+        lots = await self.fetch_my_offers(limit=limit)
+        if not lots:
+            try:
+                info = await self.fetch_homepage()
+                user_id = (info.get("user") or {}).get("id")
+                if user_id:
+                    lots = await self.fetch_user_lots(int(user_id))
+            except Exception as exc:
+                logger.debug("collect_bump_targets fallback: %s", exc)
+
+        game_categories: dict[int, dict[str, Any]] = {}
+        for lot in lots:
+            if lot.get("is_active") is False:
+                continue
+            gid = lot.get("game_id")
+            cid = lot.get("category_id")
+            if gid is None or cid is None:
+                continue
+            bucket = game_categories.setdefault(int(gid), {"category_ids": set(), "referer": None})
+            bucket["category_ids"].add(int(cid))
+            if not bucket["referer"] and lot.get("category_url"):
+                bucket["referer"] = lot["category_url"]
+
+        targets: list[dict[str, Any]] = []
+        for game_id, data in game_categories.items():
+            targets.append({
+                "game_id": game_id,
+                "category_ids": sorted(data["category_ids"]),
+                "referer": data["referer"],
+            })
+        return targets
+
+    @staticmethod
+    def _parse_bump_response(resp: httpx.Response) -> dict[str, Any]:
+        result: dict[str, Any] = {"status": resp.status_code, "success": False}
+        try:
+            data = resp.json()
+            if isinstance(data, dict):
+                result["json"] = data
+                if resp.status_code >= 400:
+                    result["success"] = False
+                elif data.get("success") is False:
+                    result["success"] = False
+                elif data.get("error"):
+                    result["success"] = False
+                else:
+                    result["success"] = True
+            else:
+                result["success"] = 200 <= resp.status_code < 300
+        except Exception:
+            result["success"] = 200 <= resp.status_code < 300
+            result["raw"] = resp.text[:2000]
+        if not result.get("json") and not result.get("raw") and resp.text:
+            result["raw"] = resp.text[:2000]
+        return result
+
     async def bump_offers(self, game_id: int, category_ids: list[int], referer: str | None = None) -> dict[str, Any]:
         """Поднимает лоты в указанных категориях."""
+        cat_ids = [int(c) for c in category_ids if c is not None]
+        if not cat_ids:
+            return {"status": 400, "success": False, "message": "empty categoryIds"}
         resp = await self._request(
             "POST",
             f"{BASE_URL}/api/offers/bump",
-            referer=referer or f"{BASE_URL}/",
-            json_body={"gameId": game_id, "categoryIds": category_ids},
+            referer=referer or f"{BASE_URL}/account/sells",
+            json_body={"gameId": int(game_id), "categoryIds": cat_ids},
         )
-        result: dict[str, Any] = {"status": resp.status_code, "success": 200 <= resp.status_code < 300}
-        try:
-            result["json"] = resp.json()
-        except Exception:
-            result["raw"] = resp.text[:2000]
-        return result
+        return self._parse_bump_response(resp)
+
+    async def bump_all_offers(self, limit: int = 200) -> tuple[int, list[str]]:
+        """Поднять все категории продавца. Возвращает (число категорий, ошибки)."""
+        targets = await self.collect_bump_targets(limit=limit)
+        if not targets:
+            return 0, ["нет лотов с game_id/category_id"]
+
+        bumped = 0
+        errors: list[str] = []
+        for target in targets:
+            game_id = int(target["game_id"])
+            cat_ids = list(target["category_ids"])
+            referer = target.get("referer") or f"{BASE_URL}/account/sells"
+            result = await self.bump_offers(game_id, cat_ids, referer=referer)
+            if result.get("success"):
+                bumped += len(cat_ids)
+                continue
+
+            for cat_id in cat_ids:
+                single = await self.bump_offers(game_id, [cat_id], referer=referer)
+                if single.get("success"):
+                    bumped += 1
+                else:
+                    msg = ""
+                    payload = single.get("json")
+                    if isinstance(payload, dict):
+                        msg = str(payload.get("message") or payload.get("error") or "")
+                    if not msg:
+                        msg = str(single.get("raw") or single.get("status") or "unknown")
+                    errors.append(f"game={game_id} cat={cat_id}: {msg[:120]}")
+                await asyncio.sleep(1.5)
+            await asyncio.sleep(1.5)
+        return bumped, errors
 
     # ── Чаты и сообщения ──────────────────────────────────────────────────
 
