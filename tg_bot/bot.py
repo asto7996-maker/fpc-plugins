@@ -429,8 +429,15 @@ class TelegramBot:
         if key not in mapping:
             await call.answer("Неизвестная функция", show_alert=True)
             return
-        new_val = await self.db.toggle_feature_flag(key)
         s = load_settings()
+        if key == "ai_replies":
+            enabled_now = await self.db.get_feature_flag("ai_replies", s.ai_replies_enabled)
+            if not enabled_now and (
+                not s.is_gemini_proxy_configured() or not s.is_gemini_configured()
+            ):
+                await call.answer("Сначала настройте прокси и API-ключ Gemini!", show_alert=True)
+                return
+        new_val = await self.db.toggle_feature_flag(key)
         setattr(s, mapping[key], new_val)
         save_settings(s)
         if key == "auto_bump":
@@ -542,9 +549,10 @@ class TelegramBot:
             "🌐 <b>Прокси для Gemini</b> (обязательно перед API-ключом)\n\n"
             f"Текущий: <code>{current}</code>\n\n"
             "Форматы:\n"
-            "• <code>http://user:pass@host:port</code>\n"
+            "• Ссылка Telegram: <code>https://t.me/socks?server=…&port=…&user=…&pass=…</code>\n"
             "• <code>socks5://user:pass@host:port</code>\n"
-            "• <code>user:pass@host:port</code>\n\n"
+            "• <code>user:pass@host:port</code>\n"
+            "• <code>host:port:user:pass</code>\n\n"
             "Отправьте прокси — бот сразу проверит доступность.",
             parse_mode="HTML",
         )

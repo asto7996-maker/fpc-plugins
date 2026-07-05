@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import re
+from urllib.parse import parse_qs, quote, unquote, urlparse
 
 import httpx
 
@@ -15,6 +16,83 @@ from utils.starvell_format import format_rub_balance
 GEMINI_MODELS = ("gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro")
 _GEMINI_KEY_RE = re.compile(r"AIza[A-Za-z0-9_-]{35}")
 _PROXY_SCHEME_RE = re.compile(r"^(https?|socks5h?|socks4)://", re.I)
+_SOCKS_PORTS = {1080, 8000, 9050, 4145, 5678, 1081}
+_HTTP_PORTS = {80, 443, 8080, 3128, 8888}
+
+
+def _build_proxy_url(
+    scheme: str,
+    host: str,
+    port: str | int,
+    user: str = "",
+    password: str = "",
+) -> str:
+    host = (host or "").strip()
+    port = str(port or "").strip()
+    if not host or not port:
+        return ""
+    scheme = scheme.lower().rstrip(":/")
+    if user:
+        user_q = quote(unquote(user), safe="")
+        pass_q = quote(unquote(password or ""), safe="")
+        return f"{scheme}://{user_q}:{pass_q}@{host}:{port}"
+    return f"{scheme}://{host}:{port}"
+
+
+def _guess_proxy_scheme(host_port: str) -> str:
+    match = re.search(r":(\d+)\s*$", host_port.strip())
+    if not match:
+        return "socks5"
+    port = int(match.group(1))
+    if port in _HTTP_PORTS:
+        return "http"
+    if port in _SOCKS_PORTS:
+        return "socks5"
+    return "socks5"
+
+
+def _parse_telegram_socks_link(text: str) -> str:
+    lowered = text.lower()
+    if "t.me/socks" not in lowered and "tg://socks" not in lowered:
+        return ""
+
+    parsed = urlparse(text.strip())
+    qs = parse_qs(parsed.query)
+    server = (qs.get("server") or qs.get("host") or [""])[0].strip()
+    port = (qs.get("port") or ["1080"])[0].strip()
+    user = unquote((qs.get("user") or qs.get("username") or [""])[0])
+    password = unquote((qs.get("pass") or qs.get("password") or [""])[0])
+    return _build_proxy_url("socks5", server, port, user, password)
+
+
+def parse_proxy_url(raw: str) -> str:
+    """Нормализует URL прокси (http/socks5), в т.ч. ссылки t.me/socks."""
+    text = (raw or "").strip()
+    if not text:
+        return ""
+    lowered = text.lower()
+    if lowered in {"-", "нет", "no", "skip", "none", "без прокси"}:
+        return ""
+
+    text = text.strip("`\"'")
+
+    tg_proxy = _parse_telegram_socks_link(text)
+    if tg_proxy:
+        return tg_proxy
+
+    if _PROXY_SCHEME_RE.match(text):
+        return text
+
+    # host:port:user:pass
+    if "@" not in text and "://" not in text and text.count(":") == 3:
+        host, port, user, password = text.split(":", 3)
+        return _build_proxy_url("socks5", host, port, user, password)
+
+    if "@" in text or text.count(":") >= 2:
+        scheme = _guess_proxy_scheme(text.split("@")[-1])
+        return f"{scheme}://{text}"
+
+    return ""
 
 
 def parse_gemini_api_key(raw: str) -> str:
@@ -45,22 +123,8 @@ def parse_gemini_api_key(raw: str) -> str:
     return first
 
 
-def parse_proxy_url(raw: str) -> str:
-    """Нормализует URL прокси (http/socks5)."""
-    text = (raw or "").strip()
-    if not text:
-        return ""
-    lowered = text.lower()
-    if lowered in {"-", "нет", "no", "skip", "none", "без прокси"}:
-        return ""
-
-    text = text.strip("`\"'")
-    if _PROXY_SCHEME_RE.match(text):
-        return text
-
-    if "@" in text or text.count(":") >= 2:
-        return f"http://{text}"
-    return ""
+def _mask_proxy_for_log(proxy_url: str) -> str:
+    return re.sub(r":([^:@/]+)@", ":***@", proxy_url)
 
 
 async def test_starvell_session(session_cookie: str) -> tuple[bool, str, dict]:
@@ -91,14 +155,19 @@ async def test_proxy_url(proxy: str) -> tuple[bool, str]:
     """Проверяет доступность прокси."""
     url = parse_proxy_url(proxy)
     if not url:
-        return False, "Прокси не указан или неверный формат"
+        return False, "Прокси не указан или неверный формат.\nПоддерживаются: t.me/socks ссылки, socks5://…, user:pass@host:port"
 
     try:
-        async with httpx.AsyncClient(proxy=url, timeout=20.0) as client:
+        async with httpx.AsyncClient(proxy=url, timeout=25.0) as client:
             resp = await client.get("https://generativelanguage.googleapis.com/")
-        return True, f"Прокси OK (HTTP {resp.status_code})"
+        return True, f"Прокси OK ({_mask_proxy_for_log(url)}, HTTP {resp.status_code})"
+    except ImportError:
+        return False, "На сервере нет поддержки SOCKS. Переустановите бота (httpx[socks])."
     except Exception as exc:
-        return False, f"Прокси недоступен: {exc}"
+        err = str(exc)
+        if "socks" in err.lower() or "proxy" in err.lower():
+            return False, f"Прокси недоступен: {err[:180]}"
+        return False, f"Прокси недоступен: {err[:180]}"
 
 
 async def test_gemini_key(
