@@ -14,7 +14,8 @@ from starvell_api import StarvellAPI
 from utils.starvell_format import format_rub_balance
 
 GEMINI_MODELS = ("gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro")
-_GEMINI_KEY_RE = re.compile(r"AIza[A-Za-z0-9_-]{35}")
+_GEMINI_STANDARD_KEY_RE = re.compile(r"AIza[A-Za-z0-9_-]{35}")
+_GEMINI_AUTH_KEY_RE = re.compile(r"AQ\.[A-Za-z0-9_.-]{20,}")
 _PROXY_SCHEME_RE = re.compile(r"^(https?|socks5h?|socks4)://", re.I)
 _SOCKS_PORTS = {1080, 8000, 9050, 4145, 5678, 1081}
 _HTTP_PORTS = {80, 443, 8080, 3128, 8888}
@@ -96,7 +97,7 @@ def parse_proxy_url(raw: str) -> str:
 
 
 def parse_gemini_api_key(raw: str) -> str:
-    """Извлекает ключ Gemini из текста (ссылка, markdown, лишние символы)."""
+    """Извлекает ключ Gemini (AIza… или AQ.… Auth key из AI Studio)."""
     text = (raw or "").strip()
     if not text:
         return ""
@@ -104,23 +105,57 @@ def parse_gemini_api_key(raw: str) -> str:
     text = text.strip("`\"' \t\n\r")
     for chunk in re.split(r"[\s,;]+", text):
         chunk = chunk.strip("`\"'")
-        match = _GEMINI_KEY_RE.search(chunk)
-        if match:
-            return match.group(0)
+        auth_match = _GEMINI_AUTH_KEY_RE.search(chunk)
+        if auth_match:
+            return auth_match.group(0)
+        std_match = _GEMINI_STANDARD_KEY_RE.search(chunk)
+        if std_match:
+            return std_match.group(0)
         if "key=" in chunk:
             for part in chunk.split("key="):
-                match = _GEMINI_KEY_RE.search(part)
-                if match:
-                    return match.group(0)
+                auth_match = _GEMINI_AUTH_KEY_RE.search(part)
+                if auth_match:
+                    return auth_match.group(0)
+                std_match = _GEMINI_STANDARD_KEY_RE.search(part)
+                if std_match:
+                    return std_match.group(0)
 
-    match = _GEMINI_KEY_RE.search(text)
-    if match:
-        return match.group(0)
+    auth_match = _GEMINI_AUTH_KEY_RE.search(text)
+    if auth_match:
+        return auth_match.group(0)
+
+    std_match = _GEMINI_STANDARD_KEY_RE.search(text)
+    if std_match:
+        return std_match.group(0)
 
     first = text.split()[0].strip("`\"'.,;")
+    if first.startswith("AQ."):
+        return first
     if first.startswith("AIza") and len(first) >= 39:
         return first[:39]
     return first
+
+
+def is_valid_gemini_key_format(key: str) -> bool:
+    key = (key or "").strip()
+    if not key:
+        return False
+    if _GEMINI_STANDARD_KEY_RE.fullmatch(key):
+        return True
+    if key.startswith("AQ.") and len(key) >= 25 and _GEMINI_AUTH_KEY_RE.fullmatch(key):
+        return True
+    return False
+
+
+def gemini_generate_url(model: str) -> str:
+    return f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+
+
+def gemini_auth_headers(api_key: str) -> dict[str, str]:
+    return {
+        "x-goog-api-key": api_key,
+        "Content-Type": "application/json",
+    }
 
 
 def _mask_proxy_for_log(proxy_url: str) -> str:
@@ -179,9 +214,9 @@ async def test_gemini_key(
     """Проверяет Gemini API ключ тестовым запросом."""
     key = parse_gemini_api_key(api_key)
     if not key:
-        return False, "Ключ пустой или не распознан (ожидается AIza…)"
-    if not _GEMINI_KEY_RE.fullmatch(key):
-        return False, "Неверный формат ключа Gemini"
+        return False, "Ключ пустой или не распознан (ожидается AIza… или AQ.…)"
+    if not is_valid_gemini_key_format(key):
+        return False, "Неверный формат ключа Gemini (AIza… или AQ.… из AI Studio)"
 
     prompt = system_prompt or DEFAULT_AI_SYSTEM_PROMPT
     payload_base = {
@@ -195,22 +230,22 @@ async def test_gemini_key(
     if proxy_url:
         client_kwargs["proxy"] = proxy_url
 
+    headers = gemini_auth_headers(key)
+
     async with httpx.AsyncClient(**client_kwargs) as client:
         for model in GEMINI_MODELS:
-            url = (
-                f"https://generativelanguage.googleapis.com/v1beta/models/"
-                f"{model}:generateContent?key={key}"
-            )
+            url = gemini_generate_url(model)
             try:
-                resp = await client.post(url, json=payload_base)
+                resp = await client.post(url, json=payload_base, headers=headers)
                 if resp.status_code == 200:
                     data = resp.json()
                     candidates = data.get("candidates") or []
                     if candidates:
-                        return True, f"Gemini OK (модель {model})"
-                if resp.status_code in (400, 403):
-                    detail = resp.text[:160]
-                    return False, f"Неверный ключ: {detail}"
+                        key_type = "Auth AQ" if key.startswith("AQ.") else "Standard"
+                        return True, f"Gemini OK ({key_type}, модель {model})"
+                if resp.status_code in (400, 401, 403):
+                    detail = resp.text[:200]
+                    return False, f"Ключ отклонён API: {detail}"
             except Exception as exc:
                 return False, f"Ошибка: {exc}"
 

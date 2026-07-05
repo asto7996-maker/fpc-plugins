@@ -10,7 +10,7 @@ from typing import Any
 import httpx
 
 from config import Settings
-from validators import GEMINI_MODELS, parse_gemini_api_key
+from validators import GEMINI_MODELS, gemini_auth_headers, gemini_generate_url, parse_gemini_api_key
 
 logger = logging.getLogger("starvell.ai")
 
@@ -140,13 +140,11 @@ class AIService:
         }
 
         async with httpx.AsyncClient(**self._client_kwargs()) as client:
+            headers = gemini_auth_headers(api_key)
             for model in models:
-                url = (
-                    f"https://generativelanguage.googleapis.com/v1beta/models/"
-                    f"{model}:generateContent?key={api_key}"
-                )
+                url = gemini_generate_url(model)
                 try:
-                    resp = await client.post(url, json=payload_base)
+                    resp = await client.post(url, json=payload_base, headers=headers)
                     if resp.status_code != 200:
                         logger.debug("Gemini %s HTTP %s: %s", model, resp.status_code, resp.text[:200])
                         continue

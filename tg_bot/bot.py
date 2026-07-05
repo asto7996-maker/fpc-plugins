@@ -570,7 +570,7 @@ class TelegramBot:
         await call.message.answer(
             "🤖 <b>Gemini API ключ</b>\n\n"
             "Получить: https://aistudio.google.com/apikey\n"
-            "Можно вставить ключ целиком или ссылку из AI Studio — бот извлечёт ключ.\n"
+            "Можно вставить ключ целиком (формат <code>AIza…</code> или <code>AQ.…</code> из AI Studio).\n"
             "Отправьте ключ — бот проверит его через прокси.",
             parse_mode="HTML",
         )
@@ -754,7 +754,7 @@ class TelegramBot:
             return
         key = parse_gemini_api_key(message.text or "")
         if not key:
-            await message.answer("❌ Ключ не распознан. Ожидается формат AIza…")
+            await message.answer("❌ Ключ не распознан. Ожидается AIza… или AQ.… из Google AI Studio")
             return
         wait = await message.answer("⏳ Проверяю Gemini…")
         ok, msg = await test_gemini_key(key, proxy=s.gemini_proxy)
