@@ -10,7 +10,7 @@ from typing import Any
 import httpx
 
 from config import Settings
-from validators import GEMINI_MODELS
+from validators import GEMINI_MODELS, parse_gemini_api_key
 
 logger = logging.getLogger("starvell.ai")
 
@@ -20,6 +20,16 @@ class AIService:
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
+
+    def _client_kwargs(self) -> dict[str, Any]:
+        kwargs: dict[str, Any] = {"timeout": 45.0}
+        proxy = self.settings.gemini_proxy_url()
+        if proxy:
+            kwargs["proxy"] = proxy
+        return kwargs
+
+    def _api_key(self) -> str:
+        return parse_gemini_api_key(self.settings.gemini_api_key)
 
     def _build_prompt(self, buyer_message: str, chat_history: list[dict[str, Any]], product_hint: str = "") -> str:
         history_lines = []
@@ -47,7 +57,7 @@ class AIService:
         chat_history: list[dict[str, Any]] | None = None,
         product_hint: str = "",
     ) -> str | None:
-        if not self.settings.gemini_api_key.strip():
+        if not self._api_key():
             return None
         blocked = self.check_blacklist(buyer_message)
         if blocked:
@@ -68,7 +78,7 @@ class AIService:
     async def translate_text(self, text: str, target_lang: str = "en") -> str:
         if not text.strip():
             return text
-        if not self.settings.gemini_api_key.strip():
+        if not self._api_key():
             return text
         lang = "английский" if target_lang == "en" else target_lang
         prompt = (
@@ -79,18 +89,46 @@ class AIService:
         return result or text
 
     async def generate_review_text(self, order: dict[str, Any]) -> str:
+        review = order.get("review") or {}
+        stars = int(review.get("stars") or review.get("rating") or 5)
+        comment = str(review.get("comment") or review.get("text") or "").strip()
+        return await self.generate_review_reply(order, stars=stars, comment=comment)
+
+    async def generate_review_reply(
+        self,
+        order: dict[str, Any],
+        *,
+        stars: int = 5,
+        comment: str = "",
+    ) -> str:
         offer = order.get("offerDetails") or {}
         desc = (offer.get("descriptions") or {}).get("rus") or {}
         product = desc.get("briefDescription") or desc.get("description") or "товар"
-        prompt = (
-            f"Напиши короткое благодарственное сообщение покупателю "
-            f"за покупку «{product}». 2-3 предложения, тёплый тон, 2-3 эмодзи."
-        )
+        buyer = (order.get("user") or {}).get("username") or "покупатель"
+        stars = max(1, min(5, int(stars or 5)))
+
+        if comment:
+            prompt = (
+                f"Покупатель {buyer} оставил отзыв {stars}/5 на товар «{product}».\n"
+                f"Текст отзыва: «{comment[:500]}»\n\n"
+                "Напиши короткий ответ продавца на отзыв (2-3 предложения, тёплый тон, 1-3 эмодзи). "
+                "Учти оценку и текст отзыва. Не обещай возврат средств."
+            )
+        else:
+            prompt = (
+                f"Покупатель {buyer} завершил заказ «{product}» (оценка {stars}/5).\n"
+                "Напиши короткое благодарственное сообщение (2-3 предложения, тёплый тон, 1-3 эмодзи)."
+            )
+
         text = await self._gemini(prompt)
-        return text or self.settings.review_template
+        if text:
+            return text
+
+        fallback = self.settings.review_replies.get(str(stars)) or self.settings.review_template
+        return fallback
 
     async def _gemini(self, user_prompt: str) -> str | None:
-        api_key = self.settings.gemini_api_key.strip()
+        api_key = self._api_key()
         if not api_key:
             return None
 
@@ -101,7 +139,7 @@ class AIService:
             "generationConfig": {"temperature": 0.85, "maxOutputTokens": 600},
         }
 
-        async with httpx.AsyncClient(timeout=45.0) as client:
+        async with httpx.AsyncClient(**self._client_kwargs()) as client:
             for model in models:
                 url = (
                     f"https://generativelanguage.googleapis.com/v1beta/models/"
@@ -110,6 +148,7 @@ class AIService:
                 try:
                     resp = await client.post(url, json=payload_base)
                     if resp.status_code != 200:
+                        logger.debug("Gemini %s HTTP %s: %s", model, resp.status_code, resp.text[:200])
                         continue
                     data = resp.json()
                     candidates = data.get("candidates") or []

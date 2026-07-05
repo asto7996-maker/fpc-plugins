@@ -27,7 +27,7 @@ from keyboards.main import premium_main_text
 from tg_bot import cbt as CBT
 from tg_bot import keyboards as KB
 from utils.tools import check_github_update, create_backup, export_settings_snapshot, logs_zip, system_stats
-from validators import test_gemini_key, test_starvell_session
+from validators import parse_gemini_api_key, parse_proxy_url, test_gemini_key, test_proxy_url, test_starvell_session
 
 logger = logging.getLogger("starvell.tg")
 
@@ -49,6 +49,8 @@ CB = {
     "check_gemini": "sc:check_gemini",
     "set_session": "sc:set_session",
     "set_gemini": "sc:set_gemini",
+    "set_gemini_proxy": "sc:set_gemini_proxy",
+    "check_proxy": "sc:check_proxy",
     "adel_add": "sc:adel_add",
     "edit_welcome": "sc:edit_welcome",
     "edit_bump": "sc:edit_bump",
@@ -59,6 +61,7 @@ CB = {
 
 class SetupStates(StatesGroup):
     session = State()
+    gemini_proxy = State()
     gemini = State()
     welcome = State()
     bump_interval = State()
@@ -200,6 +203,7 @@ class TelegramBot:
         r.callback_query.register(self.cb_tmpl_use, F.data.startswith(CBT.TMPLT_USE))
         r.callback_query.register(self.cb_ar_add, F.data == CBT.AR_ADD)
         r.message.register(self.on_session, SetupStates.session)
+        r.message.register(self.on_gemini_proxy, SetupStates.gemini_proxy)
         r.message.register(self.on_gemini, SetupStates.gemini)
         r.message.register(self.on_welcome, SetupStates.welcome)
         r.message.register(self.on_bump, SetupStates.bump_interval)
@@ -217,6 +221,8 @@ class TelegramBot:
         r.callback_query.register(self.cb_check_gemini, F.data == CB["check_gemini"])
         r.callback_query.register(self.cb_set_session, F.data == CB["set_session"])
         r.callback_query.register(self.cb_set_gemini, F.data == CB["set_gemini"])
+        r.callback_query.register(self.cb_set_gemini_proxy, F.data == CB["set_gemini_proxy"])
+        r.callback_query.register(self.cb_check_proxy, F.data == CB["check_proxy"])
         r.callback_query.register(self.cb_first_setup, F.data == CB["first_setup"])
         r.callback_query.register(self.cb_toggle, F.data.startswith(CB["toggle"]))
         r.callback_query.register(self.cb_notify, F.data.startswith(CB["notify"]))
@@ -491,11 +497,25 @@ class TelegramBot:
         if not await self._has_access(call.from_user.id):
             return
         s = load_settings()
+        if not s.is_gemini_proxy_configured():
+            await call.answer("Сначала настройте прокси Gemini!", show_alert=True)
+            return
         if not s.gemini_api_key:
             await call.answer("Gemini ключ не задан!", show_alert=True)
             return
         await call.answer("Проверяю Gemini…")
-        ok, msg = await test_gemini_key(s.gemini_api_key, s.ai_system_prompt)
+        ok, msg = await test_gemini_key(s.gemini_api_key, s.ai_system_prompt, proxy=s.gemini_proxy)
+        await call.message.answer(f"{'✅' if ok else '❌'} {msg}")
+
+    async def cb_check_proxy(self, call: CallbackQuery) -> None:
+        if not await self._has_access(call.from_user.id):
+            return
+        s = load_settings()
+        if not s.is_gemini_proxy_configured():
+            await call.answer("Прокси не задан!", show_alert=True)
+            return
+        await call.answer("Проверяю прокси…")
+        ok, msg = await test_proxy_url(s.gemini_proxy)
         await call.message.answer(f"{'✅' if ok else '❌'} {msg}")
 
     async def cb_set_session(self, call: CallbackQuery, state: FSMContext) -> None:
@@ -512,14 +532,38 @@ class TelegramBot:
         )
         await call.answer()
 
+    async def cb_set_gemini_proxy(self, call: CallbackQuery, state: FSMContext) -> None:
+        if not await self._has_access(call.from_user.id):
+            return
+        await state.set_state(SetupStates.gemini_proxy)
+        s = load_settings()
+        current = s.gemini_proxy or "не задан"
+        await call.message.answer(
+            "🌐 <b>Прокси для Gemini</b> (обязательно перед API-ключом)\n\n"
+            f"Текущий: <code>{current}</code>\n\n"
+            "Форматы:\n"
+            "• <code>http://user:pass@host:port</code>\n"
+            "• <code>socks5://user:pass@host:port</code>\n"
+            "• <code>user:pass@host:port</code>\n\n"
+            "Отправьте прокси — бот сразу проверит доступность.",
+            parse_mode="HTML",
+        )
+        await call.answer()
+
     async def cb_set_gemini(self, call: CallbackQuery, state: FSMContext) -> None:
         if not await self._has_access(call.from_user.id):
+            return
+        s = load_settings()
+        if not s.is_gemini_proxy_configured():
+            await call.answer("Сначала укажите прокси Gemini!", show_alert=True)
+            await self.cb_set_gemini_proxy(call, state)
             return
         await state.set_state(SetupStates.gemini)
         await call.message.answer(
             "🤖 <b>Gemini API ключ</b>\n\n"
             "Получить: https://aistudio.google.com/apikey\n"
-            "Отправьте ключ — бот сразу проверит его.",
+            "Можно вставить ключ целиком или ссылку из AI Studio — бот извлечёт ключ.\n"
+            "Отправьте ключ — бот проверит его через прокси.",
             parse_mode="HTML",
         )
         await call.answer()
@@ -594,17 +638,24 @@ class TelegramBot:
         if not await self._has_access(call.from_user.id):
             return
         s = load_settings()
+        proxy_ok = "✅" if s.is_gemini_proxy_configured() else "❌"
         key_ok = "✅" if s.is_gemini_configured() else "❌"
+        proxy_hint = (s.gemini_proxy[:40] + "…") if len(s.gemini_proxy) > 40 else (s.gemini_proxy or "—")
         text = (
             f"🤖 <b>Gemini — ИИ-консультант</b>\n\n"
+            f"Прокси: {proxy_ok} <code>{proxy_hint}</code>\n"
             f"Ключ: {key_ok}\n"
             f"Модель: {s.gemini_model}\n"
             f"В чатах: {self._flag(s.ai_replies_enabled)}\n\n"
             f"<i>{s.ai_system_prompt[:150]}…</i>"
         )
         kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🌐 Прокси", callback_data=CB["set_gemini_proxy"])],
             [InlineKeyboardButton(text="🔑 API ключ", callback_data=CB["set_gemini"])],
-            [InlineKeyboardButton(text="✅ Проверить", callback_data=CB["check_gemini"])],
+            [
+                InlineKeyboardButton(text="✅ Прокси", callback_data=CB["check_proxy"]),
+                InlineKeyboardButton(text="✅ Gemini", callback_data=CB["check_gemini"]),
+            ],
             [InlineKeyboardButton(text="◀️ Меню", callback_data=CB["main"])],
         ])
         await call.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
@@ -661,18 +712,51 @@ class TelegramBot:
             reply_markup=self._main_kb(),
         )
 
+    async def on_gemini_proxy(self, message: Message, state: FSMContext) -> None:
+        raw = (message.text or "").strip()
+        if not raw:
+            return
+        wait = await message.answer("⏳ Проверяю прокси…")
+        proxy = parse_proxy_url(raw)
+        if not proxy:
+            await wait.edit_text("❌ Неверный формат прокси")
+            return
+        ok, msg = await test_proxy_url(proxy)
+        if not ok:
+            await wait.edit_text(f"❌ {msg}")
+            return
+        s = load_settings()
+        s.gemini_proxy = proxy
+        save_settings(s)
+        await self.automation.reload_settings()
+        await state.clear()
+        await wait.edit_text(
+            f"✅ Прокси сохранён!\n{msg}\n\nТеперь можно указать Gemini API ключ.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔑 Gemini API ключ", callback_data=CB["set_gemini"])],
+                [InlineKeyboardButton(text="◀️ Меню", callback_data=CB["main"])],
+            ]),
+        )
+
     async def on_gemini(self, message: Message, state: FSMContext) -> None:
-        key = (message.text or "").strip()
+        s = load_settings()
+        if not s.is_gemini_proxy_configured():
+            await message.answer("❌ Сначала укажите прокси Gemini в настройках.")
+            await state.set_state(SetupStates.gemini_proxy)
+            return
+        key = parse_gemini_api_key(message.text or "")
         if not key:
+            await message.answer("❌ Ключ не распознан. Ожидается формат AIza…")
             return
         wait = await message.answer("⏳ Проверяю Gemini…")
-        ok, msg = await test_gemini_key(key)
+        ok, msg = await test_gemini_key(key, proxy=s.gemini_proxy)
         if not ok:
             await wait.edit_text(f"❌ {msg}")
             return
         s = load_settings()
         s.gemini_api_key = key
         save_settings(s)
+        await self.automation.reload_settings()
         await state.clear()
         await wait.edit_text(f"✅ Gemini настроен!\n{msg}", reply_markup=self._back_kb())
 

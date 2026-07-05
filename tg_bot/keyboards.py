@@ -169,8 +169,10 @@ def chat_actions(chat_id: str) -> InlineKeyboardMarkup:
 def setup_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="1️⃣ Session Starvell", callback_data=CBT.SET_SESSION)],
-        [InlineKeyboardButton(text="2️⃣ Gemini API", callback_data=CBT.SET_GEMINI)],
+        [InlineKeyboardButton(text="2️⃣ Прокси Gemini", callback_data=CBT.SET_GEMINI_PROXY)],
+        [InlineKeyboardButton(text="3️⃣ Gemini API", callback_data=CBT.SET_GEMINI)],
         [InlineKeyboardButton(text="✅ Проверить Starvell", callback_data=CBT.CHECK_AUTH)],
+        [InlineKeyboardButton(text="✅ Проверить прокси", callback_data=CBT.CHECK_PROXY)],
         [InlineKeyboardButton(text="✅ Проверить Gemini", callback_data=CBT.CHECK_GEMINI)],
         [InlineKeyboardButton(text="◀️ Главное меню", callback_data=CBT.MAIN)],
     ])

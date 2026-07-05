@@ -1055,10 +1055,21 @@ class StarvellAPI:
             referer=f"{BASE_URL}/order/{order_id}",
             json_body={"orderId": order_id, "content": text},
         )
-        result = {"status": resp.status_code, "success": 200 <= resp.status_code < 300}
+        result = {"status": resp.status_code, "success": False}
         try:
-            result["json"] = resp.json()
+            data = resp.json()
+            result["json"] = data
+            if isinstance(data, dict):
+                if data.get("success") is True:
+                    result["success"] = True
+                elif resp.status_code < 400 and not data.get("error"):
+                    result["success"] = True
+            elif resp.status_code < 400:
+                result["success"] = True
         except Exception:
+            result["success"] = 200 <= resp.status_code < 300
+            result["raw"] = resp.text[:1000]
+        if not result.get("json") and resp.text:
             result["raw"] = resp.text[:1000]
         return result
 

@@ -73,6 +73,7 @@ class Settings:
     auto_bump_enabled: bool = True
     auto_welcome_enabled: bool = True
     auto_review_enabled: bool = True
+    review_use_gemini: bool = False
     auto_response_enabled: bool = True
     ai_replies_enabled: bool = False
     multi_delivery: bool = True
@@ -94,7 +95,6 @@ class Settings:
         "2": "Жаль, что не всё идеально. Мы уже работаем над улучшением сервиса.",
         "1": "Нам очень жаль за негативный опыт. Напишите в чат — разберёмся лично.",
     })
-    review_use_gemini: bool = True
 
     # Тайминги
     chat_poll_interval: float = 4.0
@@ -129,6 +129,8 @@ class Settings:
 
     # Gemini
     gemini_api_key: str = ""
+    gemini_proxy: str = ""
+    starvell_proxy: str = ""
     gemini_model: str = "gemini-2.0-flash"
     ai_system_prompt: str = DEFAULT_AI_SYSTEM_PROMPT
     ai_word_blacklist: list[str] = field(default_factory=lambda: [
@@ -169,6 +171,17 @@ class Settings:
     def is_gemini_configured(self) -> bool:
         return bool(self.gemini_api_key.strip())
 
+    def is_gemini_proxy_configured(self) -> bool:
+        return bool(self.gemini_proxy.strip())
+
+    def gemini_proxy_url(self) -> str | None:
+        proxy = (self.gemini_proxy or os.getenv("GEMINI_PROXY", "")).strip()
+        return proxy or None
+
+    def starvell_proxy_url(self) -> str | None:
+        proxy = (self.starvell_proxy or os.getenv("STARVELL_PROXY", "") or os.getenv("HTTP_PROXY", "")).strip()
+        return proxy or None
+
     def ensure_dirs(self) -> None:
         for path in (CONFIG_DIR, STORAGE_DIR, LOGS_DIR, PLUGINS_DIR, PLUGIN_STATE_PATH.parent, BACKUP_DIR, PRODUCTS_DIR):
             path.mkdir(parents=True, exist_ok=True)
@@ -204,6 +217,14 @@ def load_settings() -> Settings:
     gemini_env = os.getenv("GEMINI_API_KEY", "").strip()
     if gemini_env:
         data["gemini_api_key"] = gemini_env
+
+    gemini_proxy_env = os.getenv("GEMINI_PROXY", "").strip()
+    if gemini_proxy_env:
+        data["gemini_proxy"] = gemini_proxy_env
+
+    starvell_proxy_env = os.getenv("STARVELL_PROXY", "").strip() or os.getenv("HTTP_PROXY", "").strip()
+    if starvell_proxy_env:
+        data["starvell_proxy"] = starvell_proxy_env
 
     if "accounts" in data and isinstance(data["accounts"], list):
         settings.accounts = [_account_from_dict(a) for a in data["accounts"] if isinstance(a, dict)]

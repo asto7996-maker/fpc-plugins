@@ -14,6 +14,7 @@ STV_ORDER_COMPLETED = "starvell.order.completed"
 STV_ORDER_STATUS = "starvell.order.status"
 STV_PRE_DELIVERY = "starvell.pre_delivery"
 STV_POST_DELIVERY = "starvell.post_delivery"
+STV_PRE_REVIEW = "starvell.pre_review"
 STV_BUMP = "starvell.bump"
 STV_STARTUP = "starvell.startup"
 STV_SHUTDOWN = "starvell.shutdown"
@@ -67,6 +68,12 @@ def on_pre_delivery(func: Callable) -> Callable:
 def on_post_delivery(func: Callable) -> Callable:
     """После автовыдачи."""
     func._starvell_event = STV_POST_DELIVERY  # type: ignore[attr-defined]
+    return func
+
+
+def on_pre_review(func: Callable) -> Callable:
+    """Перед автоответом на отзыв (задайте ctx.reply_text)."""
+    func._starvell_event = STV_PRE_REVIEW  # type: ignore[attr-defined]
     return func
 
 

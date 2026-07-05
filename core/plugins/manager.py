@@ -57,7 +57,7 @@ class PluginEngine:
         self.plugins: dict[str, PluginRecord] = {}
         self.disabled: set[str] = set()
         self._mtime_cache: dict[str, float] = {}
-        self._watch_interval = 5.0
+        self._watch_interval = 3.0
 
     def _ensure_dirs(self) -> None:
         os.makedirs(self.root_dir, exist_ok=True)

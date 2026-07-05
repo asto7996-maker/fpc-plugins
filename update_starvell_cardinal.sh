@@ -108,7 +108,7 @@ Group=$SERVICE_USER
 WorkingDirectory=$INSTALL_DIR
 ExecStart=$INSTALL_DIR/venv/bin/python $INSTALL_DIR/main.py
 Restart=always
-RestartSec=10
+RestartSec=3
 Environment=PYTHONUNBUFFERED=1
 EnvironmentFile=-$INSTALL_DIR/config/env
 StandardOutput=journal
@@ -122,7 +122,7 @@ EOF
 systemctl daemon-reload
 systemctl enable starvell-cardinal.service 2>/dev/null || true
 systemctl restart starvell-cardinal.service
-sleep 5
+sleep 2
 
 echo ""
 echo "=== Проверка BOT_TOKEN ==="

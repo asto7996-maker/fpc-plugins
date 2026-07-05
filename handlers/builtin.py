@@ -101,7 +101,11 @@ class BuiltinHandlers:
         order_id = str(order.get("id"))
         review = order.get("review") or {}
         stars = str(review.get("stars") or review.get("rating") or "5")
-        if settings.review_use_gemini and settings.gemini_api_key:
+        if (
+            settings.review_use_gemini
+            and settings.gemini_api_key
+            and settings.is_gemini_proxy_configured()
+        ):
             self._ai.settings = settings
             text = await self._ai.generate_review_text(order)
         else:
