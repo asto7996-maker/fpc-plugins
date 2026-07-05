@@ -7,7 +7,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import random
 import time
 from typing import Any, Callable, Awaitable
 
@@ -104,6 +103,7 @@ class AutomationEngine:
         self._payment_guard = PaymentGuard()
         self._status_cache: dict[str, Any] | None = None
         self._status_cache_at: float = 0.0
+        self._bump_cooldowns: dict[str, dict[tuple[int, int], float]] = {}
 
     async def notify(self, text: str, notify_type: str = "notify_orders", **extra) -> None:
         if self.notify_cb:
@@ -755,36 +755,88 @@ class AutomationEngine:
             logger.warning("ai reply failed: %s", exc)
 
     async def _bump_loop(self, account_name: str, api: StarvellAPI) -> None:
-        """Циклическое поднятие лотов."""
+        """Циклическая проверка автоподнятия (как Lumus LSB: bump_check_interval)."""
         while self._running:
             settings = self._get_settings()
             if not settings.auto_bump_enabled:
                 await asyncio.sleep(60)
                 continue
-            interval = max(300.0, settings.bump_interval)
-            jitter = random.randint(settings.bump_jitter_min, settings.bump_jitter_max)
-            interval = max(60.0, interval + jitter)
+            interval = max(60.0, float(settings.bump_check_interval))
             try:
                 await self._do_bump(account_name, api, settings)
             except Exception as exc:
                 logger.warning("bump_loop %s: %s", account_name, exc)
             await asyncio.sleep(interval)
 
+    @staticmethod
+    def _bump_retry_seconds(result: dict[str, Any], fallback: float) -> int:
+        payload = result.get("json")
+        if not isinstance(payload, dict):
+            payload = {}
+        wait_sec = payload.get("retryAfter") or payload.get("cooldown") or fallback
+        try:
+            return max(1, int(wait_sec))
+        except (TypeError, ValueError):
+            return max(1, int(fallback))
+
     async def _do_bump(self, account_name: str, api: StarvellAPI, settings: Settings) -> None:
-        bumped, errors = await api.bump_all_offers(limit=200)
-        if bumped:
-            logger.info("Auto bump [%s]: поднято категорий: %s", account_name, bumped)
-            if settings.notify_bump:
-                await self.notify(f"📈 [{account_name}] Лоты подняты ({bumped} категорий)", "notify_bump")
+        categories = await api.get_categories_for_bump()
+        if not categories:
+            logger.warning("Auto bump [%s]: нет категорий для поднятия", account_name)
+            return
+
+        by_game: dict[int, list[int]] = {}
+        for cat in categories:
+            by_game.setdefault(cat["gameId"], []).append(cat["categoryId"])
+
+        cooldowns = self._bump_cooldowns.setdefault(account_name, {})
+        now = time.time()
+        success_cooldown = max(60.0, float(settings.bump_success_cooldown))
+        bumped_total = 0
+        errors: list[str] = []
+
+        for game_id, cat_ids in by_game.items():
+            key = (game_id, cat_ids[0])
+            cooldown_until = cooldowns.get(key, 0.0)
+            if now < cooldown_until:
+                wait = int(cooldown_until - now)
+                logger.info("Auto bump [%s]: game=%s ждём %s сек", account_name, game_id, wait)
+                continue
+
+            result = await api.bump_offers(game_id, cat_ids)
+            if result.get("success"):
+                logger.info("Auto bump [%s]: категории подняты (game=%s)", account_name, game_id)
+                cooldowns[key] = now + success_cooldown
+                bumped_total += len(cat_ids)
+                continue
+
+            wait_sec = self._bump_retry_seconds(result, success_cooldown)
+            cooldowns[key] = now + wait_sec
+            payload = result.get("json") if isinstance(result.get("json"), dict) else {}
+            msg = str(payload.get("message") or payload.get("error") or result.get("raw") or "").strip()
+            logger.warning(
+                "Auto bump [%s]: game=%s недоступно, ждём %s сек%s",
+                account_name,
+                game_id,
+                wait_sec,
+                f" ({msg[:80]})" if msg else "",
+            )
+            if msg:
+                errors.append(f"game={game_id}: {msg[:120]}")
+
+        if bumped_total:
+            logger.info("Auto bump [%s]: поднято категорий: %s", account_name, bumped_total)
+            await self.notify(
+                f"📈 [{account_name}] Лоты подняты ({bumped_total} категорий)",
+                "notify_bump",
+            )
         elif errors:
             logger.warning("Auto bump [%s]: %s", account_name, "; ".join(errors[:3]))
-        else:
-            logger.info("Auto bump [%s]: нет категорий для поднятия", account_name)
 
         bump_ctx = BumpContext(
             core=self.cardinal,
             account_name=account_name,
-            categories_bumped=bumped,
+            categories_bumped=bumped_total,
         )
         await self._emit_starvell(STV_BUMP, bump_ctx)
 

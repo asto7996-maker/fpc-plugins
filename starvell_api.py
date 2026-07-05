@@ -462,6 +462,74 @@ class StarvellAPI:
             "category_url": f"{BASE_URL}/{game_slug}/{cat_slug}/trade" if game_slug and cat_slug else None,
         }
 
+    async def fetch_profile_offers(
+        self,
+        username: str | None = None,
+        user_id: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Категории с лотами из profile/{slug}.json (как Lumus LSB)."""
+        if not username and not user_id:
+            try:
+                info = await self.fetch_homepage()
+                user = info.get("user") or {}
+                username = user.get("username") or user.get("login")
+                uid = user.get("id")
+                if uid is not None:
+                    user_id = int(uid)
+            except Exception as exc:
+                logger.debug("fetch_profile_offers homepage: %s", exc)
+                return []
+
+        slug = (username or "").strip() or (str(user_id) if user_id else "")
+        if not slug:
+            return []
+
+        data: dict[str, Any] | None = None
+        try:
+            data = await self._next_data_get(f"profile/{slug}.json", f"{BASE_URL}/profile/{slug}")
+        except Exception as exc:
+            logger.debug("fetch_profile_offers profile/%s: %s", slug, exc)
+
+        if data is None and user_id:
+            try:
+                data = await self._next_data_get(
+                    f"users/{user_id}.json?user_id={user_id}",
+                    f"{BASE_URL}/users/{user_id}",
+                )
+            except Exception as exc:
+                logger.warning("fetch_profile_offers users/%s: %s", user_id, exc)
+                return []
+
+        if not data:
+            return []
+
+        props = data.get("pageProps", {})
+        categories = (
+            props.get("userProfileOffers")
+            or (props.get("bff") or {}).get("userProfileOffers")
+            or []
+        )
+        return categories if isinstance(categories, list) else []
+
+    async def get_categories_for_bump(self) -> list[dict[str, int]]:
+        """Список пар gameId/categoryId для автоподнятия (как Lumus get_categories_for_bump)."""
+        categories = await self.fetch_profile_offers()
+        result: list[dict[str, int]] = []
+        seen: set[tuple[int, int]] = set()
+        for cat in categories:
+            if not isinstance(cat, dict):
+                continue
+            game_id = cat.get("gameId") or (cat.get("game") or {}).get("id")
+            cat_id = cat.get("id")
+            if game_id is None or cat_id is None:
+                continue
+            key = (int(game_id), int(cat_id))
+            if key in seen:
+                continue
+            seen.add(key)
+            result.append({"gameId": key[0], "categoryId": key[1]})
+        return result
+
     async def fetch_user_lots(self, user_id: int) -> list[dict[str, Any]]:
         """Получает лоты пользователя с категориями (fallback через _next/data)."""
         try:
@@ -766,7 +834,21 @@ class StarvellAPI:
         return categories
 
     async def collect_bump_targets(self, limit: int = 200) -> list[dict[str, Any]]:
-        """Категории для автобампа: list-my + fallback через профиль продавца."""
+        """Категории для автобампа: профиль → list-my → users fallback."""
+        profile_categories = await self.get_categories_for_bump()
+        if profile_categories:
+            game_categories: dict[int, set[int]] = {}
+            for cat in profile_categories:
+                game_categories.setdefault(cat["gameId"], set()).add(cat["categoryId"])
+            return [
+                {
+                    "game_id": game_id,
+                    "category_ids": sorted(cat_ids),
+                    "referer": f"{BASE_URL}/account/sells",
+                }
+                for game_id, cat_ids in game_categories.items()
+            ]
+
         lots = await self.fetch_my_offers(limit=limit)
         if not lots:
             try:

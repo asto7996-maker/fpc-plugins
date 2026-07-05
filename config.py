@@ -99,6 +99,8 @@ class Settings:
     # Тайминги
     chat_poll_interval: float = 4.0
     orders_poll_interval: float = 4.0
+    bump_check_interval: float = 300.0
+    bump_success_cooldown: float = 3600.0
     bump_interval: float = 3600.0
     bump_jitter_min: int = -30
     bump_jitter_max: int = 45

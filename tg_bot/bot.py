@@ -531,12 +531,12 @@ class TelegramBot:
         text = (
             f"⚙️ <b>Настройки</b>\n\n"
             f"Чаты: {s.chat_poll_interval}с | Заказы: {s.orders_poll_interval}с\n"
-            f"Бамп: {int(s.bump_interval)}с | API delay: {s.api_delay_seconds}с\n"
+            f"Бамп: проверка {int(s.bump_check_interval)}с, кулдаун {int(s.bump_success_cooldown)}с | API delay: {s.api_delay_seconds}с\n"
             f"Приветствие: кулдаун {s.welcome_cooldown_minutes} мин"
         )
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="✏️ Текст приветствия", callback_data=CB["edit_welcome"])],
-            [InlineKeyboardButton(text="⏱ Интервал бампа (сек)", callback_data=CB["edit_bump"])],
+            [InlineKeyboardButton(text="⏱ Интервал проверки бампа (сек)", callback_data=CB["edit_bump"])],
             [InlineKeyboardButton(text="📄 Шаблон выдачи", callback_data=CB["edit_delivery"])],
             [InlineKeyboardButton(text="◀️ Меню", callback_data=CB["main"])],
         ])
@@ -618,7 +618,11 @@ class TelegramBot:
     async def cb_edit_bump(self, call: CallbackQuery, state: FSMContext) -> None:
         await state.set_state(SetupStates.bump_interval)
         s = load_settings()
-        await call.message.answer(f"Текущий интервал бампа: {int(s.bump_interval)} сек.\nВведите новый (мин. 300):")
+        await call.message.answer(
+            f"Текущий интервал проверки автоподнятия: {int(s.bump_check_interval)} сек.\n"
+            f"Кулдаун после успешного поднятия: {int(s.bump_success_cooldown)} сек.\n"
+            "Введите новый интервал проверки (мин. 60):"
+        )
         await call.answer()
 
     async def cb_edit_delivery(self, call: CallbackQuery, state: FSMContext) -> None:
@@ -685,16 +689,16 @@ class TelegramBot:
     async def on_bump(self, message: Message, state: FSMContext) -> None:
         try:
             val = int((message.text or "").strip())
-            val = max(300, val)
+            val = max(60, val)
         except ValueError:
             await message.answer("❌ Введите число секунд")
             return
         s = load_settings()
-        s.bump_interval = float(val)
+        s.bump_check_interval = float(val)
         save_settings(s)
         await self.automation.reload()
         await state.clear()
-        await message.answer(f"✅ Интервал бампа: {val} сек.", reply_markup=self._back_kb())
+        await message.answer(f"✅ Интервал проверки автоподнятия: {val} сек.", reply_markup=self._back_kb())
 
     async def on_delivery(self, message: Message, state: FSMContext) -> None:
         text = (message.text or "").strip()

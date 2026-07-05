@@ -14,6 +14,8 @@
   "ai_replies_enabled": false,
   "chat_poll_interval": 5.0,
   "orders_poll_interval": 10.0,
+  "bump_check_interval": 300.0,
+  "bump_success_cooldown": 3600.0,
   "bump_interval": 3600.0,
   "api_delay_seconds": 1.5,
   "api_max_per_minute": 40,
