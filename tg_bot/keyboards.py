@@ -14,7 +14,7 @@ def flag(on: bool) -> str:
 
 def back_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="◀️ Главное меню", callback_data=CBT.MAIN)],
+        [InlineKeyboardButton(text="🏠 Главная", callback_data=CBT.MAIN)],
     ])
 
 
@@ -53,7 +53,7 @@ def profile_kb() -> InlineKeyboardMarkup:
         ],
         [InlineKeyboardButton(text="🍪 Session / Авторизация", callback_data=CBT.SET_SESSION)],
         [InlineKeyboardButton(text="✅ Проверить Starvell", callback_data=CBT.CHECK_AUTH)],
-        [InlineKeyboardButton(text="◀️ Главное меню", callback_data=CBT.MAIN)],
+        [InlineKeyboardButton(text="🏠 Главная", callback_data=CBT.MAIN)],
     ])
 
 
@@ -109,7 +109,7 @@ def backup_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="📤 Создать и скачать", callback_data=CBT.BACKUP_DL)],
         [InlineKeyboardButton(text="📥 Загрузить бэкап", callback_data=CBT.BACKUP_UL)],
         [InlineKeyboardButton(text="📋 Текущие данные (JSON)", callback_data=CBT.BACKUP_EXPORT)],
-        [InlineKeyboardButton(text="◀️ Главное меню", callback_data=CBT.MAIN)],
+        [InlineKeyboardButton(text="🏠 Главная", callback_data=CBT.MAIN)],
     ])
 
 
@@ -146,7 +146,7 @@ def category_main(s) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text=f"{flag(s.auto_review_enabled)} Отзывы", callback_data=f"{CBT.SWITCH}auto_review")],
         [InlineKeyboardButton(text=f"{flag(s.order_confirm_enabled)} Подтв. заказа", callback_data=f"{CBT.SWITCH}order_confirm")],
         [InlineKeyboardButton(text=f"{flag(s.ai_replies_enabled)} Gemini в чатах", callback_data=f"{CBT.SWITCH}ai_replies")],
-        [InlineKeyboardButton(text="◀️ Главное меню", callback_data=CBT.MAIN)],
+        [InlineKeyboardButton(text="🏠 Главная", callback_data=CBT.MAIN)],
     ])
 
 
@@ -174,5 +174,5 @@ def setup_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="✅ Проверить Starvell", callback_data=CBT.CHECK_AUTH)],
         [InlineKeyboardButton(text="✅ Проверить прокси", callback_data=CBT.CHECK_PROXY)],
         [InlineKeyboardButton(text="✅ Проверить Gemini", callback_data=CBT.CHECK_GEMINI)],
-        [InlineKeyboardButton(text="◀️ Главное меню", callback_data=CBT.MAIN)],
+        [InlineKeyboardButton(text="🏠 Главная", callback_data=CBT.MAIN)],
     ])

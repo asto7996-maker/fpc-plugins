@@ -224,10 +224,9 @@ class StarvellAPI:
                 raw = wallet.get("rubBalance")
             if raw is not None:
                 try:
-                    val = float(raw)
-                    if val >= 100 and abs(val - round(val)) < 1e-9:
-                        val = val / 100.0
-                    return val
+                    from utils.starvell_format import wallet_amount_to_rub
+
+                    return wallet_amount_to_rub(float(raw))
                 except (TypeError, ValueError):
                     pass
         info = await self.fetch_homepage()

@@ -443,6 +443,14 @@ class AutomationEngine:
         if await self.db.is_order_reviewed(order_id, account_name):
             return
 
+        # Полная карточка — в ленте заказов часто нет поля review
+        try:
+            full = await api.fetch_order(order_id)
+            if isinstance(full, dict) and full:
+                order = {**order, **full}
+        except Exception as exc:
+            logger.debug("fetch_order for review %s: %s", order_id, exc)
+
         review_ctx = ReviewReplyContext.from_order(self.cardinal, order, account_name)
         await self._emit_starvell(STV_PRE_REVIEW, review_ctx)
         if review_ctx.skipped:

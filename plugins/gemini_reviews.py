@@ -10,7 +10,7 @@ from starvell_sdk import StarvellPlugin, ReviewReplyContext, on_pre_review
 
 NAME = "Gemini — отзывы"
 UUID = "b7e2f4a1-9c3d-4e8f-a2b6-1d5c8e7f0a4b"
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 DESCRIPTION = "Умные ответы на отзывы покупателей через Google Gemini"
 CREDITS = "Starvell Cardinal"
 SETTINGS_PAGE = True
@@ -22,6 +22,9 @@ DEFAULT_TEMPLATES = {
     "2": "Жаль, что не всё идеально. Мы уже работаем над улучшением сервиса.",
     "1": "Нам очень жаль за негативный опыт. Напишите в чат — разберёмся лично.",
 }
+
+
+from config import load_settings
 
 
 class Plugin(StarvellPlugin):
@@ -38,7 +41,7 @@ class Plugin(StarvellPlugin):
         if not await self.get_cfg("enabled", True):
             return
 
-        settings = self.settings
+        settings = load_settings()
         if not settings.is_gemini_proxy_configured():
             self.log("Прокси Gemini не настроен — пропуск отзыва %s", ctx.order_id, level="warning")
             return
@@ -47,7 +50,7 @@ class Plugin(StarvellPlugin):
             return
 
         order = ctx.order
-        review = order.get("review") or {}
+        review = order.get("review") or order.get("buyerReview") or {}
         stars_raw = review.get("stars") or review.get("rating")
         try:
             stars = int(stars_raw) if stars_raw is not None else 0

@@ -242,7 +242,7 @@ class TelegramBot:
 
     def _back_kb(self) -> InlineKeyboardMarkup:
         return InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="◀️ Меню", callback_data=CB["main"])],
+            [InlineKeyboardButton(text="🏠 Главная", callback_data=CB["main"])],
         ])
 
     def _setup_kb(self) -> InlineKeyboardMarkup:
@@ -466,7 +466,7 @@ class TelegramBot:
         return InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🍪 Изменить session", callback_data=CB["set_session"])],
             [InlineKeyboardButton(text="✅ Проверить авторизацию", callback_data=CB["check_auth"])],
-            [InlineKeyboardButton(text="◀️ Меню", callback_data=CB["main"])],
+            [InlineKeyboardButton(text="🏠 Главная", callback_data=CB["main"])],
         ])
 
     async def _profile_text(self) -> str:
@@ -590,7 +590,7 @@ class TelegramBot:
             [InlineKeyboardButton(text="✏️ Текст приветствия", callback_data=CB["edit_welcome"])],
             [InlineKeyboardButton(text="⏱ Интервал проверки бампа (сек)", callback_data=CB["edit_bump"])],
             [InlineKeyboardButton(text="📄 Шаблон выдачи", callback_data=CB["edit_delivery"])],
-            [InlineKeyboardButton(text="◀️ Меню", callback_data=CB["main"])],
+            [InlineKeyboardButton(text="🏠 Главная", callback_data=CB["main"])],
         ])
         await call.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
         await call.answer()
@@ -609,7 +609,7 @@ class TelegramBot:
                 [InlineKeyboardButton(text=f"{ic(user['notify_bump'])} Бамп", callback_data=f"{CB['notify']}notify_bump")],
                 [InlineKeyboardButton(text=f"{ic(user['notify_auth'])} Авторизация", callback_data=f"{CB['notify']}notify_auth")],
                 [InlineKeyboardButton(text=f"{ic(user['notify_delivery'])} Выдача", callback_data=f"{CB['notify']}notify_delivery")],
-                [InlineKeyboardButton(text="◀️ Меню", callback_data=CB["main"])],
+                [InlineKeyboardButton(text="🏠 Главная", callback_data=CB["main"])],
             ])
             await call.message.edit_text("🔔 <b>Уведомления</b>", parse_mode="HTML", reply_markup=kb)
             await call.answer()
@@ -624,7 +624,7 @@ class TelegramBot:
             [InlineKeyboardButton(text=f"{ic(user['notify_bump'])} Бамп", callback_data=f"{CB['notify']}notify_bump")],
             [InlineKeyboardButton(text=f"{ic(user['notify_auth'])} Авторизация", callback_data=f"{CB['notify']}notify_auth")],
             [InlineKeyboardButton(text=f"{ic(user['notify_delivery'])} Выдача", callback_data=f"{CB['notify']}notify_delivery")],
-            [InlineKeyboardButton(text="◀️ Меню", callback_data=CB["main"])],
+            [InlineKeyboardButton(text="🏠 Главная", callback_data=CB["main"])],
         ])
         await call.message.edit_reply_markup(reply_markup=kb)
 
@@ -661,10 +661,10 @@ class TelegramBot:
             [InlineKeyboardButton(text="🌐 Прокси", callback_data=CB["set_gemini_proxy"])],
             [InlineKeyboardButton(text="🔑 API ключ", callback_data=CB["set_gemini"])],
             [
-                InlineKeyboardButton(text="✅ Прокси", callback_data=CB["check_proxy"]),
-                InlineKeyboardButton(text="✅ Gemini", callback_data=CB["check_gemini"]),
+                InlineKeyboardButton(text="🔍 Проверить прокси", callback_data=CB["check_proxy"]),
+                InlineKeyboardButton(text="🔍 Проверить ключ", callback_data=CB["check_gemini"]),
             ],
-            [InlineKeyboardButton(text="◀️ Меню", callback_data=CB["main"])],
+            [InlineKeyboardButton(text="🏠 Главная", callback_data=CB["main"])],
         ])
         await call.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
         await call.answer()
@@ -742,7 +742,7 @@ class TelegramBot:
             f"✅ Прокси сохранён!\n{msg}\n\nТеперь можно указать Gemini API ключ.",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="🔑 Gemini API ключ", callback_data=CB["set_gemini"])],
-                [InlineKeyboardButton(text="◀️ Меню", callback_data=CB["main"])],
+                [InlineKeyboardButton(text="🏠 Главная", callback_data=CB["main"])],
             ]),
         )
 
@@ -761,12 +761,16 @@ class TelegramBot:
         if not ok:
             await wait.edit_text(f"❌ {msg}")
             return
-        s = load_settings()
         s.gemini_api_key = key
         save_settings(s)
         await self.automation.reload_settings()
         await state.clear()
-        await wait.edit_text(f"✅ Gemini настроен!\n{msg}", reply_markup=self._back_kb())
+        key_hint = f"{key[:8]}…{key[-4:]}" if len(key) > 16 else key[:6] + "…"
+        await wait.edit_text(
+            f"✅ Gemini настроен!\n{msg}\n\nКлюч: <code>{key_hint}</code>",
+            parse_mode="HTML",
+            reply_markup=self._back_kb(),
+        )
 
     async def on_welcome(self, message: Message, state: FSMContext) -> None:
         text = (message.text or "").strip()
@@ -1125,7 +1129,7 @@ class TelegramBot:
         """Запуск long-polling с проверкой токена и автоперезапуском."""
         commands = [
             {"command": "start", "description": "Главное меню"},
-            {"command": "menu", "description": "Главное меню"},
+            {"command": "panel", "description": "Панель управления"},
             {"command": "profile", "description": "Профиль и баланс"},
             {"command": "status", "description": "Статистика"},
             {"command": "session", "description": "Привязать Starvell"},

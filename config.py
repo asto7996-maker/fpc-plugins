@@ -131,7 +131,7 @@ class Settings:
     gemini_api_key: str = ""
     gemini_proxy: str = ""
     starvell_proxy: str = ""
-    gemini_model: str = "gemini-2.0-flash"
+    gemini_model: str = "gemini-2.5-flash"
     ai_system_prompt: str = DEFAULT_AI_SYSTEM_PROMPT
     ai_word_blacklist: list[str] = field(default_factory=lambda: [
         "взлом", "чит", "обман", "скам", "refund", "возврат", "арбитраж", "мошенник",

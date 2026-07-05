@@ -13,7 +13,14 @@ from config import DEFAULT_AI_SYSTEM_PROMPT
 from starvell_api import StarvellAPI
 from utils.starvell_format import format_rub_balance
 
-GEMINI_MODELS = ("gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro")
+GEMINI_MODELS = (
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+    "gemini-2.0-flash",
+    "gemini-2.0-flash-lite",
+    "gemini-1.5-flash",
+    "gemini-1.5-flash-8b",
+)
 _GEMINI_STANDARD_KEY_RE = re.compile(r"AIza[A-Za-z0-9_-]{35}")
 _GEMINI_AUTH_KEY_RE = re.compile(r"AQ\.[A-Za-z0-9_.-]{20,}")
 _PROXY_SCHEME_RE = re.compile(r"^(https?|socks5h?|socks4)://", re.I)
@@ -158,6 +165,25 @@ def gemini_auth_headers(api_key: str) -> dict[str, str]:
     }
 
 
+async def gemini_request(
+    client: httpx.AsyncClient,
+    model: str,
+    api_key: str,
+    payload: dict,
+) -> httpx.Response:
+    """POST generateContent: заголовок x-goog-api-key, fallback ?key= для AQ/AIza."""
+    url = gemini_generate_url(model)
+    headers = gemini_auth_headers(api_key)
+    resp = await client.post(url, json=payload, headers=headers)
+    if resp.status_code == 200:
+        return resp
+    if resp.status_code in (401, 403):
+        return resp
+    # Fallback: query-параметр (старые SDK и часть Auth-ключей)
+    url_q = f"{url}?key={api_key}"
+    return await client.post(url_q, json=payload, headers={"Content-Type": "application/json"})
+
+
 def _mask_proxy_for_log(proxy_url: str) -> str:
     return re.sub(r":([^:@/]+)@", ":***@", proxy_url)
 
@@ -225,28 +251,50 @@ async def test_gemini_key(
         "generationConfig": {"temperature": 0.3, "maxOutputTokens": 20},
     }
 
-    client_kwargs: dict = {"timeout": 30.0}
+    client_kwargs: dict = {"timeout": 45.0}
     proxy_url = parse_proxy_url(proxy or "")
     if proxy_url:
         client_kwargs["proxy"] = proxy_url
 
     headers = gemini_auth_headers(key)
+    last_error = "нет ответа от API"
 
     async with httpx.AsyncClient(**client_kwargs) as client:
         for model in GEMINI_MODELS:
-            url = gemini_generate_url(model)
+            # Сначала минимальный payload (надёжнее через прокси)
+            minimal = {
+                "contents": [{"role": "user", "parts": [{"text": "Ответь одним словом: работает"}]}],
+                "generationConfig": {"temperature": 0.3, "maxOutputTokens": 20},
+            }
             try:
-                resp = await client.post(url, json=payload_base, headers=headers)
+                resp = await gemini_request(client, model, key, minimal)
                 if resp.status_code == 200:
                     data = resp.json()
                     candidates = data.get("candidates") or []
                     if candidates:
                         key_type = "Auth AQ" if key.startswith("AQ.") else "Standard"
                         return True, f"Gemini OK ({key_type}, модель {model})"
+                    last_error = f"{model}: пустой ответ API"
+                    continue
                 if resp.status_code in (400, 401, 403):
-                    detail = resp.text[:200]
-                    return False, f"Ключ отклонён API: {detail}"
+                    detail = resp.text[:240]
+                    return False, f"Ключ отклонён ({model}): {detail}"
+                last_error = f"{model}: HTTP {resp.status_code} — {resp.text[:120]}"
             except Exception as exc:
-                return False, f"Ошибка: {exc}"
+                last_error = f"{model}: {exc}"
+                continue
 
-    return False, "Не удалось подключиться к Gemini (проверьте прокси и ключ)"
+            # Полный payload с systemInstruction
+            try:
+                resp = await gemini_request(client, model, key, payload_base)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    if data.get("candidates"):
+                        key_type = "Auth AQ" if key.startswith("AQ.") else "Standard"
+                        return True, f"Gemini OK ({key_type}, модель {model})"
+            except Exception as exc:
+                last_error = f"{model}: {exc}"
+
+    if not proxy_url:
+        return False, f"Не удалось подключиться к Gemini.\n{last_error}\n\nПроверьте прокси."
+    return False, f"Не удалось подключиться к Gemini через прокси.\n{last_error}"
