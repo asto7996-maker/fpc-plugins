@@ -17,6 +17,7 @@ import time
 import traceback
 from datetime import datetime
 from typing import Any, Final
+from urllib.parse import parse_qs, urlparse
 
 from FunPayAPI.common.utils import RegularExpressions
 from FunPayAPI.types import MessageTypes, Order
@@ -40,8 +41,8 @@ except ImportError:
 
 
 NAME          = "Gemini Review Reply"
-VERSION       = "3.0.0"
-DESCRIPTION   = "ИИ-ответы на отзывы FunPay (Gemini AQ + proxy + batch) 🌈"
+VERSION       = "3.0.1"
+DESCRIPTION   = "ИИ-ответы на отзывы FunPay (Gemini AQ + HTTP/SOCKS proxy + batch) 🌈"
 CREDITS       = "Cursor AI"
 UUID          = "c4e8b2f1-9a3d-4e7b-8c6f-2d1a5e9b0c3f"
 SETTINGS_PAGE = True
@@ -121,24 +122,102 @@ def _request_headers(api_key: str) -> dict[str, str]:
     return {"Content-Type": "application/json", "x-goog-api-key": api_key.strip()}
 
 
-def _client_proxies(proxy: str) -> dict[str, str] | None:
+_SOCKS_SCHEMES = ("socks4", "socks4a", "socks5", "socks5h")
+_SOCKS_READY = False
+
+
+def _ensure_socks() -> None:
+    global _SOCKS_READY
+    if _SOCKS_READY:
+        return
+    try:
+        import socks  # noqa: F401  # PySocks
+        _SOCKS_READY = True
+        return
+    except ImportError:
+        pass
+    _pip("PySocks")
+    import socks  # noqa: F401
+    _SOCKS_READY = True
+
+
+def _parse_telegram_socks(url: str) -> str:
+    """t.me/socks?server=ip&port=8000&user=login&pass=password → socks5://…"""
+    parsed = urlparse(url.strip())
+    qs = parse_qs(parsed.query)
+    server = (qs.get("server") or [""])[0].strip()
+    if not server:
+        return ""
+    port = (qs.get("port") or ["1080"])[0].strip()
+    user = (qs.get("user") or [""])[0].strip()
+    passwd = (qs.get("pass") or qs.get("password") or [""])[0].strip()
+    auth = f"{user}:{passwd}@" if user else ""
+    return f"socks5://{auth}{server}:{port}"
+
+
+def _normalize_proxy(proxy: str) -> str:
+    """
+    Поддерживаемые форматы:
+    - socks5://user:pass@host:port
+    - socks4://host:port
+    - http://user:pass@host:port
+    - https://user:pass@host:port
+    - https://t.me/socks?server=…&port=…&user=…&pass=…
+    - user:pass@host:port (по умолчанию socks5)
+    - host:port (по умолчанию socks5)
+    """
     proxy = (proxy or "").strip()
     if not proxy:
+        return ""
+
+    low = proxy.lower()
+    if "t.me/socks" in low or "telegram.me/socks" in low:
+        parsed = _parse_telegram_socks(proxy)
+        return parsed or proxy
+
+    if "://" in proxy:
+        scheme = low.split("://", 1)[0]
+        if scheme in _SOCKS_SCHEMES or scheme in ("http", "https"):
+            return proxy
+        return f"socks5://{proxy.split('://', 1)[1]}"
+
+    if "@" in proxy:
+        return f"socks5://{proxy}"
+
+    if re.match(r"^[\w.\-]+:\d+$", proxy):
+        return f"socks5://{proxy}"
+
+    return f"http://{proxy}"
+
+
+def _client_proxies(proxy: str) -> dict[str, str] | None:
+    url = _normalize_proxy(proxy)
+    if not url:
         return None
-    if not proxy.startswith("http"):
-        proxy = f"http://{proxy}"
-    return {"http": proxy, "https": proxy}
+    if url.lower().startswith(_SOCKS_SCHEMES):
+        _ensure_socks()
+    return {"http": url, "https": url}
+
+
+def _proxy_label(proxy: str) -> str:
+    url = _normalize_proxy(proxy)
+    if not url:
+        return "не задан"
+    scheme = url.split("://", 1)[0].upper()
+    return scheme
 
 
 def _check_proxy(proxy: str) -> tuple[bool, str]:
     proxies = _client_proxies(proxy)
     if not proxies:
         return False, "Прокси не задан"
+    url = _normalize_proxy(proxy)
     try:
-        r = http_get("https://api.ipify.org?format=json", proxies=proxies, timeout=12)
+        r = http_get("https://api.ipify.org?format=json", proxies=proxies, timeout=15)
         if r.status_code == 200:
             ip = r.json().get("ip", "?")
-            return True, f"OK — IP: {ip}"
+            scheme = url.split("://", 1)[0].upper()
+            return True, f"OK [{scheme}] — IP: {ip}"
         return False, f"HTTP {r.status_code}"
     except Exception as exc:
         return False, str(exc)[:120]
@@ -283,7 +362,7 @@ class Plugin:
         return {
             "enabled": True,
             "gemini_api_key": "AIzaSyA5c7Jm7DZhQ3O0A7Ld_Mh4HLq1eJpvoA0",
-            "gemini_proxy": "http://wgmGhd:FFhgh5@77.83.186.237:8000",
+            "gemini_proxy": "socks5://nLFuxn:8TzG10@45.147.180.59:8000",
             "gemini_model": "gemini-2.5-flash-lite",
             "system_prompt": DEFAULT_SYSTEM_PROMPT,
             "review_prompt": DEFAULT_REVIEW_PROMPT,
@@ -304,7 +383,16 @@ class Plugin:
         return [
             {"key": "enabled", "label": "Автоответ на новые отзывы", "type": "bool", "default": True},
             {"key": "gemini_api_key", "label": "Gemini API Key (AIza / AQ)", "type": "text", "default": ""},
-            {"key": "gemini_proxy", "label": "Proxy IPv4", "type": "text", "default": ""},
+            {
+                "key": "gemini_proxy",
+                "label": "Proxy (HTTP / SOCKS5 / t.me/socks)",
+                "type": "text",
+                "default": "",
+                "description": (
+                    "socks5://user:pass@ip:port или ссылка "
+                    "https://t.me/socks?server=…&port=…&user=…&pass=…"
+                ),
+            },
             {"key": "gemini_model", "label": "Модель Gemini", "type": "text", "default": "gemini-2.5-flash-lite"},
             {"key": "system_prompt", "label": "Системный промпт", "type": "multiline", "default": DEFAULT_SYSTEM_PROMPT},
             {"key": "review_prompt", "label": "Промпт ответа на отзыв", "type": "multiline", "default": DEFAULT_REVIEW_PROMPT},
@@ -313,7 +401,7 @@ class Plugin:
             {"key": "batch_count", "label": "Кол-во последних отзывов (N)", "type": "int", "default": 5, "min": 1, "max": 50},
             {"key": "reply_recent", "label": "▶ Ответить на последние N отзывов", "type": "action"},
             {"key": "test_gemini", "label": "🧪 Тест Gemini API", "type": "action"},
-            {"key": "check_proxy", "label": "🌐 Проверить прокси IPv4", "type": "action"},
+            {"key": "check_proxy", "label": "🌐 Проверить прокси", "type": "action"},
         ]
 
     def get_schema_field(self, key: str) -> dict[str, Any] | None:
@@ -774,14 +862,22 @@ class Plugin:
                     return
                 plugin.set_cfg(key, val)
             elif field.get("type") == "text" and key == "gemini_proxy":
-                proxy = text.strip()
-                if proxy and not proxy.startswith("http"):
-                    proxy = f"http://{proxy}"
+                proxy = _normalize_proxy(text.strip())
+                if not proxy:
+                    bot.reply_to(message, "⚠️ Прокси не распознан")
+                    return
                 ok, info = _check_proxy(proxy)
                 if not ok:
                     bot.reply_to(message, f"❌ Прокси не работает: {info}")
                     return
                 plugin.set_cfg(key, proxy)
+                tg.clear_state(message.chat.id, message.from_user.id)
+                bot.reply_to(
+                    message,
+                    f"✅ Прокси сохранён:\n<code>{_escape(proxy)}</code>\n{info}",
+                    parse_mode="HTML",
+                )
+                return
             else:
                 plugin.set_cfg(key, text if field.get("type") == "multiline" else text.strip())
             tg.clear_state(message.chat.id, message.from_user.id)
