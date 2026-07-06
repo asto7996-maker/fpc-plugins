@@ -9,7 +9,7 @@ from typing import Any
 
 import httpx
 
-from config import Settings
+from config import CONSULTANT_KNOWLEDGE_FILE, Settings
 from validators import GEMINI_MODELS
 
 logger = logging.getLogger("starvell.ai")
@@ -20,6 +20,29 @@ class AIService:
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
+
+    def _load_knowledge(self) -> str:
+        try:
+            if CONSULTANT_KNOWLEDGE_FILE.is_file():
+                text = CONSULTANT_KNOWLEDGE_FILE.read_text(encoding="utf-8").strip()
+                return text[:15000]
+        except OSError as exc:
+            logger.warning("knowledge file read: %s", exc)
+        return ""
+
+    def _system_instruction(self) -> str:
+        base = (self.settings.ai_system_prompt or "").strip()
+        extra = self._load_knowledge()
+        if extra:
+            return f"{base}\n\n--- База знаний / команды / инструкции ---\n{extra}"
+        return base
+
+    def _client_kwargs(self) -> dict[str, Any]:
+        proxy = (getattr(self.settings, "gemini_proxy", "") or "").strip()
+        kwargs: dict[str, Any] = {"timeout": 45.0}
+        if proxy:
+            kwargs["proxy"] = proxy
+        return kwargs
 
     def _build_prompt(self, buyer_message: str, chat_history: list[dict[str, Any]], product_hint: str = "") -> str:
         history_lines = []
@@ -57,7 +80,6 @@ class AIService:
         return await self._gemini(prompt)
 
     def check_blacklist(self, text: str) -> str | None:
-        """Возвращает найденное слово или None."""
         text_l = text.lower()
         for word in self.settings.ai_word_blacklist:
             w = word.strip().lower()
@@ -96,12 +118,12 @@ class AIService:
 
         models = [self.settings.gemini_model] + [m for m in GEMINI_MODELS if m != self.settings.gemini_model]
         payload_base = {
-            "systemInstruction": {"parts": [{"text": self.settings.ai_system_prompt}]},
+            "systemInstruction": {"parts": [{"text": self._system_instruction()}]},
             "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
             "generationConfig": {"temperature": 0.85, "maxOutputTokens": 600},
         }
 
-        async with httpx.AsyncClient(timeout=45.0) as client:
+        async with httpx.AsyncClient(**self._client_kwargs()) as client:
             for model in models:
                 url = (
                     f"https://generativelanguage.googleapis.com/v1beta/models/"

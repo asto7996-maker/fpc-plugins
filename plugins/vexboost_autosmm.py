@@ -1390,19 +1390,8 @@ class Plugin(StarvellPlugin):
             )
 
         orphans = _load_json("orphan_links.json", {})
-        orphan_link = orphans.pop(str(entry.get("chat_id") or ""), None)
-        if orphan_link:
-            _save_json("orphan_links.json", orphans)
-            self.log("Найдена буферная ссылка для #%s", ctx.order_id)
-            msg_ctx = MessageContext(
-                core=self.core,
-                account_name=ctx.account_name,
-                chat_id=str(entry.get("chat_id") or ""),
-                text=orphan_link,
-                author_id=ctx.buyer_id,
-                username=ctx.buyer_username,
-            )
-            await self._process_link_and_submit(msg_ctx, entry, orphan_link)
+        if orphans:
+            _save_json("orphan_links.json", {})
 
         if await self.get_cfg("notify_admin", True) and await self.get_cfg("notify_new_order", True):
             asyncio.create_task(self._notify_admin_new_order(
@@ -1490,9 +1479,6 @@ class Plugin(StarvellPlugin):
         links = _extract_links(text)
         order = await self._locate_waiting_order(ctx)
 
-        if not order and (links or _looks_like_link_attempt(text)):
-            order = await self._recover_order_for_buyer(ctx)
-
         if order and links:
             ctx.mark_handled()
             await self._process_link_and_submit(ctx, order, links[0])
@@ -1504,23 +1490,12 @@ class Plugin(StarvellPlugin):
             return
 
         if links or _looks_like_link_attempt(text):
-            link = links[0] if links else text.strip()
-            orphans = _load_json("orphan_links.json", {})
-            orphans[str(ctx.chat_id)] = link
-            _save_json("orphan_links.json", orphans)
             ctx.mark_handled()
             await self._safe_reply(
                 ctx,
-                "⏳ Ссылка получена. Ожидаю подтверждение оплаты, создам заказ автоматически.",
+                "ℹ️ Ссылку можно отправить только после оплаты заказа. "
+                "Оформите покупку на Starvell — бот попросит ссылку автоматически.",
             )
-            recovered = await self._recover_order_for_buyer(ctx)
-            if recovered:
-                await self._process_link_and_submit(ctx, recovered, link)
-            else:
-                await self._scan_created_orders_impl()
-                recovered = await self._locate_waiting_order(ctx)
-                if recovered:
-                    await self._process_link_and_submit(ctx, recovered, link)
             return
 
         waiting_any = _load_json("waiting.json", [])

@@ -18,6 +18,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from cardinal import Cardinal
+from ai_service import AIService
 from automation import AutomationEngine
 from config import VERSION, Settings, StarvellAccount, load_settings, save_settings
 from database import Database
@@ -52,7 +53,9 @@ CB = {
     "adel_add": "sc:adel_add",
     "edit_welcome": "sc:edit_welcome",
     "edit_bump": "sc:edit_bump",
-    "edit_delivery": "sc:edit_delivery",
+    "edit_gemini_prompt": "sc:edit_gemini_prompt",
+    "edit_gemini_proxy": "sc:edit_gemini_proxy",
+    "upload_gemini_knowledge": "sc:upload_gemini_knowledge",
     "first_setup": "sc:first_setup",
 }
 
@@ -66,6 +69,8 @@ class SetupStates(StatesGroup):
     adel_product = State()
     adel_items = State()
     gemini_prompt = State()
+    gemini_proxy = State()
+    gemini_knowledge = State()
     reply_chat = State()
     ar_command = State()
     ar_response = State()
@@ -204,9 +209,9 @@ class TelegramBot:
         r.message.register(self.on_welcome, SetupStates.welcome)
         r.message.register(self.on_bump, SetupStates.bump_interval)
         r.message.register(self.on_delivery, SetupStates.delivery_tpl)
-        r.message.register(self.on_adel_product, SetupStates.adel_product)
-        r.message.register(self.on_adel_items, SetupStates.adel_items)
         r.message.register(self.on_gemini_prompt, SetupStates.gemini_prompt)
+        r.message.register(self.on_gemini_proxy, SetupStates.gemini_proxy)
+        r.message.register(self.on_gemini_knowledge, SetupStates.gemini_knowledge, F.document)
 
         r.callback_query.register(self.cb_main, F.data == CB["main"])
         r.callback_query.register(self.cb_back, F.data == CB["back"])
@@ -221,10 +226,12 @@ class TelegramBot:
         r.callback_query.register(self.cb_toggle, F.data.startswith(CB["toggle"]))
         r.callback_query.register(self.cb_notify, F.data.startswith(CB["notify"]))
         # Плагины — только через hub (handlers/tg/plugins_panel.py), без legacy sc:plug:
-        r.callback_query.register(self.cb_adel_add, F.data == CB["adel_add"])
         r.callback_query.register(self.cb_edit_welcome, F.data == CB["edit_welcome"])
         r.callback_query.register(self.cb_edit_bump, F.data == CB["edit_bump"])
         r.callback_query.register(self.cb_edit_delivery, F.data == CB["edit_delivery"])
+        r.callback_query.register(self.cb_edit_gemini_prompt, F.data == CB["edit_gemini_prompt"])
+        r.callback_query.register(self.cb_edit_gemini_proxy, F.data == CB["edit_gemini_proxy"])
+        r.callback_query.register(self.cb_upload_gemini_knowledge, F.data == CB["upload_gemini_knowledge"])
 
     # ── Клавиатуры ────────────────────────────────────────────────────────
 
@@ -597,15 +604,23 @@ class TelegramBot:
             return
         s = load_settings()
         key_ok = "✅" if s.is_gemini_configured() else "❌"
+        from config import CONSULTANT_KNOWLEDGE_FILE, KNOWLEDGE_DIR
+        knowledge_ok = "✅" if CONSULTANT_KNOWLEDGE_FILE.is_file() else "❌"
+        proxy_ok = "✅" if (s.gemini_proxy or "").strip() else "—"
         text = (
             f"🤖 <b>Gemini — ИИ-консультант</b>\n\n"
             f"Ключ: {key_ok}\n"
+            f"Proxy: {proxy_ok}\n"
+            f"База знаний: {knowledge_ok}\n"
             f"Модель: {s.gemini_model}\n"
             f"В чатах: {self._flag(s.ai_replies_enabled)}\n\n"
             f"<i>{s.ai_system_prompt[:150]}…</i>"
         )
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🔑 API ключ", callback_data=CB["set_gemini"])],
+            [InlineKeyboardButton(text="🌐 Proxy", callback_data=CB["edit_gemini_proxy"])],
+            [InlineKeyboardButton(text="📝 Системный промпт", callback_data=CB["edit_gemini_prompt"])],
+            [InlineKeyboardButton(text="📎 База знаний (файл)", callback_data=CB["upload_gemini_knowledge"])],
             [InlineKeyboardButton(text="✅ Проверить", callback_data=CB["check_gemini"])],
             [InlineKeyboardButton(text="◀️ Меню", callback_data=CB["main"])],
         ])
@@ -620,11 +635,10 @@ class TelegramBot:
     async def cb_edit_bump(self, call: CallbackQuery, state: FSMContext) -> None:
         await state.set_state(SetupStates.bump_interval)
         s = load_settings()
-        from config import BUMP_CHECK_MIN_SECONDS, BUMP_CHECK_MAX_SECONDS
         await call.message.answer(
-            f"Текущая база интервала: {int(s.bump_interval)} сек "
-            f"(проверка каждые {int(BUMP_CHECK_MIN_SECONDS / 60)}–{int(BUMP_CHECK_MAX_SECONDS / 60)} мин).\n"
-            f"Введите новую базу в секундах (рекомендуется 1200–1800):",
+            f"Текущий интервал проверки бампа: {int(s.bump_interval)} сек.\n"
+            "Рекомендуется <code>300</code> (проверка каждые ~5 мин).",
+            parse_mode="HTML",
         )
         await call.answer()
 
@@ -690,10 +704,9 @@ class TelegramBot:
         await message.answer("✅ Текст приветствия сохранён.", reply_markup=self._back_kb())
 
     async def on_bump(self, message: Message, state: FSMContext) -> None:
-        from config import BUMP_CHECK_MIN_SECONDS, BUMP_CHECK_MAX_SECONDS
         try:
             val = int((message.text or "").strip())
-            val = max(int(BUMP_CHECK_MIN_SECONDS), min(int(BUMP_CHECK_MAX_SECONDS), val))
+            val = max(300, min(330, val))
         except ValueError:
             await message.answer("❌ Введите число секунд")
             return
@@ -703,8 +716,7 @@ class TelegramBot:
         await self.automation.reload()
         await state.clear()
         await message.answer(
-            f"✅ База интервала бампа: {val} сек. "
-            f"Проверка каждые {int(BUMP_CHECK_MIN_SECONDS / 60)}–{int(BUMP_CHECK_MAX_SECONDS / 60)} мин.",
+            f"✅ Интервал проверки бампа: {val} сек (~{val // 60} мин).",
             reply_markup=self._back_kb(),
         )
 
@@ -737,8 +749,79 @@ class TelegramBot:
         await state.clear()
         await message.answer(f"✅ +{added} шт. для «{product}»", reply_markup=self._back_kb())
 
+    async def cb_edit_gemini_prompt(self, call: CallbackQuery, state: FSMContext) -> None:
+        if not await self._has_access(call.from_user.id):
+            return
+        await state.set_state(SetupStates.gemini_prompt)
+        s = load_settings()
+        await call.message.answer(
+            "📝 Отправьте новый <b>системный промпт</b> для Gemini-консультанта:\n\n"
+            f"<i>Текущий:</i>\n{s.ai_system_prompt[:500]}",
+            parse_mode="HTML",
+        )
+        await call.answer()
+
+    async def cb_edit_gemini_proxy(self, call: CallbackQuery, state: FSMContext) -> None:
+        if not await self._has_access(call.from_user.id):
+            return
+        await state.set_state(SetupStates.gemini_proxy)
+        s = load_settings()
+        await call.message.answer(
+            "🌐 Отправьте proxy для Gemini (или <code>-</code> чтобы очистить):\n"
+            f"Пример: <code>http://user:pass@host:8000</code>\n\n"
+            f"Текущий: <code>{s.gemini_proxy or '—'}</code>",
+            parse_mode="HTML",
+        )
+        await call.answer()
+
+    async def cb_upload_gemini_knowledge(self, call: CallbackQuery, state: FSMContext) -> None:
+        if not await self._has_access(call.from_user.id):
+            return
+        await state.set_state(SetupStates.gemini_knowledge)
+        await call.message.answer(
+            "📎 Отправьте файл <b>.txt</b> или <b>.md</b> с командами, инструкциями и БД для консультанта.\n"
+            "Содержимое будет добавлено к системному промпту Gemini.\n\n"
+            "/cancel — отмена",
+            parse_mode="HTML",
+        )
+        await call.answer()
+
     async def on_gemini_prompt(self, message: Message, state: FSMContext) -> None:
-        pass
+        text = (message.text or "").strip()
+        if not text or text.startswith("/"):
+            return
+        s = load_settings()
+        s.ai_system_prompt = text
+        save_settings(s)
+        self.automation._ai = AIService(load_settings())
+        await state.clear()
+        await message.answer("✅ Системный промпт сохранён.", reply_markup=self._back_kb())
+
+    async def on_gemini_proxy(self, message: Message, state: FSMContext) -> None:
+        raw = (message.text or "").strip()
+        if not raw or raw.startswith("/"):
+            return
+        s = load_settings()
+        s.gemini_proxy = "" if raw in ("-", "—", "нет", "off") else raw
+        save_settings(s)
+        await state.clear()
+        await message.answer(f"✅ Proxy: <code>{s.gemini_proxy or 'выключен'}</code>", parse_mode="HTML", reply_markup=self._back_kb())
+
+    async def on_gemini_knowledge(self, message: Message, state: FSMContext) -> None:
+        from config import CONSULTANT_KNOWLEDGE_FILE, KNOWLEDGE_DIR
+        if not message.document:
+            await message.answer("❌ Отправьте файл (.txt / .md)")
+            return
+        KNOWLEDGE_DIR.mkdir(parents=True, exist_ok=True)
+        file = await self.bot.get_file(message.document.file_id)
+        data = await self.bot.download_file(file.file_path)
+        content = data.read().decode("utf-8", errors="replace")
+        CONSULTANT_KNOWLEDGE_FILE.write_text(content, encoding="utf-8")
+        await state.clear()
+        await message.answer(
+            f"✅ База знаний загружена ({len(content)} симв.). Gemini-консультант будет использовать этот файл.",
+            reply_markup=self._back_kb(),
+        )
 
     # ── FPC-команды ───────────────────────────────────────────────────────
 

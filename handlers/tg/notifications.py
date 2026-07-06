@@ -20,7 +20,7 @@ logger = logging.getLogger("starvell.handlers.notify")
 NOTIFY_FIELDS = [
     ("notify_orders", "🛒 Заказы", "Новые оплаты и смена статусов"),
     ("notify_chats", "💬 Чаты", "Сообщения покупателей"),
-    ("notify_delivery", "📦 Выдача", "Автовыдача и ошибки склада"),
+    ("notify_delivery", "📦 Выдача", "Ошибки выдачи (склад отключён)"),
     ("notify_bump", "📈 Бамп", "Поднятие лотов"),
     ("notify_auth", "🔐 Сессия", "Проблемы авторизации Starvell"),
 ]

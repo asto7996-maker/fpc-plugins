@@ -15,7 +15,6 @@ from ai_service import AIService
 from config import BASE_DIR, Settings, compute_bump_check_interval, load_settings
 from database import Database
 from handlers.builtin import BuiltinHandlers
-from core.delivery.templates import append_refund_disclaimer, render_delivery_template
 from core.plugins.context import (
     BumpContext,
     DeliveryContext,
@@ -333,69 +332,7 @@ class AutomationEngine:
             logger.info("Заказ #%s: автовыдача отменена плагином", order_id)
             return
 
-        codes: list[str] = []
-        for _ in range(qty):
-            code = await self.db.pop_autodelivery_item(product_name)
-            if code:
-                codes.append(code)
-
-        if not codes:
-            await self.notify(
-                f"⚠️ Заказ #{order_id}: автовыдача — нет товара «{product_name}» на складе",
-                "notify_delivery",
-            )
-            return
-
-        content = "\n".join(codes)
-        delivery_text = render_delivery_template(
-            settings.delivery_template,
-            username=buyer,
-            order_id=order_id,
-            product_name=product_name,
-            product=product_name,
-            content=content,
-            price=price,
-            quantity=qty,
-        )
-        delivery_text = append_refund_disclaimer(delivery_text, strict=True)
-        delivery_text = api.apply_watermark(delivery_text, settings.watermark_on, settings.watermark_text)
-
-        delivery_ctx = DeliveryContext(
-            core=self.cardinal,
-            account_name=account_name,
-            order=order,
-            order_id=order_id,
-            status=str(order.get("status") or ""),
-            buyer_username=buyer,
-            buyer_id=(order.get("user") or {}).get("id"),
-            product_name=product_name,
-            price=price,
-            quantity=qty,
-            chat_id=order_ctx.chat_id,
-            delivery_text=delivery_text,
-            codes=codes,
-        )
-
-        delivery_text = delivery_ctx.delivery_text or delivery_text
-        buyer_id = delivery_ctx.buyer_id
-        chat_id = delivery_ctx.chat_id
-        if not chat_id and buyer_id:
-            chat_id = await api.find_chat_by_buyer(int(buyer_id))
-            delivery_ctx.chat_id = chat_id
-
-        if chat_id:
-            try:
-                await api.send_message(chat_id, delivery_text)
-                delivery_ctx.success = True
-                await self.notify(f"✅ Заказ #{order_id} оплачен. Товар выдан успешно.", "notify_delivery")
-            except Exception as exc:
-                delivery_ctx.error = str(exc)
-                await self.notify(f"❌ Заказ #{order_id}: ошибка выдачи — {exc}", "notify_delivery")
-        else:
-            delivery_ctx.error = "chat_not_found"
-            await self.notify(f"⚠️ Заказ #{order_id}: товар готов, но чат с покупателем не найден", "notify_delivery")
-
-        await self._emit_starvell(STV_POST_DELIVERY, delivery_ctx)
+        # Склад автовыдачи отключён — выдача только через плагины (VexBoost и т.д.)
 
     async def _handle_completed_order(
         self, account_name: str, api: StarvellAPI, settings: Settings, order: dict
@@ -404,17 +341,23 @@ class AutomationEngine:
         if await self.db.is_order_reviewed(order_id, account_name):
             return
 
+        order_ctx = await self._build_order_ctx(account_name, order)
+        await self._emit_starvell(STV_ORDER_COMPLETED, order_ctx)
+
+        if await self.db.is_order_reviewed(order_id, account_name):
+            return
+
         review_text = await self._handlers.on_order_completed(
             order=order, api=api, settings=settings, account_name=account_name
         )
         if not review_text:
+            await self.cardinal.event_manager.dispatch("on_order_completed", {"order": order, "account": account_name})
             return
 
         buyer_id = (order.get("user") or {}).get("id")
         chat_id = await api.find_chat_by_buyer(int(buyer_id)) if buyer_id else None
 
         sent = False
-        # Ответ на отзыв через API
         try:
             result = await api.send_review_reply(order_id, review_text)
             if result.get("success"):
@@ -422,7 +365,6 @@ class AutomationEngine:
         except Exception:
             pass
 
-        # Fallback — сообщение в чат
         if not sent and chat_id:
             try:
                 await api.send_message(chat_id, review_text)
@@ -434,8 +376,6 @@ class AutomationEngine:
             await self.db.mark_order_reviewed(order_id, account_name)
             await self.notify(f"⭐ Заказ #{order_id} завершён. Благодарность отправлена.", "notify_orders")
 
-        order_ctx = await self._build_order_ctx(account_name, order)
-        await self._emit_starvell(STV_ORDER_COMPLETED, order_ctx)
         await self.cardinal.event_manager.dispatch("on_order_completed", {"order": order, "account": account_name})
 
     async def _bootstrap_orders(self, account_name: str, api: StarvellAPI) -> None:

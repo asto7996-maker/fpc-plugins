@@ -21,6 +21,9 @@ def format_vars(text: str, **kwargs: Any) -> str:
     return text
 
 
+GEMINI_REVIEW_UUID = "c4e8b2f1-9a3d-4e7b-8c6f-2d1a5e9b0c3f"
+
+
 class BuiltinHandlers:
     def __init__(self, cardinal: Any) -> None:
         self.cardinal = cardinal
@@ -97,6 +100,9 @@ class BuiltinHandlers:
         self, *, order: dict, api: Any, settings: Settings, account_name: str
     ) -> str | None:
         if not await self.db.get_feature_flag("auto_review", settings.auto_review_enabled):
+            return None
+        pm = getattr(self.cardinal, "plugin_manager", None)
+        if pm and GEMINI_REVIEW_UUID in pm.plugins and pm.plugins[GEMINI_REVIEW_UUID].enabled:
             return None
         order_id = str(order.get("id"))
         review = order.get("review") or {}

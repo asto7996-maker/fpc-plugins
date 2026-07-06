@@ -25,6 +25,8 @@ GITHUB_REPO = "asto7996-maker/fpc-plugins"
 GITHUB_BRANCH = "cursor/parser-auto-create-6ec3"
 BACKUP_DIR = STORAGE_DIR / "backups"
 PRODUCTS_DIR = STORAGE_DIR / "products"
+KNOWLEDGE_DIR = STORAGE_DIR / "knowledge"
+CONSULTANT_KNOWLEDGE_FILE = KNOWLEDGE_DIR / "consultant_knowledge.txt"
 
 DEFAULT_AI_SYSTEM_PROMPT = (
     "Ты — дружелюбный и профессиональный менеджер магазина на Starvell. "
@@ -99,9 +101,9 @@ class Settings:
     # Тайминги
     chat_poll_interval: float = 4.0
     orders_poll_interval: float = 4.0
-    bump_interval: float = 1500.0  # 25 мин — центр окна проверки 20–30 мин
-    bump_jitter_min: int = -300
-    bump_jitter_max: int = 300
+    bump_interval: float = 300.0
+    bump_jitter_min: int = 0
+    bump_jitter_max: int = 30
     api_delay_seconds: float = 0.8
     api_max_per_minute: int = 40
 
@@ -128,6 +130,7 @@ class Settings:
     # Gemini
     gemini_api_key: str = ""
     gemini_model: str = "gemini-2.0-flash"
+    gemini_proxy: str = ""
     ai_system_prompt: str = DEFAULT_AI_SYSTEM_PROMPT
     ai_word_blacklist: list[str] = field(default_factory=lambda: [
         "взлом", "чит", "обман", "скам", "refund", "возврат", "арбитраж", "мошенник",
@@ -168,7 +171,7 @@ class Settings:
         return bool(self.gemini_api_key.strip())
 
     def ensure_dirs(self) -> None:
-        for path in (CONFIG_DIR, STORAGE_DIR, LOGS_DIR, PLUGINS_DIR, PLUGIN_STATE_PATH.parent, BACKUP_DIR, PRODUCTS_DIR):
+        for path in (CONFIG_DIR, STORAGE_DIR, LOGS_DIR, PLUGINS_DIR, PLUGIN_STATE_PATH.parent, BACKUP_DIR, PRODUCTS_DIR, KNOWLEDGE_DIR):
             path.mkdir(parents=True, exist_ok=True)
 
 
@@ -186,12 +189,12 @@ def _account_to_dict(acc: StarvellAccount) -> dict[str, Any]:
     return asdict(acc)
 
 
-BUMP_CHECK_MIN_SECONDS = 1200.0   # 20 мин
-BUMP_CHECK_MAX_SECONDS = 1800.0   # 30 мин
+BUMP_CHECK_MIN_SECONDS = 300.0    # 5 мин — проверка «можно ли поднять»
+BUMP_CHECK_MAX_SECONDS = 330.0    # до 5.5 мин с джиттером
 
 
 def compute_bump_check_interval(settings: Settings) -> float:
-    """Случайный интервал проверки автобампа в окне 20–30 минут."""
+    """Интервал проверки автобампа (~300 сек)."""
     import random
     jitter = random.randint(settings.bump_jitter_min, settings.bump_jitter_max)
     interval = float(settings.bump_interval) + jitter
