@@ -53,6 +53,7 @@ CB = {
     "adel_add": "sc:adel_add",
     "edit_welcome": "sc:edit_welcome",
     "edit_bump": "sc:edit_bump",
+    "edit_delivery": "sc:edit_delivery",
     "edit_gemini_prompt": "sc:edit_gemini_prompt",
     "edit_gemini_proxy": "sc:edit_gemini_proxy",
     "upload_gemini_knowledge": "sc:upload_gemini_knowledge",
