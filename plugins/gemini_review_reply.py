@@ -41,7 +41,7 @@ except ImportError:
 
 
 NAME          = "Gemini Review Reply"
-VERSION       = "3.0.3"
+VERSION       = "3.0.4"
 DESCRIPTION   = "ИИ-ответы на отзывы FunPay (Gemini AQ + HTTP/SOCKS proxy + batch) 🌈"
 CREDITS       = "Cursor AI"
 UUID          = "c4e8b2f1-9a3d-4e7b-8c6f-2d1a5e9b0c3f"
@@ -106,6 +106,11 @@ MONTHS_RU = [
 
 logger = logging.getLogger("FPC.GeminiReviews")
 _P = "[GeminiReviews]"
+
+_REVIEW_MSG_TYPES = (
+    MessageTypes.NEW_FEEDBACK,
+    MessageTypes.FEEDBACK_CHANGED,
+)
 
 _plugin: "Plugin | None" = None
 
@@ -332,9 +337,15 @@ class Plugin:
             if os.path.exists(SETTINGS_FILE):
                 with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
                     loaded = json.load(f)
+                old_ver = str(loaded.get("_cfg_version", "0"))
                 for k, v in defaults.items():
                     loaded.setdefault(k, v)
+                if old_ver < "3.0.4":
+                    loaded["reply_on_changed"] = True
+                    loaded["_cfg_version"] = "3.0.4"
                 self._cfg = loaded
+                if old_ver < "3.0.4":
+                    self._save_settings()
             else:
                 self._cfg = defaults
                 self._save_settings()
@@ -342,12 +353,15 @@ class Plugin:
             logger.error("%s settings load: %s", _P, exc)
             self._cfg = defaults
 
-    def _save_settings(self) -> None:
+    def _save_settings_dict(self, cfg: dict[str, Any]) -> None:
         with self._lock:
             tmp = f"{SETTINGS_FILE}.tmp"
             with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(self._cfg, f, indent=4, ensure_ascii=False)
+                json.dump(cfg, f, indent=4, ensure_ascii=False)
             os.replace(tmp, SETTINGS_FILE)
+
+    def _save_settings(self) -> None:
+        self._save_settings_dict(self._cfg)
 
     def get_cfg(self, key: str, default: Any = None) -> Any:
         field = self.get_schema_field(key)
@@ -377,9 +391,10 @@ class Plugin:
             "chat_prompt": DEFAULT_CHAT_PROMPT,
             "temperature": "0.95",
             "send_chat_message": True,
-            "reply_on_changed": False,
+            "reply_on_changed": True,
             "batch_count": 5,
             "recent_replies": [],
+            "_cfg_version": "3.0.4",
         }
 
     @staticmethod
@@ -405,6 +420,12 @@ class Plugin:
             {"key": "review_prompt", "label": "Промпт ответа на отзыв", "type": "multiline", "default": DEFAULT_REVIEW_PROMPT},
             {"key": "temperature", "label": "Temperature", "type": "text", "default": "0.95"},
             {"key": "send_chat_message", "label": "Благодарность в чат", "type": "bool", "default": True},
+            {
+                "key": "reply_on_changed",
+                "label": "Отвечать при изменении/переписывании отзыва",
+                "type": "bool",
+                "default": True,
+            },
             {"key": "batch_count", "label": "N для ручной обработки старых отзывов", "type": "int", "default": 5, "min": 1, "max": 50},
             {"key": "reply_recent", "label": "▶ Вручную: ответить на N старых отзывов", "type": "action"},
             {"key": "test_gemini", "label": "🧪 Тест Gemini API", "type": "action"},
@@ -462,6 +483,10 @@ class Plugin:
             lines.append("⚡ <b>Автоответ:</b> включён — отвечаем сразу при новом отзыве")
         else:
             lines.append("🔴 <b>Автоответ выключен</b> — только кнопка ручной обработки N отзывов")
+        if self.get_cfg("reply_on_changed"):
+            lines.append("🔄 <b>Изменённые отзывы:</b> отвечаем при переписывании")
+        else:
+            lines.append("🔴 <b>Изменённые отзывы игнорируются</b>")
         if self._batch_running:
             lines.append("⏳ <b>Пакетная обработка…</b>")
         return "\n".join(lines)
@@ -631,10 +656,17 @@ class Plugin:
         )
 
     def _extract_order_id(self, obj: Any) -> str | None:
-        match = RegularExpressions().ORDER_ID.findall(str(obj))
-        if match:
-            oid = match[0]
-            return oid[1:] if oid.startswith("#") else oid
+        for source in (
+            getattr(obj, "text", None),
+            getattr(obj, "last_message_text", None),
+            str(obj),
+        ):
+            if not source:
+                continue
+            match = RegularExpressions().ORDER_ID.findall(str(source))
+            if match:
+                oid = match[0]
+                return oid[1:] if oid.startswith("#") else oid
         try:
             order = self.cardinal.get_order_from_object(obj)
             if order:
@@ -643,29 +675,32 @@ class Plugin:
             pass
         return None
 
-    def _resolve_review_order(self, obj: Any) -> Order | None:
-        """Получить заказ с отзывом; FunPay иногда отдаёт данные с задержкой."""
-        order_id = self._extract_order_id(obj)
-        delays = (0, 0.3, 0.6, 1.0, 1.5, 2.5, 4.0, 6.0, 8.0)
+    def _fetch_order_with_review(self, order_id: str) -> Order | None:
+        """Свежий get_order — без кэша get_order_from_object на объекте сообщения."""
+        delays = (0, 0.3, 0.6, 1.0, 1.5, 2.5, 4.0, 6.0, 8.0, 10.0)
         for delay in delays:
             if delay:
                 time.sleep(delay)
             try:
-                order = self.cardinal.get_order_from_object(obj)
-                if order and order.review and order.review.stars:
+                order = self.cardinal.account.get_order(order_id)
+                if order.review and order.review.stars:
                     return order
-                if order and not order_id:
-                    order_id = order.id
             except Exception as exc:
-                logger.debug("%s get_order_from_object: %s", _P, exc)
-            if order_id:
-                try:
-                    order = self.cardinal.account.get_order(order_id)
-                    if order.review and order.review.stars:
-                        return order
-                except Exception as exc:
-                    logger.debug("%s get_order #%s: %s", _P, order_id, exc)
+                logger.debug("%s get_order #%s: %s", _P, order_id, exc)
         return None
+
+    def _should_skip_review(self, order: Order, msg_type: MessageTypes) -> bool:
+        """Пропуск только если на NEW_FEEDBACK уже есть наш недавний ответ."""
+        if msg_type != MessageTypes.NEW_FEEDBACK:
+            return False
+        seller_reply = _seller_review_reply(order.review)
+        if not seller_reply:
+            return False
+        oid = order.id
+        for entry in reversed(self.get_cfg("recent_replies", [])):
+            if entry.get("order_id") == oid:
+                return True
+        return False
 
     def _handle_instant_review(self, obj: Any, chat_id: Any, msg_type: MessageTypes) -> None:
         """Мгновенная обработка нового/изменённого отзыва (в фоновом потоке)."""
@@ -675,14 +710,18 @@ class Plugin:
                 logger.warning("%s не удалось определить заказ из события отзыва: %s", _P, str(obj)[:200])
                 return
 
-            self.log("⚡ Получен отзыв #%s — отвечаю немедленно…", order_id)
-            order = self._resolve_review_order(obj)
+            self.log(
+                "⚡ Событие %s для #%s — отвечаю немедленно…",
+                msg_type.name if hasattr(msg_type, "name") else msg_type,
+                order_id,
+            )
+            order = self._fetch_order_with_review(order_id)
             if not order or not order.review or not order.review.stars:
                 logger.error("%s отзыв #%s не появился на FunPay вовремя", _P, order_id)
                 return
 
-            if msg_type == MessageTypes.NEW_FEEDBACK and _seller_review_reply(order.review):
-                self.log("Отзыв #%s уже имеет ответ продавца — пропуск", order_id)
+            if self._should_skip_review(order, msg_type):
+                self.log("Отзыв #%s уже обработан ранее — пропуск", order_id)
                 return
 
             self.process_order(order, chat_id)
@@ -734,18 +773,20 @@ class Plugin:
                 self._processing.discard(oid)
 
     def fetch_unanswered_reviews(self, limit: int) -> list[tuple[Order, datetime | None]]:
-        result: list[tuple[Order, datetime | None]] = []
+        """Последние отзывы покупателей без ответа продавца."""
+        reviewed_pool: list[tuple[Order, datetime | None]] = []
         start_from: str | None = None
         seen_ids: set[str] = set()
-        max_pages = 15
-        for _ in range(max_pages):
-            if len(result) >= limit:
+        pool_target = max(limit * 8, 40)
+        max_pages = 30
+        for page in range(max_pages):
+            if len(reviewed_pool) >= pool_target:
                 break
             try:
                 next_id, sales, _, _ = self.cardinal.account.get_sales(
                     start_from=start_from,
                     include_closed=True,
-                    include_paid=False,
+                    include_paid=True,
                     include_refunded=False,
                 )
             except Exception as exc:
@@ -759,20 +800,33 @@ class Plugin:
                 seen_ids.add(shortcut.id)
                 try:
                     order = self.cardinal.account.get_order(shortcut.id)
-                except Exception:
+                except Exception as exc:
+                    logger.debug("%s get_order #%s: %s", _P, shortcut.id, exc)
                     continue
                 if not order.review or not order.review.stars:
                     continue
-                if _seller_review_reply(order.review):
+                if order.review.hidden:
                     continue
-                result.append((order, shortcut.date))
-                if len(result) >= limit:
+                reviewed_pool.append((order, shortcut.date))
+                if len(reviewed_pool) >= pool_target:
                     break
             if not next_id:
                 break
             start_from = next_id
-            time.sleep(0.5)
-        return result[:limit]
+            time.sleep(0.35)
+
+        result: list[tuple[Order, datetime | None]] = []
+        for order, sdate in reviewed_pool:
+            if _seller_review_reply(order.review):
+                continue
+            result.append((order, sdate))
+            if len(result) >= limit:
+                break
+        self.log(
+            "Найдено %s неотвеченных из %s последних отзывов (запрошено %s)",
+            len(result), len(reviewed_pool), limit,
+        )
+        return result
 
     def batch_reply_recent(self, notify_chat_id: int | None = None) -> None:
         """Ручная обработка N последних неотвеченных отзывов (не ждёт новые)."""
@@ -984,11 +1038,9 @@ class Plugin:
             return
 
         msg_type = event.message.type
-        if msg_type == MessageTypes.NEW_FEEDBACK:
-            pass
-        elif msg_type == MessageTypes.FEEDBACK_CHANGED and self.get_cfg("reply_on_changed"):
-            pass
-        else:
+        if msg_type not in _REVIEW_MSG_TYPES:
+            return
+        if msg_type == MessageTypes.FEEDBACK_CHANGED and not self.get_cfg("reply_on_changed"):
             return
 
         if event.message.i_am_buyer:
@@ -1005,7 +1057,7 @@ class Plugin:
         if not self.cardinal.old_mode_enabled or not self.get_cfg("enabled"):
             return
         chat = event.chat
-        if chat.last_message_type not in (MessageTypes.NEW_FEEDBACK, MessageTypes.FEEDBACK_CHANGED):
+        if chat.last_message_type not in _REVIEW_MSG_TYPES:
             return
         if chat.last_message_type == MessageTypes.FEEDBACK_CHANGED and not self.get_cfg("reply_on_changed"):
             return
