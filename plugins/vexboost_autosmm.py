@@ -122,6 +122,10 @@ DEFAULT_TEMPLATES: dict[str, str] = {
     ),
     "pending_hint_message": "⚪️ Отправьте + для подтверждения, - для отмены или новую ссылку.",
     "send_link_first_message": "⚪️ Сначала отправьте ссылку для накрутки.",
+    "link_reminder_message": (
+        "⚪️ Ожидаю ссылку для накрутки.\n"
+        "Отправьте полный URL (https://...)."
+    ),
     "private_telegram_message": (
         "❌ Закрытые Telegram-каналы/группы не поддерживаются.\n"
         "Используйте публичную ссылку: https://t.me/your_channel"
@@ -154,7 +158,7 @@ logger = logging.getLogger("starvell.plugin.vexboost")
 
 # Starvell rate-limit уже в starvell_api._throttle; здесь только минимальный зазор.
 STV_MIN_API_GAP = 0.3
-MESSAGE_DEDUP_TTL = 15.0
+LINK_REMINDER_COOLDOWN = 1800  # 30 мин между напоминаниями о ссылке
 
 
 class _MessageDedup:
@@ -880,10 +884,9 @@ class Plugin(StarvellPlugin):
             self.log("catchup: waiting #%s buyer=%s", oid, octx.buyer_username)
             chat_id = str(entry.get("chat_id") or "")
             if chat_id:
-                try:
-                    await api.send_message(chat_id, await self._msg("welcome_message", order_id=oid))
-                except Exception as exc:
-                    self.log("catchup welcome #%s: %s", oid, exc, level="warning")
+                await self._send_welcome_once(
+                    oid, entry=entry, api=api, chat_id=chat_id,
+                )
                 orphan_link = orphans.pop(chat_id, None)
                 if orphan_link:
                     _save_json("orphan_links.json", orphans)
@@ -1186,7 +1189,9 @@ class Plugin(StarvellPlugin):
         service_id: int,
         quantity: int,
     ) -> dict | None:
-        order_id = ctx.order_id
+        order_id = str(ctx.order_id or "")
+        if not order_id:
+            return None
         submitted = _load_json("submitted.json", {})
         if order_id in submitted:
             return None
@@ -1226,6 +1231,69 @@ class Plugin(StarvellPlugin):
         _save_json("waiting.json", waiting)
         StatisticsManager.record_created(service_id, float(price_rub))
         return entry
+
+    def _claim_welcome_slot(self, order_id: str) -> bool:
+        """Атомарно помечает welcome_sent — True только первому вызову."""
+        oid = str(order_id or "")
+        if not oid:
+            return False
+        waiting = _load_json("waiting.json", [])
+        for item in waiting:
+            if str(item.get("order_id")) != oid:
+                continue
+            if item.get("welcome_sent"):
+                return False
+            item["welcome_sent"] = True
+            item["welcome_sent_at"] = int(time.time())
+            _save_json("waiting.json", waiting)
+            return True
+        return True
+
+    async def _send_welcome_once(
+        self,
+        order_id: str,
+        *,
+        ctx: OrderContext | None = None,
+        entry: dict | None = None,
+        api: Any = None,
+        chat_id: str = "",
+    ) -> bool:
+        oid = str(order_id or "")
+        if not oid or not self._claim_welcome_slot(oid):
+            return False
+
+        welcome = await self._msg("welcome_message", order_id=oid)
+        sent = False
+        if ctx:
+            sent = await ctx.send_to_buyer(welcome)
+            chat_id = chat_id or str((entry or {}).get("chat_id") or ctx.chat_id or "")
+            api = api or ctx.api()
+        if not sent and chat_id and api:
+            try:
+                await api.send_message(str(chat_id), welcome)
+                sent = True
+            except Exception as exc:
+                self.log("welcome send #%s: %s", oid, exc, level="warning")
+        if not sent and ctx:
+            await ctx.notify(
+                f"⚠️ VexBoost #{oid}: не удалось отправить приветствие "
+                f"(buyer={ctx.buyer_username}, chat={chat_id or '—'})",
+                "notify_orders",
+                order_id=oid,
+            )
+        return sent
+
+    async def _maybe_remind_link(self, ctx: MessageContext, order: dict) -> None:
+        if order.get("link"):
+            return
+        now = int(time.time())
+        last = int(order.get("link_reminder_at") or 0)
+        if last and now - last < LINK_REMINDER_COOLDOWN:
+            return
+        order = dict(order)
+        order["link_reminder_at"] = now
+        self._persist_waiting_order(order)
+        await self._safe_reply(ctx, await self._msg("link_reminder_message"))
 
     async def _recover_order_for_buyer(self, ctx: MessageContext) -> dict | None:
         """Если waiting пуст — ищем CREATED заказ покупателя в Starvell (как FPC payorders)."""
@@ -1372,22 +1440,7 @@ class Plugin(StarvellPlugin):
         if not entry:
             return
 
-        welcome = await self._msg("welcome_message", order_id=ctx.order_id)
-        sent = await ctx.send_to_buyer(welcome)
-        if not sent and entry.get("chat_id"):
-            api = ctx.api()
-            if api:
-                try:
-                    await api.send_message(str(entry["chat_id"]), welcome)
-                    sent = True
-                except Exception as exc:
-                    self.log("welcome send: %s", exc, level="error")
-        if not sent:
-            await ctx.notify(
-                f"⚠️ VexBoost #{ctx.order_id}: не удалось отправить приветствие "
-                f"(buyer={ctx.buyer_username}, chat={entry.get('chat_id') or '—'})",
-                "notify_orders", order_id=ctx.order_id,
-            )
+        await self._send_welcome_once(ctx.order_id, ctx=ctx, entry=entry)
 
         orphans = _load_json("orphan_links.json", {})
         if orphans:
@@ -1486,7 +1539,8 @@ class Plugin(StarvellPlugin):
 
         if order:
             ctx.mark_handled()
-            await self._safe_reply(ctx, await self._msg("welcome_message"))
+            if not order.get("link") and _looks_like_link_attempt(text):
+                await self._maybe_remind_link(ctx, order)
             return
 
         if links or _looks_like_link_attempt(text):
