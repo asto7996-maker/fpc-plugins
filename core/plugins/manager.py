@@ -291,7 +291,7 @@ class PluginEngine:
             is_base_plugin=is_base,
             settings_callback=settings_cb,
             hook_only=hook_only,
-            has_settings_page=self._has_settings_ui(settings_page, instance, is_base, is_stv, settings_cb),
+            has_settings_page=bool(settings_page or settings_cb),
             pinned=False,
             is_starvell_native=is_stv,
             is_fpc_only=False,
@@ -309,6 +309,24 @@ class PluginEngine:
         self.plugins[uuid] = new_rec
         logger.info("Hot-reload плагина %s v%s", new_rec.name, new_rec.version)
         return new_rec
+
+    async def ensure_plugin_instance(self, uuid: str) -> tuple[Any | None, PluginRecord | None]:
+        """Возвращает instance плагина, при необходимости перезагружает файл."""
+        rec = self.plugins.get(uuid)
+        if not rec:
+            return None, None
+        if rec.instance:
+            return rec.instance, rec
+        if not os.path.isfile(rec.path):
+            return None, rec
+        try:
+            new_rec = await self.reload_plugin(uuid)
+            if new_rec and new_rec.instance:
+                return new_rec.instance, new_rec
+        except Exception as exc:
+            logger.warning("ensure_plugin_instance %s: %s", uuid, exc)
+        rec = self.plugins.get(uuid)
+        return (rec.instance if rec else None), rec
 
     async def reload_changed(self) -> list[str]:
         """Перезагружает плагины, чьи файлы изменились на диске."""

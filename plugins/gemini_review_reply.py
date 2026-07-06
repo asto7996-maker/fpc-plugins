@@ -10,8 +10,13 @@ from typing import Any
 
 import httpx
 
-from gemini_api import client_kwargs, post_generate
 from starvell_sdk import OrderContext, StarvellPlugin, on_order_completed
+
+GEMINI_MODELS = (
+    "gemini-2.5-flash-lite",
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
+)
 
 NAME = "Gemini Review Reply"
 VERSION = "2.0.0"
@@ -132,19 +137,34 @@ class Plugin(StarvellPlugin):
             "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
             "generationConfig": {"temperature": temperature, "maxOutputTokens": 900},
         }
+        client_kwargs: dict[str, Any] = {"timeout": 60.0}
+        if proxy:
+            client_kwargs["proxy"] = proxy
+
+        models = [model] + [m for m in GEMINI_MODELS if m != model]
+        headers = {"Content-Type": "application/json", "x-goog-api-key": api_key}
+
         try:
-            async with httpx.AsyncClient(**client_kwargs(proxy, timeout=60.0)) as client:
-                resp = await post_generate(client, api_key, model, payload)
-                if resp.status_code != 200:
-                    self.log("Gemini HTTP %s: %s", resp.status_code, resp.text[:200], level="warning")
-                    return None
-                data = resp.json()
-                candidates = data.get("candidates") or []
-                if not candidates:
-                    return None
-                parts = candidates[0].get("content", {}).get("parts", [])
-                text = "\n".join(p.get("text", "") for p in parts if p.get("text")).strip()
-                return text[:900] if text else None
+            async with httpx.AsyncClient(**client_kwargs) as client:
+                for try_model in models:
+                    url = (
+                        "https://generativelanguage.googleapis.com/v1beta/models/"
+                        f"{try_model}:generateContent"
+                    )
+                    resp = await client.post(url, json=payload, headers=headers)
+                    if resp.status_code == 404:
+                        continue
+                    if resp.status_code != 200:
+                        self.log("Gemini HTTP %s (%s): %s", resp.status_code, try_model, resp.text[:200], level="warning")
+                        continue
+                    data = resp.json()
+                    candidates = data.get("candidates") or []
+                    if not candidates:
+                        continue
+                    parts = candidates[0].get("content", {}).get("parts", [])
+                    text = "\n".join(p.get("text", "") for p in parts if p.get("text")).strip()
+                    return text[:900] if text else None
+                return None
         except Exception as exc:
             self.log("Gemini error: %s", exc, level="warning")
             return None

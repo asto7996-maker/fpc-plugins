@@ -34,11 +34,28 @@ def _field_page(inst: Any, field_idx: int) -> int:
     return max(0, field_idx // page_size)
 
 
-def _get_plugin_instance(pm: Any, uuid: str) -> Any | None:
+async def _resolve_plugin_instance(pm: Any, uuid: str) -> tuple[Any | None, Any | None]:
+    if hasattr(pm, "ensure_plugin_instance"):
+        return await pm.ensure_plugin_instance(uuid)
     rec = pm.plugins.get(uuid)
     if not rec or not rec.instance:
-        return None
-    return rec.instance
+        return None, rec
+    return rec.instance, rec
+
+
+def _plugin_unavailable_text(rec: Any | None) -> str:
+    if not rec:
+        return "❌ Плагин не найден. Откройте список плагинов заново."
+    if rec.load_error:
+        return f"❌ Плагин не загружен:\n<code>{rec.load_error}</code>\n\nПерезагрузите плагин в карточке (🔄) или обновите бота."
+    return "❌ Плагин не загружен. Перезагрузите его в карточке плагина."
+
+
+async def _answer_plugin_unavailable(call: CallbackQuery, rec: Any | None) -> None:
+    msg = _plugin_unavailable_text(rec).replace("<code>", "").replace("</code>", "")
+    if len(msg) > 180:
+        msg = msg[:177] + "…"
+    await call.answer(msg, show_alert=True)
 
 
 def _validate_value(field: dict[str, Any], raw: str) -> tuple[Any | None, str | None]:
@@ -108,9 +125,9 @@ def create_plugin_settings_router(ctx: Any) -> Router:
         if not await ctx._has_access(call.from_user.id):
             return
         uuid, token = _parse_uuid_key(call.data, CBT.PLUGIN_SETTING)
-        inst = _get_plugin_instance(pm, uuid)
+        inst, rec = await _resolve_plugin_instance(pm, uuid)
         if not inst:
-            await call.answer("Плагин не загружен", show_alert=True)
+            await _answer_plugin_unavailable(call, rec)
             return
         field = resolve_schema_field(inst, token)
         if not field or field.get("type") != "bool":
@@ -127,9 +144,9 @@ def create_plugin_settings_router(ctx: Any) -> Router:
         if not await ctx._has_access(call.from_user.id):
             return
         uuid, token = _parse_uuid_key(call.data, CBT.PLUGIN_EDIT)
-        inst = _get_plugin_instance(pm, uuid)
+        inst, rec = await _resolve_plugin_instance(pm, uuid)
         if not inst:
-            await call.answer("Плагин не загружен", show_alert=True)
+            await _answer_plugin_unavailable(call, rec)
             return
         field = resolve_schema_field(inst, token)
         if not field:
@@ -178,10 +195,10 @@ def create_plugin_settings_router(ctx: Any) -> Router:
             await state.clear()
             return
 
-        inst = _get_plugin_instance(pm, uuid)
+        inst, rec = await _resolve_plugin_instance(pm, uuid)
         if not inst:
             await state.clear()
-            await message.answer("❌ Плагин не загружен")
+            await message.answer(_plugin_unavailable_text(rec))
             return
 
         field = inst.get_schema_field(key)
@@ -224,9 +241,9 @@ def create_plugin_settings_router(ctx: Any) -> Router:
         if not await ctx._has_access(call.from_user.id):
             return
         uuid, token = _parse_uuid_key(call.data, CBT.PLUGIN_SELECT_MENU)
-        inst = _get_plugin_instance(pm, uuid)
+        inst, rec = await _resolve_plugin_instance(pm, uuid)
         if not inst:
-            await call.answer("Плагин не загружен", show_alert=True)
+            await _answer_plugin_unavailable(call, rec)
             return
         field = resolve_schema_field(inst, token)
         if not field or field.get("type") != "select":
@@ -271,9 +288,9 @@ def create_plugin_settings_router(ctx: Any) -> Router:
             await call.answer("Ошибка", show_alert=True)
             return
 
-        inst = _get_plugin_instance(pm, uuid)
+        inst, rec = await _resolve_plugin_instance(pm, uuid)
         if not inst:
-            await call.answer("Плагин не загружен", show_alert=True)
+            await _answer_plugin_unavailable(call, rec)
             return
         field = resolve_schema_field(inst, field_token)
         if not field:
@@ -299,7 +316,7 @@ def create_plugin_settings_router(ctx: Any) -> Router:
         if not await ctx._has_access(call.from_user.id):
             return
         uuid, token = _parse_uuid_key(call.data, CBT.PLUGIN_SCHEMA_ACT)
-        inst = _get_plugin_instance(pm, uuid)
+        inst, rec = await _resolve_plugin_instance(pm, uuid)
         field = resolve_schema_field(inst, token) if inst else None
         key = field["key"] if field else token
         page = _field_page(inst, int(token)) if inst and token.isdigit() else 0
@@ -316,7 +333,7 @@ def create_plugin_settings_router(ctx: Any) -> Router:
             return
         await state.clear()
         uuid = call.data.replace(CBT.PLUGIN_RESET, "").split(":")[0]
-        inst = _get_plugin_instance(pm, uuid)
+        inst, rec = await _resolve_plugin_instance(pm, uuid)
         if inst:
             from core.plugins.settings_store import PluginSettingsStore
 
@@ -325,7 +342,7 @@ def create_plugin_settings_router(ctx: Any) -> Router:
             await call.answer("✅ Настройки сброшены")
             await _show_settings(call, pm, uuid)
             return
-        await call.answer("Плагин не найден", show_alert=True)
+        await _answer_plugin_unavailable(call, rec)
 
     return router
 
@@ -343,7 +360,7 @@ async def _show_settings(
         await call.answer("Плагин не найден", show_alert=True)
         return
 
-    inst = rec.instance
+    inst, rec = await _resolve_plugin_instance(pm, uuid)
     if inst and hasattr(inst, "render_settings_text") and hasattr(inst, "build_settings_keyboard"):
         async def render() -> None:
             try:
@@ -384,9 +401,11 @@ async def _show_settings(
         text += f"\n⚠️ {rec.load_error}"
     from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
-    kb = InlineKeyboardMarkup(inline_keyboard=[
+    rows = [
+        [InlineKeyboardButton(text="🔄 Перезагрузить", callback_data=f"{CBT.PLUGIN_RELOAD}{uuid}")],
         [InlineKeyboardButton(text="◀️ Плагины", callback_data=CBT.PLUGINS)],
-    ])
+    ]
+    kb = InlineKeyboardMarkup(inline_keyboard=rows)
     if skip_loading:
         await call.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
     else:
