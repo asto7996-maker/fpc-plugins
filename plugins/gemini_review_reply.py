@@ -41,7 +41,7 @@ except ImportError:
 
 
 NAME          = "Gemini Review Reply"
-VERSION       = "3.0.2"
+VERSION       = "3.0.3"
 DESCRIPTION   = "ИИ-ответы на отзывы FunPay (Gemini AQ + HTTP/SOCKS proxy + batch) 🌈"
 CREDITS       = "Cursor AI"
 UUID          = "c4e8b2f1-9a3d-4e7b-8c6f-2d1a5e9b0c3f"
@@ -300,6 +300,13 @@ def _format_datetime(dt: datetime) -> str:
 
 def _escape(val: Any) -> str:
     return html.escape(str(val if val is not None else ""))
+
+
+def _seller_review_reply(review: Any) -> str | None:
+    """Текст ответа продавца на отзыв (FunPayAPI: .reply, не .answer)."""
+    if not review:
+        return None
+    return getattr(review, "reply", None) or getattr(review, "answer", None)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -624,50 +631,64 @@ class Plugin:
         )
 
     def _extract_order_id(self, obj: Any) -> str | None:
+        match = RegularExpressions().ORDER_ID.findall(str(obj))
+        if match:
+            oid = match[0]
+            return oid[1:] if oid.startswith("#") else oid
         try:
             order = self.cardinal.get_order_from_object(obj)
             if order:
                 return order.id
         except Exception:
             pass
-        match = RegularExpressions().ORDER_ID.findall(str(obj))
-        if not match:
-            return None
-        oid = match[0]
-        return oid[1:] if oid.startswith("#") else oid
+        return None
 
-    def _wait_for_review_order(self, order_id: str) -> Order | None:
-        """FunPay иногда отдаёт заказ без отзыва в первые секунды — ждём и перезапрашиваем."""
-        delays = (0, 0.4, 0.8, 1.2, 2.0, 3.0, 4.0, 5.0)
+    def _resolve_review_order(self, obj: Any) -> Order | None:
+        """Получить заказ с отзывом; FunPay иногда отдаёт данные с задержкой."""
+        order_id = self._extract_order_id(obj)
+        delays = (0, 0.3, 0.6, 1.0, 1.5, 2.5, 4.0, 6.0, 8.0)
         for delay in delays:
             if delay:
                 time.sleep(delay)
             try:
-                order = self.cardinal.account.get_order(order_id)
-                if order.review and order.review.stars:
+                order = self.cardinal.get_order_from_object(obj)
+                if order and order.review and order.review.stars:
                     return order
+                if order and not order_id:
+                    order_id = order.id
             except Exception as exc:
-                logger.debug("%s get_order #%s: %s", _P, order_id, exc)
+                logger.debug("%s get_order_from_object: %s", _P, exc)
+            if order_id:
+                try:
+                    order = self.cardinal.account.get_order(order_id)
+                    if order.review and order.review.stars:
+                        return order
+                except Exception as exc:
+                    logger.debug("%s get_order #%s: %s", _P, order_id, exc)
         return None
 
     def _handle_instant_review(self, obj: Any, chat_id: Any, msg_type: MessageTypes) -> None:
         """Мгновенная обработка нового/изменённого отзыва (в фоновом потоке)."""
-        order_id = self._extract_order_id(obj)
-        if not order_id:
-            logger.warning("%s не удалось определить заказ из события отзыва", _P)
-            return
+        try:
+            order_id = self._extract_order_id(obj)
+            if not order_id:
+                logger.warning("%s не удалось определить заказ из события отзыва: %s", _P, str(obj)[:200])
+                return
 
-        self.log("⚡ Получен отзыв #%s — отвечаю немедленно…", order_id)
-        order = self._wait_for_review_order(order_id)
-        if not order or not order.review or not order.review.stars:
-            logger.error("%s отзыв #%s не появился на FunPay вовремя", _P, order_id)
-            return
+            self.log("⚡ Получен отзыв #%s — отвечаю немедленно…", order_id)
+            order = self._resolve_review_order(obj)
+            if not order or not order.review or not order.review.stars:
+                logger.error("%s отзыв #%s не появился на FunPay вовремя", _P, order_id)
+                return
 
-        if msg_type == MessageTypes.NEW_FEEDBACK and order.review.answer:
-            self.log("Отзыв #%s уже имеет ответ продавца — пропуск", order_id)
-            return
+            if msg_type == MessageTypes.NEW_FEEDBACK and _seller_review_reply(order.review):
+                self.log("Отзыв #%s уже имеет ответ продавца — пропуск", order_id)
+                return
 
-        self.process_order(order, chat_id)
+            self.process_order(order, chat_id)
+        except Exception as exc:
+            logger.error("%s ошибка мгновенного ответа: %s", _P, exc)
+            logger.debug(traceback.format_exc())
 
     def process_order(self, order: Order, chat_id: Any = None, shortcut_date: datetime | None = None) -> bool:
         if not order.review or not order.review.stars:
@@ -742,7 +763,7 @@ class Plugin:
                     continue
                 if not order.review or not order.review.stars:
                     continue
-                if order.review.answer:
+                if _seller_review_reply(order.review):
                     continue
                 result.append((order, shortcut.date))
                 if len(result) >= limit:
@@ -1008,11 +1029,23 @@ def init_plugin(cardinal: Cardinal) -> None:
     logger.info("%s v%s загружен", _P, VERSION)
 
 
+def _safe_handler(fn):
+    def wrapper(cardinal: Cardinal, event: Any) -> None:
+        try:
+            fn(cardinal, event)
+        except Exception as exc:
+            logger.error("%s handler error: %s", _P, exc)
+            logger.debug(traceback.format_exc())
+    return wrapper
+
+
+@_safe_handler
 def message_handler(cardinal: Cardinal, event: NewMessageEvent) -> None:
     if _plugin:
         _plugin.on_new_message(event)
 
 
+@_safe_handler
 def last_chat_handler(cardinal: Cardinal, event: LastChatMessageChangedEvent) -> None:
     if _plugin:
         _plugin.on_last_chat(event)
