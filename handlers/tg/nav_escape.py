@@ -14,7 +14,7 @@ def create_nav_router(ctx: Any) -> Router:
     router = Router(name="nav_escape")
 
     @router.message(CommandStart())
-    @router.message(Command("menu", "cancel"))
+    @router.message(Command("menu", "cancel", "panel"))
     async def nav_home(message: Message, state: FSMContext) -> None:
         uid = message.from_user.id if message.from_user else 0
         if not await ctx._has_access(uid):

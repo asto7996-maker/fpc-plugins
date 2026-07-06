@@ -199,6 +199,14 @@ class DeliveryContext(OrderContext):
 
 
 @dataclass
+class ReviewReplyContext(OrderContext):
+    """Автоответ на отзыв — плагины задают reply_text до отправки."""
+
+    reply_text: str | None = None
+    skipped: bool = False
+
+
+@dataclass
 class BumpContext(StarvellContext):
     """Событие автоподнятия лотов."""
 

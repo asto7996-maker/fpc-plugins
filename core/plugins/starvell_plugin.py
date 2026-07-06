@@ -9,7 +9,7 @@ import logging
 from typing import Any
 
 from core.plugins.base import BasePlugin
-from core.plugins.context import DeliveryContext, MessageContext, OrderContext
+from core.plugins.context import DeliveryContext, MessageContext, OrderContext, ReviewReplyContext
 from core.plugins.hooks import (
     STV_BUMP,
     STV_MESSAGE,
@@ -18,6 +18,7 @@ from core.plugins.hooks import (
     STV_ORDER_STATUS,
     STV_POST_DELIVERY,
     STV_PRE_DELIVERY,
+    STV_PRE_REVIEW,
     STV_SHUTDOWN,
     STV_STARTUP,
     collect_hooks,
@@ -121,6 +122,9 @@ class StarvellPlugin(BasePlugin):
     async def handle_order_completed(self, ctx: OrderContext) -> None:
         pass
 
+    async def handle_pre_review(self, ctx: ReviewReplyContext) -> None:
+        pass
+
     async def _dispatch_with_fallback(self, event: str, ctx: Any) -> None:
         await self.dispatch(event, ctx)
         if event == STV_MESSAGE and isinstance(ctx, MessageContext):
@@ -129,3 +133,5 @@ class StarvellPlugin(BasePlugin):
             await self.handle_order_paid(ctx)
         elif event == STV_ORDER_COMPLETED and isinstance(ctx, OrderContext):
             await self.handle_order_completed(ctx)
+        elif event == STV_PRE_REVIEW and isinstance(ctx, ReviewReplyContext):
+            await self.handle_pre_review(ctx)

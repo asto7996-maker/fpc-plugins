@@ -143,7 +143,7 @@ def create_profile_router(ctx: Any):
         text = await build_profile_detail(ctx)
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="◀️ Профиль", callback_data=CBT.PROFILE)],
-            [InlineKeyboardButton(text="🏠 Меню", callback_data=CBT.MAIN)],
+            [InlineKeyboardButton(text="🏠 Главная", callback_data=CBT.MAIN)],
         ])
         await call.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
 

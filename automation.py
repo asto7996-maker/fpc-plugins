@@ -11,7 +11,7 @@ import time
 from typing import Any, Callable, Awaitable
 
 from ai_service import AIService
-from config import BASE_DIR, Settings, load_settings
+from config import BASE_DIR, SETTINGS_PATH, Settings, load_settings
 from database import Database
 from handlers.builtin import BuiltinHandlers
 from core.delivery.templates import append_refund_disclaimer, render_delivery_template
@@ -20,12 +20,13 @@ from core.plugins.context import (
     DeliveryContext,
     MessageContext,
     OrderContext,
+    ReviewReplyContext,
     _resolve_order_price,
     format_rub,
 )
 from core.lsb.chats import extract_interlocutor, is_auto_message, message_author_id, message_text
 from core.lsb.events import NewMessageEvent, NewOrderEvent, OrderConfirmEvent, PaymentEvent
-from core.plugins.hooks import STV_BUMP, STV_MESSAGE, STV_ORDER_COMPLETED, STV_ORDER_PAID, STV_ORDER_STATUS, STV_POST_DELIVERY, STV_PRE_DELIVERY
+from core.plugins.hooks import STV_BUMP, STV_MESSAGE, STV_ORDER_COMPLETED, STV_ORDER_PAID, STV_ORDER_STATUS, STV_POST_DELIVERY, STV_PRE_DELIVERY, STV_PRE_REVIEW
 from core.security.payment_guard import PaymentGuard
 from plugin_manager import PluginContext
 from utils.starvell_format import format_hold_balance, format_rub_balance
@@ -104,6 +105,9 @@ class AutomationEngine:
         self._status_cache: dict[str, Any] | None = None
         self._status_cache_at: float = 0.0
         self._bump_cooldowns: dict[str, dict[tuple[int, int], float]] = {}
+        self._settings_cache: Settings | None = None
+        self._settings_mtime: float = 0.0
+        self._user_id_cache: dict[str, tuple[int | None, float]] = {}
 
     async def notify(self, text: str, notify_type: str = "notify_orders", **extra) -> None:
         if self.notify_cb:
@@ -133,24 +137,56 @@ class AutomationEngine:
         return ctx
 
     def _get_settings(self) -> Settings:
-        return load_settings()
+        try:
+            mtime = SETTINGS_PATH.stat().st_mtime
+            if self._settings_cache is None or mtime != self._settings_mtime:
+                self._settings_cache = load_settings()
+                self._settings_mtime = mtime
+            return self._settings_cache
+        except OSError:
+            return load_settings()
+
+    async def reload_settings(self) -> None:
+        """Обновляет настройки в памяти без перезапуска циклов."""
+        self._settings_cache = None
+        settings = self._get_settings()
+        self._ai.settings = settings
+        self._handlers._ai.settings = settings
 
     def _build_api(self, account) -> StarvellAPI:
         settings = self._get_settings()
+        kwargs: dict[str, Any] = {
+            "session_cookie": account.session_cookie,
+            "sid_cookie": account.sid_cookie,
+            "my_games_cookie": account.my_games_cookie,
+            "delay_seconds": settings.api_delay_seconds,
+            "max_per_minute": settings.api_max_per_minute,
+            "account_name": account.name,
+        }
         try:
             from api.starvell_client import StarvellClient
 
             cls = StarvellClient
+            proxy = settings.starvell_proxy_url()
+            if proxy:
+                kwargs["proxy"] = proxy
         except ImportError:
-            cls = StarvellAPI
-        return cls(
-            session_cookie=account.session_cookie,
-            sid_cookie=account.sid_cookie,
-            my_games_cookie=account.my_games_cookie,
-            delay_seconds=settings.api_delay_seconds,
-            max_per_minute=settings.api_max_per_minute,
-            account_name=account.name,
-        )
+            from starvell_api import StarvellAPI as cls
+        return cls(**kwargs)
+
+    async def _get_my_user_id(self, account_name: str, api: StarvellAPI) -> int | None:
+        cached = self._user_id_cache.get(account_name)
+        now = time.time()
+        if cached and now < cached[1]:
+            return cached[0]
+        info = await api.fetch_homepage()
+        uid = (info.get("user") or {}).get("id")
+        try:
+            user_id = int(uid) if uid is not None else None
+        except (TypeError, ValueError):
+            user_id = None
+        self._user_id_cache[account_name] = (user_id, now + 120.0)
+        return user_id
 
     async def start(self) -> None:
         """Запускает все фоновые циклы."""
@@ -188,7 +224,10 @@ class AutomationEngine:
     async def reload(self) -> None:
         """Перезапускает фоновые задачи (после смены session cookie)."""
         await self.stop()
+        self._settings_cache = None
+        self._user_id_cache.clear()
         self._ai = AIService(load_settings())
+        self._handlers._ai.settings = self._ai.settings
         await self.start()
 
     async def _auth_loop(self, account_name: str, api: StarvellAPI) -> None:
@@ -404,9 +443,24 @@ class AutomationEngine:
         if await self.db.is_order_reviewed(order_id, account_name):
             return
 
-        review_text = await self._handlers.on_order_completed(
-            order=order, api=api, settings=settings, account_name=account_name
-        )
+        # Полная карточка — в ленте заказов часто нет поля review
+        try:
+            full = await api.fetch_order(order_id)
+            if isinstance(full, dict) and full:
+                order = {**order, **full}
+        except Exception as exc:
+            logger.debug("fetch_order for review %s: %s", order_id, exc)
+
+        review_ctx = ReviewReplyContext.from_order(self.cardinal, order, account_name)
+        await self._emit_starvell(STV_PRE_REVIEW, review_ctx)
+        if review_ctx.skipped:
+            return
+
+        review_text = review_ctx.reply_text
+        if not review_text:
+            review_text = await self._handlers.on_order_completed(
+                order=order, api=api, settings=settings, account_name=account_name
+            )
         if not review_text:
             return
 
@@ -414,15 +468,17 @@ class AutomationEngine:
         chat_id = await api.find_chat_by_buyer(int(buyer_id)) if buyer_id else None
 
         sent = False
-        # Ответ на отзыв через API
         try:
             result = await api.send_review_reply(order_id, review_text)
             if result.get("success"):
                 sent = True
-        except Exception:
-            pass
+            elif isinstance(result.get("json"), dict):
+                err = str(result["json"].get("message") or result["json"].get("error") or "")
+                if err:
+                    logger.warning("review API order=%s: %s", order_id, err[:160])
+        except Exception as exc:
+            logger.warning("review API failed order=%s: %s", order_id, exc)
 
-        # Fallback — сообщение в чат
         if not sent and chat_id:
             try:
                 await api.send_message(chat_id, review_text)
@@ -536,8 +592,7 @@ class AutomationEngine:
             settings = self._get_settings()
             interval = max(2.0, settings.chat_poll_interval)
             try:
-                user_info = await api.fetch_homepage()
-                my_id = (user_info.get("user") or {}).get("id")
+                my_id = await self._get_my_user_id(account_name, api)
                 if not await self.db.is_chats_bootstrapped(account_name):
                     await self._bootstrap_chats(account_name, api, my_id)
                 await self._process_chats(account_name, api, settings, my_id)
@@ -727,6 +782,8 @@ class AutomationEngine:
         buyer_message: str,
         history: list[dict],
     ) -> None:
+        if not settings.is_gemini_configured() or not settings.is_gemini_proxy_configured():
+            return
         # Кулдаун 30 сек между ИИ-ответами в одном чате
         last_ai = await self.db.get_ai_cooldown(chat_id, account_name)
         if int(time.time()) - last_ai < 30:

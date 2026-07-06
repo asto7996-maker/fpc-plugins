@@ -161,7 +161,7 @@ User=$SERVICE_USER
 WorkingDirectory=$INSTALL_DIR
 ExecStart=$INSTALL_DIR/venv/bin/python $INSTALL_DIR/main.py
 Restart=always
-RestartSec=10
+RestartSec=3
 Environment=PYTHONUNBUFFERED=1
 
 [Install]
