@@ -125,15 +125,10 @@ def settings_page1() -> InlineKeyboardMarkup:
 
 
 def settings_page2() -> InlineKeyboardMarkup:
-    from config import GEMINI_REVIEW_PLUGIN_UUID
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="👋 Приветствие", callback_data=f"{CBT.CATEGORY}gr")],
         [InlineKeyboardButton(text="✅ Подтверждение заказа", callback_data=f"{CBT.CATEGORY}oc")],
-        [InlineKeyboardButton(text="⭐ Ответы на отзывы", callback_data=f"{CBT.CATEGORY}rr")],
-        [InlineKeyboardButton(
-            text="🤖 Gemini Review",
-            callback_data=f"{CBT.PLUGIN_SETTINGS}{GEMINI_REVIEW_PLUGIN_UUID}",
-        )],
+        [InlineKeyboardButton(text="⭐ Ответы на отзывы (Gemini)", callback_data=f"{CBT.CATEGORY}rr")],
         [InlineKeyboardButton(text="🚫 Чёрный список", callback_data=f"{CBT.CATEGORY}bl")],
         [InlineKeyboardButton(text="👤 Профиль Starvell", callback_data=CBT.PROFILE)],
         [InlineKeyboardButton(text="🛠 Настройка", callback_data=CBT.SETUP)],

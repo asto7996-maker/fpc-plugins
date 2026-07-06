@@ -121,7 +121,7 @@ fi
 # ── 5. Конфигурация — только BOT_TOKEN (остальное в Telegram) ───────────────
 echo ""
 echo "=== 5/6. Telegram BOT_TOKEN ==="
-echo "Starvell session настраивается в боте через /start. Gemini — только в плагине Gemini Review."
+echo "Starvell session настраивается в боте через /start. Ответы на отзывы — в плагине Gemini Review."
 echo ""
 read -rp "Telegram BOT_TOKEN (@BotFather): " BOT_TOKEN
 

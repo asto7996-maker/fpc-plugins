@@ -85,7 +85,7 @@ async def build_profile_detail(ctx: Any) -> str:
         f"• Автовыдача: {'🟢' if s.auto_delivery_enabled else '🔴'}",
         f"• Автобамп: {'🟢' if s.auto_bump_enabled else '🔴'}",
         f"• Приветствие: {'🟢' if s.auto_welcome_enabled else '🔴'}",
-        f"• Отзывы (Gemini Review): {'🟢' if s.auto_review_enabled else '🔴'}",
+        f"• Авто-отзывы: {'🟢' if s.auto_review_enabled else '🔴'}",
         f"• Poll чатов: {s.chat_poll_interval}с",
         f"• Poll заказов: {s.orders_poll_interval}с",
         "",

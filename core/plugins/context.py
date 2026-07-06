@@ -50,7 +50,7 @@ class MessageContext(StarvellContext):
     handled: bool = False
 
     def mark_handled(self) -> None:
-        """Плагин обработал сообщение — ядро не шлёт welcome/ИИ."""
+        """Плагин обработал сообщение — ядро не шлёт welcome."""
         self.handled = True
 
     async def reply(self, text: str) -> bool:

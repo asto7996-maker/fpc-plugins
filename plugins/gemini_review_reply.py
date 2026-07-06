@@ -20,7 +20,7 @@ GEMINI_MODELS = (
 
 NAME = "Gemini Review Reply"
 VERSION = "2.0.0"
-DESCRIPTION = "ИИ-ответы на отзывы покупателей (Gemini + proxy)"
+DESCRIPTION = "Автоответы на отзывы покупателей (Gemini + proxy)"
 CREDITS = "Starvell Cardinal"
 UUID = "c4e8b2f1-9a3d-4e7b-8c6f-2d1a5e9b0c3f"
 SETTINGS_PAGE = True

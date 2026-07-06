@@ -468,7 +468,7 @@ class AutomationEngine:
         return anchor
 
     async def _chats_loop(self, account_name: str, api: StarvellAPI) -> None:
-        """Мониторинг чатов: приветствие и ИИ-ответы."""
+        """Мониторинг чатов: приветствие и автоответчик."""
         while self._running:
             settings = self._get_settings()
             interval = max(2.0, settings.chat_poll_interval)
