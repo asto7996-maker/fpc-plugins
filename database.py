@@ -395,7 +395,6 @@ class Database:
             "auto_bump": settings.auto_bump_enabled,
             "auto_welcome": settings.auto_welcome_enabled,
             "auto_review": settings.auto_review_enabled,
-            "ai_replies": settings.ai_replies_enabled,
             "auto_response": settings.auto_response_enabled,
             "order_confirm": settings.order_confirm_enabled,
         }

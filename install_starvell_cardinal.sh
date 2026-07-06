@@ -121,7 +121,7 @@ fi
 # ── 5. Конфигурация — только BOT_TOKEN (остальное в Telegram) ───────────────
 echo ""
 echo "=== 5/6. Telegram BOT_TOKEN ==="
-echo "Всё остальное (Starvell session, Gemini) настраивается в боте через /start"
+echo "Starvell session настраивается в боте через /start. Gemini — только в плагине Gemini Review."
 echo ""
 read -rp "Telegram BOT_TOKEN (@BotFather): " BOT_TOKEN
 
@@ -136,12 +136,10 @@ cat > "$INSTALL_DIR/config/settings.json" <<EOF
   "owner_id": 0,
   "admin_ids": [],
   "session_cookie": "",
-  "gemini_api_key": "",
   "auto_delivery_enabled": true,
   "auto_bump_enabled": true,
   "auto_welcome_enabled": true,
-  "auto_review_enabled": true,
-  "ai_replies_enabled": false
+  "auto_review_enabled": true
 }
 EOF
 chown "$SERVICE_USER:$SERVICE_USER" "$INSTALL_DIR/config/settings.json"

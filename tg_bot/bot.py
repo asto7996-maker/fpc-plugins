@@ -18,7 +18,6 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from cardinal import Cardinal
-from ai_service import AIService
 from automation import AutomationEngine
 from config import VERSION, Settings, StarvellAccount, load_settings, save_settings
 from database import Database
@@ -28,7 +27,7 @@ from keyboards.main import premium_main_text
 from tg_bot import cbt as CBT
 from tg_bot import keyboards as KB
 from utils.tools import check_github_update, create_backup, export_settings_snapshot, logs_zip, system_stats
-from validators import test_gemini_key, test_starvell_session
+from validators import test_starvell_session
 
 logger = logging.getLogger("starvell.tg")
 
@@ -41,37 +40,27 @@ CB = {
     "plugins": "sc:plugins",
     "settings": "sc:settings",
     "adel": "sc:adel",
-    "gemini": "sc:gemini",
     "notify": "sc:notify:",
     "toggle": "sc:toggle:",
     "plug": "sc:plug:",
     "setup": "sc:setup",
     "check_auth": "sc:check_auth",
-    "check_gemini": "sc:check_gemini",
     "set_session": "sc:set_session",
-    "set_gemini": "sc:set_gemini",
     "adel_add": "sc:adel_add",
     "edit_welcome": "sc:edit_welcome",
     "edit_bump": "sc:edit_bump",
     "edit_delivery": "sc:edit_delivery",
-    "edit_gemini_prompt": "sc:edit_gemini_prompt",
-    "edit_gemini_proxy": "sc:edit_gemini_proxy",
-    "upload_gemini_knowledge": "sc:upload_gemini_knowledge",
     "first_setup": "sc:first_setup",
 }
 
 
 class SetupStates(StatesGroup):
     session = State()
-    gemini = State()
     welcome = State()
     bump_interval = State()
     delivery_tpl = State()
     adel_product = State()
     adel_items = State()
-    gemini_prompt = State()
-    gemini_proxy = State()
-    gemini_knowledge = State()
     reply_chat = State()
     ar_command = State()
     ar_response = State()
@@ -206,23 +195,16 @@ class TelegramBot:
         r.callback_query.register(self.cb_tmpl_use, F.data.startswith(CBT.TMPLT_USE))
         r.callback_query.register(self.cb_ar_add, F.data == CBT.AR_ADD)
         r.message.register(self.on_session, SetupStates.session)
-        r.message.register(self.on_gemini, SetupStates.gemini)
         r.message.register(self.on_welcome, SetupStates.welcome)
         r.message.register(self.on_bump, SetupStates.bump_interval)
         r.message.register(self.on_delivery, SetupStates.delivery_tpl)
-        r.message.register(self.on_gemini_prompt, SetupStates.gemini_prompt)
-        r.message.register(self.on_gemini_proxy, SetupStates.gemini_proxy)
-        r.message.register(self.on_gemini_knowledge, SetupStates.gemini_knowledge, F.document)
 
         r.callback_query.register(self.cb_main, F.data == CB["main"])
         r.callback_query.register(self.cb_back, F.data == CB["back"])
         r.callback_query.register(self.cb_setup, F.data == CB["setup"])
         r.callback_query.register(self.cb_settings, F.data == CB["settings"])
-        r.callback_query.register(self.cb_gemini, F.data == CB["gemini"])
         r.callback_query.register(self.cb_check_auth, F.data == CB["check_auth"])
-        r.callback_query.register(self.cb_check_gemini, F.data == CB["check_gemini"])
         r.callback_query.register(self.cb_set_session, F.data == CB["set_session"])
-        r.callback_query.register(self.cb_set_gemini, F.data == CB["set_gemini"])
         r.callback_query.register(self.cb_first_setup, F.data == CB["first_setup"])
         r.callback_query.register(self.cb_toggle, F.data.startswith(CB["toggle"]))
         r.callback_query.register(self.cb_notify, F.data.startswith(CB["notify"]))
@@ -230,9 +212,6 @@ class TelegramBot:
         r.callback_query.register(self.cb_edit_welcome, F.data == CB["edit_welcome"])
         r.callback_query.register(self.cb_edit_bump, F.data == CB["edit_bump"])
         r.callback_query.register(self.cb_edit_delivery, F.data == CB["edit_delivery"])
-        r.callback_query.register(self.cb_edit_gemini_prompt, F.data == CB["edit_gemini_prompt"])
-        r.callback_query.register(self.cb_edit_gemini_proxy, F.data == CB["edit_gemini_proxy"])
-        r.callback_query.register(self.cb_upload_gemini_knowledge, F.data == CB["upload_gemini_knowledge"])
 
     # ── Клавиатуры ────────────────────────────────────────────────────────
 
@@ -417,7 +396,6 @@ class TelegramBot:
             "auto_bump": "auto_bump_enabled",
             "auto_welcome": "auto_welcome_enabled",
             "auto_review": "auto_review_enabled",
-            "ai_replies": "ai_replies_enabled",
             "auto_response": "auto_response_enabled",
             "order_confirm": "order_confirm_enabled",
         }
@@ -426,7 +404,6 @@ class TelegramBot:
             "auto_bump": "Автобамп",
             "auto_welcome": "Приветствие",
             "auto_review": "Авто-отзывы",
-            "ai_replies": "Gemini в чатах",
             "auto_response": "Автоответ",
             "order_confirm": "Подтверждение заказа",
         }
@@ -497,17 +474,6 @@ class TelegramBot:
             save_settings(s)
         await call.message.answer(f"{'✅' if ok else '❌'} {msg}")
 
-    async def cb_check_gemini(self, call: CallbackQuery) -> None:
-        if not await self._has_access(call.from_user.id):
-            return
-        s = load_settings()
-        if not s.gemini_api_key:
-            await call.answer("Gemini ключ не задан!", show_alert=True)
-            return
-        await call.answer("Проверяю Gemini…")
-        ok, msg = await test_gemini_key(s.gemini_api_key, s.ai_system_prompt, s.gemini_proxy)
-        await call.message.answer(f"{'✅' if ok else '❌'} {msg}")
-
     async def cb_set_session(self, call: CallbackQuery, state: FSMContext) -> None:
         if not await self._has_access(call.from_user.id):
             return
@@ -518,18 +484,6 @@ class TelegramBot:
             "2. F12 → Application → Cookies → <code>session</code>\n"
             "3. Скопируйте значение и отправьте сюда\n\n"
             "Бот сразу проверит cookie.",
-            parse_mode="HTML",
-        )
-        await call.answer()
-
-    async def cb_set_gemini(self, call: CallbackQuery, state: FSMContext) -> None:
-        if not await self._has_access(call.from_user.id):
-            return
-        await state.set_state(SetupStates.gemini)
-        await call.message.answer(
-            "🤖 <b>Gemini API ключ</b>\n\n"
-            "Получить: https://aistudio.google.com/apikey\n"
-            "Отправьте ключ — бот сразу проверит его.",
             parse_mode="HTML",
         )
         await call.answer()
@@ -600,34 +554,6 @@ class TelegramBot:
         await call.message.answer("Введите название товара <b>точно как на Starvell</b>:", parse_mode="HTML")
         await call.answer()
 
-    async def cb_gemini(self, call: CallbackQuery) -> None:
-        if not await self._has_access(call.from_user.id):
-            return
-        s = load_settings()
-        key_ok = "✅" if s.is_gemini_configured() else "❌"
-        from config import CONSULTANT_KNOWLEDGE_FILE, KNOWLEDGE_DIR
-        knowledge_ok = "✅" if CONSULTANT_KNOWLEDGE_FILE.is_file() else "❌"
-        proxy_ok = "✅" if (s.gemini_proxy or "").strip() else "—"
-        text = (
-            f"🤖 <b>Gemini — ИИ-консультант</b>\n\n"
-            f"Ключ: {key_ok}\n"
-            f"Proxy: {proxy_ok}\n"
-            f"База знаний: {knowledge_ok}\n"
-            f"Модель: {s.gemini_model}\n"
-            f"В чатах: {self._flag(s.ai_replies_enabled)}\n\n"
-            f"<i>{s.ai_system_prompt[:150]}…</i>"
-        )
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🔑 API ключ", callback_data=CB["set_gemini"])],
-            [InlineKeyboardButton(text="🌐 Proxy", callback_data=CB["edit_gemini_proxy"])],
-            [InlineKeyboardButton(text="📝 Системный промпт", callback_data=CB["edit_gemini_prompt"])],
-            [InlineKeyboardButton(text="📎 База знаний (файл)", callback_data=CB["upload_gemini_knowledge"])],
-            [InlineKeyboardButton(text="✅ Проверить", callback_data=CB["check_gemini"])],
-            [InlineKeyboardButton(text="◀️ Меню", callback_data=CB["main"])],
-        ])
-        await call.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
-        await call.answer()
-
     async def cb_edit_welcome(self, call: CallbackQuery, state: FSMContext) -> None:
         await state.set_state(SetupStates.welcome)
         await call.message.answer("Введите текст приветствия:")
@@ -678,21 +604,6 @@ class TelegramBot:
             parse_mode="HTML",
             reply_markup=self._main_kb(),
         )
-
-    async def on_gemini(self, message: Message, state: FSMContext) -> None:
-        key = (message.text or "").strip()
-        if not key:
-            return
-        wait = await message.answer("⏳ Проверяю Gemini…")
-        s = load_settings()
-        ok, msg = await test_gemini_key(key, proxy=s.gemini_proxy)
-        if not ok:
-            await wait.edit_text(f"❌ {msg}")
-            return
-        s.gemini_api_key = key
-        save_settings(s)
-        await state.clear()
-        await wait.edit_text(f"✅ Gemini настроен!\n{msg}", reply_markup=self._back_kb())
 
     async def on_welcome(self, message: Message, state: FSMContext) -> None:
         text = (message.text or "").strip()
@@ -749,80 +660,6 @@ class TelegramBot:
         added = await self.db.add_autodelivery_items(product, items)
         await state.clear()
         await message.answer(f"✅ +{added} шт. для «{product}»", reply_markup=self._back_kb())
-
-    async def cb_edit_gemini_prompt(self, call: CallbackQuery, state: FSMContext) -> None:
-        if not await self._has_access(call.from_user.id):
-            return
-        await state.set_state(SetupStates.gemini_prompt)
-        s = load_settings()
-        await call.message.answer(
-            "📝 Отправьте новый <b>системный промпт</b> для Gemini-консультанта:\n\n"
-            f"<i>Текущий:</i>\n{s.ai_system_prompt[:500]}",
-            parse_mode="HTML",
-        )
-        await call.answer()
-
-    async def cb_edit_gemini_proxy(self, call: CallbackQuery, state: FSMContext) -> None:
-        if not await self._has_access(call.from_user.id):
-            return
-        await state.set_state(SetupStates.gemini_proxy)
-        s = load_settings()
-        await call.message.answer(
-            "🌐 Отправьте proxy для Gemini (или <code>-</code> чтобы очистить):\n"
-            f"Пример: <code>http://user:pass@host:8000</code>\n\n"
-            f"Текущий: <code>{s.gemini_proxy or '—'}</code>",
-            parse_mode="HTML",
-        )
-        await call.answer()
-
-    async def cb_upload_gemini_knowledge(self, call: CallbackQuery, state: FSMContext) -> None:
-        if not await self._has_access(call.from_user.id):
-            return
-        await state.set_state(SetupStates.gemini_knowledge)
-        await call.message.answer(
-            "📎 Отправьте файл <b>.txt</b> или <b>.md</b> с командами, инструкциями и БД для консультанта.\n"
-            "Содержимое будет добавлено к системному промпту Gemini.\n\n"
-            "/cancel — отмена",
-            parse_mode="HTML",
-        )
-        await call.answer()
-
-    async def on_gemini_prompt(self, message: Message, state: FSMContext) -> None:
-        text = (message.text or "").strip()
-        if not text or text.startswith("/"):
-            return
-        s = load_settings()
-        s.ai_system_prompt = text
-        save_settings(s)
-        self.automation._ai = AIService(load_settings())
-        await state.clear()
-        await message.answer("✅ Системный промпт сохранён.", reply_markup=self._back_kb())
-
-    async def on_gemini_proxy(self, message: Message, state: FSMContext) -> None:
-        raw = (message.text or "").strip()
-        if not raw or raw.startswith("/"):
-            return
-        s = load_settings()
-        s.gemini_proxy = "" if raw in ("-", "—", "нет", "off") else raw
-        save_settings(s)
-        await state.clear()
-        await message.answer(f"✅ Proxy: <code>{s.gemini_proxy or 'выключен'}</code>", parse_mode="HTML", reply_markup=self._back_kb())
-
-    async def on_gemini_knowledge(self, message: Message, state: FSMContext) -> None:
-        from config import CONSULTANT_KNOWLEDGE_FILE, KNOWLEDGE_DIR
-        if not message.document:
-            await message.answer("❌ Отправьте файл (.txt / .md)")
-            return
-        KNOWLEDGE_DIR.mkdir(parents=True, exist_ok=True)
-        file = await self.bot.get_file(message.document.file_id)
-        data = await self.bot.download_file(file.file_path)
-        content = data.read().decode("utf-8", errors="replace")
-        CONSULTANT_KNOWLEDGE_FILE.write_text(content, encoding="utf-8")
-        await state.clear()
-        await message.answer(
-            f"✅ База знаний загружена ({len(content)} симв.). Gemini-консультант будет использовать этот файл.",
-            reply_markup=self._back_kb(),
-        )
 
     # ── FPC-команды ───────────────────────────────────────────────────────
 
@@ -969,8 +806,20 @@ class TelegramBot:
             await state.set_state(SetupStates.order_confirm)
             await call.message.answer(f"Текущий текст:\n{s.order_confirm_text}\n\nОтправьте новый:")
         elif cat == "rr":
-            lines = [f"{k}⭐: {v[:40]}…" for k, v in s.review_replies.items()]
-            await call.message.edit_text("⭐ Отзывы\n" + "\n".join(lines), reply_markup=KB.back_menu())
+            from config import GEMINI_REVIEW_PLUGIN_UUID
+            await call.message.edit_text(
+                "⭐ <b>Ответы на отзывы</b>\n\n"
+                "Настраиваются в плагине <b>Gemini Review Reply</b>:\n"
+                "ключ API, proxy, модель и промпт — прямо в настройках плагина.",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(
+                        text="⚙️ Gemini Review",
+                        callback_data=f"{CBT.PLUGIN_SETTINGS}{GEMINI_REVIEW_PLUGIN_UUID}",
+                    )],
+                    [InlineKeyboardButton(text="◀️", callback_data=CBT.MAIN2)],
+                ]),
+            )
         elif cat == "bl":
             bl = await self.db.list_blacklist()
             text = "🚫 <b>Чёрный список</b>\n" + (

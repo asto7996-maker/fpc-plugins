@@ -25,13 +25,8 @@ GITHUB_REPO = "asto7996-maker/fpc-plugins"
 GITHUB_BRANCH = "cursor/parser-auto-create-6ec3"
 BACKUP_DIR = STORAGE_DIR / "backups"
 PRODUCTS_DIR = STORAGE_DIR / "products"
-KNOWLEDGE_DIR = STORAGE_DIR / "knowledge"
-CONSULTANT_KNOWLEDGE_FILE = KNOWLEDGE_DIR / "consultant_knowledge.txt"
 
-DEFAULT_AI_SYSTEM_PROMPT = (
-    "Ты — дружелюбный и профессиональный менеджер магазина на Starvell. "
-    "Твоя цель — помочь клиенту, ответить на его вопросы и оставить исключительно положительное впечатление."
-)
+GEMINI_REVIEW_PLUGIN_UUID = "c4e8b2f1-9a3d-4e7b-8c6f-2d1a5e9b0c3f"
 
 REFUND_DISCLAIMER = (
     "⚠️ ВАЖНО! Совершая покупку, вы автоматически соглашаетесь с правилами магазина. "
@@ -76,7 +71,6 @@ class Settings:
     auto_welcome_enabled: bool = True
     auto_review_enabled: bool = True
     auto_response_enabled: bool = True
-    ai_replies_enabled: bool = False
     multi_delivery: bool = True
     order_confirm_enabled: bool = True
 
@@ -96,9 +90,6 @@ class Settings:
         "2": "Жаль, что не всё идеально. Мы уже работаем над улучшением сервиса.",
         "1": "Нам очень жаль за негативный опыт. Напишите в чат — разберёмся лично.",
     })
-    review_use_gemini: bool = True
-
-    # Тайминги
     chat_poll_interval: float = 4.0
     orders_poll_interval: float = 4.0
     bump_interval: float = 300.0
@@ -127,15 +118,6 @@ class Settings:
         "Будем рады видеть вас снова! ⭐"
     )
 
-    # Gemini
-    gemini_api_key: str = ""
-    gemini_model: str = "gemini-2.5-flash-lite"
-    gemini_proxy: str = ""
-    ai_system_prompt: str = DEFAULT_AI_SYSTEM_PROMPT
-    ai_word_blacklist: list[str] = field(default_factory=lambda: [
-        "взлом", "чит", "обман", "скам", "refund", "возврат", "арбитраж", "мошенник",
-    ])
-    ai_blacklist_alert: bool = True
     language: str = "ru"
 
     watermark_on: bool = False
@@ -167,11 +149,8 @@ class Settings:
     def is_starvell_configured(self) -> bool:
         return bool(self.get_active_accounts())
 
-    def is_gemini_configured(self) -> bool:
-        return bool(self.gemini_api_key.strip())
-
     def ensure_dirs(self) -> None:
-        for path in (CONFIG_DIR, STORAGE_DIR, LOGS_DIR, PLUGINS_DIR, PLUGIN_STATE_PATH.parent, BACKUP_DIR, PRODUCTS_DIR, KNOWLEDGE_DIR):
+        for path in (CONFIG_DIR, STORAGE_DIR, LOGS_DIR, PLUGINS_DIR, PLUGIN_STATE_PATH.parent, BACKUP_DIR, PRODUCTS_DIR):
             path.mkdir(parents=True, exist_ok=True)
 
 
@@ -213,10 +192,6 @@ def load_settings() -> Settings:
     token_env = os.getenv("BOT_TOKEN", "").strip()
     if token_env:
         data["bot_token"] = token_env
-
-    gemini_env = os.getenv("GEMINI_API_KEY", "").strip()
-    if gemini_env:
-        data["gemini_api_key"] = gemini_env
 
     if "accounts" in data and isinstance(data["accounts"], list):
         settings.accounts = [_account_from_dict(a) for a in data["accounts"] if isinstance(a, dict)]

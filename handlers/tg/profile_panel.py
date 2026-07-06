@@ -56,7 +56,6 @@ async def build_profile_brief(ctx: Any) -> tuple[str, InlineKeyboardMarkup]:
     lines += [
         "",
         f"Session: {'✅ задан' if s.session_cookie else '❌ не задан'}",
-        f"Gemini: {'✅' if s.is_gemini_configured() else '❌'}",
     ]
     return "\n".join(lines), KB.profile_kb()
 
@@ -86,7 +85,7 @@ async def build_profile_detail(ctx: Any) -> str:
         f"• Автовыдача: {'🟢' if s.auto_delivery_enabled else '🔴'}",
         f"• Автобамп: {'🟢' if s.auto_bump_enabled else '🔴'}",
         f"• Приветствие: {'🟢' if s.auto_welcome_enabled else '🔴'}",
-        f"• Gemini чаты: {'🟢' if s.ai_replies_enabled else '🔴'}",
+        f"• Отзывы (Gemini Review): {'🟢' if s.auto_review_enabled else '🔴'}",
         f"• Poll чатов: {s.chat_poll_interval}с",
         f"• Poll заказов: {s.orders_poll_interval}с",
         "",

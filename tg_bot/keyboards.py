@@ -31,7 +31,7 @@ def main_menu() -> InlineKeyboardMarkup:
         ],
         [
             InlineKeyboardButton(text=f"{flag(s.auto_response_enabled)} Автоответ", callback_data=f"{CBT.SWITCH}auto_response"),
-            InlineKeyboardButton(text=f"{flag(s.ai_replies_enabled)} Gemini", callback_data=f"{CBT.SWITCH}ai_replies"),
+            InlineKeyboardButton(text=f"{flag(s.auto_review_enabled)} Отзывы", callback_data=f"{CBT.SWITCH}auto_review"),
         ],
         [
             InlineKeyboardButton(text="🔍 Парсер лотов", callback_data=CBT.PARSER),
@@ -125,12 +125,16 @@ def settings_page1() -> InlineKeyboardMarkup:
 
 
 def settings_page2() -> InlineKeyboardMarkup:
+    from config import GEMINI_REVIEW_PLUGIN_UUID
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="👋 Приветствие", callback_data=f"{CBT.CATEGORY}gr")],
         [InlineKeyboardButton(text="✅ Подтверждение заказа", callback_data=f"{CBT.CATEGORY}oc")],
         [InlineKeyboardButton(text="⭐ Ответы на отзывы", callback_data=f"{CBT.CATEGORY}rr")],
+        [InlineKeyboardButton(
+            text="🤖 Gemini Review",
+            callback_data=f"{CBT.PLUGIN_SETTINGS}{GEMINI_REVIEW_PLUGIN_UUID}",
+        )],
         [InlineKeyboardButton(text="🚫 Чёрный список", callback_data=f"{CBT.CATEGORY}bl")],
-        [InlineKeyboardButton(text="🤖 Gemini", callback_data=CBT.GEMINI)],
         [InlineKeyboardButton(text="👤 Профиль Starvell", callback_data=CBT.PROFILE)],
         [InlineKeyboardButton(text="🛠 Настройка", callback_data=CBT.SETUP)],
         [InlineKeyboardButton(text="◀️ Назад", callback_data=CBT.MAIN)],
@@ -145,7 +149,6 @@ def category_main(s) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text=f"{flag(s.auto_welcome_enabled)} Приветствие", callback_data=f"{CBT.SWITCH}auto_welcome")],
         [InlineKeyboardButton(text=f"{flag(s.auto_review_enabled)} Отзывы", callback_data=f"{CBT.SWITCH}auto_review")],
         [InlineKeyboardButton(text=f"{flag(s.order_confirm_enabled)} Подтв. заказа", callback_data=f"{CBT.SWITCH}order_confirm")],
-        [InlineKeyboardButton(text=f"{flag(s.ai_replies_enabled)} Gemini в чатах", callback_data=f"{CBT.SWITCH}ai_replies")],
         [InlineKeyboardButton(text="◀️ Главное меню", callback_data=CBT.MAIN)],
     ])
 
@@ -169,8 +172,6 @@ def chat_actions(chat_id: str) -> InlineKeyboardMarkup:
 def setup_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="1️⃣ Session Starvell", callback_data=CBT.SET_SESSION)],
-        [InlineKeyboardButton(text="2️⃣ Gemini API", callback_data=CBT.SET_GEMINI)],
         [InlineKeyboardButton(text="✅ Проверить Starvell", callback_data=CBT.CHECK_AUTH)],
-        [InlineKeyboardButton(text="✅ Проверить Gemini", callback_data=CBT.CHECK_GEMINI)],
         [InlineKeyboardButton(text="◀️ Главное меню", callback_data=CBT.MAIN)],
     ])

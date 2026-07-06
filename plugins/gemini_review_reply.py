@@ -52,7 +52,7 @@ class Plugin(StarvellPlugin):
             {"key": "gemini_api_key", "label": "Gemini API Key", "type": "text", "default": ""},
             {"key": "gemini_proxy", "label": "Proxy (http://user:pass@host:port)", "type": "text", "default": ""},
             {"key": "gemini_model", "label": "Модель Gemini", "type": "text", "default": "gemini-2.5-flash-lite"},
-            {"key": "system_prompt", "label": "Системный промпт", "type": "multiline", "default": DEFAULT_SYSTEM_PROMPT},
+            {"key": "system_prompt", "label": "Промпт для ответов на отзывы", "type": "multiline", "default": DEFAULT_SYSTEM_PROMPT},
             {"key": "temperature", "label": "Temperature", "type": "text", "default": "0.95"},
             {"key": "send_chat_message", "label": "Дублировать в чат", "type": "bool", "default": True},
         ]
@@ -118,14 +118,10 @@ class Plugin(StarvellPlugin):
     async def _generate(self, system_prompt: str, user_prompt: str) -> str | None:
         api_key = str(await self.get_cfg("gemini_api_key", "")).strip()
         if not api_key:
-            api_key = (self.settings.gemini_api_key or "").strip()
-        if not api_key:
             return None
 
         model = str(await self.get_cfg("gemini_model", "gemini-2.5-flash-lite")).strip()
         proxy = str(await self.get_cfg("gemini_proxy", "")).strip()
-        if not proxy:
-            proxy = (getattr(self.settings, "gemini_proxy", "") or "").strip()
 
         try:
             temperature = float(await self.get_cfg("temperature", "0.95"))

@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import httpx
 
-from config import DEFAULT_AI_SYSTEM_PROMPT
 from gemini_api import (
     GEMINI_MODELS,
     client_kwargs,
@@ -17,6 +16,8 @@ from gemini_api import (
 )
 from starvell_api import StarvellAPI
 from utils.starvell_format import format_rub_balance
+
+DEFAULT_TEST_PROMPT = "Ты помощник. Отвечай кратко."
 
 
 async def test_starvell_session(session_cookie: str) -> tuple[bool, str, dict]:
@@ -53,7 +54,7 @@ async def test_gemini_key(
     if not key:
         return False, "Ключ пустой"
 
-    prompt = system_prompt or DEFAULT_AI_SYSTEM_PROMPT
+    prompt = system_prompt or DEFAULT_TEST_PROMPT
     payload_base = {
         "systemInstruction": {"parts": [{"text": prompt}]},
         "contents": [{"role": "user", "parts": [{"text": "Ответь одним словом: работает"}]}],

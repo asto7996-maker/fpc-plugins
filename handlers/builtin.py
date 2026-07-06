@@ -8,8 +8,7 @@ import logging
 import time
 from typing import Any
 
-from ai_service import AIService
-from config import Settings, load_settings
+from config import Settings
 
 logger = logging.getLogger("starvell.handlers")
 
@@ -27,7 +26,6 @@ GEMINI_REVIEW_UUID = "c4e8b2f1-9a3d-4e7b-8c6f-2d1a5e9b0c3f"
 class BuiltinHandlers:
     def __init__(self, cardinal: Any) -> None:
         self.cardinal = cardinal
-        self._ai = AIService(load_settings())
 
     @property
     def db(self):
@@ -99,6 +97,7 @@ class BuiltinHandlers:
     async def on_order_completed(
         self, *, order: dict, api: Any, settings: Settings, account_name: str
     ) -> str | None:
+        """Fallback-шаблоны, если плагин Gemini Review выключен."""
         if not await self.db.get_feature_flag("auto_review", settings.auto_review_enabled):
             return None
         pm = getattr(self.cardinal, "plugin_manager", None)
@@ -107,11 +106,7 @@ class BuiltinHandlers:
         order_id = str(order.get("id"))
         review = order.get("review") or {}
         stars = str(review.get("stars") or review.get("rating") or "5")
-        if settings.review_use_gemini and settings.gemini_api_key:
-            self._ai.settings = settings
-            text = await self._ai.generate_review_text(order)
-        else:
-            text = settings.review_replies.get(stars) or settings.review_template
+        text = settings.review_replies.get(stars) or settings.review_template
         text = format_vars(text, order_id=order_id, product=self._product_name(order))
         return api.apply_watermark(text, settings.watermark_on, settings.watermark_text)
 

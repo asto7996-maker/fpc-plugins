@@ -1,5 +1,5 @@
 """
-Фоновая автоматизация: заказы, чаты, бамп, автовыдача, ИИ, отзывы.
+Фоновая автоматизация: заказы, чаты, бамп, автовыдача, отзывы.
 """
 
 from __future__ import annotations
@@ -11,7 +11,6 @@ import random
 import time
 from typing import Any, Callable, Awaitable
 
-from ai_service import AIService
 from config import BASE_DIR, Settings, compute_bump_check_interval, load_settings
 from database import Database
 from handlers.builtin import BuiltinHandlers
@@ -98,7 +97,6 @@ class AutomationEngine:
         self._running = False
         self._tasks: list[asyncio.Task] = []
         self._apis: dict[str, StarvellAPI] = {}
-        self._ai = AIService(load_settings())
         self._handlers = BuiltinHandlers(cardinal)
         self._payment_guard = PaymentGuard()
         self._status_cache: dict[str, Any] | None = None
@@ -187,7 +185,6 @@ class AutomationEngine:
     async def reload(self) -> None:
         """Перезапускает фоновые задачи (после смены session cookie)."""
         await self.stop()
-        self._ai = AIService(load_settings())
         await self.start()
 
     async def _auth_loop(self, account_name: str, api: StarvellAPI) -> None:
@@ -646,10 +643,6 @@ class AutomationEngine:
                     previous_buyer_message_at=prev_buyer_ts,
                 )
 
-            if not plugin_handled and await self.db.get_feature_flag("ai_replies", settings.ai_replies_enabled):
-                history = await api.fetch_messages(chat_id, limit=20, interlocutor_id=interlocutor_id)
-                await self._maybe_ai_reply(account_name, api, settings, chat_id, text, history)
-
             ctx = PluginContext(api, self.db, settings, account_name)
             ctx.chat_id = chat_id
             ctx.message_author_id = author_id
@@ -657,42 +650,6 @@ class AutomationEngine:
                 "on_message", {"message": text, "chat_id": chat_id, "ctx": ctx}
             )
             await self.db.set_last_notified_message(chat_id, mid, account_name)
-
-    async def _maybe_ai_reply(
-        self,
-        account_name: str,
-        api: StarvellAPI,
-        settings: Settings,
-        chat_id: str,
-        buyer_message: str,
-        history: list[dict],
-    ) -> None:
-        # Кулдаун 30 сек между ИИ-ответами в одном чате
-        last_ai = await self.db.get_ai_cooldown(chat_id, account_name)
-        if int(time.time()) - last_ai < 30:
-            return
-
-        self._ai.settings = settings
-        reply = await self._ai.generate_reply(buyer_message, history)
-        if not reply:
-            blocked = self._ai.check_blacklist(buyer_message)
-            if blocked and settings.ai_blacklist_alert:
-                await self.notify(
-                    f"⚡️ <b>ИИ отключён</b> — чёрный список слов\n"
-                    f"Слово: <code>{blocked}</code>\n"
-                    f"Чат: <code>{chat_id[:12]}</code>\n"
-                    f"<i>Требуется живой оператор.</i>",
-                    "notify_chats",
-                    chat_id=chat_id,
-                )
-            return
-        reply = api.apply_watermark(reply, settings.watermark_on, settings.watermark_text)
-        try:
-            await api.send_message(chat_id, reply)
-            await self.db.set_ai_cooldown(chat_id, account_name)
-            await self.notify(f"🤖 Gemini ответил в чате {chat_id[:8]}…", "notify_chats")
-        except Exception as exc:
-            logger.warning("ai reply failed: %s", exc)
 
     async def _bump_loop(self, account_name: str, api: StarvellAPI) -> None:
         """Проверка автобампа каждые 20–30 мин; поднимает, если Starvell разрешает."""
