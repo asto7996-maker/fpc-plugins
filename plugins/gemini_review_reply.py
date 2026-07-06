@@ -10,6 +10,7 @@ from typing import Any
 
 import httpx
 
+from gemini_api import client_kwargs, post_generate
 from starvell_sdk import OrderContext, StarvellPlugin, on_order_completed
 
 NAME = "Gemini Review Reply"
@@ -45,7 +46,7 @@ class Plugin(StarvellPlugin):
             {"key": "enabled", "label": "Включить плагин", "type": "bool", "default": True},
             {"key": "gemini_api_key", "label": "Gemini API Key", "type": "text", "default": ""},
             {"key": "gemini_proxy", "label": "Proxy (http://user:pass@host:port)", "type": "text", "default": ""},
-            {"key": "gemini_model", "label": "Модель Gemini", "type": "text", "default": "gemini-2.0-flash"},
+            {"key": "gemini_model", "label": "Модель Gemini", "type": "text", "default": "gemini-2.5-flash-lite"},
             {"key": "system_prompt", "label": "Системный промпт", "type": "multiline", "default": DEFAULT_SYSTEM_PROMPT},
             {"key": "temperature", "label": "Temperature", "type": "text", "default": "0.95"},
             {"key": "send_chat_message", "label": "Дублировать в чат", "type": "bool", "default": True},
@@ -116,7 +117,7 @@ class Plugin(StarvellPlugin):
         if not api_key:
             return None
 
-        model = str(await self.get_cfg("gemini_model", "gemini-2.0-flash")).strip()
+        model = str(await self.get_cfg("gemini_model", "gemini-2.5-flash-lite")).strip()
         proxy = str(await self.get_cfg("gemini_proxy", "")).strip()
         if not proxy:
             proxy = (getattr(self.settings, "gemini_proxy", "") or "").strip()
@@ -131,17 +132,9 @@ class Plugin(StarvellPlugin):
             "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
             "generationConfig": {"temperature": temperature, "maxOutputTokens": 900},
         }
-        url = (
-            f"https://generativelanguage.googleapis.com/v1beta/models/"
-            f"{model}:generateContent?key={api_key}"
-        )
-        client_kwargs: dict[str, Any] = {"timeout": 60.0}
-        if proxy:
-            client_kwargs["proxy"] = proxy
-
         try:
-            async with httpx.AsyncClient(**client_kwargs) as client:
-                resp = await client.post(url, json=payload)
+            async with httpx.AsyncClient(**client_kwargs(proxy, timeout=60.0)) as client:
+                resp = await post_generate(client, api_key, model, payload)
                 if resp.status_code != 200:
                     self.log("Gemini HTTP %s: %s", resp.status_code, resp.text[:200], level="warning")
                     return None

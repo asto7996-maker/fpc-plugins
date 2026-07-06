@@ -129,7 +129,7 @@ class Settings:
 
     # Gemini
     gemini_api_key: str = ""
-    gemini_model: str = "gemini-2.0-flash"
+    gemini_model: str = "gemini-2.5-flash-lite"
     gemini_proxy: str = ""
     ai_system_prompt: str = DEFAULT_AI_SYSTEM_PROMPT
     ai_word_blacklist: list[str] = field(default_factory=lambda: [

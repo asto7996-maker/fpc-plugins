@@ -505,7 +505,7 @@ class TelegramBot:
             await call.answer("Gemini ключ не задан!", show_alert=True)
             return
         await call.answer("Проверяю Gemini…")
-        ok, msg = await test_gemini_key(s.gemini_api_key, s.ai_system_prompt)
+        ok, msg = await test_gemini_key(s.gemini_api_key, s.ai_system_prompt, s.gemini_proxy)
         await call.message.answer(f"{'✅' if ok else '❌'} {msg}")
 
     async def cb_set_session(self, call: CallbackQuery, state: FSMContext) -> None:
@@ -684,11 +684,11 @@ class TelegramBot:
         if not key:
             return
         wait = await message.answer("⏳ Проверяю Gemini…")
-        ok, msg = await test_gemini_key(key)
+        s = load_settings()
+        ok, msg = await test_gemini_key(key, proxy=s.gemini_proxy)
         if not ok:
             await wait.edit_text(f"❌ {msg}")
             return
-        s = load_settings()
         s.gemini_api_key = key
         save_settings(s)
         await state.clear()

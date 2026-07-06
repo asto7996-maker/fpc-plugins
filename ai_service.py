@@ -10,7 +10,7 @@ from typing import Any
 import httpx
 
 from config import CONSULTANT_KNOWLEDGE_FILE, Settings
-from validators import GEMINI_MODELS
+from gemini_api import GEMINI_MODELS, client_kwargs, post_generate
 
 logger = logging.getLogger("starvell.ai")
 
@@ -36,13 +36,6 @@ class AIService:
         if extra:
             return f"{base}\n\n--- База знаний / команды / инструкции ---\n{extra}"
         return base
-
-    def _client_kwargs(self) -> dict[str, Any]:
-        proxy = (getattr(self.settings, "gemini_proxy", "") or "").strip()
-        kwargs: dict[str, Any] = {"timeout": 45.0}
-        if proxy:
-            kwargs["proxy"] = proxy
-        return kwargs
 
     def _build_prompt(self, buyer_message: str, chat_history: list[dict[str, Any]], product_hint: str = "") -> str:
         history_lines = []
@@ -123,14 +116,11 @@ class AIService:
             "generationConfig": {"temperature": 0.85, "maxOutputTokens": 600},
         }
 
-        async with httpx.AsyncClient(**self._client_kwargs()) as client:
+        proxy = (getattr(self.settings, "gemini_proxy", "") or "").strip()
+        async with httpx.AsyncClient(**client_kwargs(proxy, timeout=45.0)) as client:
             for model in models:
-                url = (
-                    f"https://generativelanguage.googleapis.com/v1beta/models/"
-                    f"{model}:generateContent?key={api_key}"
-                )
                 try:
-                    resp = await client.post(url, json=payload_base)
+                    resp = await post_generate(client, api_key, model, payload_base)
                     if resp.status_code != 200:
                         continue
                     data = resp.json()
