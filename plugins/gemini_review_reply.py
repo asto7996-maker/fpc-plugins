@@ -41,7 +41,7 @@ except ImportError:
 
 
 NAME          = "Gemini Review Reply"
-VERSION       = "3.1.0"
+VERSION       = "3.1.1"
 DESCRIPTION   = "ИИ-ответы на отзывы FunPay (Gemini AQ + HTTP/SOCKS proxy + batch) 🌈"
 CREDITS       = "Cursor AI"
 UUID          = "c4e8b2f1-9a3d-4e7b-8c6f-2d1a5e9b0c3f"
@@ -49,6 +49,7 @@ SETTINGS_PAGE = True
 BIND_TO_DELETE = None
 
 MAX_REVIEW_LEN:   Final[int] = 999
+DEFAULT_MIN_REVIEW_LEN: Final[int] = 300
 MAX_CHAT_LEN:     Final[int] = 240
 MAX_PROMPT_LEN:   Final[int] = 4000
 GEMINI_MAX_OUTPUT_TOKENS: Final[int] = 2048
@@ -97,7 +98,8 @@ DEFAULT_REVIEW_PROMPT = """Ты — профессиональный менед�
    * В конце ответа добавь теплое пожелание и подпись (например, «С уважением, команда магазина» или «С теплом, ваш продавец»).
 
  3. **Формат вывода:**
-   Выведи **ТОЛЬКО** готовый текст ответа, пригодный для копирования. Без вводных слов, пояснений от ИИ и кавычек по краям. Без markdown, без символов 【】 и без заголовков."""
+   Выведи **ТОЛЬКО** готовый текст ответа, пригодный для копирования. Без вводных слов, пояснений от ИИ и кавычек по краям. Без markdown, без символов 【】 и без заголовков.
+   **Длина ответа: минимум {min_review_len} символов**, максимум 999. Пиши развёрнуто, тепло и по делу."""
 
 DEFAULT_CHAT_SYSTEM = (
     "Ты — дружелюбный менеджер магазина FunPay. "
@@ -298,6 +300,7 @@ def _format_for_funpay_review(text: str) -> str:
 def _gemini_generate(
     api_key: str, proxy: str, model: str,
     system: str, prompt: str, temperature: float = 0.95,
+    min_len: int = 0,
 ) -> str | None:
     if not api_key.strip():
         return None
@@ -339,6 +342,12 @@ def _gemini_generate(
                 continue
             if _is_incomplete_reply(text):
                 logger.warning("%s Gemini %s: незавершённый ответ (%s симв.)", _P, try_model, len(text))
+                continue
+            if min_len and len(text) < min_len:
+                logger.warning(
+                    "%s Gemini %s: короткий ответ (%s < %s симв.)",
+                    _P, try_model, len(text), min_len,
+                )
                 continue
             return text
         except Exception as exc:
@@ -456,10 +465,13 @@ class Plugin:
                     loaded["_cfg_version"] = "3.0.9"
                 if old_ver < "3.1.0":
                     loaded["_cfg_version"] = "3.1.0"
+                if old_ver < "3.1.1":
+                    loaded.setdefault("min_review_len", DEFAULT_MIN_REVIEW_LEN)
+                    loaded["_cfg_version"] = "3.1.1"
                 else:
-                    loaded.setdefault("_cfg_version", "3.1.0")
+                    loaded.setdefault("_cfg_version", "3.1.1")
                 self._cfg = loaded
-                if old_ver < "3.1.0":
+                if old_ver < "3.1.1":
                     self._save_settings()
             else:
                 self._cfg = defaults
@@ -505,12 +517,13 @@ class Plugin:
             "chat_system": DEFAULT_CHAT_SYSTEM,
             "chat_prompt": DEFAULT_CHAT_PROMPT,
             "temperature": "0.95",
+            "min_review_len": DEFAULT_MIN_REVIEW_LEN,
             "send_chat_message": True,
             "reply_on_changed": True,
             "batch_count": 5,
             "batch_only_unanswered": False,
             "recent_replies": [],
-            "_cfg_version": "3.1.0",
+            "_cfg_version": "3.1.1",
         }
 
     @staticmethod
@@ -537,6 +550,14 @@ class Plugin:
             {"key": "chat_system", "label": "Системный промпт (чат)", "type": "multiline", "default": DEFAULT_CHAT_SYSTEM, "max_len": MAX_PROMPT_LEN},
             {"key": "chat_prompt", "label": "Промпт благодарности в чат", "type": "multiline", "default": DEFAULT_CHAT_PROMPT, "max_len": MAX_PROMPT_LEN},
             {"key": "temperature", "label": "Temperature", "type": "text", "default": "0.95"},
+            {
+                "key": "min_review_len",
+                "label": "Мин. длина ответа на отзыв (симв.)",
+                "type": "int",
+                "default": DEFAULT_MIN_REVIEW_LEN,
+                "min": 50,
+                "max": MAX_REVIEW_LEN,
+            },
             {"key": "send_chat_message", "label": "Благодарность в чат", "type": "bool", "default": True},
             {
                 "key": "reply_on_changed",
@@ -702,6 +723,13 @@ class Plugin:
             logger.debug("%s chat history: %s", _P, exc)
             return "История чата недоступна."
 
+    def _min_review_len(self) -> int:
+        try:
+            val = int(self.get_cfg("min_review_len", DEFAULT_MIN_REVIEW_LEN))
+        except (TypeError, ValueError):
+            val = DEFAULT_MIN_REVIEW_LEN
+        return max(50, min(MAX_REVIEW_LEN, val))
+
     def _fill(self, template: str, order: Order, chat_history: str, order_datetime: str) -> str:
         review = order.review
         subs = {
@@ -713,6 +741,7 @@ class Plugin:
             "{text}": str(review.text if review and review.text else "без текста"),
             "{chat_history}": chat_history,
             "{order_datetime}": order_datetime,
+            "{min_review_len}": str(self._min_review_len()),
         }
         for k, v in subs.items():
             template = template.replace(k, v)
@@ -746,23 +775,38 @@ class Plugin:
             temp = float(self.get_cfg("temperature", "0.95"))
         except (TypeError, ValueError):
             temp = 0.95
+        min_len = self._min_review_len()
         system_tpl = str(self.get_cfg("system_prompt", DEFAULT_SYSTEM_PROMPT))
         system = self._fill(system_tpl, order, chat_history, order_datetime)
         review_tpl = str(self.get_cfg("review_prompt", DEFAULT_REVIEW_PROMPT))
         if not review_tpl.strip():
             review_tpl = DEFAULT_REVIEW_PROMPT
-        prompt = self._fill(review_tpl, order, chat_history, order_datetime)
+        base_prompt = self._fill(review_tpl, order, chat_history, order_datetime)
         recent = self.get_cfg("recent_replies", [])[-8:]
+        history_block = ""
         if recent:
-            prompt += "\n\nНе повторяй эти ответы:\n"
+            history_block = "\n\nНе повторяй эти ответы:\n"
             for i, r in enumerate(recent, 1):
-                prompt += f"{i}. {r.get('text', '')[:100]}\n"
-        return _gemini_generate(
-            str(self.get_cfg("gemini_api_key", "")),
-            str(self.get_cfg("gemini_proxy", "")),
-            str(self.get_cfg("gemini_model", "gemini-2.5-flash-lite")),
-            system, prompt, temp,
+                history_block += f"{i}. {r.get('text', '')[:100]}\n"
+        length_rule = (
+            f"\n\nОБЯЗАТЕЛЬНО: ответ от {min_len} до {MAX_REVIEW_LEN} символов. "
+            f"Не короче {min_len} символов — развёрнутый тёплый текст."
         )
+        api_key = str(self.get_cfg("gemini_api_key", ""))
+        proxy = str(self.get_cfg("gemini_proxy", ""))
+        model = str(self.get_cfg("gemini_model", "gemini-2.5-flash-lite"))
+        for attempt in range(2):
+            extra = ""
+            if attempt == 1:
+                extra = (
+                    f"\n\nПредыдущий ответ был слишком коротким. "
+                    f"Напиши заново: минимум {min_len} символов, 2–4 предложения, тепло и по делу."
+                )
+            prompt = base_prompt + history_block + length_rule + extra
+            reply = _gemini_generate(api_key, proxy, model, system, prompt, temp, min_len=min_len)
+            if reply:
+                return reply
+        return None
 
     def _generate_chat(self, order: Order, chat_history: str, order_datetime: str) -> str | None:
         system = str(self.get_cfg("chat_system", DEFAULT_CHAT_SYSTEM))
@@ -779,30 +823,50 @@ class Plugin:
             system, prompt, temp,
         )
 
+    def _expand_reply_to_min(self, text: str, min_len: int) -> str:
+        text = (text or "").strip()
+        if len(text) >= min_len:
+            return text
+        fillers = [
+            " Нам очень приятно, что вы нашли время поделиться впечатлением — для нас это действительно важно.",
+            " Мы всегда на связи и с радостью поможем, если понадобится что-то ещё.",
+            " Будем рады видеть вас снова и постараемся каждый раз оправдывать доверие.",
+            " Спасибо, что выбираете нас — мы ценим каждого покупателя и стараемся работать на отлично.",
+            " Если захотите повторить заказ — будем только рады помочь снова.",
+        ]
+        pool = fillers.copy()
+        random.shuffle(pool)
+        for phrase in pool:
+            if len(text) >= min_len:
+                break
+            text = (text + phrase).strip()
+        while len(text) < min_len:
+            text += " Ждём вас снова! ✨"
+        return text[:MAX_REVIEW_LEN]
+
     def _fallback_reply(self, order: Order, order_datetime: str) -> str:
+        min_len = self._min_review_len()
         review = order.review
         stars = int(review.stars if review else 5)
         item = self._product_name(order)
-        text = (review.text or "").lower() if review else ""
+        review_text = (review.text or "").strip() if review else ""
         if stars == 1:
-            return _trim(
-                f"Спасибо за обратную связь по «{item}» (выполнен {order_datetime}). "
-                f"Данный отзыв не соответствует действительности, оставлен с целью ухудшения рейтинга "
-                f"и в скором времени будет удалён. Мы всегда открыты к диалогу! 🌟",
-                MAX_REVIEW_LEN,
+            base = (
+                f"Здравствуйте! Спасибо, что написали по заказу «{item}» (выполнен {order_datetime}). "
+                f"Нам жаль, что впечатление оказалось негативным. Мы внимательно относимся к каждому отзыву "
+                f"и готовы разобраться в ситуации. Если что-то пошло не так — напишите в чат, мы постараемся помочь. "
+                f"Данный отзыв не соответствует действительности и будет рассмотрен. С уважением, ваш продавец."
             )
-        beer = " Приятного отдыха! 🍺" if "пив" in text else ""
-        jokes = [
-            "Анекдот: скидка уже в вашей улыбке! 😄",
-            "Хороший отзыв — как кофе утром! ☕",
-            "Спасибо, что выбрали нас! 🎉",
-        ]
-        return _trim(
-            f"Огромное спасибо за отзыв! ⭐ Рады, что «{item}» "
-            f"(заказ {order_datetime}) вам понравился.{beer} "
-            f"{random.choice(jokes)} Ждём вас снова! 💫",
-            MAX_REVIEW_LEN,
+            return _format_for_funpay_review(self._expand_reply_to_min(base, min_len))
+        beer = " Приятного отдыха! 🍺" if "пив" in review_text.lower() else ""
+        mention = f" Приятно видеть оценку «{review_text}»!" if review_text and review_text.lower() not in ("норм", "гуд", "ok", "ок") else ""
+        base = (
+            f"Здравствуйте! Огромное спасибо за отзыв и высокую оценку! ⭐ "
+            f"Очень рады, что заказ «{item}» ({order_datetime}) вам понравился.{mention}{beer} "
+            f"Для нас важно, чтобы каждый покупатель остался доволен — именно ради таких отзывов мы и работаем. "
+            f"Будем счастливы видеть вас снова! С теплом, ваш продавец. 💫"
         )
+        return _format_for_funpay_review(self._expand_reply_to_min(base, min_len))
 
     def _extract_order_id(self, obj: Any) -> str | None:
         for source in (
@@ -903,15 +967,24 @@ class Plugin:
                 chat_id = order.chat_id
             chat_history = self._get_chat_history(chat_id, buyer)
             order_dt = self._order_datetime(order, shortcut_date)
+            min_len = self._min_review_len()
             reply = self._generate_reply(order, chat_history, order_dt)
             if not reply:
                 reply = self._fallback_reply(order, order_dt)
             else:
                 reply = _format_for_funpay_review(_strip_name(reply, buyer))
+                if len(reply) < min_len:
+                    reply = _format_for_funpay_review(
+                        self._expand_reply_to_min(reply, min_len),
+                    )
             if not reply or _is_incomplete_reply(reply):
-                reply = _format_for_funpay_review(self._fallback_reply(order, order_dt))
+                reply = self._fallback_reply(order, order_dt)
+            elif len(reply) < min_len:
+                reply = _format_for_funpay_review(
+                    self._expand_reply_to_min(reply, min_len),
+                )
             if self._is_duplicate(reply) and not force_update:
-                reply = _format_for_funpay_review(self._fallback_reply(order, order_dt))
+                reply = self._fallback_reply(order, order_dt)
             self.cardinal.account.send_review(oid, reply)
             self._remember_reply(reply, order)
             self.log("Ответ #%s отправлен (%s симв.)", oid, len(reply))
