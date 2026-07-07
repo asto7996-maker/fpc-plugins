@@ -41,7 +41,7 @@ except ImportError:
 
 
 NAME          = "Gemini Review Reply"
-VERSION       = "3.0.6"
+VERSION       = "3.0.7"
 DESCRIPTION   = "ИИ-ответы на отзывы FunPay (Gemini AQ + HTTP/SOCKS proxy + batch) 🌈"
 CREDITS       = "Cursor AI"
 UUID          = "c4e8b2f1-9a3d-4e7b-8c6f-2d1a5e9b0c3f"
@@ -50,7 +50,8 @@ BIND_TO_DELETE = None
 
 MAX_REVIEW_LEN:   Final[int] = 999
 MAX_CHAT_LEN:     Final[int] = 240
-MAX_PROMPT_LEN:   Final[int] = 2000
+MAX_PROMPT_LEN:   Final[int] = 4000
+PROMPT_PREVIEW_LEN: Final[int] = 250
 CHAT_HISTORY_MAX: Final[int] = 20
 SETTINGS_FILE     = f"storage/plugins/{UUID}/settings.json"
 CHINESE_RE        = re.compile(r"[\u4e00-\u9fff]")
@@ -358,11 +359,12 @@ class Plugin:
                     loaded["reply_on_changed"] = True
                 if old_ver < "3.0.5":
                     loaded.setdefault("batch_only_unanswered", False)
-                    loaded["_cfg_version"] = "3.0.5"
+                if old_ver < "3.0.7":
+                    loaded["_cfg_version"] = "3.0.7"
                 else:
-                    loaded.setdefault("_cfg_version", "3.0.5")
+                    loaded.setdefault("_cfg_version", "3.0.7")
                 self._cfg = loaded
-                if old_ver < "3.0.5":
+                if old_ver < "3.0.7":
                     self._save_settings()
             else:
                 self._cfg = defaults
@@ -413,7 +415,7 @@ class Plugin:
             "batch_count": 5,
             "batch_only_unanswered": False,
             "recent_replies": [],
-            "_cfg_version": "3.0.5",
+            "_cfg_version": "3.0.7",
         }
 
     @staticmethod
@@ -458,6 +460,20 @@ class Plugin:
             {"key": "test_gemini", "label": "🧪 Тест Gemini API", "type": "action"},
             {"key": "check_proxy", "label": "🌐 Проверить прокси", "type": "action"},
         ]
+
+    def _prompt_edit_intro(self, field: dict[str, Any], cur: str) -> str:
+        label = _escape(field.get("label", field.get("key", "")))
+        total = len(cur or "")
+        preview = _escape(str(cur or "")[:PROMPT_PREVIEW_LEN])
+        if total > PROMPT_PREVIEW_LEN:
+            preview += "…"
+        return (
+            f"✏️ <b>{label}</b>\n\n"
+            f"📏 Сохранено: <b>{total}</b> / {MAX_PROMPT_LEN} символов\n"
+            f"👁 Превью:\n<code>{preview or '—'}</code>\n\n"
+            f"Отправьте новый текст одним сообщением (до {MAX_PROMPT_LEN} симв.).\n"
+            f"<code>/cancel</code> — отмена"
+        )
 
     def get_schema_field(self, key: str) -> dict[str, Any] | None:
         for field in self.get_settings_schema():
@@ -1018,15 +1034,17 @@ class Plugin:
                 ftype = field.get("type", "str")
                 cur = plugin.get_cfg(key, "")
                 label = field.get("label", key)
-                max_len = field.get("max_len", MAX_PROMPT_LEN if ftype == "multiline" else 500)
-                preview = _escape(str(cur)[:max_len])
-                if len(str(cur)) > max_len:
-                    preview += "…"
-                limit_hint = f"\n\nЛимит: <b>{max_len}</b> символов." if ftype == "multiline" else ""
-                prompt = (
-                    f"✏️ <b>{label}</b>\n\nТекущее:\n<code>{preview}</code>\n\n"
-                    f"Введите новое значение.{limit_hint}\n/cancel — отмена"
-                )
+                if ftype == "multiline":
+                    prompt = plugin._prompt_edit_intro(field, str(cur))
+                else:
+                    max_len = field.get("max_len", 500)
+                    preview = _escape(str(cur)[:max_len])
+                    if len(str(cur)) > max_len:
+                        preview += "…"
+                    prompt = (
+                        f"✏️ <b>{_escape(label)}</b>\n\nТекущее:\n<code>{preview}</code>\n\n"
+                        f"Введите новое значение.\n/cancel — отмена"
+                    )
                 result = bot.send_message(chat_id, prompt, parse_mode="HTML")
                 tg.set_state(chat_id, result.id, call.from_user.id, state=f"{CB_PREFIX}:edit:{key}")
                 bot.answer_callback_query(call.id)
@@ -1077,17 +1095,27 @@ class Plugin:
                     parse_mode="HTML",
                 )
                 return
+            elif field.get("type") == "multiline":
+                max_len = int(field.get("max_len", MAX_PROMPT_LEN))
+                if len(text) > max_len:
+                    bot.reply_to(
+                        message,
+                        f"⚠️ Слишком длинно: {len(text)} / {max_len} символов. "
+                        f"Сократите промпт или разбейте шаблон.",
+                    )
+                    return
+                plugin.set_cfg(key, text)
             else:
-                if field.get("type") == "multiline":
-                    max_len = int(field.get("max_len", MAX_PROMPT_LEN))
-                    if len(text) > max_len:
-                        bot.reply_to(message, f"⚠️ Слишком длинно: {len(text)} / {max_len} символов")
-                        return
-                    plugin.set_cfg(key, text)
-                else:
-                    plugin.set_cfg(key, text.strip())
+                plugin.set_cfg(key, text.strip())
             tg.clear_state(message.chat.id, message.from_user.id)
-            bot.reply_to(message, f"✅ Сохранено: <b>{field.get('label', key)}</b>", parse_mode="HTML")
+            if field.get("type") == "multiline":
+                bot.reply_to(
+                    message,
+                    f"✅ Сохранено: <b>{field.get('label', key)}</b> ({len(text)} симв.)",
+                    parse_mode="HTML",
+                )
+            else:
+                bot.reply_to(message, f"✅ Сохранено: <b>{field.get('label', key)}</b>", parse_mode="HTML")
 
         def on_plugin_settings(call: CallbackQuery) -> None:
             if f"{CBT.PLUGIN_SETTINGS}:{UUID}" not in (call.data or ""):
