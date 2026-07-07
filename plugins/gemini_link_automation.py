@@ -2,7 +2,7 @@ from __future__ import annotations
 
 # === ОБЯЗАТЕЛЬНЫЕ ПОЛЯ FunPay Cardinal (НЕ УДАЛЯТЬ) ===
 NAME = "Gemini Link Auto"
-VERSION = "2.0.3"
+VERSION = "2.0.4"
 DESCRIPTION = "Автовыдача Gemini 18m через Reseller API + очередь + автозакупка при рестоке"
 CREDITS = "@xei1y"
 UUID = "e8a3f1c2-9b4d-4d7e-a816-5f2c9b0e3d41"
@@ -25,6 +25,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import requests
 from telebot.types import InlineKeyboardButton, InlineKeyboardMarkup
 
+from FunPayAPI.common import exceptions as fp_exceptions
 from FunPayAPI.common.enums import OrderStatuses
 from FunPayAPI.common.utils import RegularExpressions
 from FunPayAPI.types import MessageTypes
@@ -47,6 +48,7 @@ WAIT_QUEUE_FILE = f"{STORAGE_DIR}/wait_queue.json"
 INVENTORY_FILE = f"{STORAGE_DIR}/inventory.json"
 RESTOCK_SUBS_FILE = f"{STORAGE_DIR}/restock_subscribers.json"
 ATTENTION_FILE = f"{STORAGE_DIR}/manual_attention.json"
+PENDING_DELIVERY_FILE = f"{STORAGE_DIR}/pending_delivery.json"
 STATE_FILE = f"{STORAGE_DIR}/state.json"
 
 _file_lock = threading.Lock()
@@ -78,8 +80,9 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "auto_buy_on_restock": True,
     "auto_buy_quantity": 5,
     "notify_seller": True,
-    "funpay_max_message_len": 450,
-    "delivery_split_sleep_sec": 2.0,
+    "funpay_max_message_len": 200,
+    "delivery_split_sleep_sec": 2.5,
+    "delivery_send_attempts": 4,
     "delivery_use_paste_fallback": False,
     "processing_message": (
         "⏳ Заказ #{order_id} принят!\n"
@@ -293,10 +296,78 @@ def send_fp(
         kwargs["watermark"] = watermark
     try:
         result = c.send_message(chat_id, text, **kwargs)
-        return bool(result)
+        if result:
+            return True
     except Exception as exc:
-        logger.error("%s: send_fp chat=%s: %s", _P, chat_id, exc)
+        logger.debug("%s: cardinal.send_message: %s", _P, exc)
+    return _send_fp_raw(c, chat_id, text, buyer)
+
+
+def _normalize_chat_id(chat_id: Any) -> Any:
+    try:
+        return int(chat_id)
+    except (TypeError, ValueError):
+        return chat_id
+
+
+def _send_fp_raw(c: Cardinal, chat_id: Any, text: str, buyer: Optional[str] = None) -> bool:
+    text = (text or "").strip()
+    if not text:
         return False
+    cid = _normalize_chat_id(chat_id)
+    settings = load_settings()
+    attempts = int(settings.get("delivery_send_attempts", 4))
+    for attempt in range(1, attempts + 1):
+        try:
+            c.account.send_message(cid, text, buyer)
+            _log_action("FunPay отправлено", chat_id=cid, len=len(text), attempt=attempt)
+            return True
+        except fp_exceptions.MessageNotDeliveredError as exc:
+            logger.error(
+                "%s: FunPay отклонил (%s симв.): %s",
+                _P, len(text), exc.error_message or exc.short_str(),
+            )
+        except Exception as exc:
+            logger.error("%s: send_message chat=%s: %s", _P, cid, exc)
+        if attempt < attempts:
+            time.sleep(1.5 * attempt)
+    return False
+
+
+def _send_text_adaptive(
+    c: Cardinal,
+    chat_id: Any,
+    text: str,
+    buyer: Optional[str],
+    max_len: int,
+    sleep_sec: float,
+) -> bool:
+    text = text.strip()
+    if not text:
+        return True
+    if len(text) <= max_len:
+        return _send_fp_raw(c, chat_id, text, buyer)
+
+    chunks = _chunk_text(text, max_len)
+    for idx, chunk in enumerate(chunks):
+        label = f"({idx + 1}/{len(chunks)}) "
+        piece = label + chunk if len(label + chunk) <= max_len else chunk
+        if len(piece) > max_len:
+            sub_chunks = _chunk_text(chunk, max(80, max_len - len(label)))
+            for sub_idx, sub in enumerate(sub_chunks):
+                sub_piece = f"({idx + 1}.{sub_idx + 1}) {sub}"
+                if len(sub_piece) > max_len:
+                    sub_piece = sub
+                if not _send_fp_raw(c, chat_id, sub_piece, buyer):
+                    return False
+                if sleep_sec > 0:
+                    time.sleep(sleep_sec)
+            continue
+        if not _send_fp_raw(c, chat_id, piece, buyer):
+            return False
+        if sleep_sec > 0 and idx < len(chunks) - 1:
+            time.sleep(sleep_sec)
+    return True
 
 
 def _cleanup_stale(keys: Dict[str, float], ttl: float) -> None:
@@ -402,26 +473,6 @@ def _upload_paste(content: str) -> Optional[str]:
     return None
 
 
-def _build_delivery_parts(order_id: str, links: List[str]) -> List[str]:
-    settings = load_settings()
-    max_len = int(settings.get("funpay_max_message_len", 450))
-
-    parts: List[str] = [
-        f"🎉 Gemini 18 мес. готово!\n📋 Заказ: #{order_id}\n🔗 Ссылка ниже — активируйте сразу!",
-    ]
-    for idx, link in enumerate(links, 1):
-        label = f"Ссылка {idx}/{len(links)}" if len(links) > 1 else "Ссылка"
-        chunk_size = max(120, max_len - len(label) - 8)
-        chunks = _chunk_text(link, chunk_size)
-        for ci, chunk in enumerate(chunks, 1):
-            if len(chunks) == 1:
-                header = f"🔗 {label}:\n"
-            else:
-                header = f"🔗 {label} ({ci}/{len(chunks)}):\n"
-            parts.append(header + chunk)
-    return parts
-
-
 def send_fp_delivery(
     c: Cardinal,
     chat_id: Any,
@@ -433,25 +484,33 @@ def send_fp_delivery(
     if not chat_id or not links:
         return False
     settings = load_settings()
-    sleep_sec = float(settings.get("delivery_split_sleep_sec", 2.0))
-    parts = _build_delivery_parts(order_id, links)
-    sent = 0
-    for idx, part in enumerate(parts):
-        if idx > 0 and sleep_sec > 0:
+    max_len = int(settings.get("funpay_max_message_len", 200))
+    sleep_sec = float(settings.get("delivery_split_sleep_sec", 2.5))
+
+    header = f"🎉 Gemini 18m готово!\n📋 #{order_id}\n🔗 Ссылка частями:"
+    if not _send_fp_raw(c, chat_id, header, buyer):
+        if not send_fp(c, chat_id, header, buyer=buyer, buyer_id=buyer_id, watermark=False):
+            logger.error("%s: не отправлен заголовок #%s", _P, order_id)
+            return False
+
+    for idx, link in enumerate(links, 1):
+        if sleep_sec > 0:
             time.sleep(sleep_sec)
-        if send_fp(c, chat_id, part, buyer=buyer or None, buyer_id=buyer_id, watermark=(idx == 0)):
-            sent += 1
-        else:
-            logger.error("%s: не отправлена часть %s/%s для #%s", _P, idx + 1, len(parts), order_id)
-    if sent == len(parts):
-        return True
-    if sent > 0:
-        send_fp(
-            c, chat_id,
-            f"⚠️ Часть ссылок для #{order_id} не отправилась. Напишите «2» — позовём продавца.",
-            buyer=buyer or None, buyer_id=buyer_id, watermark=False,
-        )
-    return False
+        if len(links) > 1:
+            _send_fp_raw(c, chat_id, f"— ссылка {idx}/{len(links)} —", buyer)
+
+        ok = _send_text_adaptive(c, chat_id, link, buyer, max_len, sleep_sec)
+        if not ok:
+            logger.warning("%s: retry #%s с 100 симв.", _P, order_id)
+            ok = _send_text_adaptive(c, chat_id, link, buyer, 100, sleep_sec)
+        if not ok:
+            logger.warning("%s: retry #%s с 80 симв.", _P, order_id)
+            ok = _send_text_adaptive(c, chat_id, link, buyer, 80, sleep_sec)
+        if not ok:
+            return False
+
+    _send_fp_raw(c, chat_id, "📌 Активируйте ссылку сразу! Спасибо за покупку ⭐", buyer)
+    return True
 
 
 def _format_template(key: str, **kwargs: Any) -> str:
@@ -602,6 +661,40 @@ def load_attention() -> List[Dict[str, Any]]:
 
 def save_attention(items: List[Dict[str, Any]]) -> None:
     _save_json(ATTENTION_FILE, items)
+
+
+def load_pending_delivery() -> Dict[str, Any]:
+    return _load_json(PENDING_DELIVERY_FILE, {})
+
+
+def save_pending_delivery(data: Dict[str, Any]) -> None:
+    _save_json(PENDING_DELIVERY_FILE, data)
+
+
+def get_pending_links(order_id: str) -> Optional[List[str]]:
+    entry = load_pending_delivery().get(order_id)
+    if not entry:
+        return None
+    links = entry.get("links") or []
+    return links if links else None
+
+
+def set_pending_links(order_id: str, links: List[str], chat_id: Any, buyer: str) -> None:
+    data = load_pending_delivery()
+    data[order_id] = {
+        "links": links,
+        "chat_id": chat_id,
+        "buyer": buyer,
+        "at": _ts(),
+    }
+    save_pending_delivery(data)
+
+
+def clear_pending_links(order_id: str) -> None:
+    data = load_pending_delivery()
+    if order_id in data:
+        del data[order_id]
+        save_pending_delivery(data)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -824,13 +917,19 @@ class Plugin:
             logger.error("%s: #%s — пустые ссылки для выдачи", _P, order_id)
             self.notify_seller(f"⚠️ <b>{NAME}</b> #{order_id} — API не вернул ссылку")
             return False
+
+        set_pending_links(order_id, link_list, chat_id, buyer)
+
         if chat_id:
             if not send_fp_delivery(self.cardinal, chat_id, order_id, link_list, buyer, buyer_id):
                 self.notify_seller(
-                    f"⚠️ <b>{NAME}</b> #{order_id} — ошибка отправки в FunPay\n"
+                    f"⚠️ <b>{NAME}</b> #{order_id} — не удалось отправить в FunPay\n"
+                    f"Ссылка сохранена. Повтор: <code>/gl_process {order_id}</code>\n"
                     f"👤 {html.escape(buyer or '—')}"
                 )
                 return False
+
+        clear_pending_links(order_id)
         self._mark_processed(order_id)
         OrderQueue.remove(order_id)
         self.notify_seller(
@@ -1011,8 +1110,14 @@ class Plugin:
                 send_fp(
                     self.cardinal, chat_id,
                     _format_template("processing_message", order_id=order_id),
-                    buyer=buyer, buyer_id=buyer_id,
+                    buyer=buyer, buyer_id=buyer_id, watermark=False,
                 )
+
+            pending = get_pending_links(order_id)
+            if pending:
+                _log_action("Повторная выдача сохранённой ссылки", order_id=order_id)
+                if self._deliver(order_id, chat_id, pending, buyer, buyer_id):
+                    return
 
             links_from_inv: List[str] = []
             for _ in range(quantity):
@@ -1251,7 +1356,7 @@ def _settings_summary() -> str:
         f"🆔 Product ID: <code>{html.escape(str(s.get('bot_product_id') or 'auto'))}</code>\n"
         f"📦 Резерв: {inv} | Очередь: {wait}\n"
         f"🔄 Автозакупка: {s.get('auto_buy_quantity', 5)} шт. при рестоке\n\n"
-        f"/gemini_link /gl_balance /gl_stock /gl_process ID /gl_test_buy"
+        f"/gemini_link /gl_balance /gl_stock /gl_process /gl_resend /gl_test_buy"
     )
 
 
@@ -1424,6 +1529,32 @@ def setup_telegram(cardinal: Cardinal) -> None:
                 bot.send_message(msg.chat.id, f"❌ {exc}")
         threading.Thread(target=worker, daemon=True).start()
 
+    def cmd_resend(msg):
+        parts = (msg.text or "").split()
+        if len(parts) < 2:
+            bot.reply_to(msg, "/gl_resend ORDER_ID")
+            return
+        oid = parts[1].strip().lstrip("#").upper()
+        pending = get_pending_links(oid)
+        if not pending:
+            bot.reply_to(msg, f"❌ Нет сохранённой ссылки для #{oid}. Используйте /gl_process {oid}")
+            return
+        bot.reply_to(msg, f"⏳ Повторная отправка #{oid} ({len(pending)} ссыл.)...")
+        entry = load_pending_delivery().get(oid, {})
+        chat_id = entry.get("chat_id")
+        buyer = entry.get("buyer", "")
+
+        def worker():
+            ok = send_fp_delivery(_plugin.cardinal, chat_id, oid, pending, buyer)
+            if ok:
+                clear_pending_links(oid)
+                _plugin._mark_processed(oid)
+                bot.send_message(msg.chat.id, f"✅ #{oid} отправлен")
+            else:
+                bot.send_message(msg.chat.id, f"❌ #{oid} — FunPay отклонил сообщения. Проверьте логи.")
+        threading.Thread(target=worker, daemon=True).start()
+
+    tg.msg_handler(cmd_resend, func=lambda m: m.text and m.text.split()[0].lower() == "/gl_resend")
     tg.msg_handler(cmd_test_buy, func=lambda m: m.text and m.text.split()[0].lower() == "/gl_test_buy")
 
     tg.msg_handler(lambda m: _edit_panel(bot, m.chat.id), func=lambda m: m.text and m.text.split()[0].lower() in ("/gemini_link", "/gemini"))
@@ -1472,6 +1603,7 @@ def setup_telegram(cardinal: Cardinal) -> None:
             ("gl_stock", "наличие Gemini", True),
             ("gl_balance", "баланс API", True),
             ("gl_test_buy", "тест покупки API", True),
+            ("gl_resend", "повторить выдачу", True),
         ])
     except Exception:
         pass
