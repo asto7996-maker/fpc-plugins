@@ -2,7 +2,7 @@ from __future__ import annotations
 
 # === ОБЯЗАТЕЛЬНЫЕ ПОЛЯ FunPay Cardinal (НЕ УДАЛЯТЬ) ===
 NAME = "Gemini Link Auto"
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 DESCRIPTION = "Автовыдача Gemini link (18 мес.) через API Telegram-бота поставщика"
 CREDITS = "@xei1y"
 UUID = "e8a3f1c2-9b4d-4d7e-a816-5f2c9b0e3d41"
@@ -588,13 +588,13 @@ def setup_telegram(cardinal: Cardinal) -> None:
 
         if data == "gla_set_url":
             r = bot.send_message(chat_id, "Введите BOT_API_URL:")
-            tg.set_state(chat_id, r.message_id, call.from_user.id, "gla_url")
+            tg.set_state(chat_id, r.message_id, call.from_user.id, state="gla_url")
         elif data == "gla_set_key":
             r = bot.send_message(chat_id, "Введите BOT_API_KEY:")
-            tg.set_state(chat_id, r.message_id, call.from_user.id, "gla_key")
+            tg.set_state(chat_id, r.message_id, call.from_user.id, state="gla_key")
         elif data == "gla_set_keywords":
             r = bot.send_message(chat_id, "Введите ключевые слова через запятую:\n(например: Gemini link, gemini 18)")
-            tg.set_state(chat_id, r.message_id, call.from_user.id, "gla_keywords")
+            tg.set_state(chat_id, r.message_id, call.from_user.id, state="gla_keywords")
         elif data == "gla_balance":
             try:
                 bal = SupplierBotAPI.get_balance()
@@ -621,29 +621,52 @@ def setup_telegram(cardinal: Cardinal) -> None:
         bot.answer_callback_query(call.id)
 
     def on_text(msg):
-        state = tg.get_state(msg.chat.id, msg.from_user.id)
-        if not state:
+        state_data = tg.get_state(msg.chat.id, msg.from_user.id)
+        if not state_data or "state" not in state_data:
             return
+        state = state_data["state"]
+        if state not in ("gla_url", "gla_key", "gla_keywords"):
+            return
+
         settings = load_settings()
         text = (msg.text or "").strip()
+
+        if text.lower() in ("/cancel", "отмена"):
+            tg.clear_state(msg.chat.id, msg.from_user.id, True)
+            bot.reply_to(msg, "❌ Отменено")
+            return
+
         if state == "gla_url":
             settings["bot_api_url"] = text.rstrip("/")
         elif state == "gla_key":
             settings["bot_api_key"] = text
+            try:
+                bot.delete_message(msg.chat.id, msg.message_id)
+            except Exception:
+                pass
         elif state == "gla_keywords":
             settings["product_keywords"] = [k.strip() for k in text.split(",") if k.strip()]
-        else:
-            return
+
         save_settings(settings)
         tg.clear_state(msg.chat.id, msg.from_user.id, True)
-        bot.reply_to(msg, "✅ Сохранено", parse_mode="HTML")
+
+        if state == "gla_key":
+            bot.send_message(msg.chat.id, "✅ API Key сохранён.", parse_mode="HTML")
+        else:
+            bot.reply_to(msg, "✅ Сохранено", parse_mode="HTML")
         _send_panel(bot, msg.chat.id)
+
+    def _has_input_state(msg):
+        for st in ("gla_url", "gla_key", "gla_keywords"):
+            if tg.check_state(msg.chat.id, msg.from_user.id, st):
+                return True
+        return False
 
     tg.msg_handler(cmd_panel, func=lambda m: m.text and m.text.split()[0].lower() in ("/gemini_link", "/gemini"))
     tg.msg_handler(cmd_balance, func=lambda m: m.text and m.text.split()[0].lower() == "/gl_balance")
     tg.msg_handler(cmd_stock, func=lambda m: m.text and m.text.split()[0].lower() == "/gl_stock")
     tg.cbq_handler(on_callback, lambda c: (c.data or "").startswith("gla_"))
-    tg.msg_handler(on_text, func=lambda m: tg.get_state(m.chat.id, m.from_user.id) in ("gla_url", "gla_key", "gla_keywords"))
+    tg.msg_handler(on_text, func=_has_input_state)
 
     try:
         cardinal.add_telegram_commands(UUID, [
