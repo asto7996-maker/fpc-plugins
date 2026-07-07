@@ -41,7 +41,7 @@ except ImportError:
 
 
 NAME          = "Gemini Review Reply"
-VERSION       = "3.0.4"
+VERSION       = "3.0.5"
 DESCRIPTION   = "ИИ-ответы на отзывы FunPay (Gemini AQ + HTTP/SOCKS proxy + batch) 🌈"
 CREDITS       = "Cursor AI"
 UUID          = "c4e8b2f1-9a3d-4e7b-8c6f-2d1a5e9b0c3f"
@@ -314,6 +314,19 @@ def _seller_review_reply(review: Any) -> str | None:
     return getattr(review, "reply", None) or getattr(review, "answer", None)
 
 
+def _has_buyer_review(order: Order | None) -> bool:
+    if not order or not order.review:
+        return False
+    review = order.review
+    if review.hidden:
+        return False
+    stars = getattr(review, "stars", None)
+    if stars is not None and int(stars) > 0:
+        return True
+    text = str(review.text or "").strip()
+    return bool(text)
+
+
 # ═════════════════════════════════════════════════════════════════════════════
 #  Plugin (архитектура StarvellPlugin)
 # ═════════════════════════════════════════════════════════════════════════════
@@ -342,9 +355,13 @@ class Plugin:
                     loaded.setdefault(k, v)
                 if old_ver < "3.0.4":
                     loaded["reply_on_changed"] = True
-                    loaded["_cfg_version"] = "3.0.4"
+                if old_ver < "3.0.5":
+                    loaded.setdefault("batch_only_unanswered", False)
+                    loaded["_cfg_version"] = "3.0.5"
+                else:
+                    loaded.setdefault("_cfg_version", "3.0.5")
                 self._cfg = loaded
-                if old_ver < "3.0.4":
+                if old_ver < "3.0.5":
                     self._save_settings()
             else:
                 self._cfg = defaults
@@ -393,8 +410,9 @@ class Plugin:
             "send_chat_message": True,
             "reply_on_changed": True,
             "batch_count": 5,
+            "batch_only_unanswered": False,
             "recent_replies": [],
-            "_cfg_version": "3.0.4",
+            "_cfg_version": "3.0.5",
         }
 
     @staticmethod
@@ -426,8 +444,14 @@ class Plugin:
                 "type": "bool",
                 "default": True,
             },
-            {"key": "batch_count", "label": "N для ручной обработки старых отзывов", "type": "int", "default": 5, "min": 1, "max": 50},
-            {"key": "reply_recent", "label": "▶ Вручную: ответить на N старых отзывов", "type": "action"},
+            {"key": "batch_count", "label": "Кол-во последних отзывов (N)", "type": "int", "default": 5, "min": 1, "max": 50},
+            {
+                "key": "batch_only_unanswered",
+                "label": "Batch: только без ответа продавца",
+                "type": "bool",
+                "default": False,
+            },
+            {"key": "reply_recent", "label": "▶ Ответить на N последних отзывов", "type": "action"},
             {"key": "test_gemini", "label": "🧪 Тест Gemini API", "type": "action"},
             {"key": "check_proxy", "label": "🌐 Проверить прокси", "type": "action"},
         ]
@@ -482,7 +506,7 @@ class Plugin:
         if self.get_cfg("enabled"):
             lines.append("⚡ <b>Автоответ:</b> включён — отвечаем сразу при новом отзыве")
         else:
-            lines.append("🔴 <b>Автоответ выключен</b> — только кнопка ручной обработки N отзывов")
+            lines.append("🔴 <b>Автоответ выключен</b> — только кнопка обработки N последних отзывов")
         if self.get_cfg("reply_on_changed"):
             lines.append("🔄 <b>Изменённые отзывы:</b> отвечаем при переписывании")
         else:
@@ -683,7 +707,7 @@ class Plugin:
                 time.sleep(delay)
             try:
                 order = self.cardinal.account.get_order(order_id)
-                if order.review and order.review.stars:
+                if _has_buyer_review(order):
                     return order
             except Exception as exc:
                 logger.debug("%s get_order #%s: %s", _P, order_id, exc)
@@ -716,7 +740,7 @@ class Plugin:
                 order_id,
             )
             order = self._fetch_order_with_review(order_id)
-            if not order or not order.review or not order.review.stars:
+            if not _has_buyer_review(order):
                 logger.error("%s отзыв #%s не появился на FunPay вовремя", _P, order_id)
                 return
 
@@ -730,7 +754,7 @@ class Plugin:
             logger.debug(traceback.format_exc())
 
     def process_order(self, order: Order, chat_id: Any = None, shortcut_date: datetime | None = None) -> bool:
-        if not order.review or not order.review.stars:
+        if not _has_buyer_review(order):
             return False
         oid = order.id
         with self._lock:
@@ -772,15 +796,46 @@ class Plugin:
             with self._lock:
                 self._processing.discard(oid)
 
-    def fetch_unanswered_reviews(self, limit: int) -> list[tuple[Order, datetime | None]]:
-        """Последние отзывы покупателей без ответа продавца."""
-        reviewed_pool: list[tuple[Order, datetime | None]] = []
+    def _orders_from_shortcuts(
+        self, shortcuts: list[Any],
+    ) -> list[tuple[Order, datetime | None]]:
+        if not shortcuts:
+            return []
+        result: list[tuple[Order, datetime | None]] = []
+        date_map = {s.id: getattr(s, "date", None) for s in shortcuts}
+        ids = [s.id for s in shortcuts]
+        orders_map: dict[str, Order] = {}
+        try:
+            orders_map = self.cardinal.account.get_orders_by_ids(
+                *ids, include_review=True, include_details=True, include_users=True,
+            )
+        except Exception as exc:
+            logger.warning("%s get_orders_by_ids batch: %s", _P, exc)
+            for oid in ids:
+                try:
+                    orders_map[oid] = self.cardinal.account.get_order(oid)
+                except Exception as one_exc:
+                    logger.debug("%s get_order #%s: %s", _P, oid, one_exc)
+        for oid in ids:
+            order = orders_map.get(oid)
+            if not _has_buyer_review(order):
+                continue
+            result.append((order, date_map.get(oid)))
+        return result
+
+    def fetch_last_reviews(self, limit: int) -> list[tuple[Order, datetime | None]]:
+        """Последние N заказов с отзывом покупателя (по дате в списке продаж)."""
+        limit = max(1, min(50, limit))
+        only_unanswered = bool(self.get_cfg("batch_only_unanswered", False))
+        result: list[tuple[Order, datetime | None]] = []
+        pending: list[Any] = []
         start_from: str | None = None
         seen_ids: set[str] = set()
-        pool_target = max(limit * 8, 40)
-        max_pages = 30
-        for page in range(max_pages):
-            if len(reviewed_pool) >= pool_target:
+        max_pages = 50
+        max_scan = max(limit * 25, 120)
+
+        for _ in range(max_pages):
+            if len(result) >= limit or len(seen_ids) >= max_scan:
                 break
             try:
                 next_id, sales, _, _ = self.cardinal.account.get_sales(
@@ -794,42 +849,45 @@ class Plugin:
                 break
             if not sales:
                 break
+
             for shortcut in sales:
                 if shortcut.id in seen_ids:
                     continue
                 seen_ids.add(shortcut.id)
-                try:
-                    order = self.cardinal.account.get_order(shortcut.id)
-                except Exception as exc:
-                    logger.debug("%s get_order #%s: %s", _P, shortcut.id, exc)
-                    continue
-                if not order.review or not order.review.stars:
-                    continue
-                if order.review.hidden:
-                    continue
-                reviewed_pool.append((order, shortcut.date))
-                if len(reviewed_pool) >= pool_target:
-                    break
+                pending.append(shortcut)
+                if len(pending) >= 10:
+                    for order, sdate in self._orders_from_shortcuts(pending):
+                        if only_unanswered and _seller_review_reply(order.review):
+                            continue
+                        result.append((order, sdate))
+                        if len(result) >= limit:
+                            break
+                    pending = []
+                    if len(result) >= limit:
+                        break
+
+            if len(result) < limit and pending:
+                for order, sdate in self._orders_from_shortcuts(pending):
+                    if only_unanswered and _seller_review_reply(order.review):
+                        continue
+                    result.append((order, sdate))
+                    if len(result) >= limit:
+                        break
+                pending = []
+
+            if len(result) >= limit:
+                break
             if not next_id:
                 break
             start_from = next_id
-            time.sleep(0.35)
+            time.sleep(0.25)
 
-        result: list[tuple[Order, datetime | None]] = []
-        for order, sdate in reviewed_pool:
-            if _seller_review_reply(order.review):
-                continue
-            result.append((order, sdate))
-            if len(result) >= limit:
-                break
-        self.log(
-            "Найдено %s неотвеченных из %s последних отзывов (запрошено %s)",
-            len(result), len(reviewed_pool), limit,
-        )
-        return result
+        mode = "без ответа" if only_unanswered else "все"
+        self.log("Найдено %s последних отзывов (%s, запрошено %s)", len(result), mode, limit)
+        return result[:limit]
 
     def batch_reply_recent(self, notify_chat_id: int | None = None) -> None:
-        """Ручная обработка N последних неотвеченных отзывов (не ждёт новые)."""
+        """Ручная обработка N последних отзывов покупателей."""
         if self._batch_running:
             return
         self._batch_running = True
@@ -837,10 +895,10 @@ class Plugin:
         count = int(self.get_cfg("batch_count", 5))
         count = max(1, min(50, count))
         try:
-            self.log("Ручная обработка %s последних неотвеченных отзывов…", count)
-            orders = self.fetch_unanswered_reviews(count)
+            self.log("Обработка %s последних отзывов…", count)
+            orders = self.fetch_last_reviews(count)
             if not orders:
-                msg = f"📭 Нет старых неотвеченных отзывов (запрошено: {count})"
+                msg = f"📭 Не найдено отзывов (запрошено: {count}). Проверьте закрытые заказы на FunPay."
                 self.log(msg)
                 if bot and notify_chat_id:
                     bot.send_message(notify_chat_id, msg)
@@ -849,7 +907,7 @@ class Plugin:
             if bot and notify_chat_id:
                 bot.send_message(
                     notify_chat_id,
-                    f"⏳ <b>Ручная обработка:</b> {len(orders)} старых отзыв(ов)…",
+                    f"⏳ <b>Обрабатываю {len(orders)} последних отзыв(ов)…</b>",
                     parse_mode="HTML",
                 )
             for order, sdate in orders:
@@ -857,10 +915,10 @@ class Plugin:
                     ok += 1
                 else:
                     fail += 1
+                    logger.warning("%s не удалось обработать отзыв #%s", _P, order.id)
                 time.sleep(2)
             summary = (
-                f"✅ <b>Ручная обработка завершена</b>: "
-                f"успешно <b>{ok}</b>, ошибок <b>{fail}</b> из <b>{len(orders)}</b>"
+                f"✅ <b>Готово:</b> успешно <b>{ok}</b>, ошибок <b>{fail}</b> из <b>{len(orders)}</b>"
             )
             self.log(summary.replace("<b>", "").replace("</b>", ""))
             if bot and notify_chat_id:
@@ -894,7 +952,7 @@ class Plugin:
                 bot.answer_callback_query(call.id, "Уже выполняется…", show_alert=True)
                 return True
             n = int(self.get_cfg("batch_count", 5))
-            bot.answer_callback_query(call.id, f"Ручная обработка {n} старых отзывов…")
+            bot.answer_callback_query(call.id, f"Запуск: {n} последних отзывов…")
             threading.Thread(
                 target=self.batch_reply_recent, args=(chat_id,), daemon=True,
             ).start()
