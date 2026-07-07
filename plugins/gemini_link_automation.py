@@ -2,7 +2,7 @@ from __future__ import annotations
 
 # === ОБЯЗАТЕЛЬНЫЕ ПОЛЯ FunPay Cardinal (НЕ УДАЛЯТЬ) ===
 NAME = "Gemini Link Auto"
-VERSION = "1.0.2"
+VERSION = "1.1.0"
 DESCRIPTION = "Автовыдача Gemini link (18 мес.) через API Telegram-бота поставщика"
 CREDITS = "@xei1y"
 UUID = "e8a3f1c2-9b4d-4d7e-a816-5f2c9b0e3d41"
@@ -44,13 +44,15 @@ _plugin: Optional["Plugin"] = None
 _tg_bot_instance_id: Optional[int] = None
 
 DEFAULT_SETTINGS: Dict[str, Any] = {
-    "bot_api_url": "",
+    "bot_api_url": "https://worker-production-53ca.up.railway.app",
     "bot_api_key": "",
     "product_keywords": ["Gemini link"],
-    "bot_product_id": "gemini_18m",
-    "api_path_balance": "/api/v1/balance",
-    "api_path_stock": "/api/v1/stock",
-    "api_path_purchase": "/api/v1/purchase",
+    "bot_product_id": "",
+    "product_search_keywords": ["gemini"],
+    "api_path_balance": "/api/me",
+    "api_path_stock": "/api/products",
+    "api_path_purchase": "/api/buy",
+    "api_auth_header": "X-API-Key",
     "api_retry_count": 3,
     "api_retry_delay": 5,
     "notify_seller": True,
@@ -112,6 +114,11 @@ def load_settings() -> Dict[str, Any]:
     data = _load_json(SETTINGS_FILE, {})
     merged = dict(DEFAULT_SETTINGS)
     merged.update(data)
+    if "/api/v1/" in str(merged.get("api_path_balance", "")):
+        merged["api_path_balance"] = DEFAULT_SETTINGS["api_path_balance"]
+        merged["api_path_stock"] = DEFAULT_SETTINGS["api_path_stock"]
+        merged["api_path_purchase"] = DEFAULT_SETTINGS["api_path_purchase"]
+        merged["api_auth_header"] = DEFAULT_SETTINGS["api_auth_header"]
     return merged
 
 
@@ -196,7 +203,13 @@ def _format_template(key: str, **kwargs: Any) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class SupplierBotAPI:
-    HEADERS = {"Accept": "application/json", "User-Agent": f"FunPayCardinal/{VERSION}"}
+    """Клиент Reseller API: GET /api/me, GET /api/products, POST /api/buy."""
+
+    HEADERS = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "User-Agent": f"FunPayCardinal/{VERSION}",
+    }
 
     @classmethod
     def _settings(cls) -> Dict[str, Any]:
@@ -211,14 +224,20 @@ class SupplierBotAPI:
         s = cls._settings()
         headers = dict(cls.HEADERS)
         key = s.get("bot_api_key", "").strip()
+        header_name = s.get("api_auth_header", "X-API-Key")
         if key:
-            headers["Authorization"] = f"Bearer {key}"
+            headers[header_name] = key
         return headers
 
     @classmethod
     def _retry_params(cls) -> Tuple[int, int]:
         s = cls._settings()
         return int(s.get("api_retry_count", 3)), int(s.get("api_retry_delay", 5))
+
+    @classmethod
+    def _check_ok(cls, data: Dict[str, Any]) -> None:
+        if data.get("ok") is False:
+            raise RuntimeError(data.get("error") or data.get("message") or "API вернул ok=false")
 
     @classmethod
     def _request(cls, method: str, path: str, json_body: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -230,19 +249,18 @@ class SupplierBotAPI:
             try:
                 _log_action(f"API {method} {path}", attempt=attempt)
                 resp = requests.request(
-                    method,
-                    url,
-                    headers=cls._auth_headers(),
-                    json=json_body,
-                    timeout=20,
+                    method, url, headers=cls._auth_headers(), json=json_body, timeout=30,
                 )
                 if resp.status_code >= 500:
                     raise requests.HTTPError(f"HTTP {resp.status_code}")
                 data = resp.json() if resp.content else {}
                 if not resp.ok:
-                    raise requests.HTTPError(data.get("error") or data.get("message") or f"HTTP {resp.status_code}")
+                    err = data.get("error") or data.get("message") or f"HTTP {resp.status_code}"
+                    raise requests.HTTPError(str(err))
+                if isinstance(data, dict):
+                    cls._check_ok(data)
                 return data if isinstance(data, dict) else {"data": data}
-            except (requests.RequestException, ValueError) as exc:
+            except (requests.RequestException, ValueError, RuntimeError) as exc:
                 last_error = str(exc)
                 logger.warning("%s: API попытка %s/%s — %s", _P, attempt, retries, exc)
                 if attempt < retries:
@@ -251,46 +269,100 @@ class SupplierBotAPI:
         raise RuntimeError(f"API недоступен после {retries} попыток: {last_error}")
 
     @classmethod
+    def _product_names(cls, product: Dict[str, Any]) -> str:
+        parts = [
+            str(product.get("name_en") or ""),
+            str(product.get("name_ru") or ""),
+            str(product.get("name") or ""),
+        ]
+        return " ".join(parts).lower()
+
+    @classmethod
+    def _resolve_product(cls, products: List[Dict[str, Any]]) -> Dict[str, Any]:
+        s = cls._settings()
+        pid = s.get("bot_product_id")
+        if pid not in (None, "", 0, "0"):
+            try:
+                target_id = int(pid)
+                for p in products:
+                    if int(p.get("id", -1)) == target_id:
+                        return p
+                raise RuntimeError(f"Товар id={target_id} не найден в /api/products")
+            except ValueError:
+                pass
+
+        keywords = s.get("product_search_keywords") or ["gemini"]
+        matched = [
+            p for p in products
+            if all(kw.lower() in cls._product_names(p) for kw in keywords)
+        ]
+        if len(matched) == 1:
+            return matched[0]
+        if len(matched) > 1:
+            names = ", ".join(f"#{p.get('id')} {p.get('name_en', '?')}" for p in matched[:5])
+            raise RuntimeError(f"Несколько товаров: {names}. Укажите Product ID в /gemini_link")
+        if products:
+            names = ", ".join(f"#{p.get('id')} {p.get('name_en', '?')}" for p in products[:5])
+            raise RuntimeError(f"Gemini не найден. Доступно: {names}")
+        raise RuntimeError("Список товаров пуст (/api/products)")
+
+    @classmethod
+    def get_products(cls) -> List[Dict[str, Any]]:
+        s = cls._settings()
+        data = cls._request("GET", s["api_path_stock"])
+        products = data.get("products") or []
+        return products if isinstance(products, list) else []
+
+    @classmethod
     def get_balance(cls) -> Dict[str, Any]:
         s = cls._settings()
         data = cls._request("GET", s["api_path_balance"])
-        return {
-            "balance": float(data.get("balance", data.get("amount", 0))),
-            "currency": data.get("currency", "RUB"),
-        }
+        user = data.get("user") or data
+        balance = float(user.get("balance", data.get("balance", 0)))
+        return {"balance": balance, "currency": "USD", "username": user.get("username", "")}
 
     @classmethod
     def get_stock(cls) -> Dict[str, Any]:
-        s = cls._settings()
-        product = s.get("bot_product_id", "gemini_18m")
-        path = f"{s['api_path_stock']}?product={product}"
-        data = cls._request("GET", path)
-        available = int(data.get("available", data.get("quantity", data.get("stock", 0))))
-        status = data.get("status", "out_of_stock" if available <= 0 else "ok")
+        products = cls.get_products()
+        product = cls._resolve_product(products)
+        available = int(product.get("stock_count", product.get("stock", 0)))
         return {
             "available": available,
-            "price": float(data["price"]) if data.get("price") is not None else None,
-            "status": status,
+            "price": float(product.get("price", 0)),
+            "status": "out_of_stock" if available <= 0 else "ok",
+            "product_id": int(product.get("id", 0)),
+            "product_name": product.get("name_en") or product.get("name") or "?",
         }
 
     @classmethod
-    def purchase(cls, order_id: str) -> Dict[str, Any]:
+    def purchase(cls, order_id: str, quantity: int = 1) -> Dict[str, Any]:
         s = cls._settings()
+        products = cls.get_products()
+        product = cls._resolve_product(products)
+        product_id = int(product.get("id", 0))
+        if int(product.get("stock_count", 0)) <= 0:
+            return {"activation_link": None, "status": "out_of_stock"}
+
         data = cls._request(
             "POST",
             s["api_path_purchase"],
-            {"product": s.get("bot_product_id", "gemini_18m"), "order_id": order_id},
+            {"product_id": product_id, "quantity": max(1, quantity)},
         )
-        link = (
-            data.get("activation_link")
-            or data.get("link")
-            or data.get("url")
-            or data.get("activationLink")
-        )
-        status = data.get("status", "out_of_stock" if data.get("error") == "out_of_stock" else "ok")
-        if not link and status != "out_of_stock":
-            raise RuntimeError("API не вернул activation_link")
-        return {"activation_link": link, "status": status}
+        items = data.get("items") or []
+        link = str(items[0]).strip() if items else None
+        if not link:
+            link = data.get("activation_link") or data.get("link") or data.get("url")
+        if not link:
+            err = str(data.get("error", "")).lower()
+            if "stock" in err or "out" in err:
+                return {"activation_link": None, "status": "out_of_stock"}
+            raise RuntimeError("API не вернул items")
+        return {
+            "activation_link": link,
+            "status": "ok",
+            "transaction_id": data.get("transaction_id"),
+            "product_id": product_id,
+        }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -527,7 +599,8 @@ def _settings_summary() -> str:
         f"🌐 URL: <code>{html.escape(s.get('bot_api_url') or '—')}</code>\n"
         f"🔑 Key: <code>{html.escape(_mask_key(s.get('bot_api_key', '')))}</code>\n"
         f"🏷 Ключевые слова: <code>{html.escape(', '.join(s.get('product_keywords', [])))}</code>\n"
-        f"📦 Product ID: <code>{html.escape(s.get('bot_product_id', ''))}</code>\n\n"
+        f"📦 Product ID: <code>{html.escape(str(s.get('bot_product_id') or 'авто (gemini)'))}</code>\n"
+        f"🔍 Поиск в API: <code>{html.escape(', '.join(s.get('product_search_keywords', [])))}</code>\n\n"
         f"Команды:\n"
         f"⠀∟ /gemini_link — эта панель\n"
         f"⠀∟ /gl_balance — баланс бота\n"
@@ -544,6 +617,10 @@ def _main_keyboard() -> InlineKeyboardMarkup:
     kb.add(
         InlineKeyboardButton("🏷 Ключевые слова", callback_data="gla:set_keywords"),
         InlineKeyboardButton("🔄 Обновить", callback_data="gla:main"),
+    )
+    kb.add(
+        InlineKeyboardButton("🆔 Product ID", callback_data="gla:set_product"),
+        InlineKeyboardButton("📃 Список товаров", callback_data="gla:products"),
     )
     kb.add(
         InlineKeyboardButton("💰 Баланс бота", callback_data="gla:balance"),
@@ -676,6 +753,30 @@ def setup_telegram(cardinal: Cardinal) -> None:
                 )
                 tg.set_state(chat_id, r.message_id, call.from_user.id, state="gla_keywords")
 
+            elif action == "set_product":
+                _answer(call)
+                r = bot.send_message(
+                    chat_id,
+                    "🆔 Введите <b>Product ID</b> из /api/products\n"
+                    "Или <code>auto</code> для авто-поиска по «gemini»\n/cancel — отмена",
+                    parse_mode="HTML",
+                )
+                tg.set_state(chat_id, r.message_id, call.from_user.id, state="gla_product")
+
+            elif action == "products":
+                if not _is_configured():
+                    _answer(call, "Сначала укажите URL и API Key", alert=True)
+                    return
+                products = SupplierBotAPI.get_products()
+                lines = ["📃 <b>Товары API:</b>\n"]
+                for p in products[:15]:
+                    lines.append(
+                        f"#{p.get('id')} — {html.escape(str(p.get('name_en', '?')))}\n"
+                        f"  💵 ${p.get('price', '?')} | 📦 {p.get('stock_count', 0)} шт."
+                    )
+                bot.send_message(chat_id, "\n".join(lines) or "Пусто", parse_mode="HTML")
+                _answer(call)
+
             elif action == "balance":
                 if not _is_configured():
                     _answer(call, "Сначала укажите URL и API Key", alert=True)
@@ -688,7 +789,11 @@ def setup_telegram(cardinal: Cardinal) -> None:
                     _answer(call, "Сначала укажите URL и API Key", alert=True)
                     return
                 st = SupplierBotAPI.get_stock()
-                _answer(call, f"📦 В наличии: {st['available']} шт.", alert=True)
+                _answer(
+                    call,
+                    f"📦 {st['product_name']}\n{st['available']} шт. · ${st['price']:.2f}",
+                    alert=True,
+                )
 
             elif action == "queue":
                 bot.edit_message_text(
@@ -710,7 +815,7 @@ def setup_telegram(cardinal: Cardinal) -> None:
         if not state_data or "state" not in state_data:
             return
         state = state_data["state"]
-        if state not in ("gla_url", "gla_key", "gla_keywords"):
+        if state not in ("gla_url", "gla_key", "gla_keywords", "gla_product"):
             return
 
         settings = load_settings()
@@ -734,7 +839,13 @@ def setup_telegram(cardinal: Cardinal) -> None:
                 pass
         elif state == "gla_keywords":
             settings["product_keywords"] = [k.strip() for k in text.split(",") if k.strip()]
-            label = "Ключевые слова"
+            label = "Ключевые слова (FunPay)"
+        elif state == "gla_product":
+            if text.lower() in ("auto", "авто", "0", "-"):
+                settings["bot_product_id"] = ""
+            else:
+                settings["bot_product_id"] = str(int(text))
+            label = "Product ID"
         else:
             return
 
@@ -744,7 +855,7 @@ def setup_telegram(cardinal: Cardinal) -> None:
         _edit_or_send_panel(bot, msg.chat.id)
 
     def _has_input_state(msg):
-        for st in ("gla_url", "gla_key", "gla_keywords"):
+        for st in ("gla_url", "gla_key", "gla_keywords", "gla_product"):
             if tg.check_state(msg.chat.id, msg.from_user.id, st):
                 return True
         return False
