@@ -2,7 +2,7 @@ from __future__ import annotations
 
 # === ОБЯЗАТЕЛЬНЫЕ ПОЛЯ FunPay Cardinal (НЕ УДАЛЯТЬ) ===
 NAME = "Gemini Link Auto"
-VERSION = "1.0.1"
+VERSION = "1.0.2"
 DESCRIPTION = "Автовыдача Gemini link (18 мес.) через API Telegram-бота поставщика"
 CREDITS = "@xei1y"
 UUID = "e8a3f1c2-9b4d-4d7e-a816-5f2c9b0e3d41"
@@ -41,6 +41,7 @@ ATTENTION_FILE = f"{STORAGE_DIR}/manual_attention.json"
 _file_lock = threading.Lock()
 _disabled_chats: Dict[str, float] = {}
 _plugin: Optional["Plugin"] = None
+_tg_bot_instance_id: Optional[int] = None
 
 DEFAULT_SETTINGS: Dict[str, Any] = {
     "bot_api_url": "",
@@ -535,39 +536,92 @@ def _settings_summary() -> str:
 
 
 def _main_keyboard() -> InlineKeyboardMarkup:
-    kb = InlineKeyboardMarkup(row_width=1)
+    kb = InlineKeyboardMarkup(row_width=2)
     kb.add(
-        InlineKeyboardButton("🌐 URL API", callback_data="gla_set_url"),
-        InlineKeyboardButton("🔑 API Key", callback_data="gla_set_key"),
-        InlineKeyboardButton("🏷 Ключевые слова", callback_data="gla_set_keywords"),
-        InlineKeyboardButton("💰 Баланс бота", callback_data="gla_balance"),
-        InlineKeyboardButton("📦 Наличие", callback_data="gla_stock"),
-        InlineKeyboardButton("📋 Очередь / внимание", callback_data="gla_queue"),
+        InlineKeyboardButton("🌐 URL API", callback_data="gla:set_url"),
+        InlineKeyboardButton("🔑 API Key", callback_data="gla:set_key"),
     )
+    kb.add(
+        InlineKeyboardButton("🏷 Ключевые слова", callback_data="gla:set_keywords"),
+        InlineKeyboardButton("🔄 Обновить", callback_data="gla:main"),
+    )
+    kb.add(
+        InlineKeyboardButton("💰 Баланс бота", callback_data="gla:balance"),
+        InlineKeyboardButton("📦 Наличие", callback_data="gla:stock"),
+    )
+    kb.add(InlineKeyboardButton("📋 Очередь / внимание", callback_data="gla:queue"))
     return kb
 
 
-def _send_panel(bot, chat_id: int, reply_to: Any = None) -> None:
+def _queue_keyboard() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(InlineKeyboardButton("◀️ Назад", callback_data="gla:main"))
+    return kb
+
+
+def _queue_summary() -> str:
+    pre = load_preorders()
+    att = load_attention()
+    lines = [
+        f"📋 <b>Очередь и внимание</b>\n",
+        f"Предзаказы: <b>{len(pre)}</b>",
+        f"Ручное внимание: <b>{len(att)}</b>",
+    ]
+    if att:
+        lines.append("\n<b>⚠️ Требуют внимания:</b>")
+        for item in att[-5:]:
+            lines.append(f"• #{item.get('order_id')} — {html.escape(item.get('reason', '?'))}")
+    if pre:
+        lines.append("\n<b>📝 Предзаказы:</b>")
+        for item in pre[-5:]:
+            oid = item.get("order_id") or item.get("chat_id") or "—"
+            lines.append(f"• {html.escape(str(oid))}")
+    return "\n".join(lines)
+
+
+def _edit_or_send_panel(bot, chat_id: int, msg_id: Optional[int] = None) -> None:
     text = _settings_summary()
     markup = _main_keyboard()
-    if reply_to:
-        bot.reply_to(reply_to, text, reply_markup=markup, parse_mode="HTML")
-    else:
-        bot.send_message(chat_id, text, reply_markup=markup, parse_mode="HTML")
+    if msg_id:
+        try:
+            bot.edit_message_text(text, chat_id, msg_id, reply_markup=markup, parse_mode="HTML")
+            return
+        except Exception:
+            pass
+    bot.send_message(chat_id, text, reply_markup=markup, parse_mode="HTML")
 
 
 def setup_telegram(cardinal: Cardinal) -> None:
+    global _tg_bot_instance_id
+
     if not cardinal.telegram:
         logger.warning("%s: Telegram отключён — команды не зарегистрированы", _P)
         return
 
     tg = cardinal.telegram
     bot = tg.bot
+    bot_id = id(bot)
+    if _tg_bot_instance_id == bot_id:
+        logger.debug("%s: Telegram-обработчики уже зарегистрированы", _P)
+        return
+    _tg_bot_instance_id = bot_id
+
+    def _answer(call, text: str = "", alert: bool = False) -> None:
+        try:
+            if text:
+                bot.answer_callback_query(call.id, text[:200], show_alert=alert)
+            else:
+                bot.answer_callback_query(call.id)
+        except Exception as exc:
+            logger.debug("%s: answer_callback_query: %s", _P, exc)
 
     def cmd_panel(msg):
-        _send_panel(bot, msg.chat.id, reply_to=msg)
+        _edit_or_send_panel(bot, msg.chat.id)
 
     def cmd_balance(msg):
+        if not _is_configured():
+            bot.reply_to(msg, "🔴 Сначала настройте URL и API Key в /gemini_link")
+            return
         try:
             data = SupplierBotAPI.get_balance()
             bot.reply_to(msg, f"💰 Баланс бота: <b>{data['balance']:.2f}</b> {data['currency']}", parse_mode="HTML")
@@ -575,50 +629,81 @@ def setup_telegram(cardinal: Cardinal) -> None:
             bot.reply_to(msg, f"🔴 Ошибка: {html.escape(str(exc))}", parse_mode="HTML")
 
     def cmd_stock(msg):
+        if not _is_configured():
+            bot.reply_to(msg, "🔴 Сначала настройте URL и API Key в /gemini_link")
+            return
         try:
             data = SupplierBotAPI.get_stock()
             bot.reply_to(msg, f"📦 В наличии: <b>{data['available']}</b> шт.", parse_mode="HTML")
         except Exception as exc:
             bot.reply_to(msg, f"🔴 Ошибка: {html.escape(str(exc))}", parse_mode="HTML")
 
+    def on_plugin_settings(call):
+        try:
+            _edit_or_send_panel(bot, call.message.chat.id, call.message.message_id)
+            _answer(call)
+        except Exception as exc:
+            logger.error("%s: on_plugin_settings: %s", _P, exc)
+            _answer(call, f"Ошибка: {exc}", alert=True)
+
     def on_callback(call):
         chat_id = call.message.chat.id
         msg_id = call.message.message_id
-        data = call.data or ""
+        action = (call.data or "").split(":", 1)[-1] if (call.data or "").startswith("gla:") else ""
 
-        if data == "gla_set_url":
-            r = bot.send_message(chat_id, "Введите BOT_API_URL:")
-            tg.set_state(chat_id, r.message_id, call.from_user.id, state="gla_url")
-        elif data == "gla_set_key":
-            r = bot.send_message(chat_id, "Введите BOT_API_KEY:")
-            tg.set_state(chat_id, r.message_id, call.from_user.id, state="gla_key")
-        elif data == "gla_set_keywords":
-            r = bot.send_message(chat_id, "Введите ключевые слова через запятую:\n(например: Gemini link, gemini 18)")
-            tg.set_state(chat_id, r.message_id, call.from_user.id, state="gla_keywords")
-        elif data == "gla_balance":
-            try:
+        try:
+            if action == "main":
+                _edit_or_send_panel(bot, chat_id, msg_id)
+                _answer(call, "Обновлено")
+
+            elif action == "set_url":
+                _answer(call)
+                r = bot.send_message(chat_id, "🌐 Введите <b>BOT_API_URL</b>:\n/cancel — отмена", parse_mode="HTML")
+                tg.set_state(chat_id, r.message_id, call.from_user.id, state="gla_url")
+
+            elif action == "set_key":
+                _answer(call)
+                r = bot.send_message(chat_id, "🔑 Введите <b>BOT_API_KEY</b>:\n/cancel — отмена", parse_mode="HTML")
+                tg.set_state(chat_id, r.message_id, call.from_user.id, state="gla_key")
+
+            elif action == "set_keywords":
+                _answer(call)
+                r = bot.send_message(
+                    chat_id,
+                    "🏷 Введите ключевые слова через запятую:\n"
+                    "<i>например: Gemini link, gemini 18</i>\n/cancel — отмена",
+                    parse_mode="HTML",
+                )
+                tg.set_state(chat_id, r.message_id, call.from_user.id, state="gla_keywords")
+
+            elif action == "balance":
+                if not _is_configured():
+                    _answer(call, "Сначала укажите URL и API Key", alert=True)
+                    return
                 bal = SupplierBotAPI.get_balance()
-                bot.answer_callback_query(call.id, f"💰 {bal['balance']:.2f} {bal['currency']}", show_alert=True)
-            except Exception as exc:
-                bot.answer_callback_query(call.id, f"Ошибка: {exc}", show_alert=True)
-        elif data == "gla_stock":
-            try:
+                _answer(call, f"💰 {bal['balance']:.2f} {bal['currency']}", alert=True)
+
+            elif action == "stock":
+                if not _is_configured():
+                    _answer(call, "Сначала укажите URL и API Key", alert=True)
+                    return
                 st = SupplierBotAPI.get_stock()
-                bot.answer_callback_query(call.id, f"📦 {st['available']} шт.", show_alert=True)
-            except Exception as exc:
-                bot.answer_callback_query(call.id, f"Ошибка: {exc}", show_alert=True)
-        elif data == "gla_queue":
-            pre = load_preorders()
-            att = load_attention()
-            text = (
-                f"📋 Предзаказы: <b>{len(pre)}</b>\n"
-                f"⚠️ Ручное внимание: <b>{len(att)}</b>"
-            )
-            bot.edit_message_text(text, chat_id, msg_id, parse_mode="HTML", reply_markup=_main_keyboard())
-        else:
-            bot.answer_callback_query(call.id)
-            return
-        bot.answer_callback_query(call.id)
+                _answer(call, f"📦 В наличии: {st['available']} шт.", alert=True)
+
+            elif action == "queue":
+                bot.edit_message_text(
+                    _queue_summary(), chat_id, msg_id,
+                    parse_mode="HTML", reply_markup=_queue_keyboard(),
+                )
+                _answer(call)
+
+            else:
+                _answer(call)
+
+        except Exception as exc:
+            logger.error("%s: callback %s: %s", _P, call.data, exc)
+            logger.debug(traceback.format_exc())
+            _answer(call, str(exc)[:200], alert=True)
 
     def on_text(msg):
         state_data = tg.get_state(msg.chat.id, msg.from_user.id)
@@ -634,27 +719,29 @@ def setup_telegram(cardinal: Cardinal) -> None:
         if text.lower() in ("/cancel", "отмена"):
             tg.clear_state(msg.chat.id, msg.from_user.id, True)
             bot.reply_to(msg, "❌ Отменено")
+            _edit_or_send_panel(bot, msg.chat.id)
             return
 
         if state == "gla_url":
             settings["bot_api_url"] = text.rstrip("/")
+            label = "URL API"
         elif state == "gla_key":
             settings["bot_api_key"] = text
+            label = "API Key"
             try:
                 bot.delete_message(msg.chat.id, msg.message_id)
             except Exception:
                 pass
         elif state == "gla_keywords":
             settings["product_keywords"] = [k.strip() for k in text.split(",") if k.strip()]
+            label = "Ключевые слова"
+        else:
+            return
 
         save_settings(settings)
         tg.clear_state(msg.chat.id, msg.from_user.id, True)
-
-        if state == "gla_key":
-            bot.send_message(msg.chat.id, "✅ API Key сохранён.", parse_mode="HTML")
-        else:
-            bot.reply_to(msg, "✅ Сохранено", parse_mode="HTML")
-        _send_panel(bot, msg.chat.id)
+        bot.send_message(msg.chat.id, f"✅ {label} сохранён.", parse_mode="HTML")
+        _edit_or_send_panel(bot, msg.chat.id)
 
     def _has_input_state(msg):
         for st in ("gla_url", "gla_key", "gla_keywords"):
@@ -662,10 +749,17 @@ def setup_telegram(cardinal: Cardinal) -> None:
                 return True
         return False
 
+    def _is_gla_callback(call) -> bool:
+        return (call.data or "").startswith("gla:")
+
+    def _is_plugin_settings(call) -> bool:
+        return f"{CBT.PLUGIN_SETTINGS}:{UUID}" in (call.data or "")
+
     tg.msg_handler(cmd_panel, func=lambda m: m.text and m.text.split()[0].lower() in ("/gemini_link", "/gemini"))
     tg.msg_handler(cmd_balance, func=lambda m: m.text and m.text.split()[0].lower() == "/gl_balance")
     tg.msg_handler(cmd_stock, func=lambda m: m.text and m.text.split()[0].lower() == "/gl_stock")
-    tg.cbq_handler(on_callback, lambda c: (c.data or "").startswith("gla_"))
+    tg.cbq_handler(on_callback, func=_is_gla_callback)
+    tg.cbq_handler(on_plugin_settings, func=_is_plugin_settings)
     tg.msg_handler(on_text, func=_has_input_state)
 
     try:
@@ -676,6 +770,8 @@ def setup_telegram(cardinal: Cardinal) -> None:
         ])
     except Exception as exc:
         logger.error("%s: add_telegram_commands: %s", _P, exc)
+
+    logger.info("%s: Telegram UI зарегистрирован", _P)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
