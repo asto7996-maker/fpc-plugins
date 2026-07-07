@@ -2,8 +2,8 @@ from __future__ import annotations
 
 # === ОБЯЗАТЕЛЬНЫЕ ПОЛЯ FunPay Cardinal (НЕ УДАЛЯТЬ) ===
 NAME = "Gemini Link Auto"
-VERSION = "1.1.1"
-DESCRIPTION = "Автовыдача Gemini link (18 мес.) через API Telegram-бота поставщика"
+VERSION = "2.0.0"
+DESCRIPTION = "Автовыдача Gemini 18m через Reseller API + очередь + автозакупка при рестоке"
 CREDITS = "@xei1y"
 UUID = "e8a3f1c2-9b4d-4d7e-a816-5f2c9b0e3d41"
 SETTINGS_PAGE = True
@@ -19,7 +19,7 @@ import threading
 import time
 import traceback
 import unicodedata
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
@@ -36,52 +36,66 @@ _P = "GeminiLink"
 STORAGE_DIR = f"storage/plugins/{UUID}"
 SETTINGS_FILE = f"{STORAGE_DIR}/settings.json"
 PROCESSED_FILE = f"{STORAGE_DIR}/processed_orders.json"
-PREORDER_FILE = f"{STORAGE_DIR}/preorders.json"
+WAIT_QUEUE_FILE = f"{STORAGE_DIR}/wait_queue.json"
+INVENTORY_FILE = f"{STORAGE_DIR}/inventory.json"
+RESTOCK_SUBS_FILE = f"{STORAGE_DIR}/restock_subscribers.json"
 ATTENTION_FILE = f"{STORAGE_DIR}/manual_attention.json"
+STATE_FILE = f"{STORAGE_DIR}/state.json"
 
 _file_lock = threading.Lock()
 _disabled_chats: Dict[str, float] = {}
 _plugin: Optional["Plugin"] = None
 _tg_bot_instance_id: Optional[int] = None
+_restock_thread_started = False
 
 DEFAULT_SETTINGS: Dict[str, Any] = {
     "bot_api_url": "https://worker-production-53ca.up.railway.app",
     "bot_api_key": "",
     "product_keywords": ["gemini", "18 мес", "gemini link", "gemini pro", "активация ссылкой"],
-    "bot_product_id": "",
-    "product_search_keywords": ["gemini"],
+    "bot_product_id": "1",
+    "product_search_keywords": ["gemini", "18m"],
     "api_path_balance": "/api/me",
     "api_path_stock": "/api/products",
     "api_path_purchase": "/api/buy",
     "api_auth_header": "X-API-Key",
     "api_retry_count": 3,
     "api_retry_delay": 5,
+    "wait_hours": 12,
+    "restock_check_interval_sec": 300,
+    "restock_info_hours": 12,
+    "auto_buy_on_restock": True,
+    "auto_buy_quantity": 5,
     "notify_seller": True,
     "processing_message": (
         "⏳ Заказ #{order_id} принят!\n"
-        "Формируем ссылку активации Gemini — подождите 1–2 минуты..."
+        "Формируем ссылку Gemini 18 мес. — подождите 1–2 минуты..."
     ),
     "delivery_message": (
         "🎉 Ваша подписка Gemini готова!\n\n"
         "🔗 Ссылка для активации (18 месяцев):\n"
         "{link}\n\n"
-        "📌 Перейдите по ссылке и следуйте инструкции Google.\n"
+        "📌 Активируйте сразу после получения!\n"
         "📋 Заказ: #{order_id}\n\n"
         "Спасибо за покупку! ⭐"
     ),
-    "delay_message": (
-        "🛠 Техническая задержка\n\n"
-        "При автоматической выдаче подписки Gemini произошла временная ошибка.\n"
-        "Продавец уже уведомлён и обработает заказ вручную.\n\n"
-        "📋 Заказ: #{order_id}\n"
-        "Приносим извинения за неудобства! 🙏"
-    ),
     "out_of_stock_message": (
-        "⏳ Gemini Link — временно нет в наличии\n\n"
-        "Ваш заказ поставлен в очередь предзаказа.\n"
-        "📋 ID заказа: #{order_id}\n\n"
-        "Ссылка будет выдана сразу после пополнения склада.\n"
-        "💬 Срочно? Напишите /Gemini help"
+        "⏳ Ссылки Gemini 18 мес. сейчас закончились.\n\n"
+        "📋 Заказ: #{order_id}\n\n"
+        "Выберите действие:\n"
+        "1️⃣ Напишите «1» — ждать ссылку до {wait_hours} ч. (выдадим автоматически при рестоке)\n"
+        "2️⃣ Напишите «2» — позвать продавца и обсудить возврат\n\n"
+        "💡 Ресток поставщика — примерно каждые {restock_hours} ч."
+    ),
+    "wait_confirmed_message": (
+        "✅ Вы в очереди ожидания!\n\n"
+        "Мы выдадим ссылку автоматически, как только появится ресток "
+        "(до {wait_hours} ч.).\n"
+        "📋 Заказ: #{order_id}"
+    ),
+    "refund_requested_message": (
+        "🆘 Продавец уведомлён о вашем запросе.\n\n"
+        "Ожидайте ответа для обсуждения возврата средств.\n"
+        "📋 Заказ: #{order_id}"
     ),
 }
 
@@ -120,10 +134,8 @@ def load_settings() -> Dict[str, Any]:
     merged = dict(DEFAULT_SETTINGS)
     merged.update(data)
     if "/api/v1/" in str(merged.get("api_path_balance", "")):
-        merged["api_path_balance"] = DEFAULT_SETTINGS["api_path_balance"]
-        merged["api_path_stock"] = DEFAULT_SETTINGS["api_path_stock"]
-        merged["api_path_purchase"] = DEFAULT_SETTINGS["api_path_purchase"]
-        merged["api_auth_header"] = DEFAULT_SETTINGS["api_auth_header"]
+        for k in ("api_path_balance", "api_path_stock", "api_path_purchase", "api_auth_header"):
+            merged[k] = DEFAULT_SETTINGS[k]
     if merged.get("product_keywords") == ["Gemini link"]:
         merged["product_keywords"] = list(DEFAULT_SETTINGS["product_keywords"])
     return merged
@@ -131,30 +143,6 @@ def load_settings() -> Dict[str, Any]:
 
 def save_settings(data: Dict[str, Any]) -> None:
     _save_json(SETTINGS_FILE, data)
-
-
-def load_processed() -> List[str]:
-    return _load_json(PROCESSED_FILE, [])
-
-
-def save_processed(items: List[str]) -> None:
-    _save_json(PROCESSED_FILE, items)
-
-
-def load_preorders() -> List[Dict[str, Any]]:
-    return _load_json(PREORDER_FILE, [])
-
-
-def save_preorders(items: List[Dict[str, Any]]) -> None:
-    _save_json(PREORDER_FILE, items)
-
-
-def load_attention() -> List[Dict[str, Any]]:
-    return _load_json(ATTENTION_FILE, [])
-
-
-def save_attention(items: List[Dict[str, Any]]) -> None:
-    _save_json(ATTENTION_FILE, items)
 
 
 def _ts() -> str:
@@ -180,7 +168,6 @@ def _is_configured(settings: Optional[Dict[str, Any]] = None) -> bool:
 
 
 def _normalize_text(text: str) -> str:
-    """NFKC: ＧＥＭＩＮＩ → GEMINI для корректного поиска."""
     return unicodedata.normalize("NFKC", text or "").lower()
 
 
@@ -215,22 +202,158 @@ def send_fp(c: Cardinal, chat_id: Any, text: str) -> None:
 def _format_template(key: str, **kwargs: Any) -> str:
     settings = load_settings()
     template = settings.get(key, DEFAULT_SETTINGS.get(key, ""))
+    defaults = {
+        "wait_hours": settings.get("wait_hours", 12),
+        "restock_hours": settings.get("restock_info_hours", 12),
+    }
+    defaults.update(kwargs)
     try:
-        return template.format(**kwargs)
+        return template.format(**defaults)
     except (KeyError, ValueError):
         result = str(template)
-        for k, v in kwargs.items():
+        for k, v in defaults.items():
             result = result.replace("{" + k + "}", str(v))
         return result
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# API Telegram-бота поставщика
+# Очередь, инвентарь, подписчики
+# ─────────────────────────────────────────────────────────────────────────────
+
+class OrderQueue:
+    @staticmethod
+    def load_wait() -> List[Dict[str, Any]]:
+        return _load_json(WAIT_QUEUE_FILE, [])
+
+    @staticmethod
+    def save_wait(items: List[Dict[str, Any]]) -> None:
+        _save_json(WAIT_QUEUE_FILE, items)
+
+    @staticmethod
+    def load_inventory() -> List[Dict[str, Any]]:
+        return _load_json(INVENTORY_FILE, [])
+
+    @staticmethod
+    def save_inventory(items: List[Dict[str, Any]]) -> None:
+        _save_json(INVENTORY_FILE, items)
+
+    @staticmethod
+    def pop_link() -> Optional[str]:
+        items = OrderQueue.load_inventory()
+        if not items:
+            return None
+        item = items.pop(0)
+        OrderQueue.save_inventory(items)
+        return item.get("link")
+
+    @staticmethod
+    def push_links(links: List[str], product_id: int = 0) -> None:
+        items = OrderQueue.load_inventory()
+        for link in links:
+            items.append({"link": link, "at": _ts(), "product_id": product_id})
+        OrderQueue.save_inventory(items)
+
+    @staticmethod
+    def add_waiting(order_id: str, chat_id: Any, buyer: str, quantity: int = 1) -> None:
+        items = OrderQueue.load_wait()
+        if any(x.get("order_id") == order_id for x in items):
+            return
+        settings = load_settings()
+        wait_h = int(settings.get("wait_hours", 12))
+        items.append({
+            "order_id": order_id,
+            "chat_id": chat_id,
+            "buyer": buyer,
+            "quantity": quantity,
+            "status": "awaiting_choice",
+            "created_at": _ts(),
+            "wait_until_ts": time.time() + wait_h * 3600,
+        })
+        OrderQueue.save_wait(items)
+
+    @staticmethod
+    def find_by_chat(chat_id: Any, statuses: Optional[List[str]] = None) -> Optional[Dict[str, Any]]:
+        cid = str(chat_id)
+        for item in reversed(OrderQueue.load_wait()):
+            if str(item.get("chat_id")) != cid:
+                continue
+            if statuses and item.get("status") not in statuses:
+                continue
+            return item
+        return None
+
+    @staticmethod
+    def update_entry(order_id: str, **fields: Any) -> None:
+        items = OrderQueue.load_wait()
+        for item in items:
+            if item.get("order_id") == order_id:
+                item.update(fields)
+                break
+        OrderQueue.save_wait(items)
+
+    @staticmethod
+    def pending_delivery() -> List[Dict[str, Any]]:
+        now = time.time()
+        result = []
+        for item in OrderQueue.load_wait():
+            if item.get("status") not in ("waiting_link", "preorder_paid"):
+                continue
+            if item.get("wait_until_ts", now + 1) < now:
+                item["status"] = "expired"
+                continue
+            result.append(item)
+        OrderQueue.save_wait(OrderQueue.load_wait())
+        return sorted(result, key=lambda x: x.get("created_at", ""))
+
+    @staticmethod
+    def remove(order_id: str) -> None:
+        items = [x for x in OrderQueue.load_wait() if x.get("order_id") != order_id]
+        OrderQueue.save_wait(items)
+
+    @staticmethod
+    def subscribe_restock(chat_id: Any) -> None:
+        subs = _load_json(RESTOCK_SUBS_FILE, [])
+        cid = str(chat_id)
+        if cid not in subs:
+            subs.append(cid)
+            _save_json(RESTOCK_SUBS_FILE, subs)
+
+    @staticmethod
+    def pop_restock_subscribers() -> List[str]:
+        subs = _load_json(RESTOCK_SUBS_FILE, [])
+        _save_json(RESTOCK_SUBS_FILE, [])
+        return subs
+
+    @staticmethod
+    def load_state() -> Dict[str, Any]:
+        return _load_json(STATE_FILE, {"last_stock": 0, "last_restock_at": 0})
+
+    @staticmethod
+    def save_state(state: Dict[str, Any]) -> None:
+        _save_json(STATE_FILE, state)
+
+
+def load_processed() -> List[str]:
+    return _load_json(PROCESSED_FILE, [])
+
+
+def save_processed(items: List[str]) -> None:
+    _save_json(PROCESSED_FILE, items)
+
+
+def load_attention() -> List[Dict[str, Any]]:
+    return _load_json(ATTENTION_FILE, [])
+
+
+def save_attention(items: List[Dict[str, Any]]) -> None:
+    _save_json(ATTENTION_FILE, items)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Reseller API
 # ─────────────────────────────────────────────────────────────────────────────
 
 class SupplierBotAPI:
-    """Клиент Reseller API: GET /api/me, GET /api/products, POST /api/buy."""
-
     HEADERS = {
         "Accept": "application/json",
         "Content-Type": "application/json",
@@ -250,9 +373,8 @@ class SupplierBotAPI:
         s = cls._settings()
         headers = dict(cls.HEADERS)
         key = s.get("bot_api_key", "").strip()
-        header_name = s.get("api_auth_header", "X-API-Key")
         if key:
-            headers[header_name] = key
+            headers[s.get("api_auth_header", "X-API-Key")] = key
         return headers
 
     @classmethod
@@ -263,45 +385,34 @@ class SupplierBotAPI:
     @classmethod
     def _check_ok(cls, data: Dict[str, Any]) -> None:
         if data.get("ok") is False:
-            raise RuntimeError(data.get("error") or data.get("message") or "API вернул ok=false")
+            raise RuntimeError(data.get("error") or data.get("message") or "API ok=false")
 
     @classmethod
     def _request(cls, method: str, path: str, json_body: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         retries, delay = cls._retry_params()
         url = f"{cls._base_url()}{path}"
         last_error = "unknown"
-
         for attempt in range(1, retries + 1):
             try:
-                _log_action(f"API {method} {path}", attempt=attempt)
-                resp = requests.request(
-                    method, url, headers=cls._auth_headers(), json=json_body, timeout=30,
-                )
+                resp = requests.request(method, url, headers=cls._auth_headers(), json=json_body, timeout=30)
                 if resp.status_code >= 500:
                     raise requests.HTTPError(f"HTTP {resp.status_code}")
                 data = resp.json() if resp.content else {}
                 if not resp.ok:
-                    err = data.get("error") or data.get("message") or f"HTTP {resp.status_code}"
-                    raise requests.HTTPError(str(err))
+                    raise requests.HTTPError(str(data.get("error") or data.get("message") or resp.status_code))
                 if isinstance(data, dict):
                     cls._check_ok(data)
                 return data if isinstance(data, dict) else {"data": data}
             except (requests.RequestException, ValueError, RuntimeError) as exc:
                 last_error = str(exc)
-                logger.warning("%s: API попытка %s/%s — %s", _P, attempt, retries, exc)
+                logger.warning("%s: API %s/%s — %s", _P, attempt, retries, exc)
                 if attempt < retries:
                     time.sleep(delay)
-
-        raise RuntimeError(f"API недоступен после {retries} попыток: {last_error}")
+        raise RuntimeError(f"API недоступен: {last_error}")
 
     @classmethod
     def _product_names(cls, product: Dict[str, Any]) -> str:
-        parts = [
-            str(product.get("name_en") or ""),
-            str(product.get("name_ru") or ""),
-            str(product.get("name") or ""),
-        ]
-        return " ".join(parts).lower()
+        return _normalize_text(" ".join(str(product.get(k) or "") for k in ("name_en", "name_ru", "name")))
 
     @classmethod
     def _resolve_product(cls, products: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -309,49 +420,41 @@ class SupplierBotAPI:
         pid = s.get("bot_product_id")
         if pid not in (None, "", 0, "0"):
             try:
-                target_id = int(pid)
+                tid = int(pid)
                 for p in products:
-                    if int(p.get("id", -1)) == target_id:
+                    if int(p.get("id", -1)) == tid:
                         return p
-                raise RuntimeError(f"Товар id={target_id} не найден в /api/products")
             except ValueError:
                 pass
-
-        keywords = s.get("product_search_keywords") or ["gemini"]
-        matched = [
-            p for p in products
-            if all(kw.lower() in cls._product_names(p) for kw in keywords)
-        ]
+        keywords = s.get("product_search_keywords") or ["gemini", "18m"]
+        matched = [p for p in products if all(_normalize_text(k) in cls._product_names(p) for k in keywords)]
         if len(matched) == 1:
             return matched[0]
         if len(matched) > 1:
-            names = ", ".join(f"#{p.get('id')} {p.get('name_en', '?')}" for p in matched[:5])
-            raise RuntimeError(f"Несколько товаров: {names}. Укажите Product ID в /gemini_link")
-        if products:
-            names = ", ".join(f"#{p.get('id')} {p.get('name_en', '?')}" for p in products[:5])
-            raise RuntimeError(f"Gemini не найден. Доступно: {names}")
-        raise RuntimeError("Список товаров пуст (/api/products)")
+            # предпочитаем товар с 18m в названии
+            for p in matched:
+                if "18m" in cls._product_names(p):
+                    return p
+            return matched[0]
+        raise RuntimeError("Gemini 18m не найден в /api/products — укажите Product ID")
 
     @classmethod
     def get_products(cls) -> List[Dict[str, Any]]:
-        s = cls._settings()
-        data = cls._request("GET", s["api_path_stock"])
+        data = cls._request("GET", cls._settings()["api_path_stock"])
         products = data.get("products") or []
         return products if isinstance(products, list) else []
 
     @classmethod
     def get_balance(cls) -> Dict[str, Any]:
-        s = cls._settings()
-        data = cls._request("GET", s["api_path_balance"])
+        data = cls._request("GET", cls._settings()["api_path_balance"])
         user = data.get("user") or data
-        balance = float(user.get("balance", data.get("balance", 0)))
-        return {"balance": balance, "currency": "USD", "username": user.get("username", "")}
+        return {"balance": float(user.get("balance", 0)), "currency": "USD"}
 
     @classmethod
     def get_stock(cls) -> Dict[str, Any]:
         products = cls.get_products()
         product = cls._resolve_product(products)
-        available = int(product.get("stock_count", product.get("stock", 0)))
+        available = int(product.get("stock_count", 0))
         return {
             "available": available,
             "price": float(product.get("price", 0)),
@@ -361,46 +464,29 @@ class SupplierBotAPI:
         }
 
     @classmethod
-    def purchase(cls, order_id: str, quantity: int = 1) -> Dict[str, Any]:
-        s = cls._settings()
+    def purchase(cls, quantity: int = 1) -> Dict[str, Any]:
         products = cls.get_products()
         product = cls._resolve_product(products)
         product_id = int(product.get("id", 0))
-        if int(product.get("stock_count", 0)) <= 0:
-            return {"activation_link": None, "status": "out_of_stock"}
-
-        data = cls._request(
-            "POST",
-            s["api_path_purchase"],
-            {"product_id": product_id, "quantity": max(1, quantity)},
-        )
-        items = data.get("items") or []
-        links = [str(i).strip() for i in items if str(i).strip()]
-        link = links[0] if links else None
-        if not link:
-            link = data.get("activation_link") or data.get("link") or data.get("url")
-        if not link:
-            err = str(data.get("error", "")).lower()
-            if "stock" in err or "out" in err:
-                return {"activation_link": None, "status": "out_of_stock", "items": []}
-            raise RuntimeError("API не вернул items")
-        return {
-            "activation_link": link,
-            "items": links or [link],
-            "status": "ok",
-            "transaction_id": data.get("transaction_id"),
-            "product_id": product_id,
-        }
+        stock = int(product.get("stock_count", 0))
+        qty = max(1, min(quantity, stock))
+        if stock <= 0:
+            return {"items": [], "status": "out_of_stock", "product_id": product_id}
+        data = cls._request("POST", cls._settings()["api_path_purchase"], {"product_id": product_id, "quantity": qty})
+        links = [str(i).strip() for i in (data.get("items") or []) if str(i).strip()]
+        if not links:
+            return {"items": [], "status": "out_of_stock", "product_id": product_id}
+        return {"items": links, "status": "ok", "product_id": product_id, "transaction_id": data.get("transaction_id")}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Основной класс плагина
+# Основной класс
 # ─────────────────────────────────────────────────────────────────────────────
 
 class Plugin:
     def __init__(self, cardinal: Cardinal) -> None:
         self.cardinal = cardinal
-        self._processing_lock = threading.Lock()
+        self._lock = threading.Lock()
         _ensure_storage()
         if not os.path.exists(SETTINGS_FILE):
             save_settings(dict(DEFAULT_SETTINGS))
@@ -416,42 +502,105 @@ class Plugin:
         except Exception as exc:
             logger.error("%s: notify_seller: %s", _P, exc)
 
-    def _already_processed(self, order_id: str) -> bool:
-        return order_id in load_processed()
-
     def _mark_processed(self, order_id: str) -> None:
         items = load_processed()
         if order_id not in items:
             items.append(order_id)
             save_processed(items)
 
-    def _add_attention(self, order_id: str, chat_id: Any, reason: str) -> None:
-        items = load_attention()
-        if not any(x.get("order_id") == order_id for x in items):
-            items.append({"order_id": order_id, "chat_id": chat_id, "reason": reason, "at": _ts()})
-            save_attention(items)
-        self.notify_seller(
-            f"⚠️ <b>{NAME}</b>\n\n"
-            f"Заказ <code>#{order_id}</code> требует ручного внимания.\n"
-            f"Причина: <b>{html.escape(reason)}</b>"
-        )
+    def _deliver(self, order_id: str, chat_id: Any, link: str, buyer: str = "") -> None:
+        if chat_id:
+            send_fp(self.cardinal, chat_id, _format_template("delivery_message", order_id=order_id, link=link))
+        self._mark_processed(order_id)
+        OrderQueue.remove(order_id)
+        self.notify_seller(f"✅ <b>{NAME}</b>\n\nЗаказ <code>#{order_id}</code> выдан.\n👤 {html.escape(buyer or '—')}")
 
-    def _add_preorder(self, order_id: str, chat_id: Any) -> None:
-        items = load_preorders()
-        if not any(x.get("order_id") == order_id for x in items):
-            items.append({"order_id": order_id, "chat_id": chat_id, "at": _ts(), "status": "waiting"})
-            save_preorders(items)
+    def _try_fulfill_with_link(self, entry: Dict[str, Any], link: str) -> None:
+        self._deliver(entry["order_id"], entry.get("chat_id"), link, entry.get("buyer", ""))
 
-    def process_order(self, order_id: str, force: bool = False) -> None:
-        with self._processing_lock:
-            if not force and self._already_processed(order_id):
-                _log_action("Заказ уже обработан — пропуск", order_id=order_id)
+    def _buy_and_store(self, quantity: int) -> List[str]:
+        result = SupplierBotAPI.purchase(quantity)
+        if result["status"] == "out_of_stock":
+            return []
+        links = result.get("items") or []
+        if links:
+            OrderQueue.push_links(links, result.get("product_id", 0))
+            _log_action("Куплено в инвентарь", qty=len(links))
+        return links
+
+    def fulfill_queue(self) -> None:
+        if not _is_configured():
+            return
+        with self._lock:
+            try:
+                stock = SupplierBotAPI.get_stock()
+            except Exception as exc:
+                logger.debug("%s: fulfill_queue stock: %s", _P, exc)
                 return
 
-        settings = load_settings()
-        if not _is_configured(settings):
-            logger.warning("%s: API бота не настроен — заказ #%s не обработан", _P, order_id)
-            self.notify_seller(f"⚠️ <b>{NAME}</b>\n\nЗаказ <code>#{order_id}</code> — API не настроен")
+            settings = load_settings()
+            state = OrderQueue.load_state()
+            prev_stock = int(state.get("last_stock", 0))
+            cur_stock = stock["available"]
+            state["last_stock"] = cur_stock
+
+            # ресток обнаружен
+            if cur_stock > 0 and prev_stock == 0:
+                state["last_restock_at"] = time.time()
+                _log_action("Ресток обнаружен", stock=cur_stock)
+                if settings.get("auto_buy_on_restock"):
+                    buy_qty = min(int(settings.get("auto_buy_quantity", 5)), cur_stock)
+                    self._buy_and_store(buy_qty)
+                # уведомить подписчиков
+                for cid in OrderQueue.pop_restock_subscribers():
+                    try:
+                        send_fp(self.cardinal, cid,
+                                f"🔔 Ресток Gemini 18m!\nВ наличии: {cur_stock} шт.\nМожете оформить заказ.")
+                    except Exception:
+                        pass
+                self.notify_seller(f"🔔 <b>{NAME}</b> Ресток! В наличии: {cur_stock} шт.")
+
+            OrderQueue.save_state(state)
+
+            # выдача очереди
+            for entry in OrderQueue.pending_delivery():
+                order_id = entry["order_id"]
+                qty = int(entry.get("quantity", 1))
+                link = OrderQueue.pop_link()
+                if not link:
+                    try:
+                        purchase = SupplierBotAPI.purchase(qty)
+                        if purchase["status"] == "out_of_stock":
+                            continue
+                        links = purchase.get("items") or []
+                        link = links[0] if links else None
+                        extra = links[1:] if len(links) > 1 else []
+                        if extra:
+                            OrderQueue.push_links(extra)
+                    except Exception as exc:
+                        logger.error("%s: fulfill #%s: %s", _P, order_id, exc)
+                        continue
+                if link:
+                    self._try_fulfill_with_link(entry, link)
+
+            # просроченные
+            now = time.time()
+            for item in OrderQueue.load_wait():
+                if item.get("status") in ("waiting_link", "preorder_paid", "awaiting_choice"):
+                    if item.get("wait_until_ts", now + 1) < now and item.get("status") != "expired":
+                        item["status"] = "expired"
+                        self.notify_seller(
+                            f"⏰ <b>{NAME}</b> Заказ <code>#{item.get('order_id')}</code> — "
+                            f"истекло время ожидания ({settings.get('wait_hours')}ч)"
+                        )
+            OrderQueue.save_wait(OrderQueue.load_wait())
+
+    def process_order(self, order_id: str, force: bool = False) -> None:
+        order_id = order_id.strip().lstrip("#").upper()
+        if not force and order_id in load_processed():
+            return
+        if not _is_configured():
+            self.notify_seller(f"⚠️ #{order_id} — API не настроен")
             return
 
         try:
@@ -460,105 +609,118 @@ class Plugin:
             logger.error("%s: get_order #%s: %s", _P, order_id, exc)
             return
 
-        order_text = _extract_order_text(full_order)
-        if not _matches_keywords(order_text, settings):
-            logger.info(
-                "%s: заказ #%s не совпал с keywords %s (текст: %.120s…)",
-                _P, order_id, settings.get("product_keywords"), order_text[:120],
-            )
+        if not _matches_keywords(_extract_order_text(full_order)):
             return
 
         buyer = full_order.buyer_username
         chat = self.cardinal.account.get_chat_by_name(buyer)
-        chat_id = (
-            chat.id if chat
-            else getattr(full_order, "chat_id", None)
-        )
+        chat_id = chat.id if chat else getattr(full_order, "chat_id", None)
+        quantity = max(1, int(getattr(full_order, "amount", 1) or 1))
 
-        _log_action("Обнаружен заказ Gemini", order_id=order_id, buyer=buyer, chat_id=chat_id)
-
+        _log_action("Новый заказ", order_id=order_id, buyer=buyer, qty=quantity)
         if chat_id:
             send_fp(self.cardinal, chat_id, _format_template("processing_message", order_id=order_id))
 
-        try:
-            balance = SupplierBotAPI.get_balance()
-            _log_action("Баланс проверен", order_id=order_id, balance=balance["balance"])
-
-            stock = SupplierBotAPI.get_stock()
-            _log_action("Наличие проверено", order_id=order_id, available=stock["available"])
-
-            if stock["status"] == "out_of_stock" or stock["available"] <= 0:
-                self._handle_out_of_stock(order_id, chat_id)
-                return
-
-            quantity = max(1, int(getattr(full_order, "amount", 1) or 1))
-            total_price = stock["price"] * quantity
-            if balance["balance"] < total_price:
-                self._add_attention(order_id, chat_id, "insufficient_balance")
-                if chat_id:
-                    send_fp(self.cardinal, chat_id, _format_template("delay_message", order_id=order_id))
-                return
-
-            _log_action("Запрос покупки к боту", order_id=order_id, quantity=quantity)
-            purchase = SupplierBotAPI.purchase(order_id, quantity=quantity)
-
-            if purchase["status"] == "out_of_stock":
-                self._handle_out_of_stock(order_id, chat_id)
-                return
-
-            links = purchase.get("items") or [purchase["activation_link"]]
-            link = "\n".join(links) if len(links) > 1 else links[0]
-            _log_action("Ссылка получена", order_id=order_id)
-
-            if chat_id:
-                send_fp(
-                    self.cardinal,
-                    chat_id,
-                    _format_template("delivery_message", order_id=order_id, link=link),
-                )
-                _log_action("Ссылка отправлена покупателю", order_id=order_id, chat_id=chat_id)
+        # 1) инвентарь
+        links_from_inv: List[str] = []
+        for _ in range(quantity):
+            link = OrderQueue.pop_link()
+            if link:
+                links_from_inv.append(link)
             else:
-                self._add_attention(order_id, None, "no_chat_id")
+                break
+        if len(links_from_inv) == quantity:
+            self._deliver(order_id, chat_id, "\n".join(links_from_inv), buyer)
+            return
+        for link in links_from_inv:
+            OrderQueue.push_links([link])
 
-            self._mark_processed(order_id)
-            self.notify_seller(
-                f"✅ <b>{NAME}</b>\n\n"
-                f"Заказ <code>#{order_id}</code> выполнен автоматически.\n"
-                f"👤 {html.escape(buyer or '—')}"
-            )
+        # 2) покупка в API
+        try:
+            stock = SupplierBotAPI.get_stock()
+            if stock["available"] <= 0:
+                self._enqueue_out_of_stock(order_id, chat_id, buyer, quantity)
+                return
+            balance = SupplierBotAPI.get_balance()
+            if balance["balance"] < stock["price"] * quantity:
+                self._notify_attention(order_id, chat_id, "insufficient_balance")
+                return
+            purchase = SupplierBotAPI.purchase(quantity)
+            if purchase["status"] == "out_of_stock":
+                self._enqueue_out_of_stock(order_id, chat_id, buyer, quantity)
+                return
+            items = purchase.get("items") or []
+            if items:
+                self._deliver(order_id, chat_id, "\n".join(items), buyer)
+            else:
+                self._enqueue_out_of_stock(order_id, chat_id, buyer, quantity)
         except Exception as exc:
             logger.error("%s: process_order #%s: %s", _P, order_id, exc)
-            logger.debug(traceback.format_exc())
-            self._add_attention(order_id, chat_id, "api_failure")
+            self._notify_attention(order_id, chat_id, "api_failure")
             if chat_id:
-                send_fp(self.cardinal, chat_id, _format_template("delay_message", order_id=order_id))
+                send_fp(self.cardinal, chat_id, _format_template("out_of_stock_message", order_id=order_id))
 
-    def _handle_out_of_stock(self, order_id: str, chat_id: Any) -> None:
-        _log_action("Out of stock — предзаказ", order_id=order_id)
-        self._add_preorder(order_id, chat_id)
+    def _enqueue_out_of_stock(self, order_id: str, chat_id: Any, buyer: str, quantity: int) -> None:
+        OrderQueue.add_waiting(order_id, chat_id, buyer, quantity)
         if chat_id:
             send_fp(self.cardinal, chat_id, _format_template("out_of_stock_message", order_id=order_id))
-        self._add_attention(order_id, chat_id, "out_of_stock")
 
-    # ── Команды /Gemini в чате FunPay ────────────────────────────────────────
+    def _notify_attention(self, order_id: str, chat_id: Any, reason: str) -> None:
+        items = load_attention()
+        if not any(x.get("order_id") == order_id for x in items):
+            items.append({"order_id": order_id, "chat_id": chat_id, "reason": reason, "at": _ts()})
+            save_attention(items)
+        self.notify_seller(f"⚠️ <b>{NAME}</b> #{order_id} — {html.escape(reason)}")
 
-    def _chat_disabled(self, chat_id: Any) -> bool:
-        key = str(chat_id)
-        until = _disabled_chats.get(key)
-        if until and time.time() < until:
+    # ── Сообщения покупателя ─────────────────────────────────────────────────
+
+    def handle_buyer_message(self, text: str, chat_id: Any) -> bool:
+        """Возвращает True если сообщение обработано."""
+        if str(chat_id) in _disabled_chats and time.time() < _disabled_chats[str(chat_id)]:
+            return False
+
+        raw = (text or "").strip()
+        lower = _normalize_text(raw)
+
+        # Команда 1 — ждать ссылку
+        if lower in ("1", "+", "1️⃣", "ждать", "жду", "подождать", "wait", "ожидать"):
+            entry = OrderQueue.find_by_chat(chat_id, ["awaiting_choice", "waiting_link"])
+            if entry:
+                settings = load_settings()
+                wait_h = int(settings.get("wait_hours", 12))
+                OrderQueue.update_entry(
+                    entry["order_id"],
+                    status="waiting_link",
+                    wait_until_ts=time.time() + wait_h * 3600,
+                )
+                send_fp(self.cardinal, chat_id, _format_template(
+                    "wait_confirmed_message", order_id=entry["order_id"]))
+                threading.Thread(target=self.fulfill_queue, daemon=True).start()
+                return True
+
+        # Команда 2 — возврат / продавец
+        if lower in ("2", "-", "2️⃣", "возврат", "refund", "продавец", "help"):
+            entry = OrderQueue.find_by_chat(chat_id, ["awaiting_choice", "waiting_link", "preorder_paid"])
+            if entry:
+                OrderQueue.update_entry(entry["order_id"], status="refund_requested")
+                _disabled_chats[str(chat_id)] = time.time() + 3600
+                send_fp(self.cardinal, chat_id, _format_template(
+                    "refund_requested_message", order_id=entry["order_id"]))
+                self.notify_seller(
+                    f"🆘 <b>{NAME}</b> Возврат/помощь\n"
+                    f"Заказ <code>#{entry['order_id']}</code>\n"
+                    f"💬 chat: <code>{chat_id}</code>")
+                return True
+
+        if re.match(r"^/gemini\b", raw, re.I):
+            self.handle_gemini_command(raw, chat_id)
             return True
-        if until:
-            _disabled_chats.pop(key, None)
+
         return False
 
     def handle_gemini_command(self, text: str, chat_id: Any) -> None:
-        if self._chat_disabled(chat_id):
-            return
-
         parts = text.strip().split()
         sub = parts[1].lower() if len(parts) > 1 else ""
-
-        _log_action("Команда /Gemini", chat_id=chat_id, sub=sub or "menu")
 
         if not sub:
             send_fp(self.cardinal, chat_id, self._main_menu())
@@ -566,6 +728,8 @@ class Plugin:
 
         if sub in ("check", "stock", "наличие"):
             self._cmd_check(chat_id)
+        elif sub in ("restock", "ресток", "when"):
+            self._cmd_restock_info(chat_id)
         elif sub in ("preorder", "предзаказ"):
             self._cmd_preorder(chat_id)
         elif sub in ("help", "помощь"):
@@ -574,134 +738,149 @@ class Plugin:
             send_fp(self.cardinal, chat_id, self._main_menu())
 
     def _main_menu(self) -> str:
+        s = load_settings()
         return (
-            "🌟 Gemini Link — Меню\n\n"
-            "📦 /Gemini check — Проверить наличие\n"
-            "📝 /Gemini preorder — Сделать предзаказ\n"
+            "🌟 Gemini 18m — Меню\n\n"
+            "📦 /Gemini check — Наличие\n"
+            "🕐 /Gemini restock — Когда ресток\n"
+            "📝 /Gemini preorder — Предзаказ\n"
             "🆘 /Gemini help — Позвать продавца\n\n"
-            "💡 После оплаты ссылка выдаётся автоматически."
+            f"💡 Ресток поставщика ~ каждые {s.get('restock_info_hours', 12)} ч.\n"
+            "После оплаты ссылка выдаётся автоматически."
         )
 
     def _cmd_check(self, chat_id: Any) -> None:
         try:
             stock = SupplierBotAPI.get_stock()
+            inv = len(OrderQueue.load_inventory())
             msg = (
-                f"📦 Проверка наличия\n\n"
-                f"✅ В наличии: {stock['available']} шт.\n\n"
-                + (
-                    "🛒 Можете оформить заказ — ссылка придёт после оплаты!"
-                    if stock["available"] > 0
-                    else "⏳ Нет в наличии. Используйте /Gemini preorder"
-                )
+                f"📦 {stock['product_name']}\n\n"
+                f"🛒 У поставщика: {stock['available']} шт.\n"
+                f"📦 Наш резерв: {inv} шт.\n"
+                f"💵 Цена: ${stock['price']:.2f}\n\n"
+                + ("✅ Можно покупать!" if stock["available"] > 0 or inv > 0
+                   else f"⏳ Нет в наличии. Ресток ~ каждые {load_settings().get('restock_info_hours', 12)} ч.\n"
+                        "Напишите /Gemini restock для уведомления")
             )
             send_fp(self.cardinal, chat_id, msg)
         except Exception as exc:
-            send_fp(self.cardinal, chat_id, "⚠️ Не удалось проверить наличие. Попробуйте /Gemini help")
-            logger.error("%s: cmd check: %s", _P, exc)
+            send_fp(self.cardinal, chat_id, f"⚠️ Ошибка: {exc}")
+
+    def _cmd_restock_info(self, chat_id: Any) -> None:
+        s = load_settings()
+        state = OrderQueue.load_state()
+        last = state.get("last_restock_at", 0)
+        if last:
+            ago = int((time.time() - last) / 3600)
+            eta = max(0, int(s.get("restock_info_hours", 12)) - ago)
+            info = f"Последний ресток: {ago} ч. назад.\nОжидаем следующий через ~{eta} ч."
+        else:
+            info = f"Ресток поставщика примерно каждые {s.get('restock_info_hours', 12)} ч."
+        OrderQueue.subscribe_restock(chat_id)
+        send_fp(
+            self.cardinal, chat_id,
+            f"🕐 Информация о рестоке\n\n{info}\n\n"
+            "🔔 Вы подписаны на уведомление о рестоке!\n"
+            "📝 /Gemini preorder — инструкция по предзаказу",
+        )
 
     def _cmd_preorder(self, chat_id: Any) -> None:
-        items = load_preorders()
-        items.append({"chat_id": chat_id, "type": "intent", "at": _ts(), "status": "intent"})
-        save_preorders(items)
+        OrderQueue.subscribe_restock(chat_id)
         send_fp(
-            self.cardinal,
-            chat_id,
-            "📝 Предзаказ Gemini Link (18 мес.)\n\n"
-            "Вы в списке предзаказа ✅\n\n"
-            "1. Оформите заказ на лот «Gemini link»\n"
-            "2. После оплаты ссылка выдаётся автоматически\n"
-            "3. При отсутствии товара — приоритетная очередь\n\n"
-            "💬 /Gemini help — связь с продавцом",
+            self.cardinal, chat_id,
+            "📝 Предзаказ Gemini 18m\n\n"
+            "1. Оформите и оплатите заказ на FunPay\n"
+            "2. Если ссылка есть — выдадим сразу\n"
+            "3. Если нет — напишите «1» и ждите до 12 ч.\n"
+            "4. При рестоке — автоматическая выдача\n\n"
+            "🕐 /Gemini restock — уведомление о рестоке",
         )
 
     def _cmd_help(self, chat_id: Any) -> None:
-        _disabled_chats[str(chat_id)] = time.time() + 30 * 60
-        _log_action("🆘 Требуется продавец", chat_id=chat_id)
-        self.notify_seller(f"🆘 <b>{NAME}</b>\n\nПокупатель просит помощь.\n💬 chat_id: <code>{chat_id}</code>")
-        send_fp(
-            self.cardinal,
-            chat_id,
-            "🆘 Продавец уведомлён!\n\n"
-            "Автоответчик отключён на 30 минут.\n"
-            "Продавец ответит лично в ближайшее время.",
-        )
+        _disabled_chats[str(chat_id)] = time.time() + 1800
+        self.notify_seller(f"🆘 <b>{NAME}</b> Помощь в чате <code>{chat_id}</code>")
+        send_fp(self.cardinal, chat_id, "🆘 Продавец уведомлён. Ожидайте ответа.")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Telegram UI (настройки продавца)
+# Фоновый монитор рестока
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _restock_loop() -> None:
+    while True:
+        try:
+            if _plugin and _is_configured():
+                _plugin.fulfill_queue()
+        except Exception as exc:
+            logger.error("%s: restock_loop: %s", _P, exc)
+        interval = int(load_settings().get("restock_check_interval_sec", 300))
+        time.sleep(max(60, interval))
+
+
+def start_restock_monitor() -> None:
+    global _restock_thread_started
+    if _restock_thread_started:
+        return
+    _restock_thread_started = True
+    threading.Thread(target=_restock_loop, daemon=True, name="GeminiLinkRestock").start()
+    logger.info("%s: монитор рестока запущен", _P)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Telegram UI (продавец) — компактная версия
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _settings_summary() -> str:
     s = load_settings()
-    configured = _is_configured(s)
-    status = "🟢 Настроен" if configured else "🔴 Не настроен"
+    inv = len(OrderQueue.load_inventory())
+    wait = len(OrderQueue.load_wait())
     return (
         f"⚙️ <b>{NAME}</b> v{VERSION}\n\n"
-        f"Статус API: {status}\n"
-        f"🌐 URL: <code>{html.escape(s.get('bot_api_url') or '—')}</code>\n"
-        f"🔑 Key: <code>{html.escape(_mask_key(s.get('bot_api_key', '')))}</code>\n"
-        f"🏷 Ключевые слова: <code>{html.escape(', '.join(s.get('product_keywords', [])))}</code>\n"
-        f"📦 Product ID: <code>{html.escape(str(s.get('bot_product_id') or 'авто (gemini)'))}</code>\n"
-        f"🔍 Поиск в API: <code>{html.escape(', '.join(s.get('product_search_keywords', [])))}</code>\n\n"
-        f"Команды:\n"
-        f"⠀∟ /gemini_link — эта панель\n"
-        f"⠀∟ /gl_balance — баланс бота\n"
-        f"⠀∟ /gl_stock — наличие\n"
-        f"⠀∟ /gl_process — выдать заказ вручную"
+        f"API: {'🟢' if _is_configured(s) else '🔴'}\n"
+        f"🌐 <code>{html.escape(s.get('bot_api_url', '—'))}</code>\n"
+        f"🔑 <code>{html.escape(_mask_key(s.get('bot_api_key', '')))}</code>\n"
+        f"🆔 Product ID: <code>{html.escape(str(s.get('bot_product_id') or 'auto'))}</code>\n"
+        f"📦 Резерв: {inv} | Очередь: {wait}\n"
+        f"🔄 Автозакупка: {s.get('auto_buy_quantity', 5)} шт. при рестоке\n\n"
+        f"/gemini_link /gl_balance /gl_stock /gl_process ID"
     )
 
 
 def _main_keyboard() -> InlineKeyboardMarkup:
     kb = InlineKeyboardMarkup(row_width=2)
     kb.add(
-        InlineKeyboardButton("🌐 URL API", callback_data="gla:set_url"),
-        InlineKeyboardButton("🔑 API Key", callback_data="gla:set_key"),
-    )
-    kb.add(
-        InlineKeyboardButton("🏷 Ключевые слова", callback_data="gla:set_keywords"),
-        InlineKeyboardButton("🔄 Обновить", callback_data="gla:main"),
+        InlineKeyboardButton("🌐 URL", callback_data="gla:set_url"),
+        InlineKeyboardButton("🔑 Key", callback_data="gla:set_key"),
     )
     kb.add(
         InlineKeyboardButton("🆔 Product ID", callback_data="gla:set_product"),
-        InlineKeyboardButton("📃 Список товаров", callback_data="gla:products"),
+        InlineKeyboardButton("📃 Товары", callback_data="gla:products"),
     )
     kb.add(
-        InlineKeyboardButton("💰 Баланс бота", callback_data="gla:balance"),
-        InlineKeyboardButton("📦 Наличие", callback_data="gla:stock"),
+        InlineKeyboardButton("🔢 Автозакупка", callback_data="gla:set_autobuy"),
+        InlineKeyboardButton("💰 Баланс", callback_data="gla:balance"),
     )
-    kb.add(InlineKeyboardButton("📋 Очередь / внимание", callback_data="gla:queue"))
-    return kb
-
-
-def _queue_keyboard() -> InlineKeyboardMarkup:
-    kb = InlineKeyboardMarkup(row_width=1)
-    kb.add(InlineKeyboardButton("◀️ Назад", callback_data="gla:main"))
+    kb.add(
+        InlineKeyboardButton("📦 Наличие", callback_data="gla:stock"),
+        InlineKeyboardButton("📋 Очередь", callback_data="gla:queue"),
+    )
+    kb.add(InlineKeyboardButton("🔄 Обновить", callback_data="gla:main"))
     return kb
 
 
 def _queue_summary() -> str:
-    pre = load_preorders()
-    att = load_attention()
-    lines = [
-        f"📋 <b>Очередь и внимание</b>\n",
-        f"Предзаказы: <b>{len(pre)}</b>",
-        f"Ручное внимание: <b>{len(att)}</b>",
-    ]
-    if att:
-        lines.append("\n<b>⚠️ Требуют внимания:</b>")
-        for item in att[-5:]:
-            lines.append(f"• #{item.get('order_id')} — {html.escape(item.get('reason', '?'))}")
-    if pre:
-        lines.append("\n<b>📝 Предзаказы:</b>")
-        for item in pre[-5:]:
-            oid = item.get("order_id") or item.get("chat_id") or "—"
-            lines.append(f"• {html.escape(str(oid))}")
-    return "\n".join(lines)
+    wait = OrderQueue.load_wait()
+    inv = OrderQueue.load_inventory()
+    lines = [f"📋 <b>Очередь</b> ({len(wait)}) | Резерв: {len(inv)}\n"]
+    for item in wait[-8:]:
+        lines.append(
+            f"• #{item.get('order_id')} — {item.get('status')} — {item.get('buyer', '?')}"
+        )
+    return "\n".join(lines) if len(lines) > 1 else lines[0] + "\nПусто"
 
 
-def _edit_or_send_panel(bot, chat_id: int, msg_id: Optional[int] = None) -> None:
-    text = _settings_summary()
-    markup = _main_keyboard()
+def _edit_panel(bot, chat_id: int, msg_id: Optional[int] = None) -> None:
+    text, markup = _settings_summary(), _main_keyboard()
     if msg_id:
         try:
             bot.edit_message_text(text, chat_id, msg_id, reply_markup=markup, parse_mode="HTML")
@@ -713,285 +892,190 @@ def _edit_or_send_panel(bot, chat_id: int, msg_id: Optional[int] = None) -> None
 
 def setup_telegram(cardinal: Cardinal) -> None:
     global _tg_bot_instance_id
-
     if not cardinal.telegram:
-        logger.warning("%s: Telegram отключён — команды не зарегистрированы", _P)
         return
-
-    tg = cardinal.telegram
-    bot = tg.bot
-    bot_id = id(bot)
-    if _tg_bot_instance_id == bot_id:
-        logger.debug("%s: Telegram-обработчики уже зарегистрированы", _P)
+    tg, bot = cardinal.telegram, cardinal.telegram.bot
+    if _tg_bot_instance_id == id(bot):
         return
-    _tg_bot_instance_id = bot_id
+    _tg_bot_instance_id = id(bot)
 
     def _answer(call, text: str = "", alert: bool = False) -> None:
         try:
-            if text:
-                bot.answer_callback_query(call.id, text[:200], show_alert=alert)
-            else:
-                bot.answer_callback_query(call.id)
-        except Exception as exc:
-            logger.debug("%s: answer_callback_query: %s", _P, exc)
-
-    def cmd_panel(msg):
-        _edit_or_send_panel(bot, msg.chat.id)
-
-    def cmd_balance(msg):
-        if not _is_configured():
-            bot.reply_to(msg, "🔴 Сначала настройте URL и API Key в /gemini_link")
-            return
-        try:
-            data = SupplierBotAPI.get_balance()
-            bot.reply_to(msg, f"💰 Баланс бота: <b>{data['balance']:.2f}</b> {data['currency']}", parse_mode="HTML")
-        except Exception as exc:
-            bot.reply_to(msg, f"🔴 Ошибка: {html.escape(str(exc))}", parse_mode="HTML")
-
-    def cmd_stock(msg):
-        if not _is_configured():
-            bot.reply_to(msg, "🔴 Сначала настройте URL и API Key в /gemini_link")
-            return
-        try:
-            data = SupplierBotAPI.get_stock()
-            bot.reply_to(
-                msg,
-                f"📦 <b>{html.escape(data['product_name'])}</b>\n"
-                f"В наличии: <b>{data['available']}</b> шт.\n"
-                f"Цена: <b>${data['price']:.2f}</b>",
-                parse_mode="HTML",
-            )
-        except Exception as exc:
-            bot.reply_to(msg, f"🔴 Ошибка: {html.escape(str(exc))}", parse_mode="HTML")
-
-    def cmd_process(msg):
-        parts = (msg.text or "").split()
-        if len(parts) < 2:
-            bot.reply_to(msg, "Использование: <code>/gl_process HTXBF22B</code>", parse_mode="HTML")
-            return
-        order_id = parts[1].strip().lstrip("#").upper()
-        bot.reply_to(msg, f"⏳ Запускаю выдачу для заказа <code>#{order_id}</code>...", parse_mode="HTML")
-        threading.Thread(target=_plugin.process_order, args=(order_id, True), daemon=True).start()
-
-    def on_plugin_settings(call):
-        try:
-            _edit_or_send_panel(bot, call.message.chat.id, call.message.message_id)
-            _answer(call)
-        except Exception as exc:
-            logger.error("%s: on_plugin_settings: %s", _P, exc)
-            _answer(call, f"Ошибка: {exc}", alert=True)
+            bot.answer_callback_query(call.id, text[:200] if text else None, show_alert=alert)
+        except Exception:
+            pass
 
     def on_callback(call):
-        chat_id = call.message.chat.id
-        msg_id = call.message.message_id
-        action = (call.data or "").split(":", 1)[-1] if (call.data or "").startswith("gla:") else ""
-
+        action = (call.data or "").split(":", 1)[-1]
+        cid, mid = call.message.chat.id, call.message.message_id
         try:
             if action == "main":
-                _edit_or_send_panel(bot, chat_id, msg_id)
-                _answer(call, "Обновлено")
-
+                _edit_panel(bot, cid, mid)
+                _answer(call)
             elif action == "set_url":
                 _answer(call)
-                r = bot.send_message(chat_id, "🌐 Введите <b>BOT_API_URL</b>:\n/cancel — отмена", parse_mode="HTML")
-                tg.set_state(chat_id, r.message_id, call.from_user.id, state="gla_url")
-
+                r = bot.send_message(cid, "🌐 BOT_API_URL:\n/cancel")
+                tg.set_state(cid, r.message_id, call.from_user.id, state="gla_url")
             elif action == "set_key":
                 _answer(call)
-                r = bot.send_message(chat_id, "🔑 Введите <b>BOT_API_KEY</b>:\n/cancel — отмена", parse_mode="HTML")
-                tg.set_state(chat_id, r.message_id, call.from_user.id, state="gla_key")
-
-            elif action == "set_keywords":
-                _answer(call)
-                r = bot.send_message(
-                    chat_id,
-                    "🏷 Введите ключевые слова через запятую:\n"
-                    "<i>например: Gemini link, gemini 18</i>\n/cancel — отмена",
-                    parse_mode="HTML",
-                )
-                tg.set_state(chat_id, r.message_id, call.from_user.id, state="gla_keywords")
-
+                r = bot.send_message(cid, "🔑 BOT_API_KEY:\n/cancel")
+                tg.set_state(cid, r.message_id, call.from_user.id, state="gla_key")
             elif action == "set_product":
                 _answer(call)
-                r = bot.send_message(
-                    chat_id,
-                    "🆔 Введите <b>Product ID</b> из /api/products\n"
-                    "Или <code>auto</code> для авто-поиска по «gemini»\n/cancel — отмена",
-                    parse_mode="HTML",
-                )
-                tg.set_state(chat_id, r.message_id, call.from_user.id, state="gla_product")
-
+                r = bot.send_message(cid, "🆔 Product ID (1 = Gemini 18m) или auto:\n/cancel")
+                tg.set_state(cid, r.message_id, call.from_user.id, state="gla_product")
+            elif action == "set_autobuy":
+                _answer(call)
+                r = bot.send_message(cid, "🔢 Кол-во автозакупки при рестоке (число):\n/cancel")
+                tg.set_state(cid, r.message_id, call.from_user.id, state="gla_autobuy")
             elif action == "products":
                 if not _is_configured():
-                    _answer(call, "Сначала укажите URL и API Key", alert=True)
+                    _answer(call, "Настройте API", alert=True)
                     return
-                products = SupplierBotAPI.get_products()
-                lines = ["📃 <b>Товары API:</b>\n"]
-                for p in products[:15]:
-                    lines.append(
-                        f"#{p.get('id')} — {html.escape(str(p.get('name_en', '?')))}\n"
-                        f"  💵 ${p.get('price', '?')} | 📦 {p.get('stock_count', 0)} шт."
-                    )
-                bot.send_message(chat_id, "\n".join(lines) or "Пусто", parse_mode="HTML")
+                lines = ["📃 Товары:\n"]
+                for p in SupplierBotAPI.get_products()[:15]:
+                    lines.append(f"#{p.get('id')} {p.get('name_en')} — ${p.get('price')} × {p.get('stock_count')}")
+                bot.send_message(cid, "\n".join(lines), parse_mode="HTML")
                 _answer(call)
-
             elif action == "balance":
-                if not _is_configured():
-                    _answer(call, "Сначала укажите URL и API Key", alert=True)
-                    return
                 bal = SupplierBotAPI.get_balance()
-                _answer(call, f"💰 {bal['balance']:.2f} {bal['currency']}", alert=True)
-
+                _answer(call, f"💰 {bal['balance']:.2f} USD", alert=True)
             elif action == "stock":
-                if not _is_configured():
-                    _answer(call, "Сначала укажите URL и API Key", alert=True)
-                    return
                 st = SupplierBotAPI.get_stock()
-                _answer(
-                    call,
-                    f"📦 {st['product_name']}\n{st['available']} шт. · ${st['price']:.2f}",
-                    alert=True,
-                )
-
+                inv = len(OrderQueue.load_inventory())
+                _answer(call, f"📦 API:{st['available']} + резерв:{inv}", alert=True)
             elif action == "queue":
-                bot.edit_message_text(
-                    _queue_summary(), chat_id, msg_id,
-                    parse_mode="HTML", reply_markup=_queue_keyboard(),
-                )
+                bot.edit_message_text(_queue_summary(), cid, mid, parse_mode="HTML",
+                                      reply_markup=InlineKeyboardMarkup().add(
+                                          InlineKeyboardButton("◀️", callback_data="gla:main")))
                 _answer(call)
-
             else:
                 _answer(call)
-
         except Exception as exc:
-            logger.error("%s: callback %s: %s", _P, call.data, exc)
-            logger.debug(traceback.format_exc())
             _answer(call, str(exc)[:200], alert=True)
 
     def on_text(msg):
-        state_data = tg.get_state(msg.chat.id, msg.from_user.id)
-        if not state_data or "state" not in state_data:
+        st_data = tg.get_state(msg.chat.id, msg.from_user.id)
+        if not st_data or "state" not in st_data:
             return
-        state = state_data["state"]
-        if state not in ("gla_url", "gla_key", "gla_keywords", "gla_product"):
-            return
-
-        settings = load_settings()
+        state = st_data["state"]
         text = (msg.text or "").strip()
-
         if text.lower() in ("/cancel", "отмена"):
             tg.clear_state(msg.chat.id, msg.from_user.id, True)
             bot.reply_to(msg, "❌ Отменено")
-            _edit_or_send_panel(bot, msg.chat.id)
             return
-
+        settings = load_settings()
         if state == "gla_url":
             settings["bot_api_url"] = text.rstrip("/")
-            label = "URL API"
         elif state == "gla_key":
             settings["bot_api_key"] = text
-            label = "API Key"
             try:
                 bot.delete_message(msg.chat.id, msg.message_id)
             except Exception:
                 pass
-        elif state == "gla_keywords":
-            settings["product_keywords"] = [k.strip() for k in text.split(",") if k.strip()]
-            label = "Ключевые слова (FunPay)"
         elif state == "gla_product":
-            if text.lower() in ("auto", "авто", "0", "-"):
-                settings["bot_product_id"] = ""
-            else:
-                try:
-                    settings["bot_product_id"] = str(int(text))
-                except ValueError:
-                    bot.reply_to(msg, "⚠️ Введите число (Product ID) или auto")
-                    return
-            label = "Product ID"
+            settings["bot_product_id"] = "" if text.lower() in ("auto", "авто") else str(int(text))
+        elif state == "gla_autobuy":
+            settings["auto_buy_quantity"] = max(1, int(text))
         else:
             return
-
         save_settings(settings)
         tg.clear_state(msg.chat.id, msg.from_user.id, True)
-        bot.send_message(msg.chat.id, f"✅ {label} сохранён.", parse_mode="HTML")
-        _edit_or_send_panel(bot, msg.chat.id)
+        bot.reply_to(msg, "✅ Сохранено")
+        _edit_panel(bot, msg.chat.id)
 
-    def _has_input_state(msg):
-        for st in ("gla_url", "gla_key", "gla_keywords", "gla_product"):
-            if tg.check_state(msg.chat.id, msg.from_user.id, st):
-                return True
-        return False
+    def cmd_process(msg):
+        parts = (msg.text or "").split()
+        if len(parts) < 2:
+            bot.reply_to(msg, "/gl_process ORDER_ID")
+            return
+        oid = parts[1].strip().lstrip("#").upper()
+        bot.reply_to(msg, f"⏳ #{oid}...")
+        threading.Thread(target=_plugin.process_order, args=(oid, True), daemon=True).start()
 
-    def _is_gla_callback(call) -> bool:
-        return (call.data or "").startswith("gla:")
+    tg.msg_handler(lambda m: _edit_panel(bot, m.chat.id), func=lambda m: m.text and m.text.split()[0].lower() in ("/gemini_link", "/gemini"))
+    def cmd_balance(msg):
+        if not _is_configured():
+            bot.reply_to(msg, "⚠️ API не настроен")
+            return
+        try:
+            bal = SupplierBotAPI.get_balance()
+            bot.reply_to(msg, f"💰 {bal['balance']:.2f} USD")
+        except Exception as exc:
+            bot.reply_to(msg, f"⚠️ {exc}")
 
-    def _is_plugin_settings(call) -> bool:
-        return f"{CBT.PLUGIN_SETTINGS}:{UUID}" in (call.data or "")
+    def cmd_stock(msg):
+        if not _is_configured():
+            bot.reply_to(msg, "⚠️ API не настроен")
+            return
+        try:
+            st = SupplierBotAPI.get_stock()
+            inv = len(OrderQueue.load_inventory())
+            wait = len(OrderQueue.load_wait())
+            bot.reply_to(
+                msg,
+                f"📦 {st['product_name']}\n"
+                f"API: {st['available']} | Резерв: {inv} | Очередь: {wait}\n"
+                f"💵 ${st['price']:.2f}",
+            )
+        except Exception as exc:
+            bot.reply_to(msg, f"⚠️ {exc}")
 
-    tg.msg_handler(cmd_panel, func=lambda m: m.text and m.text.split()[0].lower() in ("/gemini_link", "/gemini"))
     tg.msg_handler(cmd_balance, func=lambda m: m.text and m.text.split()[0].lower() == "/gl_balance")
     tg.msg_handler(cmd_stock, func=lambda m: m.text and m.text.split()[0].lower() == "/gl_stock")
     tg.msg_handler(cmd_process, func=lambda m: m.text and m.text.split()[0].lower() == "/gl_process")
-    tg.cbq_handler(on_callback, func=_is_gla_callback)
-    tg.cbq_handler(on_plugin_settings, func=_is_plugin_settings)
-    tg.msg_handler(on_text, func=_has_input_state)
+    tg.cbq_handler(on_callback, func=lambda c: (c.data or "").startswith("gla:"))
+    tg.cbq_handler(lambda c: (_edit_panel(bot, c.message.chat.id, c.message.message_id), _answer(c)),
+                   func=lambda c: f"{CBT.PLUGIN_SETTINGS}:{UUID}" in (c.data or ""))
+    def _in_gla_state(msg) -> bool:
+        state = (tg.get_state(msg.chat.id, msg.from_user.id) or {}).get("state", "")
+        return state in ("gla_url", "gla_key", "gla_product", "gla_autobuy")
 
+    tg.msg_handler(on_text, func=_in_gla_state)
     try:
         cardinal.add_telegram_commands(UUID, [
-            ("gemini_link", f"панель {NAME}", True),
-            ("gl_balance", f"баланс бота {NAME}", True),
-            ("gl_stock", f"наличие {NAME}", True),
-            ("gl_process", f"выдать заказ {NAME}", True),
+            ("gemini_link", "панель Gemini", True),
+            ("gl_process", "выдать заказ", True),
+            ("gl_stock", "наличие Gemini", True),
+            ("gl_balance", "баланс API", True),
         ])
-    except Exception as exc:
-        logger.error("%s: add_telegram_commands: %s", _P, exc)
-
-    logger.info("%s: Telegram UI зарегистрирован", _P)
+    except Exception:
+        pass
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Обработчики событий FunPay
+# События FunPay
 # ─────────────────────────────────────────────────────────────────────────────
 
 def init_plugin(cardinal: Cardinal, *_args) -> None:
     global _plugin
     _plugin = Plugin(cardinal)
     setup_telegram(cardinal)
+    start_restock_monitor()
     logger.info("%s v%s загружен", _P, VERSION)
 
 
 def on_new_order(cardinal: Cardinal, event: NewOrderEvent) -> None:
-    if not _plugin:
-        return
-    order_id = str(event.order.id)
-    logger.info("%s: NewOrderEvent #%s", _P, order_id)
-    threading.Thread(target=_plugin.process_order, args=(order_id, False), daemon=True).start()
+    if _plugin:
+        threading.Thread(target=_plugin.process_order, args=(str(event.order.id), False), daemon=True).start()
+
+
+def _handle_fp_message(cardinal: Cardinal, text: str, chat_id: Any) -> None:
+    if _plugin and text:
+        _plugin.handle_buyer_message(text, chat_id)
 
 
 def on_new_message(cardinal: Cardinal, event: NewMessageEvent) -> None:
-    if not _plugin:
-        return
     msg = event.message
-    if msg.type != MessageTypes.NON_SYSTEM:
+    if msg.type != MessageTypes.NON_SYSTEM or msg.author_id == cardinal.account.id:
         return
-    if msg.author_id == cardinal.account.id:
-        return
-    text = (msg.text or msg.get_message() or "").strip()
-    if not re.match(r"^/gemini\b", text, re.I):
-        return
-    _plugin.handle_gemini_command(text, msg.chat_id)
+    _handle_fp_message(cardinal, (getattr(msg, "text", None) or "").strip(), msg.chat_id)
 
 
 def on_last_chat(cardinal: Cardinal, event: LastChatMessageChangedEvent) -> None:
-    if not _plugin or not cardinal.old_mode_enabled:
+    if not cardinal.old_mode_enabled or not event.chat.unread:
         return
-    chat = event.chat
-    if not chat.unread:
-        return
-    text = str(chat).strip()
-    if not re.match(r"^/gemini\b", text, re.I):
-        return
-    _plugin.handle_gemini_command(text, chat.id)
+    _handle_fp_message(cardinal, str(event.chat).strip(), event.chat.id)
 
 
 def safe_handler(func):
@@ -999,7 +1083,7 @@ def safe_handler(func):
         try:
             return func(*args, **kwargs)
         except Exception as exc:
-            logger.error("%s: ошибка в %s: %s", _P, func.__name__, exc)
+            logger.error("%s: %s: %s", _P, func.__name__, exc)
             logger.debug(traceback.format_exc())
     wrapper.__name__ = func.__name__
     return wrapper
