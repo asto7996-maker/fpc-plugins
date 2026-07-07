@@ -2,7 +2,7 @@ from __future__ import annotations
 
 # === ОБЯЗАТЕЛЬНЫЕ ПОЛЯ FunPay Cardinal (НЕ УДАЛЯТЬ) ===
 NAME = "Gemini Link Auto"
-VERSION = "2.0.2"
+VERSION = "2.0.3"
 DESCRIPTION = "Автовыдача Gemini 18m через Reseller API + очередь + автозакупка при рестоке"
 CREDITS = "@xei1y"
 UUID = "e8a3f1c2-9b4d-4d7e-a816-5f2c9b0e3d41"
@@ -38,6 +38,7 @@ from tg_bot import CBT
 
 logger = logging.getLogger("FPC.GeminiLink")
 _P = "GeminiLink"
+_URL_RE = re.compile(r"https?://[^\s<>\"\'{}|\\^`\[\]]+", re.I)
 
 STORAGE_DIR = f"storage/plugins/{UUID}"
 SETTINGS_FILE = f"{STORAGE_DIR}/settings.json"
@@ -77,9 +78,9 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "auto_buy_on_restock": True,
     "auto_buy_quantity": 5,
     "notify_seller": True,
-    "funpay_max_message_len": 1900,
-    "delivery_split_sleep_sec": 1.5,
-    "delivery_use_paste_fallback": True,
+    "funpay_max_message_len": 450,
+    "delivery_split_sleep_sec": 2.0,
+    "delivery_use_paste_fallback": False,
     "processing_message": (
         "⏳ Заказ #{order_id} принят!\n"
         "Формируем ссылку Gemini 18 мес. — подождите 1–2 минуты..."
@@ -267,22 +268,35 @@ def _matches_keywords(text: str, settings: Optional[Dict[str, Any]] = None) -> b
     return any(_normalize_text(kw) in normalized for kw in keywords)
 
 
+def _is_paid_notification(text: str) -> bool:
+    res = RegularExpressions()
+    return bool(res.ORDER_PURCHASED.search(text or "") and res.ORDER_PURCHASED2.search(text or ""))
+
+
 def send_fp(
     c: Cardinal,
     chat_id: Any,
     text: str,
     buyer: Optional[str] = None,
+    buyer_id: Optional[int] = None,
     watermark: Optional[bool] = None,
-) -> None:
+) -> bool:
     if not chat_id:
         logger.warning("%s: send_fp без chat_id", _P)
-        return
+        return False
     kwargs: Dict[str, Any] = {}
     if buyer:
         kwargs["chat_name"] = buyer
+    if buyer_id:
+        kwargs["interlocutor_id"] = buyer_id
     if watermark is not None:
         kwargs["watermark"] = watermark
-    c.send_message(chat_id, text, **kwargs)
+    try:
+        result = c.send_message(chat_id, text, **kwargs)
+        return bool(result)
+    except Exception as exc:
+        logger.error("%s: send_fp chat=%s: %s", _P, chat_id, exc)
+        return False
 
 
 def _cleanup_stale(keys: Dict[str, float], ttl: float) -> None:
@@ -296,6 +310,8 @@ def _try_begin_order(order_id: str, force: bool = False) -> bool:
     now = time.time()
     with _order_lock:
         _cleanup_stale(_inflight_orders, 600)
+        if force:
+            _inflight_orders.pop(order_id, None)
         if order_id in _inflight_orders and not force:
             logger.debug("%s: #%s уже обрабатывается — пропуск", _P, order_id)
             return False
@@ -320,15 +336,44 @@ def _mark_processing_sent(order_id: str) -> bool:
 
 
 def _normalize_links(link_data: Any) -> List[str]:
-    if isinstance(link_data, list):
-        raw = link_data
-    else:
-        raw = str(link_data or "").splitlines()
     links: List[str] = []
-    for item in raw:
-        link = str(item).strip()
-        if link.startswith("http") and link not in links:
-            links.append(link)
+
+    def add(raw: str) -> None:
+        for url in _URL_RE.findall(raw or ""):
+            u = url.rstrip(".,;)")
+            if u not in links:
+                links.append(u)
+
+    if isinstance(link_data, list):
+        for item in link_data:
+            if isinstance(item, str):
+                add(item)
+            elif isinstance(item, dict):
+                add(json.dumps(item, ensure_ascii=False))
+            else:
+                add(str(item))
+    else:
+        add(str(link_data or ""))
+    return links
+
+
+def _extract_urls_from_json(data: Any) -> List[str]:
+    links: List[str] = []
+
+    def walk(obj: Any) -> None:
+        if isinstance(obj, dict):
+            for val in obj.values():
+                walk(val)
+        elif isinstance(obj, list):
+            for val in obj:
+                walk(val)
+        elif isinstance(obj, str):
+            for url in _URL_RE.findall(obj):
+                u = url.rstrip(".,;)")
+                if u not in links:
+                    links.append(u)
+
+    walk(data)
     return links
 
 
@@ -359,48 +404,54 @@ def _upload_paste(content: str) -> Optional[str]:
 
 def _build_delivery_parts(order_id: str, links: List[str]) -> List[str]:
     settings = load_settings()
-    max_len = int(settings.get("funpay_max_message_len", 1900))
-    link_tpl = settings.get("delivery_link_message", DEFAULT_SETTINGS["delivery_link_message"])
+    max_len = int(settings.get("funpay_max_message_len", 450))
 
-    # Одна короткая ссылка — одним сообщением (legacy)
-    if len(links) == 1:
-        single = _format_template("delivery_message", order_id=order_id, link=links[0])
-        if len(single) <= max_len:
-            return [single]
-
-    parts: List[str] = [_format_template("delivery_header_message", order_id=order_id)]
+    parts: List[str] = [
+        f"🎉 Gemini 18 мес. готово!\n📋 Заказ: #{order_id}\n🔗 Ссылка ниже — активируйте сразу!",
+    ]
     for idx, link in enumerate(links, 1):
-        label = f"Ссылка {idx}/{len(links)}" if len(links) > 1 else "Ссылка для активации"
-        body = link_tpl.format(label=label, link=link)
-        if len(body) <= max_len:
-            parts.append(body)
-            continue
-        prefix = f"🔗 {label} (часть {{n}}/{{total}}):\n"
-        chunk_size = max(200, max_len - 40)
+        label = f"Ссылка {idx}/{len(links)}" if len(links) > 1 else "Ссылка"
+        chunk_size = max(120, max_len - len(label) - 8)
         chunks = _chunk_text(link, chunk_size)
         for ci, chunk in enumerate(chunks, 1):
-            header = prefix.format(n=ci, total=len(chunks))
+            if len(chunks) == 1:
+                header = f"🔗 {label}:\n"
+            else:
+                header = f"🔗 {label} ({ci}/{len(chunks)}):\n"
             parts.append(header + chunk)
-
-    if any(len(p) > max_len for p in parts):
-        paste_url = _upload_paste("\n\n".join(f"#{i + 1}\n{link}" for i, link in enumerate(links)))
-        if paste_url:
-            return [_format_template(
-                "delivery_paste_message", order_id=order_id, paste_url=paste_url, count=len(links),
-            )]
     return parts
 
 
-def send_fp_delivery(c: Cardinal, chat_id: Any, order_id: str, links: List[str], buyer: str = "") -> None:
+def send_fp_delivery(
+    c: Cardinal,
+    chat_id: Any,
+    order_id: str,
+    links: List[str],
+    buyer: str = "",
+    buyer_id: Optional[int] = None,
+) -> bool:
     if not chat_id or not links:
-        return
+        return False
     settings = load_settings()
-    sleep_sec = float(settings.get("delivery_split_sleep_sec", 1.5))
+    sleep_sec = float(settings.get("delivery_split_sleep_sec", 2.0))
     parts = _build_delivery_parts(order_id, links)
+    sent = 0
     for idx, part in enumerate(parts):
         if idx > 0 and sleep_sec > 0:
             time.sleep(sleep_sec)
-        send_fp(c, chat_id, part, buyer=buyer or None, watermark=(idx == 0))
+        if send_fp(c, chat_id, part, buyer=buyer or None, buyer_id=buyer_id, watermark=(idx == 0)):
+            sent += 1
+        else:
+            logger.error("%s: не отправлена часть %s/%s для #%s", _P, idx + 1, len(parts), order_id)
+    if sent == len(parts):
+        return True
+    if sent > 0:
+        send_fp(
+            c, chat_id,
+            f"⚠️ Часть ссылок для #{order_id} не отправилась. Напишите «2» — позовём продавца.",
+            buyer=buyer or None, buyer_id=buyer_id, watermark=False,
+        )
+    return False
 
 
 def _format_template(key: str, **kwargs: Any) -> str:
@@ -650,32 +701,72 @@ class SupplierBotAPI:
 
     @classmethod
     def _extract_links(cls, data: Dict[str, Any]) -> List[str]:
-        links: List[str] = []
+        links = _extract_urls_from_json(data)
+        if links:
+            return links
 
         def add_link(value: Any) -> None:
             if not isinstance(value, str):
                 return
-            link = value.strip()
-            if link and link not in links:
-                links.append(link)
+            for url in _URL_RE.findall(value.strip()):
+                u = url.rstrip(".,;)")
+                if u not in links:
+                    links.append(u)
 
-        items = data.get("items") or data.get("links") or []
-        if isinstance(items, list):
-            for item in items:
-                if isinstance(item, str):
-                    add_link(item)
-                elif isinstance(item, dict):
-                    for key in ("link", "url", "value", "item", "activation_link", "text", "content", "data"):
-                        add_link(item.get(key))
+        for key in ("items", "links", "keys", "accounts", "deliveries", "purchased"):
+            items = data.get(key)
+            if isinstance(items, list):
+                for item in items:
+                    if isinstance(item, str):
+                        add_link(item)
+                    elif isinstance(item, dict):
+                        for k in (
+                            "link", "url", "value", "item", "activation_link",
+                            "text", "content", "data", "key", "account", "delivery",
+                        ):
+                            add_link(item.get(k))
 
-        for key in ("activation_link", "link", "url", "item"):
+        for key in ("activation_link", "link", "url", "item", "content", "text"):
             add_link(data.get(key))
 
-        nested = data.get("data") or data.get("result") or data.get("purchase")
-        if isinstance(nested, dict) and not links:
-            links.extend(cls._extract_links(nested))
+        nested = data.get("data") or data.get("result") or data.get("purchase") or data.get("order")
+        if isinstance(nested, dict):
+            for u in cls._extract_links(nested):
+                if u not in links:
+                    links.append(u)
 
-        return [link for link in links if link.startswith("http")]
+        return links
+
+    @classmethod
+    def purchase(cls, quantity: int = 1) -> Dict[str, Any]:
+        products = cls.get_products()
+        product = cls._resolve_product(products)
+        product_id = int(product.get("id", 0))
+        stock = int(product.get("stock_count", product.get("stock", 0)))
+        qty = max(1, min(quantity, stock))
+        if stock <= 0:
+            _log_action("API: нет stock", product_id=product_id, stock=stock)
+            return {"items": [], "status": "out_of_stock", "product_id": product_id}
+
+        _log_action("API: покупка", product_id=product_id, qty=qty)
+        data = cls._request("POST", cls._settings()["api_path_purchase"], {"product_id": product_id, "quantity": qty})
+        links = cls._extract_links(data)
+        if not links:
+            logger.error("%s: /api/buy без ссылок, ответ: %s", _P, json.dumps(data, ensure_ascii=False)[:500])
+            return {
+                "items": [],
+                "status": "no_links",
+                "product_id": product_id,
+                "raw": data,
+                "transaction_id": data.get("transaction_id"),
+            }
+        _log_action("API: куплено", qty=len(links), product_id=product_id)
+        return {
+            "items": links,
+            "status": "ok",
+            "product_id": product_id,
+            "transaction_id": data.get("transaction_id"),
+        }
 
     @classmethod
     def get_balance(cls) -> Dict[str, Any]:
@@ -695,26 +786,6 @@ class SupplierBotAPI:
             "status": "out_of_stock" if available <= 0 else "ok",
             "product_id": int(product.get("id", 0)),
             "product_name": product.get("name_en") or product.get("name") or "?",
-        }
-
-    @classmethod
-    def purchase(cls, quantity: int = 1) -> Dict[str, Any]:
-        products = cls.get_products()
-        product = cls._resolve_product(products)
-        product_id = int(product.get("id", 0))
-        stock = int(product.get("stock_count", product.get("stock", 0)))
-        qty = max(1, min(quantity, stock))
-        if stock <= 0:
-            return {"items": [], "status": "out_of_stock", "product_id": product_id}
-        data = cls._request("POST", cls._settings()["api_path_purchase"], {"product_id": product_id, "quantity": qty})
-        links = cls._extract_links(data)
-        if not links:
-            return {"items": [], "status": "out_of_stock", "product_id": product_id}
-        return {
-            "items": links,
-            "status": "ok",
-            "product_id": product_id,
-            "transaction_id": data.get("transaction_id"),
         }
 
 
@@ -747,22 +818,44 @@ class Plugin:
             items.append(order_id)
             save_processed(items)
 
-    def _deliver(self, order_id: str, chat_id: Any, links: Any, buyer: str = "") -> None:
+    def _deliver(self, order_id: str, chat_id: Any, links: Any, buyer: str = "", buyer_id: Optional[int] = None) -> bool:
         link_list = _normalize_links(links)
         if not link_list:
             logger.error("%s: #%s — пустые ссылки для выдачи", _P, order_id)
-            return
+            self.notify_seller(f"⚠️ <b>{NAME}</b> #{order_id} — API не вернул ссылку")
+            return False
         if chat_id:
-            send_fp_delivery(self.cardinal, chat_id, order_id, link_list, buyer)
+            if not send_fp_delivery(self.cardinal, chat_id, order_id, link_list, buyer, buyer_id):
+                self.notify_seller(
+                    f"⚠️ <b>{NAME}</b> #{order_id} — ошибка отправки в FunPay\n"
+                    f"👤 {html.escape(buyer or '—')}"
+                )
+                return False
         self._mark_processed(order_id)
         OrderQueue.remove(order_id)
         self.notify_seller(
             f"✅ <b>{NAME}</b>\n\nЗаказ <code>#{order_id}</code> выдан "
             f"({len(link_list)} ссыл.).\n👤 {html.escape(buyer or '—')}"
         )
+        return True
+
+    def _purchase_links(self, quantity: int) -> List[str]:
+        purchase = SupplierBotAPI.purchase(quantity)
+        status = purchase.get("status")
+        if status == "ok":
+            return purchase.get("items") or []
+        if status == "no_links":
+            self.notify_seller(
+                f"⚠️ <b>{NAME}</b> Покупка прошла, но ссылка не распознана.\n"
+                f"Проверьте логи /api/buy"
+            )
+        return []
 
     def _try_fulfill_with_link(self, entry: Dict[str, Any], link: str) -> None:
-        self._deliver(entry["order_id"], entry.get("chat_id"), link, entry.get("buyer", ""))
+        self._deliver(
+            entry["order_id"], entry.get("chat_id"), link,
+            entry.get("buyer", ""), entry.get("buyer_id"),
+        )
 
     def _buy_and_store(self, quantity: int) -> List[str]:
         result = SupplierBotAPI.purchase(quantity)
@@ -908,16 +1001,17 @@ class Plugin:
             return
 
         buyer = full_order.buyer_username
+        buyer_id = getattr(full_order, "buyer_id", None)
         chat_id = _resolve_chat_id(self.cardinal, buyer, chat_id_hint)
         try:
             quantity = _order_quantity(full_order)
 
-            _log_action("Новый заказ", order_id=order_id, buyer=buyer, qty=quantity, chat_id=chat_id)
+            _log_action("Обработка заказа", order_id=order_id, buyer=buyer, qty=quantity, chat_id=chat_id)
             if chat_id and _mark_processing_sent(order_id):
                 send_fp(
                     self.cardinal, chat_id,
                     _format_template("processing_message", order_id=order_id),
-                    buyer=buyer,
+                    buyer=buyer, buyer_id=buyer_id,
                 )
 
             links_from_inv: List[str] = []
@@ -928,16 +1022,19 @@ class Plugin:
                 else:
                     break
             if len(links_from_inv) == quantity:
-                self._deliver(order_id, chat_id, links_from_inv, buyer)
-                return
+                if self._deliver(order_id, chat_id, links_from_inv, buyer, buyer_id):
+                    return
             for link in links_from_inv:
                 OrderQueue.push_links([link])
 
             stock = SupplierBotAPI.get_stock()
+            _log_action("Stock check", order_id=order_id, available=stock["available"], price=stock["price"])
             if stock["available"] <= 0:
                 self._enqueue_out_of_stock(order_id, chat_id, buyer, quantity)
                 return
+
             balance = SupplierBotAPI.get_balance()
+            _log_action("Balance check", order_id=order_id, balance=balance["balance"])
             if balance["balance"] < stock["price"] * quantity:
                 self._notify_attention(order_id, chat_id, "insufficient_balance")
                 if chat_id:
@@ -945,26 +1042,29 @@ class Plugin:
                         self.cardinal, chat_id,
                         f"⏳ Заказ #{order_id} принят.\n"
                         "Сейчас пополняем баланс поставщика — выдадим ссылку в ближайшее время.",
-                        buyer=buyer,
+                        buyer=buyer, buyer_id=buyer_id,
                     )
                 return
-            purchase = SupplierBotAPI.purchase(quantity)
-            if purchase["status"] == "out_of_stock":
-                self._enqueue_out_of_stock(order_id, chat_id, buyer, quantity)
-                return
-            items = purchase.get("items") or []
+
+            items = self._purchase_links(quantity)
             if items:
-                self._deliver(order_id, chat_id, items, buyer)
-            else:
-                self._enqueue_out_of_stock(order_id, chat_id, buyer, quantity)
+                if self._deliver(order_id, chat_id, items, buyer, buyer_id):
+                    return
+                self._notify_attention(order_id, chat_id, "delivery_failed")
+                return
+
+            if stock["available"] > 0:
+                self._notify_attention(order_id, chat_id, "purchase_no_links")
+            self._enqueue_out_of_stock(order_id, chat_id, buyer, quantity)
         except Exception as exc:
             logger.error("%s: process_order #%s: %s", _P, order_id, exc)
+            logger.debug(traceback.format_exc())
             self._notify_attention(order_id, chat_id, "api_failure")
             if chat_id:
                 send_fp(
                     self.cardinal, chat_id,
                     _format_template("out_of_stock_message", order_id=order_id),
-                    buyer=buyer,
+                    buyer=buyer, buyer_id=buyer_id,
                 )
         finally:
             _end_order(order_id)
@@ -972,7 +1072,7 @@ class Plugin:
     def _enqueue_out_of_stock(self, order_id: str, chat_id: Any, buyer: str, quantity: int) -> None:
         OrderQueue.add_waiting(order_id, chat_id, buyer, quantity)
         if chat_id:
-            send_fp(self.cardinal, chat_id, _format_template("out_of_stock_message", order_id=order_id))
+            send_fp(self.cardinal, chat_id, _format_template("out_of_stock_message", order_id=order_id), buyer=buyer)
 
     def _notify_attention(self, order_id: str, chat_id: Any, reason: str) -> None:
         items = load_attention()
@@ -1151,7 +1251,7 @@ def _settings_summary() -> str:
         f"🆔 Product ID: <code>{html.escape(str(s.get('bot_product_id') or 'auto'))}</code>\n"
         f"📦 Резерв: {inv} | Очередь: {wait}\n"
         f"🔄 Автозакупка: {s.get('auto_buy_quantity', 5)} шт. при рестоке\n\n"
-        f"/gemini_link /gl_balance /gl_stock /gl_process ID"
+        f"/gemini_link /gl_balance /gl_stock /gl_process ID /gl_test_buy"
     )
 
 
@@ -1299,8 +1399,32 @@ def setup_telegram(cardinal: Cardinal) -> None:
             bot.reply_to(msg, "/gl_process ORDER_ID")
             return
         oid = parts[1].strip().lstrip("#").upper()
-        bot.reply_to(msg, f"⏳ #{oid}...")
-        threading.Thread(target=_plugin.process_order, args=(oid, True), daemon=True).start()
+        bot.reply_to(msg, f"⏳ Покупка и выдача #{oid}...")
+        _plugin.schedule_process(oid, force=True, delay=0)
+
+    def cmd_test_buy(msg):
+        if not _is_configured():
+            bot.reply_to(msg, "⚠️ API не настроен")
+            return
+        bot.reply_to(msg, "⏳ Тестовая покупка 1 шт...")
+        def worker():
+            try:
+                st = SupplierBotAPI.get_stock()
+                bal = SupplierBotAPI.get_balance()
+                purchase = SupplierBotAPI.purchase(1)
+                links = purchase.get("items") or []
+                bot.send_message(
+                    msg.chat.id,
+                    f"📦 Stock: {st['available']}\n💰 Balance: ${bal['balance']:.2f}\n"
+                    f"Status: {purchase.get('status')}\n"
+                    f"Links: {len(links)}\n"
+                    + (f"Sample: {links[0][:80]}…" if links else "❌ Ссылка не получена"),
+                )
+            except Exception as exc:
+                bot.send_message(msg.chat.id, f"❌ {exc}")
+        threading.Thread(target=worker, daemon=True).start()
+
+    tg.msg_handler(cmd_test_buy, func=lambda m: m.text and m.text.split()[0].lower() == "/gl_test_buy")
 
     tg.msg_handler(lambda m: _edit_panel(bot, m.chat.id), func=lambda m: m.text and m.text.split()[0].lower() in ("/gemini_link", "/gemini"))
     def cmd_balance(msg):
@@ -1347,6 +1471,7 @@ def setup_telegram(cardinal: Cardinal) -> None:
             ("gl_process", "выдать заказ", True),
             ("gl_stock", "наличие Gemini", True),
             ("gl_balance", "баланс API", True),
+            ("gl_test_buy", "тест покупки API", True),
         ])
     except Exception:
         pass
@@ -1392,12 +1517,13 @@ def _handle_fp_message(cardinal: Cardinal, text: str, chat_id: Any, msg_type: An
 
 def on_new_message(cardinal: Cardinal, event: NewMessageEvent) -> None:
     msg = event.message
-    if msg.type == MessageTypes.ORDER_PURCHASED:
-        _handle_order_paid(cardinal, (getattr(msg, "text", None) or str(msg)).strip(), msg.chat_id)
+    text = (getattr(msg, "text", None) or str(msg)).strip()
+    if msg.type == MessageTypes.ORDER_PURCHASED or _is_paid_notification(text):
+        _handle_order_paid(cardinal, text, msg.chat_id)
         return
     if msg.type != MessageTypes.NON_SYSTEM or msg.author_id == cardinal.account.id:
         return
-    _handle_fp_message(cardinal, (getattr(msg, "text", None) or "").strip(), msg.chat_id, msg.type)
+    _handle_fp_message(cardinal, text, msg.chat_id, msg.type)
 
 
 def on_last_chat(cardinal: Cardinal, event: LastChatMessageChangedEvent) -> None:
@@ -1405,7 +1531,7 @@ def on_last_chat(cardinal: Cardinal, event: LastChatMessageChangedEvent) -> None
         return
     chat = event.chat
     text = str(chat).strip()
-    if chat.last_message_type == MessageTypes.ORDER_PURCHASED:
+    if chat.last_message_type == MessageTypes.ORDER_PURCHASED or _is_paid_notification(text):
         _handle_order_paid(cardinal, text, chat.id)
         return
     _handle_fp_message(cardinal, text, chat.id)
