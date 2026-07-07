@@ -2,7 +2,7 @@ from __future__ import annotations
 
 # === ОБЯЗАТЕЛЬНЫЕ ПОЛЯ FunPay Cardinal (НЕ УДАЛЯТЬ) ===
 NAME = "Gemini Link Auto"
-VERSION = "2.0.0"
+VERSION = "2.0.1"
 DESCRIPTION = "Автовыдача Gemini 18m через Reseller API + очередь + автозакупка при рестоке"
 CREDITS = "@xei1y"
 UUID = "e8a3f1c2-9b4d-4d7e-a816-5f2c9b0e3d41"
@@ -25,8 +25,15 @@ from typing import Any, Dict, List, Optional, Tuple
 import requests
 from telebot.types import InlineKeyboardButton, InlineKeyboardMarkup
 
+from FunPayAPI.common.enums import OrderStatuses
+from FunPayAPI.common.utils import RegularExpressions
 from FunPayAPI.types import MessageTypes
-from FunPayAPI.updater.events import LastChatMessageChangedEvent, NewMessageEvent, NewOrderEvent
+from FunPayAPI.updater.events import (
+    LastChatMessageChangedEvent,
+    NewMessageEvent,
+    NewOrderEvent,
+    OrderStatusChangedEvent,
+)
 from cardinal import Cardinal
 from tg_bot import CBT
 
@@ -53,7 +60,9 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "bot_api_key": "",
     "product_keywords": ["gemini", "18 мес", "gemini link", "gemini pro", "активация ссылкой"],
     "bot_product_id": "1",
-    "product_search_keywords": ["gemini", "18m"],
+    "product_search_keywords": ["gemini"],
+    "order_process_delay_sec": 2,
+    "order_process_retries": 3,
     "api_path_balance": "/api/me",
     "api_path_stock": "/api/products",
     "api_path_purchase": "/api/buy",
@@ -180,9 +189,54 @@ def _extract_order_text(order: Any) -> str:
         val = getattr(order, attr, None)
         if val:
             parts.append(str(val))
+    subcategory = getattr(order, "subcategory", None)
+    if subcategory:
+        parts.append(str(getattr(subcategory, "name", "") or ""))
     if hasattr(order, "lot_params") and order.lot_params:
         parts.append(str(order.lot_params))
     return _normalize_text("\n".join(parts))
+
+
+def _extract_order_id(text: str) -> Optional[str]:
+    matches = RegularExpressions().ORDER_ID.findall(text or "")
+    if not matches:
+        return None
+    return matches[0].lstrip("#").upper()
+
+
+def _order_quantity(order: Any) -> int:
+    amount = getattr(order, "amount", None)
+    if amount:
+        try:
+            return max(1, int(amount))
+        except (TypeError, ValueError):
+            pass
+    for source in (
+        getattr(order, "full_description", None),
+        getattr(order, "description", None),
+        getattr(order, "short_description", None),
+    ):
+        if not source:
+            continue
+        found = RegularExpressions().PRODUCTS_AMOUNT.findall(str(source))
+        if found:
+            try:
+                return max(1, int(found[0].split()[0]))
+            except (TypeError, ValueError, IndexError):
+                pass
+    return 1
+
+
+def _resolve_chat_id(cardinal: Cardinal, buyer: str, hint: Any = None) -> Any:
+    if hint:
+        return hint
+    try:
+        chat = cardinal.account.get_chat_by_name(buyer)
+        if chat:
+            return chat.id
+    except Exception as exc:
+        logger.debug("%s: get_chat_by_name(%s): %s", _P, buyer, exc)
+    return None
 
 
 def _matches_keywords(text: str, settings: Optional[Dict[str, Any]] = None) -> bool:
@@ -445,16 +499,46 @@ class SupplierBotAPI:
         return products if isinstance(products, list) else []
 
     @classmethod
+    def _extract_links(cls, data: Dict[str, Any]) -> List[str]:
+        links: List[str] = []
+
+        def add_link(value: Any) -> None:
+            if not isinstance(value, str):
+                return
+            link = value.strip()
+            if link and link not in links:
+                links.append(link)
+
+        items = data.get("items") or data.get("links") or []
+        if isinstance(items, list):
+            for item in items:
+                if isinstance(item, str):
+                    add_link(item)
+                elif isinstance(item, dict):
+                    for key in ("link", "url", "value", "item", "activation_link", "text", "content", "data"):
+                        add_link(item.get(key))
+
+        for key in ("activation_link", "link", "url", "item"):
+            add_link(data.get(key))
+
+        nested = data.get("data") or data.get("result") or data.get("purchase")
+        if isinstance(nested, dict) and not links:
+            links.extend(cls._extract_links(nested))
+
+        return [link for link in links if link.startswith("http")]
+
+    @classmethod
     def get_balance(cls) -> Dict[str, Any]:
         data = cls._request("GET", cls._settings()["api_path_balance"])
         user = data.get("user") or data
-        return {"balance": float(user.get("balance", 0)), "currency": "USD"}
+        balance = float(user.get("balance", data.get("balance", 0)))
+        return {"balance": balance, "currency": "USD"}
 
     @classmethod
     def get_stock(cls) -> Dict[str, Any]:
         products = cls.get_products()
         product = cls._resolve_product(products)
-        available = int(product.get("stock_count", 0))
+        available = int(product.get("stock_count", product.get("stock", 0)))
         return {
             "available": available,
             "price": float(product.get("price", 0)),
@@ -468,15 +552,20 @@ class SupplierBotAPI:
         products = cls.get_products()
         product = cls._resolve_product(products)
         product_id = int(product.get("id", 0))
-        stock = int(product.get("stock_count", 0))
+        stock = int(product.get("stock_count", product.get("stock", 0)))
         qty = max(1, min(quantity, stock))
         if stock <= 0:
             return {"items": [], "status": "out_of_stock", "product_id": product_id}
         data = cls._request("POST", cls._settings()["api_path_purchase"], {"product_id": product_id, "quantity": qty})
-        links = [str(i).strip() for i in (data.get("items") or []) if str(i).strip()]
+        links = cls._extract_links(data)
         if not links:
             return {"items": [], "status": "out_of_stock", "product_id": product_id}
-        return {"items": links, "status": "ok", "product_id": product_id, "transaction_id": data.get("transaction_id")}
+        return {
+            "items": links,
+            "status": "ok",
+            "product_id": product_id,
+            "transaction_id": data.get("transaction_id"),
+        }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -595,7 +684,31 @@ class Plugin:
                         )
             OrderQueue.save_wait(OrderQueue.load_wait())
 
-    def process_order(self, order_id: str, force: bool = False) -> None:
+    def schedule_process(
+        self,
+        order_id: str,
+        force: bool = False,
+        chat_id_hint: Any = None,
+        delay: Optional[float] = None,
+        retry: int = 0,
+    ) -> None:
+        settings = load_settings()
+        wait = delay if delay is not None else float(settings.get("order_process_delay_sec", 2))
+
+        def worker() -> None:
+            if wait > 0:
+                time.sleep(wait)
+            self.process_order(order_id, force=force, chat_id_hint=chat_id_hint, retry=retry)
+
+        threading.Thread(target=worker, daemon=True, name=f"GeminiLink-{order_id}").start()
+
+    def process_order(
+        self,
+        order_id: str,
+        force: bool = False,
+        chat_id_hint: Any = None,
+        retry: int = 0,
+    ) -> None:
         order_id = order_id.strip().lstrip("#").upper()
         if not force and order_id in load_processed():
             return
@@ -607,17 +720,38 @@ class Plugin:
             full_order = self.cardinal.account.get_order(order_id)
         except Exception as exc:
             logger.error("%s: get_order #%s: %s", _P, order_id, exc)
+            settings = load_settings()
+            max_retries = int(settings.get("order_process_retries", 3))
+            if retry < max_retries:
+                logger.error("%s: get_order #%s — повтор %s/%s", _P, order_id, retry + 1, max_retries)
+                self.schedule_process(order_id, force=force, chat_id_hint=chat_id_hint, delay=3, retry=retry + 1)
             return
 
-        if not _matches_keywords(_extract_order_text(full_order)):
+        if not force and getattr(full_order, "status", None) == OrderStatuses.REFUNDED:
+            return
+
+        order_text = _extract_order_text(full_order)
+        if not force and not _matches_keywords(order_text):
+            settings = load_settings()
+            max_retries = int(settings.get("order_process_retries", 3))
+            if retry < max_retries:
+                logger.info(
+                    "%s: #%s keywords не совпали, повтор %s/%s (%.120s…)",
+                    _P, order_id, retry + 1, max_retries, order_text[:120],
+                )
+                self.schedule_process(order_id, chat_id_hint=chat_id_hint, delay=3, retry=retry + 1)
+                return
+            logger.info(
+                "%s: #%s пропущен — keywords %s (текст: %.120s…)",
+                _P, order_id, settings.get("product_keywords"), order_text[:120],
+            )
             return
 
         buyer = full_order.buyer_username
-        chat = self.cardinal.account.get_chat_by_name(buyer)
-        chat_id = chat.id if chat else getattr(full_order, "chat_id", None)
-        quantity = max(1, int(getattr(full_order, "amount", 1) or 1))
+        chat_id = _resolve_chat_id(self.cardinal, buyer, chat_id_hint)
+        quantity = _order_quantity(full_order)
 
-        _log_action("Новый заказ", order_id=order_id, buyer=buyer, qty=quantity)
+        _log_action("Новый заказ", order_id=order_id, buyer=buyer, qty=quantity, chat_id=chat_id)
         if chat_id:
             send_fp(self.cardinal, chat_id, _format_template("processing_message", order_id=order_id))
 
@@ -644,6 +778,12 @@ class Plugin:
             balance = SupplierBotAPI.get_balance()
             if balance["balance"] < stock["price"] * quantity:
                 self._notify_attention(order_id, chat_id, "insufficient_balance")
+                if chat_id:
+                    send_fp(
+                        self.cardinal, chat_id,
+                        f"⏳ Заказ #{order_id} принят.\n"
+                        "Сейчас пополняем баланс поставщика — выдадим ссылку в ближайшее время.",
+                    )
                 return
             purchase = SupplierBotAPI.purchase(quantity)
             if purchase["status"] == "out_of_stock":
@@ -1056,26 +1196,57 @@ def init_plugin(cardinal: Cardinal, *_args) -> None:
 
 
 def on_new_order(cardinal: Cardinal, event: NewOrderEvent) -> None:
-    if _plugin:
-        threading.Thread(target=_plugin.process_order, args=(str(event.order.id), False), daemon=True).start()
+    if not _plugin:
+        return
+    order = event.order
+    hint = _extract_order_text(order)
+    if hint and not _matches_keywords(hint):
+        return
+    _plugin.schedule_process(str(order.id))
 
 
-def _handle_fp_message(cardinal: Cardinal, text: str, chat_id: Any) -> None:
+def on_order_status_changed(cardinal: Cardinal, event: OrderStatusChangedEvent) -> None:
+    if not _plugin:
+        return
+    if event.order.status != OrderStatuses.PAID:
+        return
+    _plugin.schedule_process(str(event.order.id))
+
+
+def _handle_order_paid(cardinal: Cardinal, text: str, chat_id: Any) -> None:
+    order_id = _extract_order_id(text)
+    if order_id and _plugin:
+        _log_action("Оплата заказа", order_id=order_id, chat_id=chat_id)
+        _plugin.schedule_process(order_id, chat_id_hint=chat_id)
+
+
+def _handle_fp_message(cardinal: Cardinal, text: str, chat_id: Any, msg_type: Any = None) -> None:
+    if msg_type == MessageTypes.ORDER_PURCHASED:
+        _handle_order_paid(cardinal, text, chat_id)
+        return
     if _plugin and text:
         _plugin.handle_buyer_message(text, chat_id)
 
 
 def on_new_message(cardinal: Cardinal, event: NewMessageEvent) -> None:
     msg = event.message
+    if msg.type == MessageTypes.ORDER_PURCHASED:
+        _handle_order_paid(cardinal, (getattr(msg, "text", None) or str(msg)).strip(), msg.chat_id)
+        return
     if msg.type != MessageTypes.NON_SYSTEM or msg.author_id == cardinal.account.id:
         return
-    _handle_fp_message(cardinal, (getattr(msg, "text", None) or "").strip(), msg.chat_id)
+    _handle_fp_message(cardinal, (getattr(msg, "text", None) or "").strip(), msg.chat_id, msg.type)
 
 
 def on_last_chat(cardinal: Cardinal, event: LastChatMessageChangedEvent) -> None:
     if not cardinal.old_mode_enabled or not event.chat.unread:
         return
-    _handle_fp_message(cardinal, str(event.chat).strip(), event.chat.id)
+    chat = event.chat
+    text = str(chat).strip()
+    if chat.last_message_type == MessageTypes.ORDER_PURCHASED:
+        _handle_order_paid(cardinal, text, chat.id)
+        return
+    _handle_fp_message(cardinal, text, chat.id)
 
 
 def safe_handler(func):
@@ -1091,6 +1262,7 @@ def safe_handler(func):
 
 BIND_TO_PRE_INIT = [init_plugin]
 BIND_TO_NEW_ORDER = [safe_handler(on_new_order)]
+BIND_TO_ORDER_STATUS_CHANGED = [safe_handler(on_order_status_changed)]
 BIND_TO_NEW_MESSAGE = [safe_handler(on_new_message)]
 BIND_TO_LAST_CHAT_MESSAGE_CHANGED = [safe_handler(on_last_chat)]
 
