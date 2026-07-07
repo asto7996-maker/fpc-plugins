@@ -2,7 +2,7 @@ from __future__ import annotations
 
 # === ОБЯЗАТЕЛЬНЫЕ ПОЛЯ FunPay Cardinal (НЕ УДАЛЯТЬ) ===
 NAME = "Gemini Link Auto"
-VERSION = "2.0.4"
+VERSION = "2.1.0"
 DESCRIPTION = "Автовыдача Gemini 18m через Reseller API + очередь + автозакупка при рестоке"
 CREDITS = "@xei1y"
 UUID = "e8a3f1c2-9b4d-4d7e-a816-5f2c9b0e3d41"
@@ -49,6 +49,7 @@ INVENTORY_FILE = f"{STORAGE_DIR}/inventory.json"
 RESTOCK_SUBS_FILE = f"{STORAGE_DIR}/restock_subscribers.json"
 ATTENTION_FILE = f"{STORAGE_DIR}/manual_attention.json"
 PENDING_DELIVERY_FILE = f"{STORAGE_DIR}/pending_delivery.json"
+TEST_LINKS_FILE = f"{STORAGE_DIR}/test_links.json"
 STATE_FILE = f"{STORAGE_DIR}/state.json"
 
 _file_lock = threading.Lock()
@@ -80,8 +81,10 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "auto_buy_on_restock": True,
     "auto_buy_quantity": 5,
     "notify_seller": True,
+    "test_mode": False,
+    "link_parts_count": 3,
     "funpay_max_message_len": 200,
-    "delivery_split_sleep_sec": 2.5,
+    "delivery_split_sleep_sec": 3.0,
     "delivery_send_attempts": 4,
     "delivery_use_paste_fallback": False,
     "processing_message": (
@@ -473,6 +476,28 @@ def _upload_paste(content: str) -> Optional[str]:
     return None
 
 
+def _split_link_parts(link: str, parts_count: int = 3, max_part_len: int = 90) -> List[str]:
+    """Делит ссылку на N частей; при необходимости увеличивает N, чтобы часть ≤ max_part_len."""
+    link = (link or "").strip()
+    if not link:
+        return []
+    n = max(1, int(parts_count))
+    max_len = max(40, int(max_part_len))
+    while len(link) // n + (1 if len(link) % n else 0) > max_len:
+        n += 1
+    if len(link) <= n:
+        return [link]
+    size = len(link) // n
+    rem = len(link) % n
+    parts: List[str] = []
+    pos = 0
+    for i in range(n):
+        chunk = size + (1 if i < rem else 0)
+        parts.append(link[pos:pos + chunk])
+        pos += chunk
+    return parts
+
+
 def send_fp_delivery(
     c: Cardinal,
     chat_id: Any,
@@ -484,32 +509,54 @@ def send_fp_delivery(
     if not chat_id or not links:
         return False
     settings = load_settings()
-    max_len = int(settings.get("funpay_max_message_len", 200))
-    sleep_sec = float(settings.get("delivery_split_sleep_sec", 2.5))
+    parts_count = int(settings.get("link_parts_count", 3))
+    max_part = int(settings.get("funpay_max_message_len", 200)) // 2
+    sleep_sec = float(settings.get("delivery_split_sleep_sec", 3.0))
+    test_mode = bool(settings.get("test_mode"))
 
-    header = f"🎉 Gemini 18m готово!\n📋 #{order_id}\n🔗 Ссылка частями:"
+    tag = "🧪 ТЕСТ — " if test_mode else ""
+    header = (
+        f"{tag}Gemini 18m #{order_id}\n"
+        f"Ссылка будет в нескольких сообщениях.\n"
+        f"Склейте части по порядку (1, 2, 3…) в адресной строке."
+    )
     if not _send_fp_raw(c, chat_id, header, buyer):
-        if not send_fp(c, chat_id, header, buyer=buyer, buyer_id=buyer_id, watermark=False):
-            logger.error("%s: не отправлен заголовок #%s", _P, order_id)
-            return False
+        logger.error("%s: заголовок не отправлен #%s", _P, order_id)
+        return False
 
-    for idx, link in enumerate(links, 1):
-        if sleep_sec > 0:
-            time.sleep(sleep_sec)
+    time.sleep(sleep_sec)
+
+    for link_num, link in enumerate(links, 1):
         if len(links) > 1:
-            _send_fp_raw(c, chat_id, f"— ссылка {idx}/{len(links)} —", buyer)
+            if not _send_fp_raw(c, chat_id, f"--- ссылка {link_num}/{len(links)} ---", buyer):
+                return False
+            time.sleep(sleep_sec)
 
-        ok = _send_text_adaptive(c, chat_id, link, buyer, max_len, sleep_sec)
-        if not ok:
-            logger.warning("%s: retry #%s с 100 симв.", _P, order_id)
-            ok = _send_text_adaptive(c, chat_id, link, buyer, 100, sleep_sec)
-        if not ok:
-            logger.warning("%s: retry #%s с 80 симв.", _P, order_id)
-            ok = _send_text_adaptive(c, chat_id, link, buyer, 80, sleep_sec)
-        if not ok:
+        parts = _split_link_parts(link, parts_count, max_part)
+        if not parts:
             return False
+        total = len(parts)
 
-    _send_fp_raw(c, chat_id, "📌 Активируйте ссылку сразу! Спасибо за покупку ⭐", buyer)
+        for idx, part in enumerate(parts, 1):
+            # Только ASCII-префикс + часть URL (без emoji в теле ссылки)
+            msg = f"[{idx}/{total}] {part}"
+            if not _send_fp_raw(c, chat_id, msg, buyer):
+                # повтор без префикса
+                if not _send_fp_raw(c, chat_id, part, buyer):
+                    logger.error(
+                        "%s: часть %s/%s не отправлена (#%s, len=%s)",
+                        _P, idx, total, order_id, len(part),
+                    )
+                    return False
+            if idx < len(parts):
+                time.sleep(sleep_sec)
+
+    time.sleep(sleep_sec)
+    _send_fp_raw(
+        c, chat_id,
+        "Готово! Склейте части подряд и откройте в браузере. Спасибо!",
+        buyer,
+    )
     return True
 
 
@@ -695,6 +742,60 @@ def clear_pending_links(order_id: str) -> None:
     if order_id in data:
         del data[order_id]
         save_pending_delivery(data)
+
+
+def load_test_links() -> List[str]:
+    raw = _load_json(TEST_LINKS_FILE, [])
+    links: List[str] = []
+    for item in raw if isinstance(raw, list) else []:
+        for url in _normalize_links(item):
+            if url not in links:
+                links.append(url)
+    return links
+
+
+def save_test_links(links: List[str]) -> None:
+    _save_json(TEST_LINKS_FILE, links[-30:])
+
+
+def archive_test_link(link: str) -> None:
+    links = load_test_links()
+    for url in _normalize_links(link):
+        if url not in links:
+            links.append(url)
+    save_test_links(links)
+
+
+def get_test_link() -> Optional[str]:
+    """Берёт тестовую ссылку без удаления (переиспользование)."""
+    links = load_test_links()
+    if links:
+        idx = int(time.time() // 120) % len(links)
+        return links[idx]
+    for entry in load_pending_delivery().values():
+        pending = entry.get("links") or []
+        if pending:
+            return pending[0]
+    inv = OrderQueue.load_inventory()
+    if inv:
+        return inv[0].get("link")
+    return None
+
+
+def import_pending_to_test_links() -> int:
+    added = 0
+    links = load_test_links()
+    for entry in load_pending_delivery().values():
+        for url in _normalize_links(entry.get("links") or []):
+            if url not in links:
+                links.append(url)
+                added += 1
+    save_test_links(links)
+    return added
+
+
+def _is_test_mode() -> bool:
+    return bool(load_settings().get("test_mode"))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -942,13 +1043,25 @@ class Plugin:
         purchase = SupplierBotAPI.purchase(quantity)
         status = purchase.get("status")
         if status == "ok":
-            return purchase.get("items") or []
+            items = purchase.get("items") or []
+            for link in items:
+                archive_test_link(link)
+            return items
         if status == "no_links":
             self.notify_seller(
                 f"⚠️ <b>{NAME}</b> Покупка прошла, но ссылка не распознана.\n"
                 f"Проверьте логи /api/buy"
             )
         return []
+
+    def _get_test_links_for_order(self, quantity: int) -> List[str]:
+        pool = load_test_links()
+        if not pool:
+            return []
+        result: List[str] = []
+        for i in range(quantity):
+            result.append(pool[i % len(pool)])
+        return result
 
     def _try_fulfill_with_link(self, entry: Dict[str, Any], link: str) -> None:
         self._deliver(
@@ -967,7 +1080,7 @@ class Plugin:
         return links
 
     def fulfill_queue(self) -> None:
-        if not _is_configured():
+        if _is_test_mode() or not _is_configured():
             return
         with self._lock:
             try:
@@ -1061,7 +1174,9 @@ class Plugin:
         order_id = order_id.strip().lstrip("#").upper()
         if not force and order_id in load_processed():
             return
-        if not _is_configured():
+        settings = load_settings()
+        test_mode = bool(settings.get("test_mode"))
+        if not test_mode and not _is_configured(settings):
             self.notify_seller(f"⚠️ #{order_id} — API не настроен")
             return
 
@@ -1118,6 +1233,27 @@ class Plugin:
                 _log_action("Повторная выдача сохранённой ссылки", order_id=order_id)
                 if self._deliver(order_id, chat_id, pending, buyer, buyer_id):
                     return
+
+            if test_mode:
+                test_links = self._get_test_links_for_order(quantity)
+                if not test_links:
+                    self.notify_seller(
+                        f"🧪 <b>{NAME}</b> Тестовый режим: нет ссылок в пуле.\n"
+                        f"Добавьте: <code>/gl_add_test_link URL</code>\n"
+                        f"Или импорт: <code>/gl_import_test_links</code>"
+                    )
+                    if chat_id:
+                        send_fp(
+                            self.cardinal, chat_id,
+                            f"🧪 Тест: ссылка для #{order_id} не настроена. Продавец уведомлён.",
+                            buyer=buyer, buyer_id=buyer_id,
+                        )
+                    return
+                _log_action("Тестовая выдача (без покупки)", order_id=order_id, links=len(test_links))
+                if self._deliver(order_id, chat_id, test_links, buyer, buyer_id):
+                    return
+                self._notify_attention(order_id, chat_id, "test_delivery_failed")
+                return
 
             links_from_inv: List[str] = []
             for _ in range(quantity):
@@ -1348,15 +1484,20 @@ def _settings_summary() -> str:
     s = load_settings()
     inv = len(OrderQueue.load_inventory())
     wait = len(OrderQueue.load_wait())
+    test_links = len(load_test_links())
+    test_on = bool(s.get("test_mode"))
     return (
         f"⚙️ <b>{NAME}</b> v{VERSION}\n\n"
+        f"🧪 Тест: {'🟢 ВКЛ (покупка отключена)' if test_on else '⚪ выкл'} | Пул: {test_links} ссыл.\n"
         f"API: {'🟢' if _is_configured(s) else '🔴'}\n"
         f"🌐 <code>{html.escape(s.get('bot_api_url', '—'))}</code>\n"
         f"🔑 <code>{html.escape(_mask_key(s.get('bot_api_key', '')))}</code>\n"
         f"🆔 Product ID: <code>{html.escape(str(s.get('bot_product_id') or 'auto'))}</code>\n"
         f"📦 Резерв: {inv} | Очередь: {wait}\n"
+        f"🔗 Выдача: {s.get('link_parts_count', 3)} части | пауза {s.get('delivery_split_sleep_sec', 3)}с\n"
         f"🔄 Автозакупка: {s.get('auto_buy_quantity', 5)} шт. при рестоке\n\n"
-        f"/gemini_link /gl_balance /gl_stock /gl_process /gl_resend /gl_test_buy"
+        f"/gl_test_mode on|off · /gl_add_test_link URL · /gl_import_test_links\n"
+        f"/gemini_link /gl_process /gl_resend /gl_stock /gl_balance"
     )
 
 
@@ -1378,6 +1519,11 @@ def _main_keyboard() -> InlineKeyboardMarkup:
         InlineKeyboardButton("📦 Наличие", callback_data="gla:stock"),
         InlineKeyboardButton("📋 Очередь", callback_data="gla:queue"),
     )
+    test_on = bool(load_settings().get("test_mode"))
+    kb.add(InlineKeyboardButton(
+        f"🧪 Тест: {'ВКЛ' if test_on else 'ВЫКЛ'}",
+        callback_data="gla:toggle_test",
+    ))
     kb.add(InlineKeyboardButton("🔄 Обновить", callback_data="gla:main"))
     return kb
 
@@ -1463,6 +1609,13 @@ def setup_telegram(cardinal: Cardinal) -> None:
                                       reply_markup=InlineKeyboardMarkup().add(
                                           InlineKeyboardButton("◀️", callback_data="gla:main")))
                 _answer(call)
+            elif action == "toggle_test":
+                settings = load_settings()
+                settings["test_mode"] = not bool(settings.get("test_mode"))
+                save_settings(settings)
+                state = "ВКЛ — покупка отключена" if settings["test_mode"] else "ВЫКЛ"
+                _edit_panel(bot, cid, mid)
+                _answer(call, f"🧪 Тест {state}", alert=True)
             else:
                 _answer(call)
         except Exception as exc:
@@ -1504,8 +1657,54 @@ def setup_telegram(cardinal: Cardinal) -> None:
             bot.reply_to(msg, "/gl_process ORDER_ID")
             return
         oid = parts[1].strip().lstrip("#").upper()
-        bot.reply_to(msg, f"⏳ Покупка и выдача #{oid}...")
+        mode = "🧪 тестовая выдача" if _is_test_mode() else "покупка и выдача"
+        bot.reply_to(msg, f"⏳ {mode} #{oid}...")
         _plugin.schedule_process(oid, force=True, delay=0)
+
+    def cmd_test_mode(msg):
+        parts = (msg.text or "").split()
+        settings = load_settings()
+        if len(parts) >= 2:
+            arg = parts[1].lower()
+            if arg in ("on", "1", "вкл", "enable", "true"):
+                settings["test_mode"] = True
+            elif arg in ("off", "0", "выкл", "disable", "false"):
+                settings["test_mode"] = False
+            else:
+                bot.reply_to(msg, "Использование: /gl_test_mode on|off")
+                return
+            save_settings(settings)
+        state = "ВКЛ (покупка отключена)" if settings.get("test_mode") else "ВЫКЛ"
+        pool = len(load_test_links())
+        bot.reply_to(
+            msg,
+            f"🧪 Тестовый режим: {state}\n"
+            f"Пул ссылок: {pool}\n\n"
+            f"Добавить: /gl_add_test_link URL\n"
+            f"Импорт из pending: /gl_import_test_links",
+        )
+
+    def cmd_add_test_link(msg):
+        text = (msg.text or "").strip()
+        parts = text.split(maxsplit=1)
+        if len(parts) < 2:
+            bot.reply_to(msg, "Использование: /gl_add_test_link https://...")
+            return
+        urls = _normalize_links(parts[1])
+        if not urls:
+            bot.reply_to(msg, "❌ URL не найден в сообщении")
+            return
+        for url in urls:
+            archive_test_link(url)
+        bot.reply_to(msg, f"✅ Добавлено {len(urls)} ссыл. в тест-пул (всего {len(load_test_links())})")
+
+    def cmd_import_test_links(msg):
+        added = import_pending_to_test_links()
+        bot.reply_to(
+            msg,
+            f"✅ Импортировано {added} ссыл. из pending\n"
+            f"Всего в тест-пуле: {len(load_test_links())}",
+        )
 
     def cmd_test_buy(msg):
         if not _is_configured():
@@ -1555,6 +1754,9 @@ def setup_telegram(cardinal: Cardinal) -> None:
         threading.Thread(target=worker, daemon=True).start()
 
     tg.msg_handler(cmd_resend, func=lambda m: m.text and m.text.split()[0].lower() == "/gl_resend")
+    tg.msg_handler(cmd_test_mode, func=lambda m: m.text and m.text.split()[0].lower() == "/gl_test_mode")
+    tg.msg_handler(cmd_add_test_link, func=lambda m: m.text and m.text.split()[0].lower() == "/gl_add_test_link")
+    tg.msg_handler(cmd_import_test_links, func=lambda m: m.text and m.text.split()[0].lower() == "/gl_import_test_links")
     tg.msg_handler(cmd_test_buy, func=lambda m: m.text and m.text.split()[0].lower() == "/gl_test_buy")
 
     tg.msg_handler(lambda m: _edit_panel(bot, m.chat.id), func=lambda m: m.text and m.text.split()[0].lower() in ("/gemini_link", "/gemini"))
@@ -1602,7 +1804,10 @@ def setup_telegram(cardinal: Cardinal) -> None:
             ("gl_process", "выдать заказ", True),
             ("gl_stock", "наличие Gemini", True),
             ("gl_balance", "баланс API", True),
-            ("gl_test_buy", "тест покупки API", True),
+            ("gl_test_mode", "тестовый режим on/off", True),
+            ("gl_add_test_link", "добавить тест-ссылку", True),
+            ("gl_import_test_links", "импорт ссылок из pending", True),
+            ("gl_test_buy", "тест покупки API ($)", True),
             ("gl_resend", "повторить выдачу", True),
         ])
     except Exception:
