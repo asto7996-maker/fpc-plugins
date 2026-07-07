@@ -41,7 +41,7 @@ except ImportError:
 
 
 NAME          = "Gemini Review Reply"
-VERSION       = "3.0.9"
+VERSION       = "3.1.0"
 DESCRIPTION   = "ИИ-ответы на отзывы FunPay (Gemini AQ + HTTP/SOCKS proxy + batch) 🌈"
 CREDITS       = "Cursor AI"
 UUID          = "c4e8b2f1-9a3d-4e7b-8c6f-2d1a5e9b0c3f"
@@ -51,10 +51,11 @@ BIND_TO_DELETE = None
 MAX_REVIEW_LEN:   Final[int] = 999
 MAX_CHAT_LEN:     Final[int] = 240
 MAX_PROMPT_LEN:   Final[int] = 4000
+GEMINI_MAX_OUTPUT_TOKENS: Final[int] = 2048
 PROMPT_PREVIEW_LEN: Final[int] = 250
 CHAT_HISTORY_MAX: Final[int] = 20
 SETTINGS_FILE     = f"storage/plugins/{UUID}/settings.json"
-CHINESE_RE        = re.compile(r"[\u4e00-\u9fff]")
+CHINESE_RE        = re.compile(r"[\u4e00-\u9fff\u3000-\u303f\uff00-\uffef]")
 CB_PREFIX         = f"grv_{UUID[:8]}"
 
 GEMINI_MODELS = (
@@ -96,7 +97,7 @@ DEFAULT_REVIEW_PROMPT = """Ты — профессиональный менед�
    * В конце ответа добавь теплое пожелание и подпись (например, «С уважением, команда магазина» или «С теплом, ваш продавец»).
 
  3. **Формат вывода:**
-   Выведи **ТОЛЬКО** готовый текст ответа, пригодный для копирования. Без вводных слов, пояснений от ИИ и кавычек по краям."""
+   Выведи **ТОЛЬКО** готовый текст ответа, пригодный для копирования. Без вводных слов, пояснений от ИИ и кавычек по краям. Без markdown, без символов 【】 и без заголовков."""
 
 DEFAULT_CHAT_SYSTEM = (
     "Ты — дружелюбный менеджер магазина FunPay. "
@@ -240,23 +241,77 @@ def _check_proxy(proxy: str) -> tuple[bool, str]:
         return False, str(exc)[:120]
 
 
+def _gemini_generation_config(model: str, temperature: float) -> dict[str, Any]:
+    cfg: dict[str, Any] = {
+        "temperature": temperature,
+        "maxOutputTokens": GEMINI_MAX_OUTPUT_TOKENS,
+    }
+    if "2.5" in model or "3." in model:
+        cfg["thinkingConfig"] = {"thinkingBudget": 0}
+    return cfg
+
+
+def _sanitize_reply_text(text: str) -> str:
+    text = (text or "").strip()
+    text = re.sub(r"[#*_`]+", "", text)
+    text = text.replace("【", "").replace("】", "").replace("「", "").replace("」", "")
+    text = CHINESE_RE.sub("", text)
+    text = re.sub(r"\s+\n", "\n", text)
+    return re.sub(r" {2,}", " ", text).strip()
+
+
+def _is_incomplete_reply(text: str) -> bool:
+    text = (text or "").strip()
+    if len(text) < 40:
+        return True
+    if text[-1] in ".!?…:;)»\"":
+        return False
+    if text.endswith("…"):
+        return False
+    return True
+
+
+def _format_for_funpay_review(text: str) -> str:
+    """Форматирование как в Cardinal: до 999 символов и не более 9 переносов строк."""
+    text = _sanitize_reply_text(text)
+    max_l = MAX_REVIEW_LEN
+    if len(text) <= max_l:
+        trimmed = text
+    else:
+        trimmed = text[: max_l + 1]
+        indexes: list[int] = []
+        for char in (".", "!", "?", "\n"):
+            idx = trimmed.rfind(char)
+            indexes.extend([idx, trimmed[:idx].rfind(char) if idx >= 0 else -1])
+        cut_at = max(indexes, key=lambda x: (x < len(trimmed) - 1, x))
+        if cut_at > max_l // 2:
+            trimmed = trimmed[: cut_at + 1].strip()
+        else:
+            trimmed = trimmed[:max_l].rsplit(" ", 1)[0].strip() + "…"
+    while trimmed.count("\n") > 9 and trimmed.count("\n\n") > 1:
+        trimmed = trimmed[::-1].replace("\n\n", "\n", 1)[::-1]
+    if trimmed.count("\n") > 9:
+        trimmed = trimmed[::-1].replace("\n", " ", trimmed.count("\n") - 9)[::-1]
+    return trimmed.strip()
+
+
 def _gemini_generate(
     api_key: str, proxy: str, model: str,
     system: str, prompt: str, temperature: float = 0.95,
 ) -> str | None:
     if not api_key.strip():
         return None
-    payload = {
-        "systemInstruction": {"parts": [{"text": system}]},
-        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": temperature, "maxOutputTokens": 900},
-    }
     proxies = _client_proxies(proxy)
     for try_model in [model] + [m for m in GEMINI_MODELS if m != model]:
+        payload = {
+            "systemInstruction": {"parts": [{"text": system}]},
+            "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+            "generationConfig": _gemini_generation_config(try_model, temperature),
+        }
         try:
             resp = http_post(
                 _gemini_url(try_model), json=payload,
-                headers=_request_headers(api_key), proxies=proxies, timeout=60,
+                headers=_request_headers(api_key), proxies=proxies, timeout=90,
             )
             if resp.status_code in (404, 429):
                 if resp.status_code == 429:
@@ -265,13 +320,27 @@ def _gemini_generate(
             if resp.status_code != 200:
                 logger.warning("%s Gemini %s: %s", _P, resp.status_code, resp.text[:180])
                 continue
-            candidates = resp.json().get("candidates") or []
+            data = resp.json()
+            candidates = data.get("candidates") or []
             if not candidates:
                 continue
-            parts = candidates[0].get("content", {}).get("parts", [])
+            candidate = candidates[0]
+            finish = str(candidate.get("finishReason") or "")
+            parts = candidate.get("content", {}).get("parts", [])
             text = "\n".join(p.get("text", "") for p in parts if p.get("text")).strip()
-            if text and not _is_bad(text):
-                return text
+            text = _sanitize_reply_text(text)
+            if not text or _is_bad(text):
+                continue
+            if finish == "MAX_TOKENS" and _is_incomplete_reply(text):
+                logger.warning(
+                    "%s Gemini %s: обрезанный ответ (%s симв., finish=%s)",
+                    _P, try_model, len(text), finish,
+                )
+                continue
+            if _is_incomplete_reply(text):
+                logger.warning("%s Gemini %s: незавершённый ответ (%s симв.)", _P, try_model, len(text))
+                continue
+            return text
         except Exception as exc:
             logger.warning("%s Gemini %s err: %s", _P, try_model, exc)
     return None
@@ -383,11 +452,14 @@ class Plugin:
                 if old_ver < "3.0.8":
                     loaded["system_prompt"] = DEFAULT_SYSTEM_PROMPT
                     loaded["review_prompt"] = DEFAULT_REVIEW_PROMPT
-                    loaded["_cfg_version"] = "3.0.8"
+                if old_ver < "3.0.9":
+                    loaded["_cfg_version"] = "3.0.9"
+                if old_ver < "3.1.0":
+                    loaded["_cfg_version"] = "3.1.0"
                 else:
-                    loaded.setdefault("_cfg_version", "3.0.8")
+                    loaded.setdefault("_cfg_version", "3.1.0")
                 self._cfg = loaded
-                if old_ver < "3.0.8":
+                if old_ver < "3.1.0":
                     self._save_settings()
             else:
                 self._cfg = defaults
@@ -438,7 +510,7 @@ class Plugin:
             "batch_count": 5,
             "batch_only_unanswered": False,
             "recent_replies": [],
-            "_cfg_version": "3.0.8",
+            "_cfg_version": "3.1.0",
         }
 
     @staticmethod
@@ -835,9 +907,11 @@ class Plugin:
             if not reply:
                 reply = self._fallback_reply(order, order_dt)
             else:
-                reply = _trim(_strip_name(reply, buyer), MAX_REVIEW_LEN)
+                reply = _format_for_funpay_review(_strip_name(reply, buyer))
+            if not reply or _is_incomplete_reply(reply):
+                reply = _format_for_funpay_review(self._fallback_reply(order, order_dt))
             if self._is_duplicate(reply) and not force_update:
-                reply = self._fallback_reply(order, order_dt)
+                reply = _format_for_funpay_review(self._fallback_reply(order, order_dt))
             self.cardinal.account.send_review(oid, reply)
             self._remember_reply(reply, order)
             self.log("Ответ #%s отправлен (%s симв.)", oid, len(reply))
