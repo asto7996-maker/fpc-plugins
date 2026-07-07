@@ -4,7 +4,7 @@ from __future__ import annotations
 NAME = "Gemini Link Auto"
 VERSION = "1.0.0"
 DESCRIPTION = "Автовыдача Gemini link (18 мес.) через API Telegram-бота поставщика"
-CREDITS = "Cursor AI"
+CREDITS = "@xei1y"
 UUID = "f7a2b8c3-4d5e-6f7a-8b9c-0d1e2f3a4b5c"
 SETTINGS_PAGE = True
 BIND_TO_DELETE = None
