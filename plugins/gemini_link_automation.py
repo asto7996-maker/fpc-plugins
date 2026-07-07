@@ -2,7 +2,7 @@ from __future__ import annotations
 
 # === ОБЯЗАТЕЛЬНЫЕ ПОЛЯ FunPay Cardinal (НЕ УДАЛЯТЬ) ===
 NAME = "Gemini Link Auto"
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 DESCRIPTION = "Автовыдача Gemini link (18 мес.) через API Telegram-бота поставщика"
 CREDITS = "@xei1y"
 UUID = "e8a3f1c2-9b4d-4d7e-a816-5f2c9b0e3d41"
@@ -18,6 +18,7 @@ import re
 import threading
 import time
 import traceback
+import unicodedata
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -46,7 +47,7 @@ _tg_bot_instance_id: Optional[int] = None
 DEFAULT_SETTINGS: Dict[str, Any] = {
     "bot_api_url": "https://worker-production-53ca.up.railway.app",
     "bot_api_key": "",
-    "product_keywords": ["Gemini link"],
+    "product_keywords": ["gemini", "18 мес", "gemini link", "gemini pro", "активация ссылкой"],
     "bot_product_id": "",
     "product_search_keywords": ["gemini"],
     "api_path_balance": "/api/me",
@@ -56,6 +57,10 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "api_retry_count": 3,
     "api_retry_delay": 5,
     "notify_seller": True,
+    "processing_message": (
+        "⏳ Заказ #{order_id} принят!\n"
+        "Формируем ссылку активации Gemini — подождите 1–2 минуты..."
+    ),
     "delivery_message": (
         "🎉 Ваша подписка Gemini готова!\n\n"
         "🔗 Ссылка для активации (18 месяцев):\n"
@@ -119,6 +124,8 @@ def load_settings() -> Dict[str, Any]:
         merged["api_path_stock"] = DEFAULT_SETTINGS["api_path_stock"]
         merged["api_path_purchase"] = DEFAULT_SETTINGS["api_path_purchase"]
         merged["api_auth_header"] = DEFAULT_SETTINGS["api_auth_header"]
+    if merged.get("product_keywords") == ["Gemini link"]:
+        merged["product_keywords"] = list(DEFAULT_SETTINGS["product_keywords"])
     return merged
 
 
@@ -172,11 +179,30 @@ def _is_configured(settings: Optional[Dict[str, Any]] = None) -> bool:
     return bool(s.get("bot_api_url", "").strip() and s.get("bot_api_key", "").strip())
 
 
+def _normalize_text(text: str) -> str:
+    """NFKC: ＧＥＭＩＮＩ → GEMINI для корректного поиска."""
+    return unicodedata.normalize("NFKC", text or "").lower()
+
+
+def _extract_order_text(order: Any) -> str:
+    parts: List[str] = []
+    for attr in (
+        "full_description", "short_description", "title", "description",
+        "lot_name", "name", "html", "subcategory_name", "category_name",
+    ):
+        val = getattr(order, attr, None)
+        if val:
+            parts.append(str(val))
+    if hasattr(order, "lot_params") and order.lot_params:
+        parts.append(str(order.lot_params))
+    return _normalize_text("\n".join(parts))
+
+
 def _matches_keywords(text: str, settings: Optional[Dict[str, Any]] = None) -> bool:
     s = settings or load_settings()
-    lower = (text or "").lower()
+    normalized = _normalize_text(text)
     keywords = s.get("product_keywords") or DEFAULT_SETTINGS["product_keywords"]
-    return any(kw.lower() in lower for kw in keywords)
+    return any(_normalize_text(kw) in normalized for kw in keywords)
 
 
 def send_fp(c: Cardinal, chat_id: Any, text: str) -> None:
@@ -349,16 +375,18 @@ class SupplierBotAPI:
             {"product_id": product_id, "quantity": max(1, quantity)},
         )
         items = data.get("items") or []
-        link = str(items[0]).strip() if items else None
+        links = [str(i).strip() for i in items if str(i).strip()]
+        link = links[0] if links else None
         if not link:
             link = data.get("activation_link") or data.get("link") or data.get("url")
         if not link:
             err = str(data.get("error", "")).lower()
             if "stock" in err or "out" in err:
-                return {"activation_link": None, "status": "out_of_stock"}
+                return {"activation_link": None, "status": "out_of_stock", "items": []}
             raise RuntimeError("API не вернул items")
         return {
             "activation_link": link,
+            "items": links or [link],
             "status": "ok",
             "transaction_id": data.get("transaction_id"),
             "product_id": product_id,
@@ -414,15 +442,16 @@ class Plugin:
             items.append({"order_id": order_id, "chat_id": chat_id, "at": _ts(), "status": "waiting"})
             save_preorders(items)
 
-    def process_order(self, order_id: str) -> None:
+    def process_order(self, order_id: str, force: bool = False) -> None:
         with self._processing_lock:
-            if self._already_processed(order_id):
+            if not force and self._already_processed(order_id):
                 _log_action("Заказ уже обработан — пропуск", order_id=order_id)
                 return
 
         settings = load_settings()
         if not _is_configured(settings):
-            logger.warning("%s: API бота не настроен", _P)
+            logger.warning("%s: API бота не настроен — заказ #%s не обработан", _P, order_id)
+            self.notify_seller(f"⚠️ <b>{NAME}</b>\n\nЗаказ <code>#{order_id}</code> — API не настроен")
             return
 
         try:
@@ -431,15 +460,25 @@ class Plugin:
             logger.error("%s: get_order #%s: %s", _P, order_id, exc)
             return
 
-        description = full_order.full_description or full_order.short_description or ""
-        if not _matches_keywords(description, settings):
+        order_text = _extract_order_text(full_order)
+        if not _matches_keywords(order_text, settings):
+            logger.info(
+                "%s: заказ #%s не совпал с keywords %s (текст: %.120s…)",
+                _P, order_id, settings.get("product_keywords"), order_text[:120],
+            )
             return
 
         buyer = full_order.buyer_username
         chat = self.cardinal.account.get_chat_by_name(buyer)
-        chat_id = chat.id if chat else getattr(full_order, "chat_id", None)
+        chat_id = (
+            chat.id if chat
+            else getattr(full_order, "chat_id", None)
+        )
 
-        _log_action("Обнаружен заказ Gemini link", order_id=order_id, buyer=buyer)
+        _log_action("Обнаружен заказ Gemini", order_id=order_id, buyer=buyer, chat_id=chat_id)
+
+        if chat_id:
+            send_fp(self.cardinal, chat_id, _format_template("processing_message", order_id=order_id))
 
         try:
             balance = SupplierBotAPI.get_balance()
@@ -452,20 +491,23 @@ class Plugin:
                 self._handle_out_of_stock(order_id, chat_id)
                 return
 
-            if stock["price"] is not None and balance["balance"] < stock["price"]:
+            quantity = max(1, int(getattr(full_order, "amount", 1) or 1))
+            total_price = stock["price"] * quantity
+            if balance["balance"] < total_price:
                 self._add_attention(order_id, chat_id, "insufficient_balance")
                 if chat_id:
                     send_fp(self.cardinal, chat_id, _format_template("delay_message", order_id=order_id))
                 return
 
-            _log_action("Запрос покупки к боту", order_id=order_id)
-            purchase = SupplierBotAPI.purchase(order_id)
+            _log_action("Запрос покупки к боту", order_id=order_id, quantity=quantity)
+            purchase = SupplierBotAPI.purchase(order_id, quantity=quantity)
 
             if purchase["status"] == "out_of_stock":
                 self._handle_out_of_stock(order_id, chat_id)
                 return
 
-            link = purchase["activation_link"]
+            links = purchase.get("items") or [purchase["activation_link"]]
+            link = "\n".join(links) if len(links) > 1 else links[0]
             _log_action("Ссылка получена", order_id=order_id)
 
             if chat_id:
@@ -604,7 +646,8 @@ def _settings_summary() -> str:
         f"Команды:\n"
         f"⠀∟ /gemini_link — эта панель\n"
         f"⠀∟ /gl_balance — баланс бота\n"
-        f"⠀∟ /gl_stock — наличие"
+        f"⠀∟ /gl_stock — наличие\n"
+        f"⠀∟ /gl_process — выдать заказ вручную"
     )
 
 
@@ -711,9 +754,24 @@ def setup_telegram(cardinal: Cardinal) -> None:
             return
         try:
             data = SupplierBotAPI.get_stock()
-            bot.reply_to(msg, f"📦 В наличии: <b>{data['available']}</b> шт.", parse_mode="HTML")
+            bot.reply_to(
+                msg,
+                f"📦 <b>{html.escape(data['product_name'])}</b>\n"
+                f"В наличии: <b>{data['available']}</b> шт.\n"
+                f"Цена: <b>${data['price']:.2f}</b>",
+                parse_mode="HTML",
+            )
         except Exception as exc:
             bot.reply_to(msg, f"🔴 Ошибка: {html.escape(str(exc))}", parse_mode="HTML")
+
+    def cmd_process(msg):
+        parts = (msg.text or "").split()
+        if len(parts) < 2:
+            bot.reply_to(msg, "Использование: <code>/gl_process HTXBF22B</code>", parse_mode="HTML")
+            return
+        order_id = parts[1].strip().lstrip("#").upper()
+        bot.reply_to(msg, f"⏳ Запускаю выдачу для заказа <code>#{order_id}</code>...", parse_mode="HTML")
+        threading.Thread(target=_plugin.process_order, args=(order_id, True), daemon=True).start()
 
     def on_plugin_settings(call):
         try:
@@ -844,7 +902,11 @@ def setup_telegram(cardinal: Cardinal) -> None:
             if text.lower() in ("auto", "авто", "0", "-"):
                 settings["bot_product_id"] = ""
             else:
-                settings["bot_product_id"] = str(int(text))
+                try:
+                    settings["bot_product_id"] = str(int(text))
+                except ValueError:
+                    bot.reply_to(msg, "⚠️ Введите число (Product ID) или auto")
+                    return
             label = "Product ID"
         else:
             return
@@ -869,6 +931,7 @@ def setup_telegram(cardinal: Cardinal) -> None:
     tg.msg_handler(cmd_panel, func=lambda m: m.text and m.text.split()[0].lower() in ("/gemini_link", "/gemini"))
     tg.msg_handler(cmd_balance, func=lambda m: m.text and m.text.split()[0].lower() == "/gl_balance")
     tg.msg_handler(cmd_stock, func=lambda m: m.text and m.text.split()[0].lower() == "/gl_stock")
+    tg.msg_handler(cmd_process, func=lambda m: m.text and m.text.split()[0].lower() == "/gl_process")
     tg.cbq_handler(on_callback, func=_is_gla_callback)
     tg.cbq_handler(on_plugin_settings, func=_is_plugin_settings)
     tg.msg_handler(on_text, func=_has_input_state)
@@ -878,6 +941,7 @@ def setup_telegram(cardinal: Cardinal) -> None:
             ("gemini_link", f"панель {NAME}", True),
             ("gl_balance", f"баланс бота {NAME}", True),
             ("gl_stock", f"наличие {NAME}", True),
+            ("gl_process", f"выдать заказ {NAME}", True),
         ])
     except Exception as exc:
         logger.error("%s: add_telegram_commands: %s", _P, exc)
@@ -900,7 +964,8 @@ def on_new_order(cardinal: Cardinal, event: NewOrderEvent) -> None:
     if not _plugin:
         return
     order_id = str(event.order.id)
-    threading.Thread(target=_plugin.process_order, args=(order_id,), daemon=True).start()
+    logger.info("%s: NewOrderEvent #%s", _P, order_id)
+    threading.Thread(target=_plugin.process_order, args=(order_id, False), daemon=True).start()
 
 
 def on_new_message(cardinal: Cardinal, event: NewMessageEvent) -> None:
