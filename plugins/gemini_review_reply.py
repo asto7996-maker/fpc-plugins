@@ -41,7 +41,7 @@ except ImportError:
 
 
 NAME          = "Gemini Review Reply"
-VERSION       = "3.0.8"
+VERSION       = "3.0.9"
 DESCRIPTION   = "ИИ-ответы на отзывы FunPay (Gemini AQ + HTTP/SOCKS proxy + batch) 🌈"
 CREDITS       = "Cursor AI"
 UUID          = "c4e8b2f1-9a3d-4e7b-8c6f-2d1a5e9b0c3f"
@@ -121,6 +121,8 @@ _REVIEW_MSG_TYPES = (
     MessageTypes.NEW_FEEDBACK,
     MessageTypes.FEEDBACK_CHANGED,
 )
+
+_REVIEW_DELETE_TYPES = (MessageTypes.FEEDBACK_DELETED,)
 
 _plugin: "Plugin | None" = None
 
@@ -307,6 +309,15 @@ def _strip_name(text: str, buyer: str) -> str:
 
 def _reply_hash(text: str) -> str:
     return hashlib.sha256(re.sub(r"\s+", " ", text.strip().lower()).encode()).hexdigest()[:16]
+
+
+def _review_fingerprint(order: Order) -> str:
+    review = order.review
+    if not review:
+        return ""
+    normalized = re.sub(r"\s+", " ", str(review.text or "").strip().lower())
+    payload = f"{review.stars or 0}|{normalized}"
+    return hashlib.sha256(payload.encode()).hexdigest()[:16]
 
 
 def _format_datetime(dt: datetime) -> str:
@@ -639,11 +650,22 @@ class Plugin:
         h = _reply_hash(text)
         return any(r.get("hash") == h for r in self.get_cfg("recent_replies", []))
 
-    def _remember_reply(self, text: str, order_id: str) -> None:
+    def _clear_order_reply_memory(self, order_id: str) -> None:
+        recent = [r for r in self.get_cfg("recent_replies", []) if r.get("order_id") != order_id]
+        self.set_cfg("recent_replies", recent)
+        self.log("Память ответов для #%s сброшена (отзыв удалён)", order_id)
+
+    def _remember_reply(self, text: str, order: Order) -> None:
         recent = list(self.get_cfg("recent_replies", []))
+        recent = [r for r in recent if not (
+            r.get("order_id") == order.id and r.get("review_hash") == _review_fingerprint(order)
+        )]
         recent.append({
-            "hash": _reply_hash(text), "order_id": order_id,
-            "text": text[:200], "datetime": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "hash": _reply_hash(text),
+            "order_id": order.id,
+            "review_hash": _review_fingerprint(order),
+            "text": text[:200],
+            "datetime": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         })
         self.set_cfg("recent_replies", recent[-50:])
 
@@ -745,17 +767,22 @@ class Plugin:
         return None
 
     def _should_skip_review(self, order: Order, msg_type: MessageTypes) -> bool:
-        """Пропуск только если на NEW_FEEDBACK уже есть наш недавний ответ."""
-        if msg_type != MessageTypes.NEW_FEEDBACK:
+        """Пропуск только если на этот же текст отзыва уже отвечали."""
+        if msg_type == MessageTypes.FEEDBACK_CHANGED:
             return False
-        seller_reply = _seller_review_reply(order.review)
-        if not seller_reply:
+        fp = _review_fingerprint(order)
+        if not fp:
             return False
-        oid = order.id
         for entry in reversed(self.get_cfg("recent_replies", [])):
-            if entry.get("order_id") == oid:
+            if entry.get("order_id") == order.id and entry.get("review_hash") == fp:
                 return True
         return False
+
+    def _handle_review_deleted(self, obj: Any) -> None:
+        order_id = self._extract_order_id(obj)
+        if not order_id:
+            return
+        self._clear_order_reply_memory(order_id)
 
     def _handle_instant_review(self, obj: Any, chat_id: Any, msg_type: MessageTypes) -> None:
         """Мгновенная обработка нового/изменённого отзыва (в фоновом потоке)."""
@@ -776,15 +803,21 @@ class Plugin:
                 return
 
             if self._should_skip_review(order, msg_type):
-                self.log("Отзыв #%s уже обработан ранее — пропуск", order_id)
+                self.log("Отзыв #%s без изменений — пропуск", order_id)
                 return
 
-            self.process_order(order, chat_id)
+            if msg_type == MessageTypes.FEEDBACK_CHANGED:
+                self.log("Отзыв #%s изменён — обновляю ответ продавца", order_id)
+
+            self.process_order(order, chat_id, force_update=msg_type == MessageTypes.FEEDBACK_CHANGED)
         except Exception as exc:
             logger.error("%s ошибка мгновенного ответа: %s", _P, exc)
             logger.debug(traceback.format_exc())
 
-    def process_order(self, order: Order, chat_id: Any = None, shortcut_date: datetime | None = None) -> bool:
+    def process_order(
+        self, order: Order, chat_id: Any = None,
+        shortcut_date: datetime | None = None, force_update: bool = False,
+    ) -> bool:
         if not _has_buyer_review(order):
             return False
         oid = order.id
@@ -803,10 +836,10 @@ class Plugin:
                 reply = self._fallback_reply(order, order_dt)
             else:
                 reply = _trim(_strip_name(reply, buyer), MAX_REVIEW_LEN)
-            if self._is_duplicate(reply):
+            if self._is_duplicate(reply) and not force_update:
                 reply = self._fallback_reply(order, order_dt)
             self.cardinal.account.send_review(oid, reply)
-            self._remember_reply(reply, oid)
+            self._remember_reply(reply, order)
             self.log("Ответ #%s отправлен (%s симв.)", oid, len(reply))
             if self.get_cfg("send_chat_message"):
                 chat_msg = self._generate_chat(order, chat_history, order_dt)
@@ -1150,10 +1183,21 @@ class Plugin:
     # ── Event hooks ──────────────────────────────────────────────────────────
 
     def on_new_message(self, event: NewMessageEvent) -> None:
+        msg_type = event.message.type
+
+        if msg_type in _REVIEW_DELETE_TYPES:
+            if event.message.i_am_buyer:
+                return
+            threading.Thread(
+                target=self._handle_review_deleted,
+                args=(event.message,),
+                daemon=True,
+            ).start()
+            return
+
         if not self.get_cfg("enabled"):
             return
 
-        msg_type = event.message.type
         if msg_type not in _REVIEW_MSG_TYPES:
             return
         if msg_type == MessageTypes.FEEDBACK_CHANGED and not self.get_cfg("reply_on_changed"):
@@ -1170,9 +1214,22 @@ class Plugin:
         ).start()
 
     def on_last_chat(self, event: LastChatMessageChangedEvent) -> None:
-        if not self.cardinal.old_mode_enabled or not self.get_cfg("enabled"):
+        if not self.cardinal.old_mode_enabled:
             return
         chat = event.chat
+
+        if chat.last_message_type in _REVIEW_DELETE_TYPES:
+            if f" {self.cardinal.account.username} " in str(chat):
+                return
+            threading.Thread(
+                target=self._handle_review_deleted,
+                args=(chat,),
+                daemon=True,
+            ).start()
+            return
+
+        if not self.get_cfg("enabled"):
+            return
         if chat.last_message_type not in _REVIEW_MSG_TYPES:
             return
         if chat.last_message_type == MessageTypes.FEEDBACK_CHANGED and not self.get_cfg("reply_on_changed"):
