@@ -2,7 +2,7 @@ from __future__ import annotations
 
 # === ОБЯЗАТЕЛЬНЫЕ ПОЛЯ FunPay Cardinal (НЕ УДАЛЯТЬ) ===
 NAME = "Gemini Link Auto"
-VERSION = "2.1.1"
+VERSION = "2.1.2"
 DESCRIPTION = "Автовыдача Gemini 18m через Reseller API + очередь + автозакупка при рестоке"
 CREDITS = "@xei1y"
 UUID = "e8a3f1c2-9b4d-4d7e-a816-5f2c9b0e3d41"
@@ -1090,6 +1090,8 @@ class Plugin:
         return links
 
     def fulfill_queue(self) -> None:
+        if _is_test_mode():
+            return
         if not _is_configured():
             return
         with self._lock:
@@ -1163,7 +1165,6 @@ class Plugin:
         chat_id_hint: Any = None,
         delay: Optional[float] = None,
         retry: int = 0,
-        manual_test: bool = False,
     ) -> None:
         settings = load_settings()
         wait = delay if delay is not None else float(settings.get("order_process_delay_sec", 2))
@@ -1171,9 +1172,7 @@ class Plugin:
         def worker() -> None:
             if wait > 0:
                 time.sleep(wait)
-            self.process_order(
-                order_id, force=force, chat_id_hint=chat_id_hint, retry=retry, manual_test=manual_test,
-            )
+            self.process_order(order_id, force=force, chat_id_hint=chat_id_hint, retry=retry)
 
         threading.Thread(target=worker, daemon=True, name=f"GeminiLink-{order_id}").start()
 
@@ -1183,13 +1182,12 @@ class Plugin:
         force: bool = False,
         chat_id_hint: Any = None,
         retry: int = 0,
-        manual_test: bool = False,
     ) -> None:
         order_id = order_id.strip().lstrip("#").upper()
         if not force and order_id in load_processed():
             return
         settings = load_settings()
-        use_test = bool(settings.get("test_mode")) and manual_test
+        use_test = bool(settings.get("test_mode"))
         if not use_test and not _is_configured(settings):
             self.notify_seller(f"⚠️ #{order_id} — API не настроен")
             return
@@ -1263,7 +1261,7 @@ class Plugin:
                             buyer=buyer, buyer_id=buyer_id,
                         )
                     return
-                _log_action("Тестовая выдача /gl_process (без покупки)", order_id=order_id, links=len(test_links))
+                _log_action("Тестовая выдача (без покупки)", order_id=order_id, links=len(test_links))
                 if self._deliver(order_id, chat_id, test_links, buyer, buyer_id, is_test=True):
                     return
                 self._notify_attention(order_id, chat_id, "test_delivery_failed")
@@ -1502,7 +1500,7 @@ def _settings_summary() -> str:
     test_on = bool(s.get("test_mode"))
     return (
         f"⚙️ <b>{NAME}</b> v{VERSION}\n\n"
-        f"🧪 Тест: {'🟢 ВКЛ (только /gl_process)' if test_on else '⚪ выкл'} | Пул: {test_links} ссыл.\n"
+        f"🧪 Тест: {'🟢 ВКЛ (все заказы — тест-ссылки)' if test_on else '⚪ выкл'} | Пул: {test_links} ссыл.\n"
         f"API: {'🟢' if _is_configured(s) else '🔴'}\n"
         f"🌐 <code>{html.escape(s.get('bot_api_url', '—'))}</code>\n"
         f"🔑 <code>{html.escape(_mask_key(s.get('bot_api_key', '')))}</code>\n"
@@ -1627,7 +1625,7 @@ def setup_telegram(cardinal: Cardinal) -> None:
                 settings = load_settings()
                 settings["test_mode"] = not bool(settings.get("test_mode"))
                 save_settings(settings)
-                state = "ВКЛ — только /gl_process" if settings["test_mode"] else "ВЫКЛ"
+                state = "ВКЛ — тест-ссылки, покупка отключена" if settings["test_mode"] else "ВЫКЛ"
                 _edit_panel(bot, cid, mid)
                 _answer(call, f"🧪 Тест {state}", alert=True)
             else:
@@ -1673,7 +1671,7 @@ def setup_telegram(cardinal: Cardinal) -> None:
         oid = parts[1].strip().lstrip("#").upper()
         mode = "🧪 тестовая выдача" if _is_test_mode() else "покупка и выдача"
         bot.reply_to(msg, f"⏳ {mode} #{oid}...")
-        _plugin.schedule_process(oid, force=True, delay=0, manual_test=_is_test_mode())
+        _plugin.schedule_process(oid, force=True, delay=0)
 
     def cmd_test_mode(msg):
         parts = (msg.text or "").split()
@@ -1688,14 +1686,14 @@ def setup_telegram(cardinal: Cardinal) -> None:
                 bot.reply_to(msg, "Использование: /gl_test_mode on|off")
                 return
             save_settings(settings)
-        state = "ВКЛ (только /gl_process, авто-заказы — реальные)" if settings.get("test_mode") else "ВЫКЛ"
+        state = "ВКЛ (все заказы — тест-ссылки, API не тратится)" if settings.get("test_mode") else "ВЫКЛ"
         pool = len(load_test_links())
         bot.reply_to(
             msg,
             f"🧪 Тестовый режим: {state}\n"
             f"Пул ссылок: {pool}\n\n"
-            f"Авто-заказы FunPay всегда покупают реальную ссылку.\n"
-            f"Тест без денег: /gl_test_mode on → /gl_process ORDER_ID\n\n"
+            f"При ВКЛ: покупка с любого аккаунта → тест-ссылка из пула.\n"
+            f"Не забудьте /gl_test_mode off перед боевой работой!\n\n"
             f"Добавить: /gl_add_test_link URL\n"
             f"Импорт из pending: /gl_import_test_links",
         )
