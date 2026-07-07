@@ -41,7 +41,7 @@ except ImportError:
 
 
 NAME          = "Gemini Review Reply"
-VERSION       = "3.0.5"
+VERSION       = "3.0.6"
 DESCRIPTION   = "ИИ-ответы на отзывы FunPay (Gemini AQ + HTTP/SOCKS proxy + batch) 🌈"
 CREDITS       = "Cursor AI"
 UUID          = "c4e8b2f1-9a3d-4e7b-8c6f-2d1a5e9b0c3f"
@@ -50,6 +50,7 @@ BIND_TO_DELETE = None
 
 MAX_REVIEW_LEN:   Final[int] = 999
 MAX_CHAT_LEN:     Final[int] = 240
+MAX_PROMPT_LEN:   Final[int] = 2000
 CHAT_HISTORY_MAX: Final[int] = 20
 SETTINGS_FILE     = f"storage/plugins/{UUID}/settings.json"
 CHINESE_RE        = re.compile(r"[\u4e00-\u9fff]")
@@ -434,8 +435,10 @@ class Plugin:
                 ),
             },
             {"key": "gemini_model", "label": "Модель Gemini", "type": "text", "default": "gemini-2.5-flash-lite"},
-            {"key": "system_prompt", "label": "Системный промпт", "type": "multiline", "default": DEFAULT_SYSTEM_PROMPT},
-            {"key": "review_prompt", "label": "Промпт ответа на отзыв", "type": "multiline", "default": DEFAULT_REVIEW_PROMPT},
+            {"key": "system_prompt", "label": "Системный промпт", "type": "multiline", "default": DEFAULT_SYSTEM_PROMPT, "max_len": MAX_PROMPT_LEN},
+            {"key": "review_prompt", "label": "Промпт ответа на отзыв", "type": "multiline", "default": DEFAULT_REVIEW_PROMPT, "max_len": MAX_PROMPT_LEN},
+            {"key": "chat_system", "label": "Системный промпт (чат)", "type": "multiline", "default": DEFAULT_CHAT_SYSTEM, "max_len": MAX_PROMPT_LEN},
+            {"key": "chat_prompt", "label": "Промпт благодарности в чат", "type": "multiline", "default": DEFAULT_CHAT_PROMPT, "max_len": MAX_PROMPT_LEN},
             {"key": "temperature", "label": "Temperature", "type": "text", "default": "0.95"},
             {"key": "send_chat_message", "label": "Благодарность в чат", "type": "bool", "default": True},
             {
@@ -1015,7 +1018,15 @@ class Plugin:
                 ftype = field.get("type", "str")
                 cur = plugin.get_cfg(key, "")
                 label = field.get("label", key)
-                prompt = f"✏️ <b>{label}</b>\n\nТекущее:\n<code>{_escape(str(cur)[:500])}</code>\n\nВведите новое значение.\n/cancel — отмена"
+                max_len = field.get("max_len", MAX_PROMPT_LEN if ftype == "multiline" else 500)
+                preview = _escape(str(cur)[:max_len])
+                if len(str(cur)) > max_len:
+                    preview += "…"
+                limit_hint = f"\n\nЛимит: <b>{max_len}</b> символов." if ftype == "multiline" else ""
+                prompt = (
+                    f"✏️ <b>{label}</b>\n\nТекущее:\n<code>{preview}</code>\n\n"
+                    f"Введите новое значение.{limit_hint}\n/cancel — отмена"
+                )
                 result = bot.send_message(chat_id, prompt, parse_mode="HTML")
                 tg.set_state(chat_id, result.id, call.from_user.id, state=f"{CB_PREFIX}:edit:{key}")
                 bot.answer_callback_query(call.id)
@@ -1067,7 +1078,14 @@ class Plugin:
                 )
                 return
             else:
-                plugin.set_cfg(key, text if field.get("type") == "multiline" else text.strip())
+                if field.get("type") == "multiline":
+                    max_len = int(field.get("max_len", MAX_PROMPT_LEN))
+                    if len(text) > max_len:
+                        bot.reply_to(message, f"⚠️ Слишком длинно: {len(text)} / {max_len} символов")
+                        return
+                    plugin.set_cfg(key, text)
+                else:
+                    plugin.set_cfg(key, text.strip())
             tg.clear_state(message.chat.id, message.from_user.id)
             bot.reply_to(message, f"✅ Сохранено: <b>{field.get('label', key)}</b>", parse_mode="HTML")
 
