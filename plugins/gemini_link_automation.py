@@ -2,7 +2,7 @@ from __future__ import annotations
 
 # === ОБЯЗАТЕЛЬНЫЕ ПОЛЯ FunPay Cardinal (НЕ УДАЛЯТЬ) ===
 NAME = "Gemini Link Auto"
-VERSION = "2.0.1"
+VERSION = "2.0.2"
 DESCRIPTION = "Автовыдача Gemini 18m через Reseller API + очередь + автозакупка при рестоке"
 CREDITS = "@xei1y"
 UUID = "e8a3f1c2-9b4d-4d7e-a816-5f2c9b0e3d41"
@@ -32,7 +32,6 @@ from FunPayAPI.updater.events import (
     LastChatMessageChangedEvent,
     NewMessageEvent,
     NewOrderEvent,
-    OrderStatusChangedEvent,
 )
 from cardinal import Cardinal
 from tg_bot import CBT
@@ -50,7 +49,10 @@ ATTENTION_FILE = f"{STORAGE_DIR}/manual_attention.json"
 STATE_FILE = f"{STORAGE_DIR}/state.json"
 
 _file_lock = threading.Lock()
+_order_lock = threading.Lock()
 _disabled_chats: Dict[str, float] = {}
+_inflight_orders: Dict[str, float] = {}
+_processing_msg_sent: Dict[str, float] = {}
 _plugin: Optional["Plugin"] = None
 _tg_bot_instance_id: Optional[int] = None
 _restock_thread_started = False
@@ -75,9 +77,19 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "auto_buy_on_restock": True,
     "auto_buy_quantity": 5,
     "notify_seller": True,
+    "funpay_max_message_len": 1900,
+    "delivery_split_sleep_sec": 1.5,
+    "delivery_use_paste_fallback": True,
     "processing_message": (
         "⏳ Заказ #{order_id} принят!\n"
         "Формируем ссылку Gemini 18 мес. — подождите 1–2 минуты..."
+    ),
+    "delivery_header_message": (
+        "🎉 Ваша подписка Gemini готова!\n\n"
+        "📋 Заказ: #{order_id}\n"
+        "🔗 Ссылка(и) для активации — в следующем сообщении(ях).\n"
+        "📌 Активируйте сразу после получения!\n\n"
+        "Спасибо за покупку! ⭐"
     ),
     "delivery_message": (
         "🎉 Ваша подписка Gemini готова!\n\n"
@@ -86,6 +98,15 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
         "📌 Активируйте сразу после получения!\n"
         "📋 Заказ: #{order_id}\n\n"
         "Спасибо за покупку! ⭐"
+    ),
+    "delivery_link_message": "🔗 {label}\n{link}",
+    "delivery_paste_message": (
+        "🎉 Ваша подписка Gemini готова!\n\n"
+        "📋 Заказ: #{order_id}\n"
+        "📎 Ссылок: {count} шт.\n\n"
+        "Все ссылки здесь (скопируйте и активируйте):\n"
+        "{paste_url}\n\n"
+        "📌 Ссылка действует ограниченное время — активируйте сразу!"
     ),
     "out_of_stock_message": (
         "⏳ Ссылки Gemini 18 мес. сейчас закончились.\n\n"
@@ -246,11 +267,140 @@ def _matches_keywords(text: str, settings: Optional[Dict[str, Any]] = None) -> b
     return any(_normalize_text(kw) in normalized for kw in keywords)
 
 
-def send_fp(c: Cardinal, chat_id: Any, text: str) -> None:
+def send_fp(
+    c: Cardinal,
+    chat_id: Any,
+    text: str,
+    buyer: Optional[str] = None,
+    watermark: Optional[bool] = None,
+) -> None:
     if not chat_id:
         logger.warning("%s: send_fp без chat_id", _P)
         return
-    c.send_message(chat_id, text)
+    kwargs: Dict[str, Any] = {}
+    if buyer:
+        kwargs["chat_name"] = buyer
+    if watermark is not None:
+        kwargs["watermark"] = watermark
+    c.send_message(chat_id, text, **kwargs)
+
+
+def _cleanup_stale(keys: Dict[str, float], ttl: float) -> None:
+    now = time.time()
+    stale = [k for k, ts in keys.items() if now - ts > ttl]
+    for k in stale:
+        keys.pop(k, None)
+
+
+def _try_begin_order(order_id: str, force: bool = False) -> bool:
+    now = time.time()
+    with _order_lock:
+        _cleanup_stale(_inflight_orders, 600)
+        if order_id in _inflight_orders and not force:
+            logger.debug("%s: #%s уже обрабатывается — пропуск", _P, order_id)
+            return False
+        _inflight_orders[order_id] = now
+        return True
+
+
+def _end_order(order_id: str) -> None:
+    with _order_lock:
+        _inflight_orders.pop(order_id, None)
+
+
+def _mark_processing_sent(order_id: str) -> bool:
+    """True если можно отправить «формируем ссылку» (ещё не отправляли)."""
+    now = time.time()
+    with _order_lock:
+        _cleanup_stale(_processing_msg_sent, 86400)
+        if order_id in _processing_msg_sent:
+            return False
+        _processing_msg_sent[order_id] = now
+        return True
+
+
+def _normalize_links(link_data: Any) -> List[str]:
+    if isinstance(link_data, list):
+        raw = link_data
+    else:
+        raw = str(link_data or "").splitlines()
+    links: List[str] = []
+    for item in raw:
+        link = str(item).strip()
+        if link.startswith("http") and link not in links:
+            links.append(link)
+    return links
+
+
+def _chunk_text(text: str, max_len: int) -> List[str]:
+    if len(text) <= max_len:
+        return [text]
+    return [text[i:i + max_len] for i in range(0, len(text), max_len)]
+
+
+def _upload_paste(content: str) -> Optional[str]:
+    settings = load_settings()
+    if not settings.get("delivery_use_paste_fallback"):
+        return None
+    try:
+        resp = requests.post(
+            "https://dpaste.com/api/v2/",
+            data={"content": content, "expiry_days": 7},
+            timeout=20,
+        )
+        if resp.ok:
+            url = resp.text.strip()
+            if url.startswith("http"):
+                return url
+    except Exception as exc:
+        logger.warning("%s: paste upload failed: %s", _P, exc)
+    return None
+
+
+def _build_delivery_parts(order_id: str, links: List[str]) -> List[str]:
+    settings = load_settings()
+    max_len = int(settings.get("funpay_max_message_len", 1900))
+    link_tpl = settings.get("delivery_link_message", DEFAULT_SETTINGS["delivery_link_message"])
+
+    # Одна короткая ссылка — одним сообщением (legacy)
+    if len(links) == 1:
+        single = _format_template("delivery_message", order_id=order_id, link=links[0])
+        if len(single) <= max_len:
+            return [single]
+
+    parts: List[str] = [_format_template("delivery_header_message", order_id=order_id)]
+    for idx, link in enumerate(links, 1):
+        label = f"Ссылка {idx}/{len(links)}" if len(links) > 1 else "Ссылка для активации"
+        body = link_tpl.format(label=label, link=link)
+        if len(body) <= max_len:
+            parts.append(body)
+            continue
+        prefix = f"🔗 {label} (часть {{n}}/{{total}}):\n"
+        chunk_size = max(200, max_len - 40)
+        chunks = _chunk_text(link, chunk_size)
+        for ci, chunk in enumerate(chunks, 1):
+            header = prefix.format(n=ci, total=len(chunks))
+            parts.append(header + chunk)
+
+    if any(len(p) > max_len for p in parts):
+        paste_url = _upload_paste("\n\n".join(f"#{i + 1}\n{link}" for i, link in enumerate(links)))
+        if paste_url:
+            return [_format_template(
+                "delivery_paste_message", order_id=order_id, paste_url=paste_url, count=len(links),
+            )]
+    return parts
+
+
+def send_fp_delivery(c: Cardinal, chat_id: Any, order_id: str, links: List[str], buyer: str = "") -> None:
+    if not chat_id or not links:
+        return
+    settings = load_settings()
+    sleep_sec = float(settings.get("delivery_split_sleep_sec", 1.5))
+    parts = _build_delivery_parts(order_id, links)
+    for idx, part in enumerate(parts):
+        if idx > 0 and sleep_sec > 0:
+            time.sleep(sleep_sec)
+        send_fp(c, chat_id, part, buyer=buyer or None, watermark=(idx == 0))
 
 
 def _format_template(key: str, **kwargs: Any) -> str:
@@ -597,12 +747,19 @@ class Plugin:
             items.append(order_id)
             save_processed(items)
 
-    def _deliver(self, order_id: str, chat_id: Any, link: str, buyer: str = "") -> None:
+    def _deliver(self, order_id: str, chat_id: Any, links: Any, buyer: str = "") -> None:
+        link_list = _normalize_links(links)
+        if not link_list:
+            logger.error("%s: #%s — пустые ссылки для выдачи", _P, order_id)
+            return
         if chat_id:
-            send_fp(self.cardinal, chat_id, _format_template("delivery_message", order_id=order_id, link=link))
+            send_fp_delivery(self.cardinal, chat_id, order_id, link_list, buyer)
         self._mark_processed(order_id)
         OrderQueue.remove(order_id)
-        self.notify_seller(f"✅ <b>{NAME}</b>\n\nЗаказ <code>#{order_id}</code> выдан.\n👤 {html.escape(buyer or '—')}")
+        self.notify_seller(
+            f"✅ <b>{NAME}</b>\n\nЗаказ <code>#{order_id}</code> выдан "
+            f"({len(link_list)} ссыл.).\n👤 {html.escape(buyer or '—')}"
+        )
 
     def _try_fulfill_with_link(self, entry: Dict[str, Any], link: str) -> None:
         self._deliver(entry["order_id"], entry.get("chat_id"), link, entry.get("buyer", ""))
@@ -747,30 +904,35 @@ class Plugin:
             )
             return
 
+        if not _try_begin_order(order_id, force=force):
+            return
+
         buyer = full_order.buyer_username
         chat_id = _resolve_chat_id(self.cardinal, buyer, chat_id_hint)
-        quantity = _order_quantity(full_order)
-
-        _log_action("Новый заказ", order_id=order_id, buyer=buyer, qty=quantity, chat_id=chat_id)
-        if chat_id:
-            send_fp(self.cardinal, chat_id, _format_template("processing_message", order_id=order_id))
-
-        # 1) инвентарь
-        links_from_inv: List[str] = []
-        for _ in range(quantity):
-            link = OrderQueue.pop_link()
-            if link:
-                links_from_inv.append(link)
-            else:
-                break
-        if len(links_from_inv) == quantity:
-            self._deliver(order_id, chat_id, "\n".join(links_from_inv), buyer)
-            return
-        for link in links_from_inv:
-            OrderQueue.push_links([link])
-
-        # 2) покупка в API
         try:
+            quantity = _order_quantity(full_order)
+
+            _log_action("Новый заказ", order_id=order_id, buyer=buyer, qty=quantity, chat_id=chat_id)
+            if chat_id and _mark_processing_sent(order_id):
+                send_fp(
+                    self.cardinal, chat_id,
+                    _format_template("processing_message", order_id=order_id),
+                    buyer=buyer,
+                )
+
+            links_from_inv: List[str] = []
+            for _ in range(quantity):
+                link = OrderQueue.pop_link()
+                if link:
+                    links_from_inv.append(link)
+                else:
+                    break
+            if len(links_from_inv) == quantity:
+                self._deliver(order_id, chat_id, links_from_inv, buyer)
+                return
+            for link in links_from_inv:
+                OrderQueue.push_links([link])
+
             stock = SupplierBotAPI.get_stock()
             if stock["available"] <= 0:
                 self._enqueue_out_of_stock(order_id, chat_id, buyer, quantity)
@@ -783,6 +945,7 @@ class Plugin:
                         self.cardinal, chat_id,
                         f"⏳ Заказ #{order_id} принят.\n"
                         "Сейчас пополняем баланс поставщика — выдадим ссылку в ближайшее время.",
+                        buyer=buyer,
                     )
                 return
             purchase = SupplierBotAPI.purchase(quantity)
@@ -791,14 +954,20 @@ class Plugin:
                 return
             items = purchase.get("items") or []
             if items:
-                self._deliver(order_id, chat_id, "\n".join(items), buyer)
+                self._deliver(order_id, chat_id, items, buyer)
             else:
                 self._enqueue_out_of_stock(order_id, chat_id, buyer, quantity)
         except Exception as exc:
             logger.error("%s: process_order #%s: %s", _P, order_id, exc)
             self._notify_attention(order_id, chat_id, "api_failure")
             if chat_id:
-                send_fp(self.cardinal, chat_id, _format_template("out_of_stock_message", order_id=order_id))
+                send_fp(
+                    self.cardinal, chat_id,
+                    _format_template("out_of_stock_message", order_id=order_id),
+                    buyer=buyer,
+                )
+        finally:
+            _end_order(order_id)
 
     def _enqueue_out_of_stock(self, order_id: str, chat_id: Any, buyer: str, quantity: int) -> None:
         OrderQueue.add_waiting(order_id, chat_id, buyer, quantity)
@@ -1196,21 +1365,14 @@ def init_plugin(cardinal: Cardinal, *_args) -> None:
 
 
 def on_new_order(cardinal: Cardinal, event: NewOrderEvent) -> None:
+    """Резервный триггер — основной: ORDER_PURCHASED в чате."""
     if not _plugin:
         return
     order = event.order
     hint = _extract_order_text(order)
     if hint and not _matches_keywords(hint):
         return
-    _plugin.schedule_process(str(order.id))
-
-
-def on_order_status_changed(cardinal: Cardinal, event: OrderStatusChangedEvent) -> None:
-    if not _plugin:
-        return
-    if event.order.status != OrderStatuses.PAID:
-        return
-    _plugin.schedule_process(str(event.order.id))
+    _plugin.schedule_process(str(order.id), delay=5)
 
 
 def _handle_order_paid(cardinal: Cardinal, text: str, chat_id: Any) -> None:
@@ -1262,7 +1424,6 @@ def safe_handler(func):
 
 BIND_TO_PRE_INIT = [init_plugin]
 BIND_TO_NEW_ORDER = [safe_handler(on_new_order)]
-BIND_TO_ORDER_STATUS_CHANGED = [safe_handler(on_order_status_changed)]
 BIND_TO_NEW_MESSAGE = [safe_handler(on_new_message)]
 BIND_TO_LAST_CHAT_MESSAGE_CHANGED = [safe_handler(on_last_chat)]
 
