@@ -34,7 +34,7 @@ except ImportError:
 
 
 NAME          = "Gemini Link Auto"
-VERSION       = "2.4.1"
+VERSION       = "2.5.0"
 DESCRIPTION   = "GPT plus 1M (NW) — авто-закупка аккаунтов и выдача на FunPay"
 CREDITS       = "Cursor AI"
 UUID          = "f7a2e8c1-4b3d-4e9f-a8c2-1d5e9b0f6a3c"
@@ -49,6 +49,9 @@ DEFAULT_LOT_MATCH: Final[str] = "GPT plus 1M (NW)"
 DEFAULT_MIN_LOT_STOCK: Final[int] = 3
 DEFAULT_AUTO_INTERVAL: Final[int] = 300
 LOT_CACHE_TTL: Final[int] = 600
+PRODUCT_CACHE_TTL: Final[int] = 300
+UI_API_TIMEOUT: Final[float] = 8.0
+BUY_API_TIMEOUT: Final[float] = 60.0
 SETTINGS_FILE     = f"storage/plugins/{UUID}/settings.json"
 AUTOBUY_LOG_FILE  = f"storage/plugins/{UUID}/autobuy.json"
 IMPORT_LOG_FILE   = f"storage/plugins/{UUID}/import_stock.json"
@@ -213,8 +216,8 @@ def _shop_request(
         return None, str(exc)
 
 
-def _shop_get_balance(api_url: str, api_key: str) -> tuple[float | None, str]:
-    data, err = _shop_request(api_url, api_key, "GET", "/api/me")
+def _shop_get_balance(api_url: str, api_key: str, timeout: float = BUY_API_TIMEOUT) -> tuple[float | None, str]:
+    data, err = _shop_request(api_url, api_key, "GET", "/api/me", timeout=timeout)
     if err:
         return None, err
     user = _dig(data, "user")
@@ -226,8 +229,8 @@ def _shop_get_balance(api_url: str, api_key: str) -> tuple[float | None, str]:
         return None, "некорректный баланс в ответе API"
 
 
-def _shop_get_products(api_url: str, api_key: str) -> tuple[list[dict[str, Any]], str]:
-    data, err = _shop_request(api_url, api_key, "GET", "/api/products")
+def _shop_get_products(api_url: str, api_key: str, timeout: float = BUY_API_TIMEOUT) -> tuple[list[dict[str, Any]], str]:
+    data, err = _shop_request(api_url, api_key, "GET", "/api/products", timeout=timeout)
     if err:
         return [], err
     products = data.get("products") if isinstance(data, dict) else None
@@ -236,19 +239,37 @@ def _shop_get_products(api_url: str, api_key: str) -> tuple[list[dict[str, Any]]
     return [p for p in products if isinstance(p, dict)], ""
 
 
+def _product_display_name(product: dict[str, Any]) -> str:
+    for field in ("name_en", "name", "title"):
+        val = str(product.get(field, "")).strip()
+        if val:
+            return val
+    return ""
+
+
+def _product_matches_name(product: dict[str, Any], name: str = SHOP_PRODUCT_NAME) -> bool:
+    needle = name.strip().casefold()
+    if not needle:
+        return False
+    disp = _product_display_name(product).casefold()
+    return disp == needle or needle in disp
+
+
 def _shop_find_product(products: list[dict[str, Any]], name: str = SHOP_PRODUCT_NAME) -> dict[str, Any] | None:
-    needle = name.casefold()
+    needle = name.strip().casefold()
+    exact: list[dict[str, Any]] = []
+    partial: list[dict[str, Any]] = []
     for product in products:
-        for field in ("name_en", "name", "title"):
-            val = str(product.get(field, "")).strip()
-            if val and needle in val.casefold():
-                return product
-    for product in products:
-        for field in ("name_en", "name", "title"):
-            val = str(product.get(field, "")).strip()
-            if val and val.casefold() == needle:
-                return product
-    return None
+        disp = _product_display_name(product).casefold()
+        if not disp:
+            continue
+        if disp == needle:
+            exact.append(product)
+        elif needle in disp:
+            partial.append(product)
+    if exact:
+        return exact[0]
+    return partial[0] if partial else None
 
 
 def _shop_buy(
@@ -271,6 +292,12 @@ def _shop_buy(
     items = [x for x in items if x and "@" in x]
     if not items:
         return [], (str(data)[:300] if data else "пустой ответ"), data if isinstance(data, dict) else {}
+    if len(items) < quantity:
+        return (
+            items,
+            f"ожидали {quantity} акк., API вернул {len(items)}",
+            data if isinstance(data, dict) else {},
+        )
     total = _dig(data, "total_price")
     new_bal = _dig(data, "new_balance")
     info = f"куплено {len(items)} шт."
@@ -337,6 +364,10 @@ class Plugin:
         self._import_target: dict[int, str] = {}
         self._cached_lot_id: int | None = None
         self._cached_lot_ts: float = 0.0
+        self._product_cache: dict[str, Any] | None = None
+        self._product_cache_ts: float = 0.0
+        self._buy_plan_cache: dict[str, Any] | None = None
+        self._buy_plan_cache_ts: float = 0.0
         self._stop_auto = False
         self._auto_thread: threading.Thread | None = None
         self.reload_settings()
@@ -371,6 +402,8 @@ class Plugin:
                     if loaded.get("stock_mode") == "stocked" and not loaded.get("supplier_api_key"):
                         loaded["stock_mode"] = "auto_buy"
                     loaded["_cfg_version"] = "2.4.0"
+                if str(loaded.get("_cfg_version", "0")) < "2.5.0":
+                    loaded["_cfg_version"] = "2.5.0"
                 self._cfg = loaded
             else:
                 self._cfg = defaults
@@ -401,8 +434,10 @@ class Plugin:
         self.on_setting_change(key, value)
 
     def on_setting_change(self, key: str, value: Any) -> None:
-        if key == "stock_mode" and str(value) == "stocked":
-            pass
+        if key in ("supplier_api_key", "supplier_api_url", "buy_budget_usd", "reserve_balance_usd"):
+            self._invalidate_product_cache()
+        if key in ("autobuy_lot_id", "autobuy_lot_match"):
+            self._invalidate_lot_cache()
 
     @staticmethod
     def _default_cfg() -> dict[str, Any]:
@@ -421,7 +456,7 @@ class Plugin:
             "imported_order_ids": [],
             "stock_mode": "auto_buy",
             "warehouse_release_qty": 5,
-            "_cfg_version": "2.4.0",
+            "_cfg_version": "2.5.0",
         }
 
     # ── UI: компактные страницы вместо длинного списка кнопок ───────────────
@@ -497,31 +532,65 @@ class Plugin:
         key = str(self.get_cfg("supplier_api_key", "")).strip()
         return url or DEFAULT_API_URL, key
 
+    def _invalidate_product_cache(self) -> None:
+        self._product_cache = None
+        self._product_cache_ts = 0.0
+        self._buy_plan_cache = None
+        self._buy_plan_cache_ts = 0.0
+
+    def _get_shop_product(self, timeout: float = BUY_API_TIMEOUT) -> tuple[dict[str, Any] | None, str]:
+        if self._product_cache and (time.time() - self._product_cache_ts) < PRODUCT_CACHE_TTL:
+            return self._product_cache, ""
+        api_url, api_key = self._shop_client()
+        if not api_key:
+            return None, "Не задан API-ключ"
+        products, err = _shop_get_products(api_url, api_key, timeout=timeout)
+        if err:
+            return None, f"Товары: {err}"
+        product = _shop_find_product(products, SHOP_PRODUCT_NAME)
+        if not product:
+            return None, f"Товар «{SHOP_PRODUCT_NAME}» не найден в магазине"
+        if not _product_matches_name(product, SHOP_PRODUCT_NAME):
+            return None, f"Товар магазина «{_product_display_name(product)}» ≠ «{SHOP_PRODUCT_NAME}»"
+        self._product_cache = product
+        self._product_cache_ts = time.time()
+        return product, ""
+
     def _float_cfg(self, key: str, default: float = 0.0) -> float:
         try:
             return float(self.get_cfg(key, default))
         except (TypeError, ValueError):
             return default
 
-    def calc_buy_plan(self, max_qty: int | None = None, *, fast: bool = False) -> dict[str, Any]:
+    def calc_buy_plan(
+        self,
+        max_qty: int | None = None,
+        *,
+        fast: bool = False,
+        instant: bool = False,
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
+        if instant:
+            return {"ok": False, "instant": True}
+
         if fast:
-            cached = getattr(self, "_buy_plan_cache", None)
-            if isinstance(cached, dict) and (time.time() - getattr(self, "_buy_plan_cache_ts", 0)) < 60:
-                return cached
-            api_key = str(self.get_cfg("shop_api_key", "") or "").strip()
+            if isinstance(self._buy_plan_cache, dict) and (time.time() - self._buy_plan_cache_ts) < 60:
+                return self._buy_plan_cache
+            api_key = str(self.get_cfg("supplier_api_key", "") or "").strip()
             if not api_key:
                 return {"ok": False, "error": "Не задан API-ключ. Настройки → API-ключ."}
-            return {"ok": False, "error": "нажмите «Баланс» для обновления"}
+            return {"ok": False, "error": "обновляется…"}
 
+        req_timeout = timeout if timeout is not None else UI_API_TIMEOUT
         api_url, api_key = self._shop_client()
         if not api_key:
             return {"ok": False, "error": "Не задан API-ключ. Настройки → API-ключ."}
-        balance, err = _shop_get_balance(api_url, api_key)
+        balance, err = _shop_get_balance(api_url, api_key, timeout=req_timeout)
         if err:
             return {"ok": False, "error": f"Баланс: {err}"}
         reserve = max(0.0, self._float_cfg("reserve_balance_usd", 10.0))
         budget_set = max(0.0, self._float_cfg("buy_budget_usd", 0.0))
-        available = balance - reserve
+        available = round(balance - reserve, 2)
         if available <= 0:
             return {
                 "ok": False,
@@ -529,16 +598,9 @@ class Plugin:
                 "balance": balance, "reserve": reserve,
             }
         spend_cap = min(budget_set, available) if budget_set > 0 else available
-        products, err = _shop_get_products(api_url, api_key)
-        if err:
-            return {"ok": False, "error": f"Товары: {err}", "balance": balance, "reserve": reserve}
-        product = _shop_find_product(products, SHOP_PRODUCT_NAME)
-        if not product:
-            return {
-                "ok": False,
-                "error": f"Товар «{SHOP_PRODUCT_NAME}» не найден в магазине",
-                "balance": balance, "reserve": reserve,
-            }
+        product, err = self._get_shop_product(timeout=req_timeout)
+        if err or not product:
+            return {"ok": False, "error": err or "товар не найден", "balance": balance, "reserve": reserve}
         try:
             price = float(product.get("price", 0))
         except (TypeError, ValueError):
@@ -555,6 +617,11 @@ class Plugin:
                 "balance": balance, "reserve": reserve, "price": price,
             }
         spend = round(qty * price, 2)
+        if spend > available + 0.01:
+            return {"ok": False, "error": "Сумма превышает баланс после резерва", "balance": balance, "reserve": reserve}
+        if budget_set > 0 and spend > budget_set + 0.01:
+            return {"ok": False, "error": "Сумма превышает заданный бюджет", "balance": balance, "reserve": reserve}
+        product_name = _product_display_name(product) or SHOP_PRODUCT_NAME
         result = {
             "ok": True,
             "qty": qty,
@@ -564,12 +631,28 @@ class Plugin:
             "available": available,
             "price": price,
             "product_id": int(product["id"]),
-            "product_name": str(product.get("name_en") or product.get("name") or SHOP_PRODUCT_NAME),
+            "product_name": product_name,
             "shop_stock": product.get("stock_count"),
         }
         self._buy_plan_cache = result
         self._buy_plan_cache_ts = time.time()
         return result
+
+    def _validate_buy_plan(self, plan: dict[str, Any]) -> tuple[bool, str]:
+        if not plan.get("ok"):
+            return False, str(plan.get("error", "закупка недоступна"))
+        pname = str(plan.get("product_name", ""))
+        if not _product_matches_name({"name": pname}, SHOP_PRODUCT_NAME):
+            return False, f"Товар «{pname}» ≠ «{SHOP_PRODUCT_NAME}»"
+        spend = float(plan.get("spend", 0))
+        reserve = max(0.0, self._float_cfg("reserve_balance_usd", 10.0))
+        balance = float(plan.get("balance", 0))
+        if spend > round(balance - reserve, 2) + 0.01:
+            return False, f"Закупка ${spend:.2f} нарушает резерв ${reserve:.2f}"
+        budget = max(0.0, self._float_cfg("buy_budget_usd", 0.0))
+        if budget > 0 and spend > budget + 0.01:
+            return False, f"Закупка ${spend:.2f} превышает бюджет ${budget:.2f}"
+        return True, ""
 
     def _lot_full_text(self, lot_id: int) -> str:
         chunks: list[str] = []
@@ -646,6 +729,10 @@ class Plugin:
         if result:
             self._cached_lot_id = result[0]
             self._cached_lot_ts = time.time()
+            saved = str(self.get_cfg("autobuy_lot_id", "")).strip()
+            if not saved:
+                self._cfg["autobuy_lot_id"] = str(result[0])
+                self._save_settings()
         return result
 
     def _format_account_lines(self, accounts: list[str]) -> list[str]:
@@ -661,30 +748,51 @@ class Plugin:
         return self._append_stock_lines_to_lot(lot_id, lines)
 
     def _append_stock_lines_to_lot(self, lot_id: int, lines: list[str]) -> tuple[bool, str]:
-        lines = [ln.strip() for ln in lines if ln and ln.strip()]
+        lines = [ln.strip() for ln in self._format_account_lines(lines) if ln and ln.strip()]
         if not lines:
             return False, "нет данных для выдачи"
         acc = self.cardinal.account
-        for attempt in range(3):
+        lot_id = int(lot_id)
+        last_err = ""
+        for attempt in range(5):
             try:
-                lf = acc.get_lot_fields(int(lot_id))
-                before = len(lf.secrets)
-                existing = set(lf.secrets)
-                for line in lines:
-                    if line not in existing:
-                        lf.secrets.append(line)
-                        existing.add(line)
+                lf = acc.get_lot_fields(lot_id)
+                before = len(lf.secrets or [])
+                existing = set(lf.secrets or [])
+                pending = [ln for ln in lines if ln not in existing]
+                if not pending:
+                    lf.auto_delivery = True
+                    lf.active = True
+                    lf.renew_fields()
+                    acc.save_lot(lf)
+                    return True, f"лот #{lot_id}: все {len(lines)} акк. уже на месте (🟢 активен + АВ)"
+                for line in pending:
+                    lf.secrets.append(line)
                 lf.auto_delivery = True
                 lf.active = True
                 lf.renew_fields()
                 acc.save_lot(lf)
-                added = len(lf.secrets) - before
-                state = "🟢 активен + АВ" if lf.active and lf.auto_delivery else "⚠️ проверьте лот"
-                return True, f"лот #{lot_id}: +{added} шт., всего {len(lf.secrets)} ({state})"
+                time.sleep(0.8)
+                lf_check = acc.get_lot_fields(lot_id)
+                secrets_set = set(lf_check.secrets or [])
+                missing = [ln for ln in lines if ln not in secrets_set]
+                added = len(lf_check.secrets or []) - before
+                if not missing and lf_check.active and lf_check.auto_delivery:
+                    return True, (
+                        f"лот #{lot_id}: +{added} шт., всего {len(lf_check.secrets)} "
+                        f"(🟢 активен + АВ)"
+                    )
+                last_err = (
+                    f"лот #{lot_id}: загружено {added}/{len(pending)}, "
+                    f"не хватает {len(missing)}, АВ={lf_check.auto_delivery}, "
+                    f"активен={lf_check.active}"
+                )
+                self.log("save_lot verify #%s attempt %s: %s", lot_id, attempt + 1, last_err)
             except Exception as exc:
+                last_err = str(exc)
                 self.log("save_lot #%s attempt %s: %s", lot_id, attempt + 1, exc)
-                time.sleep(1.5)
-        return False, f"не удалось сохранить лот #{lot_id}"
+            time.sleep(1.2 * (attempt + 1))
+        return False, last_err or f"не удалось сохранить лот #{lot_id}"
 
     def _purchase_accounts(self, product_id: int, quantity: int) -> tuple[list[str], str]:
         api_url, api_key = self._shop_client()
@@ -713,14 +821,14 @@ class Plugin:
     ) -> None:
         if self._autobuy_running:
             return
-        plan = self.calc_buy_plan(max_qty=max_qty)
-        if not plan.get("ok"):
+        plan = self.calc_buy_plan(max_qty=max_qty, timeout=BUY_API_TIMEOUT)
+        ok, reason = self._validate_buy_plan(plan)
+        if not ok:
             if not auto:
                 bot = self.cardinal.telegram.bot if self.cardinal.telegram else None
-                reason = str(plan.get("error", "закупка недоступна"))
                 if bot and notify_chat_id:
                     bot.send_message(notify_chat_id, f"⛔ {_escape(reason)}", parse_mode="HTML")
-            self.log("autobuy blocked: %s", plan.get("error"))
+            self.log("autobuy blocked: %s", reason)
             return
         lot_ids = self._resolve_autobuy_lot_ids(silent=auto)
         if not lot_ids:
@@ -746,7 +854,10 @@ class Plugin:
         t0 = time.time()
         try:
             tag = "авто" if auto else "ручная"
-            self.log("%s закупка: %s шт. ($%.2f) → лот #%s", tag, qty, spend, lot_id)
+            self.log(
+                "%s закупка: %s × «%s» ($%.2f) → лот #%s",
+                tag, qty, product_name, spend, lot_id,
+            )
             if bot and notify_chat_id:
                 bot.send_message(
                     notify_chat_id,
@@ -764,24 +875,36 @@ class Plugin:
                     bot.send_message(notify_chat_id, msg, parse_mode="HTML")
                 self._log_autobuy({"time": started, "ok": False, "error": buy_info, "qty": qty, "auto": auto})
                 return
+            if len(accounts) < qty:
+                self.log(
+                    "autobuy partial API: запрошено %s, получено %s — выкладываю полученное",
+                    qty, len(accounts),
+                )
 
             success, info = self._append_accounts_to_lot(lot_id, accounts)
+            if not success:
+                self.log("autobuy upload fail: %s", info)
             summary = (
                 f"{'✅' if success else '⚠️'} <b>Готово за {int(time.time() - t0)}с</b>\n"
                 f"🛒 <b>{len(accounts)}</b> акк. — {buy_info}\n"
-                f"📦 {_escape(info)}"
+                f"📦 {_escape(info)}\n"
+                f"<i>FunPay выдаст покупателю столько акк., сколько штук в заказе (1→1, 2→2).</i>"
             )
-            self.log("autobuy ok: %s accounts -> #%s", len(accounts), lot_id)
+            self.log("autobuy ok: %s accounts -> #%s (%s)", len(accounts), lot_id, info)
             if bot and notify_chat_id:
                 bot.send_message(notify_chat_id, summary, parse_mode="HTML")
             self._log_autobuy({
                 "time": started, "ok": success, "bought": len(accounts),
                 "spend": spend, "lots": lot_ids, "results": [info], "auto": auto,
+                "product": product_name,
             })
             self._cfg["last_auto_at"] = started
             self._save_settings()
+            self._invalidate_product_cache()
+            self._invalidate_lot_cache()
         except Exception as exc:
             logger.error("%s autobuy: %s", _P, exc)
+            logger.debug(traceback.format_exc())
             if bot and notify_chat_id:
                 bot.send_message(
                     notify_chat_id,
@@ -809,9 +932,10 @@ class Plugin:
         if current >= min_stock:
             return
         needed = max(1, min_stock - current)
-        plan = self.calc_buy_plan(max_qty=needed)
-        if not plan.get("ok"):
-            self.log("auto: %s", plan.get("error"))
+        plan = self.calc_buy_plan(max_qty=needed, timeout=BUY_API_TIMEOUT)
+        ok, reason = self._validate_buy_plan(plan)
+        if not ok:
+            self.log("auto: %s", reason)
             return
         self.log("auto: лот #%s — %s/%s акк., докупаю %s", lot_id, current, min_stock, plan["qty"])
         self.run_autobuy(notify_chat_id=None, max_qty=needed, auto=True)
@@ -848,7 +972,7 @@ class Plugin:
         bot = self.cardinal.telegram.bot if self.cardinal.telegram else None
         if not bot:
             return
-        plan = self.calc_buy_plan()
+        plan = self.calc_buy_plan(timeout=UI_API_TIMEOUT)
         lines = [f"💰 <b>Баланс магазина</b>", f"📦 Товар: <code>{_escape(SHOP_PRODUCT_NAME)}</code>"]
         if "balance" in plan:
             lines.append(f"💵 Баланс: <b>${float(plan['balance']):.2f}</b>")
@@ -1141,9 +1265,10 @@ class Plugin:
         return mode if mode in STOCK_MODES else "stocked"
 
     def _autobuy_allowed(self) -> tuple[bool, str]:
-        plan = self.calc_buy_plan()
-        if not plan.get("ok"):
-            return False, str(plan.get("error", "закупка недоступна"))
+        plan = self.calc_buy_plan(timeout=UI_API_TIMEOUT)
+        ok, reason = self._validate_buy_plan(plan)
+        if not ok:
+            return False, reason
         if not self._resolve_autobuy_lot_ids(silent=True):
             return False, "Не найден лот FunPay — укажите ID лота"
         return True, ""
@@ -1316,7 +1441,15 @@ class Plugin:
         except Exception:
             return "—"
 
-    def render_settings_text(self, page: str = "hub", fast: bool = False) -> str:
+    def _lot_hint_instant(self) -> str:
+        lot_raw = str(self.get_cfg("autobuy_lot_id", "")).strip()
+        if lot_raw.isdigit():
+            return f"#{lot_raw}"
+        if self._cached_lot_id:
+            return f"#{self._cached_lot_id}"
+        return "…"
+
+    def render_settings_text(self, page: str = "hub", fast: bool = False, instant: bool = False) -> str:
         pages = self._ui_pages()
         page = page if page in pages else "hub"
         lines = [
@@ -1330,7 +1463,34 @@ class Plugin:
             wh_qty = int(self.get_cfg("warehouse_release_qty", 5) or 0)
             budget = self._float_cfg("buy_budget_usd")
             reserve = self._float_cfg("reserve_balance_usd", 10.0)
-            plan = self.calc_buy_plan(fast=fast)
+            if instant:
+                lines += [
+                    f"<b>Режим:</b> {self.stock_mode_label(mode)}",
+                    f"📦 <b>Лот FunPay:</b> {self._lot_hint_instant()}",
+                    f"🗄 <b>Склад плагина:</b> {self.warehouse_count()} шт.",
+                ]
+                if mode == "auto_buy":
+                    auto_on = bool(self.get_cfg("auto_enabled", True))
+                    min_stock = int(self.get_cfg("min_lot_stock", DEFAULT_MIN_LOT_STOCK))
+                    lines += [
+                        f"🛍 <b>Товар:</b> <code>{_escape(SHOP_PRODUCT_NAME)}</code>",
+                        f"📋 <b>Формат:</b> <code>почта|пароль|2FA</code>",
+                        (
+                            f"🤖 <b>Авто:</b> {'🟢 ВКЛ' if auto_on else '🔴 ВЫКЛ'} | "
+                            f"мин. на лоте: <b>{min_stock}</b>"
+                        ),
+                        (
+                            f"🎯 <b>Потратить:</b> "
+                            f"{'всё после резерва' if budget <= 0 else f'${budget:.2f}'}"
+                            f" | <b>Резерв:</b> ${reserve:.2f}"
+                        ),
+                        "<i>⏳ Загрузка баланса и лота…</i>",
+                    ]
+                else:
+                    lines.append(f"📤 <b>Выложить со склада:</b> {wh_qty} шт. за раз")
+                return "\n".join(lines)
+
+            plan = self.calc_buy_plan(fast=fast, timeout=UI_API_TIMEOUT)
             lines += [
                 f"<b>Режим:</b> {self.stock_mode_label(mode)}",
                 f"📦 <b>Лот FunPay:</b> {self._lot_stock_info(fast=fast)}",
@@ -1387,7 +1547,7 @@ class Plugin:
             )
         return "\n".join(lines)
 
-    def build_settings_keyboard(self, page: str = "hub", fast: bool = False) -> IKM:
+    def build_settings_keyboard(self, page: str = "hub", fast: bool = False, instant: bool = False) -> IKM:
         kb = IKM()
         page = page if page in self._ui_pages() else "hub"
 
@@ -1408,7 +1568,11 @@ class Plugin:
                 reserve = self._float_cfg("reserve_balance_usd", 10.0)
                 auto_on = bool(self.get_cfg("auto_enabled", True))
                 min_stock = int(self.get_cfg("min_lot_stock", DEFAULT_MIN_LOT_STOCK))
-                plan = self.calc_buy_plan(fast=fast)
+                plan = (
+                    {"ok": False}
+                    if instant
+                    else self.calc_buy_plan(fast=fast, timeout=UI_API_TIMEOUT)
+                )
                 kb.row(IKB(
                     f"{'🟢' if auto_on else '🔴'} Авто: {'ВКЛ' if auto_on else 'ВЫКЛ'}",
                     callback_data=f"{CB_PREFIX}:togkey:auto_enabled",
@@ -1460,7 +1624,7 @@ class Plugin:
                     callback_data=f"{CB_PREFIX}:edit:{page}:{i}",
                 ))
             if page == "settings":
-                plan = self.calc_buy_plan(fast=fast)
+                plan = self.calc_buy_plan(fast=fast, timeout=UI_API_TIMEOUT)
                 if plan.get("ok"):
                     kb.row(IKB(
                         f"🛒 Купить {plan['qty']} шт.",
@@ -1523,7 +1687,7 @@ class Plugin:
             if self._autobuy_running:
                 bot.answer_callback_query(call.id, "Уже выполняется…", show_alert=True)
                 return True
-            plan = self.calc_buy_plan()
+            plan = self.calc_buy_plan(timeout=UI_API_TIMEOUT)
             bot.answer_callback_query(call.id, f"Закупка {plan.get('qty', 0)} шт…")
             threading.Thread(target=self.run_autobuy, args=(chat_id,), daemon=True).start()
             return True
@@ -1574,13 +1738,32 @@ class Plugin:
         bot = tg.bot
         plugin = self
 
-        def show_settings(chat_id: int, msg_id: int, page: str = "hub", fast: bool = False) -> None:
-            text = plugin.render_settings_text(page, fast=fast)
-            kb = plugin.build_settings_keyboard(page, fast=fast)
+        def show_settings(
+            chat_id: int, msg_id: int, page: str = "hub",
+            fast: bool = False, instant: bool = False,
+        ) -> None:
+            text = plugin.render_settings_text(page, fast=fast, instant=instant)
+            kb = plugin.build_settings_keyboard(page, fast=fast, instant=instant)
             try:
                 bot.edit_message_text(text, chat_id, msg_id, reply_markup=kb, parse_mode="HTML")
             except Exception:
                 bot.send_message(chat_id, text, reply_markup=kb, parse_mode="HTML")
+
+        def refresh_settings_ui(chat_id: int, msg_id: int, page: str = "hub") -> None:
+            try:
+                if page == "hub":
+                    plugin._resolve_autobuy_lot_ids(silent=True, fast=False)
+                    plugin.calc_buy_plan(timeout=UI_API_TIMEOUT)
+                show_settings(chat_id, msg_id, page, fast=False, instant=False)
+            except Exception as exc:
+                plugin.log("refresh UI error: %s", exc)
+                logger.debug(traceback.format_exc())
+
+        def open_hub_settings(chat_id: int, msg_id: int) -> None:
+            show_settings(chat_id, msg_id, "hub", instant=True)
+            threading.Thread(
+                target=refresh_settings_ui, args=(chat_id, msg_id, "hub"), daemon=True,
+            ).start()
 
         def on_callback(call: CallbackQuery) -> None:
             data = call.data or ""
@@ -1594,14 +1777,19 @@ class Plugin:
                 bot.answer_callback_query(call.id)
                 return
             if action == "nav":
-                show_settings(chat_id, msg_id, parts[2] if len(parts) > 2 else "hub")
+                page = parts[2] if len(parts) > 2 else "hub"
                 bot.answer_callback_query(call.id)
+                if page == "hub":
+                    open_hub_settings(chat_id, msg_id)
+                else:
+                    show_settings(chat_id, msg_id, page)
                 return
             if action == "togkey":
                 key = parts[2] if len(parts) > 2 else ""
                 if key:
                     plugin.set_cfg(key, not bool(plugin.get_cfg(key)))
-                    show_settings(chat_id, msg_id, "hub")
+                    plugin._invalidate_product_cache()
+                    open_hub_settings(chat_id, msg_id)
                 bot.answer_callback_query(call.id)
                 return
             if action == "editkey" and len(parts) >= 3:
@@ -1648,8 +1836,8 @@ class Plugin:
                 return
             if action == "mode" and len(parts) >= 3:
                 plugin.set_cfg("stock_mode", parts[2])
-                show_settings(chat_id, msg_id, "hub")
                 bot.answer_callback_query(call.id, plugin.stock_mode_label(parts[2])[:180])
+                open_hub_settings(chat_id, msg_id)
                 return
             if action == "act":
                 key = parts[2]
@@ -1835,7 +2023,7 @@ class Plugin:
             except Exception:
                 pass
             try:
-                show_settings(call.message.chat.id, call.message.message_id, "hub", fast=True)
+                open_hub_settings(call.message.chat.id, call.message.message_id)
             except Exception as exc:
                 plugin.log("ошибка открытия настроек: %s", exc)
                 logger.debug("TRACEBACK", exc_info=True)
@@ -1866,9 +2054,12 @@ class Plugin:
 
         def send_panel(message: Message) -> None:
             chat_id = message.chat.id
-            text_msg = plugin.render_settings_text("hub")
-            kb = plugin.build_settings_keyboard("hub")
-            bot.send_message(chat_id, text_msg, reply_markup=kb, parse_mode="HTML")
+            text_msg = plugin.render_settings_text("hub", instant=True)
+            kb = plugin.build_settings_keyboard("hub", instant=True)
+            sent = bot.send_message(chat_id, text_msg, reply_markup=kb, parse_mode="HTML")
+            threading.Thread(
+                target=refresh_settings_ui, args=(chat_id, sent.message_id, "hub"), daemon=True,
+            ).start()
 
         def send_stock_cmd(message: Message) -> None:
             chat_id = message.chat.id
