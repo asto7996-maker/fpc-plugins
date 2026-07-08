@@ -41,8 +41,8 @@ except ImportError:
 
 
 NAME          = "Gemini Review Reply"
-VERSION       = "3.6.0"
-DESCRIPTION   = "ИИ-отзывы + 3 режима выдачи ссылок на FunPay"
+VERSION       = "3.7.0"
+DESCRIPTION   = "ИИ-отзывы + 2 режима: автозакупка или купленные ссылки"
 CREDITS       = "Cursor AI"
 UUID          = "c4e8b2f1-9a3d-4e7b-8c6f-2d1a5e9b0c3f"
 SETTINGS_PAGE = True
@@ -67,11 +67,11 @@ CHINESE_RE        = re.compile(r"[\u4e00-\u9fff\u3000-\u303f\uff00-\uffef]")
 CB_PREFIX         = f"grv_{UUID[:8]}"
 
 STOCK_MODES: Final[dict[str, str]] = {
-    "auto_buy": "🤖 Автопокупка → лот",
-    "import_lot": "📥 Импорт закупки → лот",
-    "warehouse": "📦 Со склада → лот",
+    "auto_buy": "🤖 Автозакупка → FunPay",
+    "stocked": "📦 Купленные ссылки → FunPay",
 }
-STOCK_MODE_ORDER: Final[tuple[str, ...]] = ("auto_buy", "import_lot", "warehouse")
+STOCK_MODE_ORDER: Final[tuple[str, ...]] = ("auto_buy", "stocked")
+_LEGACY_STOCK_MODES: Final[frozenset[str]] = frozenset({"import_lot", "warehouse"})
 
 _SHOP_ORDER_RE = re.compile(
     r"Order\s*#(?P<order_id>\d+)\s*\n"
@@ -899,7 +899,9 @@ def _supplier_request(
     api_key = (api_key or "").strip()
     product_id = (product_id or "").strip()
     product_name = (product_name or DEFAULT_SUPPLIER_PRODUCT).strip()
-    quantity = max(1, int(quantity))
+    quantity = max(0, int(quantity))
+    if quantity <= 0:
+        return [], "количество 0 — закупка отключена"
 
     if not api_url:
         return [], "URL API поставщика не задан"
@@ -940,6 +942,37 @@ def _supplier_request(
         except Exception as exc:
             last_err = str(exc)
         return [], last_err
+
+    if mode == "gemini_worker":
+        base = api_url.rstrip("/")
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "X-API-Key": api_key,
+            "Content-Type": "application/json",
+        }
+        payloads = (
+            {"product_id": product_id or product_name, "product": product_id or product_name, "quantity": quantity},
+            {"productId": product_id or product_name, "count": quantity},
+        )
+        endpoints = ("/api/purchase", "/api/buy", "/purchase", "/buy")
+        for ep in endpoints:
+            for body in payloads:
+                try:
+                    resp = http_post(f"{base}{ep}", json=body, headers=headers, timeout=90)
+                    try:
+                        data = resp.json()
+                    except Exception:
+                        data = resp.text
+                    if isinstance(data, dict) and data.get("success") is False:
+                        last_err = str(data.get("error") or data.get("message") or data)[:300]
+                        continue
+                    accounts = _extract_accounts_from_payload(data)
+                    if accounts:
+                        return accounts[:quantity], f"куплено {len(accounts[:quantity])} шт."
+                    last_err = (resp.text or str(data))[:300]
+                except Exception as exc:
+                    last_err = str(exc)
+        return [], last_err or "gemini_worker: не удалось купить"
 
     if mode == "get_query":
         params = {
@@ -1184,11 +1217,20 @@ class Plugin:
                     loaded.setdefault("imported_order_ids", [])
                     loaded["_cfg_version"] = "3.5.0"
                 if old_ver < "3.6.0":
-                    loaded.setdefault("stock_mode", "import_lot")
+                    loaded.setdefault("stock_mode", "stocked")
                     loaded.setdefault("warehouse_release_qty", 5)
                     loaded["_cfg_version"] = "3.6.0"
+                if old_ver < "3.7.0":
+                    sm = str(loaded.get("stock_mode", "stocked"))
+                    if sm in _LEGACY_STOCK_MODES:
+                        loaded["stock_mode"] = "stocked"
+                    loaded.setdefault("autobuy_auto_restock", False)
+                    loaded.setdefault("autobuy_min_lot_stock", 0)
+                    if not loaded.get("autobuy_enabled"):
+                        loaded["autobuy_auto_restock"] = False
+                    loaded["_cfg_version"] = "3.7.0"
                 else:
-                    loaded.setdefault("_cfg_version", "3.6.0")
+                    loaded.setdefault("_cfg_version", "3.7.0")
                 self._cfg = loaded
                 if old_ver < "3.3.0":
                     self._save_settings()
@@ -1223,6 +1265,19 @@ class Plugin:
     def on_setting_change(self, key: str, value: Any) -> None:
         if key == "gemini_api_key" and value:
             self.log("API key обновлён")
+        if key == "autobuy_enabled" and not value:
+            self._cfg["autobuy_auto_restock"] = False
+            self._save_settings()
+        if key == "autobuy_quantity":
+            try:
+                if int(value) <= 0:
+                    self._cfg["autobuy_auto_restock"] = False
+                    self._save_settings()
+            except (TypeError, ValueError):
+                pass
+        if key == "stock_mode" and str(value) == "stocked":
+            self._cfg["autobuy_auto_restock"] = False
+            self._save_settings()
 
     @staticmethod
     def _default_cfg() -> dict[str, Any]:
@@ -1254,7 +1309,7 @@ class Plugin:
             "supplier_api_key": "",
             "supplier_product_id": "",
             "supplier_product_name": DEFAULT_SUPPLIER_PRODUCT,
-            "supplier_mode": "json_post",
+            "supplier_mode": "gemini_worker",
             "supplier_bulk": True,
             "supplier_parallel": 4,
             "account_line_template": "{account}",
@@ -1262,9 +1317,11 @@ class Plugin:
             "import_line_template": "{url}",
             "import_skip_duplicates": True,
             "imported_order_ids": [],
-            "stock_mode": "import_lot",
+            "stock_mode": "stocked",
             "warehouse_release_qty": 5,
-            "_cfg_version": "3.6.0",
+            "autobuy_auto_restock": False,
+            "autobuy_min_lot_stock": 0,
+            "_cfg_version": "3.7.0",
         }
 
     # ── UI: компактные страницы вместо длинного списка кнопок ───────────────
@@ -1298,23 +1355,23 @@ class Plugin:
 
     def _autobuy_fields(self) -> list[dict[str, Any]]:
         return [
-            {"key": "autobuy_enabled", "label": "Автозакупка по кнопке", "type": "bool"},
-            {"key": "autobuy_quantity", "label": "Сколько покупать (шт.)", "type": "int", "min": 1, "max": 100},
+            {"key": "autobuy_enabled", "label": "Автозакупка включена", "type": "bool"},
+            {"key": "autobuy_quantity", "label": "Покупать за раз (0 = выкл.)", "type": "int", "min": 0, "max": 100},
+            {"key": "autobuy_auto_restock", "label": "Докупать при нехватке на лоте", "type": "bool"},
+            {"key": "autobuy_min_lot_stock", "label": "Мин. остаток на лоте", "type": "int", "min": 0, "max": 100},
             {"key": "autobuy_lot_match", "label": "Метка в описании лота", "type": "text"},
             {"key": "autobuy_lot_id", "label": "ID лота (быстрее)", "type": "text"},
             {"key": "supplier_api_url", "label": "URL API поставщика", "type": "text"},
             {"key": "supplier_api_key", "label": "API-ключ поставщика", "type": "text"},
-            {"key": "supplier_product_id", "label": "ID товара у поставщика", "type": "text"},
+            {"key": "supplier_product_id", "label": "ID товара (gemini_18m)", "type": "text"},
             {"key": "supplier_product_name", "label": "Название товара", "type": "text"},
-            {"key": "supplier_mode", "label": "Режим API (json_post/get_query/smm_v2)", "type": "text"},
+            {"key": "supplier_mode", "label": "Режим API", "type": "text"},
             {"key": "supplier_bulk", "label": "Одним запросом (bulk)", "type": "bool"},
             {"key": "supplier_parallel", "label": "Параллельность", "type": "int", "min": 1, "max": AUTOBUY_MAX_PARALLEL},
-            {"key": "account_line_template", "label": "Шаблон строки", "type": "text"},
             {"key": "import_routes", "label": "Маршруты товар→лот", "type": "multiline", "max_len": 2000},
             {"key": "import_line_template", "label": "Шаблон ссылки в АВ", "type": "text"},
             {"key": "import_skip_duplicates", "label": "Пропускать дубли заказов", "type": "bool"},
-            {"key": "stock_mode", "label": "Режим выдачи", "type": "text"},
-            {"key": "warehouse_release_qty", "label": "Выложить со склада (шт.)", "type": "int", "min": 1, "max": 100},
+            {"key": "warehouse_release_qty", "label": "Выложить со склада (шт.)", "type": "int", "min": 0, "max": 100},
         ]
 
     def _advanced_fields(self) -> list[dict[str, Any]]:
@@ -1488,9 +1545,16 @@ class Plugin:
     def run_autobuy(self, notify_chat_id: int | None = None) -> None:
         if self._autobuy_running:
             return
+        allowed, reason = self._autobuy_allowed()
+        if not allowed:
+            bot = self.cardinal.telegram.bot if self.cardinal.telegram else None
+            if bot and notify_chat_id:
+                bot.send_message(notify_chat_id, f"⛔ {_escape(reason)}", parse_mode="HTML")
+            self.log("autobuy blocked: %s", reason)
+            return
         self._autobuy_running = True
         bot = self.cardinal.telegram.bot if self.cardinal.telegram else None
-        qty = int(self.get_cfg("autobuy_quantity", 5))
+        qty = int(self.get_cfg("autobuy_quantity", 0))
         match = str(self.get_cfg("autobuy_lot_match", DEFAULT_LOT_MATCH))
         started = datetime.now().isoformat(timespec="seconds")
         t0 = time.time()
@@ -1831,8 +1895,25 @@ class Plugin:
         self._import_target.pop(chat_id, None)
 
     def stock_mode(self) -> str:
-        mode = str(self.get_cfg("stock_mode", "import_lot") or "import_lot")
-        return mode if mode in STOCK_MODES else "import_lot"
+        mode = str(self.get_cfg("stock_mode", "stocked") or "stocked")
+        if mode in _LEGACY_STOCK_MODES:
+            return "stocked"
+        return mode if mode in STOCK_MODES else "stocked"
+
+    def _autobuy_allowed(self) -> tuple[bool, str]:
+        if not bool(self.get_cfg("autobuy_enabled", False)):
+            return False, "Автозакупка выключена. Включите переключатель на главной."
+        try:
+            qty = int(self.get_cfg("autobuy_quantity", 0))
+        except (TypeError, ValueError):
+            qty = 0
+        if qty <= 0:
+            return False, "Количество = 0. Закупка отключена."
+        if not str(self.get_cfg("supplier_api_url", "")).strip():
+            return False, "Не задан URL API поставщика."
+        if not str(self.get_cfg("supplier_api_key", "")).strip():
+            return False, "Не задан API-ключ поставщика."
+        return True, ""
 
     def stock_mode_label(self, mode: str | None = None) -> str:
         return STOCK_MODES.get(mode or self.stock_mode(), mode or self.stock_mode())
@@ -1898,9 +1979,14 @@ class Plugin:
         self._import_running = True
         bot = self.cardinal.telegram.bot if self.cardinal.telegram else None
         qty = int(count or self.get_cfg("warehouse_release_qty", 5))
-        qty = max(1, min(100, qty))
+        qty = max(0, min(100, qty))
         t0 = time.time()
         try:
+            if qty <= 0:
+                msg = "⛔ Количество для выкладки = 0. Укажите число > 0 в настройках."
+                if bot and notify_chat_id:
+                    bot.send_message(notify_chat_id, msg, parse_mode="HTML")
+                return
             wh = self._load_warehouse()
             if not wh:
                 msg = "📦 <b>Склад пуст.</b> Сначала загрузите Purchase History кнопкой «📥 В склад»."
@@ -2007,28 +2093,32 @@ class Plugin:
         ]
         if page == "hub":
             mode = self.stock_mode()
-            qty = int(self.get_cfg("autobuy_quantity", 5))
-            wh_qty = int(self.get_cfg("warehouse_release_qty", 5))
+            try:
+                ab_qty = int(self.get_cfg("autobuy_quantity", 0))
+            except (TypeError, ValueError):
+                ab_qty = 0
+            wh_qty = int(self.get_cfg("warehouse_release_qty", 5) or 0)
+            ab_on = bool(self.get_cfg("autobuy_enabled"))
             lines += [
                 f"{'🟢' if self.get_cfg('enabled') else '🔴'} <b>Автоответ</b> на отзывы",
-                f"<b>Режим выдачи:</b> {self.stock_mode_label(mode)}",
+                f"<b>Режим:</b> {self.stock_mode_label(mode)}",
                 f"📦 <b>На лоте FunPay:</b> {self._lot_stock_info()}",
-                f"🗄 <b>На складе (купленные):</b> {self.warehouse_count()} шт.",
+                f"🗄 <b>Купленные (склад):</b> {self.warehouse_count()} шт.",
             ]
             if mode == "auto_buy":
-                lines.append(f"🤖 <b>Автопокупка:</b> {qty} шт. за раз через API")
-            elif mode == "import_lot":
-                lines.append("📥 <b>Импорт:</b> Purchase History → сразу на лот")
+                ab_state = "🟢 ВКЛ" if ab_on and ab_qty > 0 else "🔴 ВЫКЛ"
+                lines.append(f"🤖 <b>Автозакупка:</b> {ab_state} | за раз: <b>{ab_qty}</b> шт.")
+                if ab_qty <= 0:
+                    lines.append("⛔ <i>Количество 0 — закупка полностью отключена</i>")
             else:
-                lines.append(f"📤 <b>Со склада:</b> выложить {wh_qty} шт. на лот")
+                lines.append(f"📤 <b>Выложить со склада:</b> {wh_qty} шт. за раз")
             lines.append(f"📏 <b>Ответы:</b> {self._min_review_len()}–{self._max_review_len()} симв.")
             if self._batch_running:
                 lines.append("⏳ <i>Пакетная обработка отзывов…</i>")
             if self._autobuy_running:
-                lines.append("⏳ <i>Закупка и выкладка…</i>")
+                lines.append("⏳ <i>Закупка…</i>")
             if self._import_running:
-                lines.append("⏳ <i>Выкладка со склада…</i>")
-            lines.append("\n<i>Выберите режим ниже — кнопка действия меняется автоматически.</i>")
+                lines.append("⏳ <i>Выкладка…</i>")
             return "\n".join(lines)
 
         title = pages[page]["title"]
@@ -2051,53 +2141,45 @@ class Plugin:
         page = page if page in self._ui_pages() else "hub"
 
         if page == "hub":
-            on = bool(self.get_cfg("enabled"))
             mode = self.stock_mode()
-            kb.row(IKB(
-                f"{'🟢' if on else '🔴'} Автоответ: {'ВКЛ' if on else 'ВЫКЛ'}",
-                callback_data=f"{CB_PREFIX}:togkey:enabled",
-            ))
-            mode_btns = []
-            for m in STOCK_MODE_ORDER:
-                mark = "• " if m == mode else ""
-                short = {"auto_buy": "🤖 API", "import_lot": "📥 Импорт", "warehouse": "📦 Склад"}[m]
-                mode_btns.append(IKB(
-                    f"{mark}{short}",
-                    callback_data=f"{CB_PREFIX}:mode:{m}",
+            kb.row(
+                IKB(
+                    f"{'• ' if mode == 'auto_buy' else ''}🤖 Автозакупка",
+                    callback_data=f"{CB_PREFIX}:mode:auto_buy",
+                ),
+                IKB(
+                    f"{'• ' if mode == 'stocked' else ''}📦 Купленные",
+                    callback_data=f"{CB_PREFIX}:mode:stocked",
+                ),
+            )
+            if mode == "auto_buy":
+                ab_on = bool(self.get_cfg("autobuy_enabled"))
+                ab_qty = int(self.get_cfg("autobuy_quantity", 0) or 0)
+                kb.row(IKB(
+                    f"{'🟢' if ab_on and ab_qty > 0 else '🔴'} Автозакупка: "
+                    f"{'ВКЛ' if ab_on and ab_qty > 0 else 'ВЫКЛ'}",
+                    callback_data=f"{CB_PREFIX}:togkey:autobuy_enabled",
                 ))
-            kb.row(*mode_btns)
+                if ab_on and ab_qty > 0:
+                    kb.row(IKB(
+                        f"🤖 Купить {ab_qty} шт → FunPay",
+                        callback_data=f"{CB_PREFIX}:act:run_autobuy",
+                    ))
+                kb.row(IKB("⚙️ API поставщика", callback_data=f"{CB_PREFIX}:nav:autobuy"))
+            else:
+                wh_qty = int(self.get_cfg("warehouse_release_qty", 5) or 0)
+                kb.row(IKB("📥 Загрузить Purchase History", callback_data=f"{CB_PREFIX}:act:start_import:warehouse"))
+                if wh_qty > 0:
+                    kb.row(IKB(
+                        f"📤 Выложить {wh_qty} шт → FunPay",
+                        callback_data=f"{CB_PREFIX}:act:release_warehouse",
+                    ))
             n_un = int(self.get_cfg("batch_unanswered_count", 10))
             kb.row(IKB(f"📭 Неотвеченные ({n_un})", callback_data=f"{CB_PREFIX}:act:reply_unanswered"))
-            qty = int(self.get_cfg("autobuy_quantity", 5))
-            wh_qty = int(self.get_cfg("warehouse_release_qty", 5))
-            if mode == "auto_buy":
-                kb.row(IKB(
-                    f"🤖 Купить {qty} шт → лот",
-                    callback_data=f"{CB_PREFIX}:act:run_autobuy",
-                ))
-            elif mode == "import_lot":
-                kb.row(IKB(
-                    "📥 Загрузить закупку → лот",
-                    callback_data=f"{CB_PREFIX}:act:start_import:lot",
-                ))
-            else:
-                kb.row(IKB(
-                    f"📤 Выложить {wh_qty} шт со склада → лот",
-                    callback_data=f"{CB_PREFIX}:act:release_warehouse",
-                ))
-                kb.row(IKB(
-                    "📥 Загрузить в склад (купленные)",
-                    callback_data=f"{CB_PREFIX}:act:start_import:warehouse",
-                ))
             kb.row(
-                IKB("🧪 Тест Gemini", callback_data=f"{CB_PREFIX}:act:test_gemini"),
-                IKB("📊 Склад", callback_data=f"{CB_PREFIX}:act:stock_status"),
-            )
-            kb.row(
+                IKB("📊 Остатки", callback_data=f"{CB_PREFIX}:act:stock_status"),
                 IKB("📝 Отзывы", callback_data=f"{CB_PREFIX}:nav:reviews"),
-                IKB("🛒 API закупки", callback_data=f"{CB_PREFIX}:nav:autobuy"),
             )
-            kb.row(IKB("🔧 Промпты", callback_data=f"{CB_PREFIX}:nav:advanced"))
         else:
             fields = self._fields_for_page(page)
             for i, field in enumerate(fields):
@@ -2125,13 +2207,15 @@ class Plugin:
                 )
                 kb.row(IKB("🌐 Прокси", callback_data=f"{CB_PREFIX}:act:check_proxy"))
             elif page == "autobuy":
-                qty = int(self.get_cfg("autobuy_quantity", 5))
-                wh_qty = int(self.get_cfg("warehouse_release_qty", 5))
-                kb.row(IKB(f"🤖 API: {qty} шт", callback_data=f"{CB_PREFIX}:act:run_autobuy"))
-                kb.row(IKB("📥 Импорт → лот", callback_data=f"{CB_PREFIX}:act:start_import:lot"))
-                kb.row(IKB(f"📤 Со склада: {wh_qty} шт", callback_data=f"{CB_PREFIX}:act:release_warehouse"))
-                kb.row(IKB("📥 В склад", callback_data=f"{CB_PREFIX}:act:start_import:warehouse"))
-                kb.row(IKB("📊 Статус", callback_data=f"{CB_PREFIX}:act:stock_status"))
+                ab_on = bool(self.get_cfg("autobuy_enabled"))
+                ab_qty = int(self.get_cfg("autobuy_quantity", 0) or 0)
+                kb.row(IKB(
+                    f"{'🟢' if ab_on else '🔴'} Автозакупка: {'ВКЛ' if ab_on else 'ВЫКЛ'}",
+                    callback_data=f"{CB_PREFIX}:togkey:autobuy_enabled",
+                ))
+                if ab_on and ab_qty > 0:
+                    kb.row(IKB(f"🤖 Купить {ab_qty} шт", callback_data=f"{CB_PREFIX}:act:run_autobuy"))
+                kb.row(IKB("📊 Остатки", callback_data=f"{CB_PREFIX}:act:stock_status"))
             kb.row(IKB("🏠 Главная", callback_data=f"{CB_PREFIX}:nav:hub"))
 
         kb.add(IKB("◀️ К плагину", callback_data=f"{CBT.EDIT_PLUGIN}:{UUID}:0"))
@@ -2803,10 +2887,14 @@ class Plugin:
             ).start()
             return True
         if action == "run_autobuy":
-            if self._autobuy_running:
-                bot.answer_callback_query(call.id, "Закупка уже идёт…", show_alert=True)
+            allowed, reason = self._autobuy_allowed()
+            if not allowed:
+                bot.answer_callback_query(call.id, reason[:180], show_alert=True)
                 return True
-            qty = int(self.get_cfg("autobuy_quantity", 5))
+            if self._autobuy_running:
+                bot.answer_callback_query(call.id, "Уже выполняется…", show_alert=True)
+                return True
+            qty = int(self.get_cfg("autobuy_quantity", 0))
             bot.answer_callback_query(call.id, f"Закупка {qty} шт…")
             threading.Thread(target=self.run_autobuy, args=(chat_id,), daemon=True).start()
             return True
@@ -2815,9 +2903,9 @@ class Plugin:
             threading.Thread(target=self.notify_stock_status, args=(chat_id,), daemon=True).start()
             return True
         if action == "start_import":
-            target = arg if arg in ("lot", "warehouse") else (
-                "warehouse" if self.stock_mode() == "warehouse" else "lot"
-            )
+            target = arg if arg in ("lot", "warehouse") else "warehouse"
+            if self.stock_mode() == "stocked":
+                target = "warehouse"
             bot.answer_callback_query(call.id)
             prompt = self.start_import_mode(chat_id, call.from_user.id, target)
             bot.send_message(chat_id, prompt, parse_mode="HTML")
@@ -2841,7 +2929,10 @@ class Plugin:
             if self._import_running:
                 bot.answer_callback_query(call.id, "Уже выполняется…", show_alert=True)
                 return True
-            wh_qty = int(self.get_cfg("warehouse_release_qty", 5))
+            wh_qty = int(self.get_cfg("warehouse_release_qty", 0) or 0)
+            if wh_qty <= 0:
+                bot.answer_callback_query(call.id, "Количество = 0. Укажите в настройках.", show_alert=True)
+                return True
             bot.answer_callback_query(call.id, f"Выкладываю {wh_qty} шт…")
             threading.Thread(
                 target=self.release_warehouse_to_lot, args=(chat_id, wh_qty), daemon=True,
