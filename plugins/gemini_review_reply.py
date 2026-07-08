@@ -1302,7 +1302,7 @@ class Plugin:
             "batch_only_unanswered": True,
             "recent_replies": [],
             "autobuy_enabled": False,
-            "autobuy_quantity": 5,
+            "autobuy_quantity": 0,
             "autobuy_lot_match": DEFAULT_LOT_MATCH,
             "autobuy_lot_id": "",
             "supplier_api_url": "",
