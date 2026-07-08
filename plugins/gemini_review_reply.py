@@ -41,16 +41,16 @@ except ImportError:
 
 
 NAME          = "Gemini Review Reply"
-VERSION       = "3.1.3"
-DESCRIPTION   = "ИИ-ответы на отзывы FunPay (Gemini AQ + HTTP/SOCKS proxy + batch) 🌈"
+VERSION       = "3.2.0"
+DESCRIPTION   = "ИИ-ответы на отзывы FunPay — уникальные тексты 300–600 симв. + batch без ответа 🌈"
 CREDITS       = "Cursor AI"
 UUID          = "c4e8b2f1-9a3d-4e7b-8c6f-2d1a5e9b0c3f"
 SETTINGS_PAGE = True
 BIND_TO_DELETE = None
 
 MAX_REVIEW_LEN:   Final[int] = 999
-DEFAULT_MIN_REVIEW_LEN: Final[int] = 350
-DEFAULT_MAX_REVIEW_LEN: Final[int] = 500
+DEFAULT_MIN_REVIEW_LEN: Final[int] = 300
+DEFAULT_MAX_REVIEW_LEN: Final[int] = 600
 MAX_CHAT_LEN:     Final[int] = 240
 MAX_PROMPT_LEN:   Final[int] = 4000
 GEMINI_MAX_OUTPUT_TOKENS: Final[int] = 2048
@@ -69,41 +69,116 @@ GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
 
 _SYSTEM_PROMPT_RULES = """
 ДАННЫЕ:
-Товар: {item}
+Категория/товар (кратко): {item_short}
+Полное название (для контекста, НЕ копировать целиком): {item}
 Сумма: {cost} {currency} | Дата: {order_datetime}
-Оценка: {rating}/5 | Отзыв: {text}
+Оценка: {rating}/5 | Отзыв покупателя: {text}
 Чат: {chat_history}
 
+СТИЛЬ ЭТОГО ОТВЕТА: {style_angle}
+
 ПРАВИЛА:
-Без приветствий и имён: Начни сразу с сути. Полное табу на «Здравствуйте», «Приветствуем», «Добрый день» и имя покупателя.
-Товар: Полностью скопируй текст {item} и вставь его в первый абзац.
-Эмодзи: Очень много ярких эмодзи — буквально в каждое предложение.
-Структура: Строго 3–4 абзаца. Между абзацами — пустая строка (двойной Enter).
-Тон: Сочный, премиальный, позитивный, благодарный. Красиво обыграй отзыв «{text}».
-Уникальность: Каждый ответ должен заметно отличаться от всех предыдущих — другие слова, фразы, эмодзи и подача. Никогда не повторяй шаблоны, клише и заезженные обороты.
-Длина: Строго от {min_review_len} до {max_review_len} символов.
-Вывод: ТОЛЬКО готовый текст ответа, без кавычек и комментариев ИИ."""
+Без приветствий и имён: сразу с сути. Табу: «Здравствуйте», «Приветствуем», «Добрый день», имя покупателя.
+Товар: упомяни КРАТКО (до 40 символов), НЕ вставляй полное название лота с эмодзи.
+Эмодзи: много ярких, но количество и расстановка — на твоё усмотрение (каждый раз по-разному).
+Структура: {paragraph_rule}. Между абзацами — пустая строка.
+Тон: сочный, позитивный, живой. Обыграй отзыв «{text}» по-своему.
+Уникальность: этот текст должен РАДИКАЛЬНО отличаться от других — другой зачин, слова, ритм, эмодзи, структура.
+Запрещённые зачины: «Огромная благодарность», «Рады, что», «Для нас каждый заказ», «Потрясающе».
+Длина: строго {min_review_len}–{max_review_len} символов.
+Вывод: ТОЛЬКО готовый текст ответа."""
 
 SYSTEM_PROMPT_INTROS: Final[tuple[str, ...]] = (
-    "Напиши развёрнутый, красочный ответ на отзыв от лица продавца ({min_review_len}–{max_review_len} символов).",
-    "Создай яркий, позитивный и премиальный ответ продавца на отзыв покупателя ({min_review_len}–{max_review_len} символов).",
-    "Сформулируй сочный, эмоциональный и благодарный ответ продавца на отзыв ({min_review_len}–{max_review_len} символов).",
-    "Напиши живой, праздничный и восторженный ответ на отзыв от лица продавца ({min_review_len}–{max_review_len} символов).",
-    "Составь тёплый, стильный и запоминающийся ответ продавца на отзыв ({min_review_len}–{max_review_len} символов).",
-    "Подготовь энергичный, красочный и искренне радостный ответ продавца на отзыв ({min_review_len}–{max_review_len} символов).",
+    "Напиши уникальный красочный ответ продавца на отзыв ({min_review_len}–{max_review_len} симв.).",
+    "Создай совершенно новый по стилю ответ на отзыв покупателя ({min_review_len}–{max_review_len} симв.).",
+    "Сформулируй свежий, нешаблонный ответ продавца ({min_review_len}–{max_review_len} симв.).",
+    "Придумай оригинальный позитивный ответ на отзыв ({min_review_len}–{max_review_len} симв.).",
+    "Составь живой и запоминающийся ответ, не похожий на типовые ({min_review_len}–{max_review_len} симв.).",
+    "Подготовь яркий ответ с необычной подачей ({min_review_len}–{max_review_len} симв.).",
+    "Напиши ответ в неожиданном стиле — но тепло и позитивно ({min_review_len}–{max_review_len} симв.).",
+    "Сгенерируй ответ, который нельзя спутать с шаблоном ({min_review_len}–{max_review_len} симв.).",
+)
+
+REPLY_STYLE_ANGLES: Final[tuple[str, ...]] = (
+    "Начни с эмоциональной реакции на слова отзыва, товар — одной короткой фразой.",
+    "Начни с благодарности за доверие, но НЕ словом «благодарность» в первых 30 символах.",
+    "Начни с риторического вопроса, потом ответь на отзыв.",
+    "Расскажи мини-историю: почему этот заказ важен для магазина.",
+    "Акцент на качестве сервиса, скорости и заботе о покупателе.",
+    "Лёгкий позитивный тон с живой энергией, без пафоса.",
+    "Поэтичная подача с метафорами и образами.",
+    "Практичный тон: что ещё можем предложить и чем помочь.",
+    "Начни с цепочки из 3–5 эмодзи, затем развёрнутый текст.",
+    "Отзовись на конкретные слова отзыва, перефразируя их творчески.",
+    "Тон «праздник в магазине» — радость, сюрприз, восторг.",
+    "Спокойный премиальный тон без крикливых клише.",
+)
+
+PARAGRAPH_RULES: Final[tuple[str, ...]] = (
+    "2 коротких абзаца",
+    "3 абзаца разной длины",
+    "4 абзаца, последний — приглашение вернуться",
+    "2–3 абзаца, первый — самый длинный",
+)
+
+BANNED_OPENINGS: Final[tuple[str, ...]] = (
+    "огромная благодарность",
+    "рады, что",
+    "для нас каждый заказ",
+    "потрясающе",
+    "какая радость",
+    "огромное спасибо",
 )
 
 DEFAULT_SYSTEM_PROMPT = SYSTEM_PROMPT_INTROS[0] + _SYSTEM_PROMPT_RULES
 
 DEFAULT_REVIEW_PROMPT = (
-    "Строго выполни все правила из системного промпта. "
-    "Ответ только готовым текстом, от {min_review_len} до {max_review_len} символов. "
-    "Текст должен быть уникальным и не похожим на предыдущие ответы."
+    "Сгенерируй уникальный ответ продавца. "
+    "Длина {min_review_len}–{max_review_len} символов. "
+    "Содержание должно быть СОВЕРШЕННО другим — другой зачин, мысли, эмодзи. "
+    "Не копируй полное название товара."
 )
 
 
 def _pick_system_prompt_template() -> str:
     return random.choice(SYSTEM_PROMPT_INTROS) + _SYSTEM_PROMPT_RULES
+
+
+def _pick_style_angle() -> str:
+    return random.choice(REPLY_STYLE_ANGLES)
+
+
+def _pick_paragraph_rule() -> str:
+    return random.choice(PARAGRAPH_RULES)
+
+
+def _opening_phrase(text: str, n: int = 40) -> str:
+    clean = re.sub(r"\s+", " ", (text or "").strip().lower())
+    return clean[:n]
+
+
+def _is_too_similar(text: str, recent: list[dict[str, Any]], threshold: float = 0.55) -> bool:
+    if not text or not recent:
+        return False
+    opening = _opening_phrase(text)
+    if any(opening.startswith(banned) for banned in BANNED_OPENINGS):
+        return True
+    words = set(re.findall(r"[а-яёa-z]{4,}", text.lower()))
+    if not words:
+        return False
+    for entry in recent:
+        prev = str(entry.get("text", ""))
+        if not prev:
+            continue
+        if _opening_phrase(prev, len(opening)) == opening:
+            return True
+        prev_words = set(re.findall(r"[а-яёa-z]{4,}", prev.lower()))
+        if not prev_words:
+            continue
+        overlap = len(words & prev_words) / max(len(words | prev_words), 1)
+        if overlap >= threshold:
+            return True
+    return False
 
 DEFAULT_CHAT_SYSTEM = (
     "Ты — дружелюбный менеджер магазина FunPay. "
@@ -423,6 +498,33 @@ def _seller_review_reply(review: Any) -> str | None:
     return getattr(review, "reply", None) or getattr(review, "answer", None)
 
 
+def _has_seller_reply(review: Any) -> bool:
+    text = _seller_review_reply(review)
+    if not text:
+        return False
+    cleaned = re.sub(r"<[^>]+>", "", str(text))
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return len(cleaned) >= 2
+
+
+def _short_product_label(order: Order, max_len: int = 45) -> str:
+    """Короткое название без простыни эмодзи из лота."""
+    raw = ""
+    if order.short_description:
+        raw = order.short_description.strip()
+    elif order.subcategory:
+        raw = order.subcategory.fullname.strip()
+    elif order.lot_params_text:
+        raw = order.lot_params_text.strip()[:80]
+    else:
+        raw = "товар"
+    raw = re.sub(r"[\U0001F300-\U0001FAFF\U00002700-\U000027BF]+", " ", raw)
+    raw = re.sub(r"\s+", " ", raw).strip(" ,.-")
+    if len(raw) > max_len:
+        raw = raw[:max_len].rsplit(" ", 1)[0].strip() or raw[:max_len]
+    return raw or "товар"
+
+
 def _has_buyer_review(order: Order | None) -> bool:
     if not order or not order.review:
         return False
@@ -490,10 +592,18 @@ class Plugin:
                     loaded.setdefault("max_review_len", DEFAULT_MAX_REVIEW_LEN)
                     loaded.setdefault("use_system_variants", True)
                     loaded["_cfg_version"] = "3.1.3"
+                if old_ver < "3.2.0":
+                    loaded["system_prompt"] = DEFAULT_SYSTEM_PROMPT
+                    loaded["review_prompt"] = DEFAULT_REVIEW_PROMPT
+                    loaded["min_review_len"] = DEFAULT_MIN_REVIEW_LEN
+                    loaded["max_review_len"] = DEFAULT_MAX_REVIEW_LEN
+                    loaded.setdefault("use_system_variants", True)
+                    loaded.setdefault("batch_unanswered_count", loaded.get("batch_count", 5))
+                    loaded["_cfg_version"] = "3.2.0"
                 else:
-                    loaded.setdefault("_cfg_version", "3.1.3")
+                    loaded.setdefault("_cfg_version", "3.2.0")
                 self._cfg = loaded
-                if old_ver < "3.1.3":
+                if old_ver < "3.2.0":
                     self._save_settings()
             else:
                 self._cfg = defaults
@@ -538,16 +648,17 @@ class Plugin:
             "review_prompt": DEFAULT_REVIEW_PROMPT,
             "chat_system": DEFAULT_CHAT_SYSTEM,
             "chat_prompt": DEFAULT_CHAT_PROMPT,
-            "temperature": "0.95",
+            "temperature": "1.0",
             "min_review_len": DEFAULT_MIN_REVIEW_LEN,
             "max_review_len": DEFAULT_MAX_REVIEW_LEN,
             "use_system_variants": True,
             "send_chat_message": True,
             "reply_on_changed": True,
             "batch_count": 5,
-            "batch_only_unanswered": False,
+            "batch_unanswered_count": 10,
+            "batch_only_unanswered": True,
             "recent_replies": [],
-            "_cfg_version": "3.1.3",
+            "_cfg_version": "3.2.0",
         }
 
     @staticmethod
@@ -573,7 +684,7 @@ class Plugin:
             {"key": "review_prompt", "label": "Промпт ответа на отзыв", "type": "multiline", "default": DEFAULT_REVIEW_PROMPT, "max_len": MAX_PROMPT_LEN},
             {"key": "chat_system", "label": "Системный промпт (чат)", "type": "multiline", "default": DEFAULT_CHAT_SYSTEM, "max_len": MAX_PROMPT_LEN},
             {"key": "chat_prompt", "label": "Промпт благодарности в чат", "type": "multiline", "default": DEFAULT_CHAT_PROMPT, "max_len": MAX_PROMPT_LEN},
-            {"key": "temperature", "label": "Temperature", "type": "text", "default": "0.95"},
+            {"key": "temperature", "label": "Temperature", "type": "text", "default": "1.0"},
             {
                 "key": "min_review_len",
                 "label": "Мин. длина ответа на отзыв (симв.)",
@@ -605,12 +716,22 @@ class Plugin:
             },
             {"key": "batch_count", "label": "Кол-во последних отзывов (N)", "type": "int", "default": 5, "min": 1, "max": 50},
             {
+                "key": "batch_unanswered_count",
+                "label": "Кол-во неотвеченных отзывов (N)",
+                "type": "int",
+                "default": 10,
+                "min": 1,
+                "max": 50,
+            },
+            {
                 "key": "batch_only_unanswered",
                 "label": "Batch: только без ответа продавца",
                 "type": "bool",
-                "default": False,
+                "default": True,
             },
-            {"key": "reply_recent", "label": "▶ Ответить на N последних отзывов", "type": "action"},
+            {"key": "reply_unanswered", "label": "📭 Ответить на N неотвеченных", "type": "action"},
+            {"key": "count_unanswered", "label": "🔍 Сколько неотвеченных?", "type": "action"},
+            {"key": "reply_recent", "label": "▶ Ответить на N последних (все)", "type": "action"},
             {"key": "test_gemini", "label": "🧪 Тест Gemini API", "type": "action"},
             {"key": "check_proxy", "label": "🌐 Проверить прокси", "type": "action"},
         ]
@@ -677,7 +798,12 @@ class Plugin:
         recent = self.get_cfg("recent_replies", [])
         lines.append(f"\n📊 История ответов: <b>{len(recent)}</b>")
         if self.get_cfg("use_system_variants", True):
-            lines.append("🎲 <b>Варианты промпта:</b> случайный выбор из 6 шаблонов")
+            lines.append("🎲 <b>Варианты промпта:</b> случайный стиль каждый раз")
+        lines.append(
+            f"📏 <b>Длина ответа:</b> {self._min_review_len()}–{self._max_review_len()} симв."
+        )
+        unanswered_n = int(self.get_cfg("batch_unanswered_count", 10))
+        lines.append(f"📭 <b>Неотвеченные:</b> кнопка обработает до {unanswered_n} шт.")
         if self.get_cfg("enabled"):
             lines.append("⚡ <b>Автоответ:</b> включён — отвечаем сразу при новом отзыве")
         else:
@@ -777,10 +903,14 @@ class Plugin:
             val = DEFAULT_MAX_REVIEW_LEN
         return max(self._min_review_len(), min(MAX_REVIEW_LEN, val))
 
-    def _fill(self, template: str, order: Order, chat_history: str, order_datetime: str) -> str:
+    def _fill(
+        self, template: str, order: Order, chat_history: str, order_datetime: str,
+        style_angle: str = "", paragraph_rule: str = "",
+    ) -> str:
         review = order.review
         subs = {
             "{item}": self._product_name(order),
+            "{item_short}": _short_product_label(order),
             "{product_name}": self._product_name(order),
             "{cost}": str(order.sum),
             "{currency}": str(order.currency),
@@ -790,6 +920,8 @@ class Plugin:
             "{order_datetime}": order_datetime,
             "{min_review_len}": str(self._min_review_len()),
             "{max_review_len}": str(self._max_review_len()),
+            "{style_angle}": style_angle or _pick_style_angle(),
+            "{paragraph_rule}": paragraph_rule or _pick_paragraph_rule(),
         }
         for k, v in subs.items():
             template = template.replace(k, v)
@@ -820,53 +952,69 @@ class Plugin:
 
     def _generate_reply(self, order: Order, chat_history: str, order_datetime: str) -> str | None:
         try:
-            temp = float(self.get_cfg("temperature", "0.95"))
+            temp = float(self.get_cfg("temperature", "1.0"))
         except (TypeError, ValueError):
-            temp = 0.95
+            temp = 1.0
         min_len = self._min_review_len()
         max_len = self._max_review_len()
-        if self.get_cfg("use_system_variants", True):
-            system_tpl = _pick_system_prompt_template()
-        else:
-            system_tpl = str(self.get_cfg("system_prompt", DEFAULT_SYSTEM_PROMPT))
-        system = self._fill(system_tpl, order, chat_history, order_datetime)
-        review_tpl = str(self.get_cfg("review_prompt", DEFAULT_REVIEW_PROMPT))
-        if not review_tpl.strip():
-            review_tpl = DEFAULT_REVIEW_PROMPT
-        base_prompt = self._fill(review_tpl, order, chat_history, order_datetime)
-        recent = self.get_cfg("recent_replies", [])[-8:]
-        history_block = ""
-        if recent:
-            history_block = "\n\nНе повторяй эти ответы — каждый новый текст должен заметно отличаться:\n"
-            for i, r in enumerate(recent, 1):
-                history_block += f"{i}. {r.get('text', '')[:100]}\n"
-        length_rule = (
-            f"\n\nОБЯЗАТЕЛЬНО: ответ строго от {min_len} до {max_len} символов. "
-            f"Без приветствий. Красочно, позитивно, уникально — не копируй шаблоны."
-        )
+        recent = self.get_cfg("recent_replies", [])[-12:]
         api_key = str(self.get_cfg("gemini_api_key", ""))
         proxy = str(self.get_cfg("gemini_proxy", ""))
         model = str(self.get_cfg("gemini_model", "gemini-2.5-flash-lite"))
-        for attempt in range(3):
+        history_block = ""
+        if recent:
+            history_block = "\n\nЗАПРЕЩЕНО повторять эти ответы (другой зачин и содержание):\n"
+            for i, r in enumerate(recent, 1):
+                history_block += f"{i}. {r.get('text', '')[:120]}\n"
+        for attempt in range(5):
+            style_angle = _pick_style_angle()
+            paragraph_rule = _pick_paragraph_rule()
+            if self.get_cfg("use_system_variants", True):
+                system_tpl = _pick_system_prompt_template()
+            else:
+                system_tpl = str(self.get_cfg("system_prompt", DEFAULT_SYSTEM_PROMPT))
+            system = self._fill(
+                system_tpl, order, chat_history, order_datetime,
+                style_angle=style_angle, paragraph_rule=paragraph_rule,
+            )
+            review_tpl = str(self.get_cfg("review_prompt", DEFAULT_REVIEW_PROMPT))
+            if not review_tpl.strip():
+                review_tpl = DEFAULT_REVIEW_PROMPT
+            base_prompt = self._fill(
+                review_tpl, order, chat_history, order_datetime,
+                style_angle=style_angle, paragraph_rule=paragraph_rule,
+            )
             extra = ""
             if attempt == 1:
                 extra = (
-                    f"\n\nПредыдущий ответ был слишком коротким. "
-                    f"Напиши заново: от {min_len} до {max_len} символов, 3–4 абзаца, ярко и тепло."
+                    f"\n\nПредыдущий ответ слишком короткий. "
+                    f"Напиши заново: {min_len}–{max_len} символов."
                 )
             elif attempt == 2:
                 extra = (
-                    f"\n\nПредыдущие попытки не подошли. "
-                    f"Создай полностью новый уникальный текст ({min_len}–{max_len} симв.), "
-                    f"другие слова, эмодзи и структура."
+                    f"\n\nПредыдущий ответ был шаблонным. "
+                    f"Начни с ДРУГОГО зачина. Стиль: {style_angle}"
                 )
+            elif attempt >= 3:
+                extra = (
+                    f"\n\nКРИТИЧНО: текст должен быть уникальным. "
+                    f"Другая структура, другие слова, другие эмодзи. "
+                    f"Стиль: {style_angle}. Абзацы: {paragraph_rule}."
+                )
+            length_rule = (
+                f"\n\nДлина: {min_len}–{max_len} символов. "
+                f"Без приветствий. Не копируй полное название товара."
+            )
+            attempt_temp = min(1.2, temp + attempt * 0.05)
             prompt = base_prompt + history_block + length_rule + extra
             reply = _gemini_generate(
-                api_key, proxy, model, system, prompt, temp,
+                api_key, proxy, model, system, prompt, attempt_temp,
                 min_len=min_len, max_len=max_len,
             )
-            if reply:
+            if reply and not _is_too_similar(reply, recent):
                 return reply
+            if reply:
+                logger.warning("%s ответ похож на предыдущие — повтор генерации", _P)
         return None
 
     def _generate_chat(self, order: Order, chat_history: str, order_datetime: str) -> str | None:
@@ -916,48 +1064,84 @@ class Plugin:
         max_len = self._max_review_len()
         review = order.review
         stars = int(review.stars if review else 5)
-        item = self._product_name(order)
+        item = _short_product_label(order)
         review_text = (review.text or "").strip() if review else ""
-        variants = [
-            (
-                f"Огромная благодарность за потрясающую оценку! ⭐🔥 Рады, что «{item}» "
-                f"({order_datetime}, {order.sum} {order.currency}) пришёлся именно по душе!"
-                f"{' Отзыв «' + review_text + '» — это лучшая награда!' if review_text else ''}\n\n"
-                f"Для нас каждый заказ — это маленький праздник, и такие отзывы заряжают на новые свершения! 💎🚀 "
-                f"Мы вкладываем душу в каждую услугу и всегда стремимся к идеалу. 🌟\n\n"
-                f"Будем рады видеть вас снова и снова готовы порадовать качественным сервисом! 💫🎉 "
-                f"Спасибо, что выбрали нас — вы лучшие! ❤️"
-            ),
-            (
-                f"Какая радость получить такой яркий отзыв! 🌈✨ «{item}» "
-                f"({order_datetime}) — и мы счастливы, что всё прошло на высшем уровне!"
-                f"{' Ваши слова «' + review_text + '» согрели душу!' if review_text else ''}\n\n"
-                f"Каждый заказ для нас — особенный, и ваша оценка мотивирует дарить только лучшее! 💎🔥 "
-                f"Мы тщательно следим за качеством и всегда готовы помочь. 🌟\n\n"
-                f"Ждём вас снова с открытыми объятиями и новыми приятными сюрпризами! 🎊💫 "
-                f"Спасибо за доверие — это бесценно! ❤️🚀"
-            ),
-            (
-                f"Потрясающе! ⭐💫 «{item}» ({order_datetime}, {order.sum} {order.currency}) "
-                f"— и такой тёплый отклик делает наш день по-настоящему праздничным!"
-                f"{' Особенно приятно услышать: «' + review_text + '»!' if review_text else ''}\n\n"
-                f"Мы вкладываем сердце в каждую сделку и радуемся, когда покупатели остаются довольны! 🔥💎 "
-                f"Качество, скорость и забота — наш ежедневный стандарт. 🌟✨\n\n"
-                f"Возвращайтесь к нам снова — будем рады порадовать ещё ярче! 🎉❤️ "
-                f"Вы — лучшее подтверждение, что мы на правильном пути! 🚀"
-            ),
-        ]
+        seed = int(hashlib.md5(f"{order.id}:{review_text}".encode()).hexdigest()[:8], 16)
+        rng = random.Random(seed)
         if stars == 1:
-            base = (
-                f"Очень жаль, что заказ «{item}» ({order_datetime}) не оправдал ожиданий. 😔 "
-                f"Мы внимательно относимся к каждому отзыву и готовы разобраться в ситуации. "
-                f"Напишите в чат — постараемся помочь и всё исправить. 🙏 "
-                f"Нам важен каждый покупатель, и мы работаем над качеством каждый день. ✨"
-            )
+            bases = [
+                (
+                    f"Жаль, что {item} ({order_datetime}) не зашёл как ожидалось. 😔 "
+                    f"Разберёмся в чате и постараемся всё исправить — нам важен каждый покупатель. 🙏"
+                ),
+                (
+                    f"Видим оценку по {item} и хотим разобраться. 💬 "
+                    f"Напишите в чат — найдём решение и улучшим сервис. ✨"
+                ),
+            ]
+            base = rng.choice(bases)
             return _format_for_funpay_review(
                 self._expand_reply_to_min(base, min_len, max_len), max_len,
             )
-        base = random.choice(variants)
+        note = f"«{review_text}»" if review_text and review_text not in (".", "…") else "ваша оценка"
+        variants = [
+            (
+                f"⭐ {note} — именно то, ради чего мы стараемся! 🔥 "
+                f"Заказ {item} ({order.sum} {order.currency}) прошёл {order_datetime} — и это вдохновляет команду! 💎\n\n"
+                f"Каждый отзыв — как заряд энергии: хочется делать сервис ещё быстрее и приятнее. 🚀 "
+                f"Если понадобится помощь — мы рядом. 🌟\n\n"
+                f"Возвращайтесь — будем рады новым заказам! 🎉✨"
+            ),
+            (
+                f"Вау, {note}! 🌈✨ {item} — и такой отклик согревает! "
+                f"Дата заказа: {order_datetime}. Ценим доверие на {order.sum} {order.currency}. 💫\n\n"
+                f"Мы вкладываемся в скорость, качество и заботу — и ваши слова подтверждают, что движемся верно. 🔥\n\n"
+                f"Ждём снова — готовы порадовать ещё ярче! 🎊❤️"
+            ),
+            (
+                f"🎯 {note} — лучший комплимент для нас! "
+                f"По {item} ({order_datetime}) рады, что всё сложилось отлично. 💎\n\n"
+                f"Для команды это не просто заказ — это мотивация держать планку высоко. 🚀 "
+                f"Всегда на связи, если что-то понадобится. ✨\n\n"
+                f"До новых встреч в магазине! 🌟🎉"
+            ),
+            (
+                f"✨ Услышали вас: {note}! "
+                f"Сервис {item} — наша гордость, а {order_datetime} запомнился как удачная сделка. 🔥\n\n"
+                f"Стараемся, чтобы каждый шаг — от оплаты до результата — был комфортным. 💫 "
+                f"Спасибо за {order.sum} {order.currency} доверия! ❤️\n\n"
+                f"Заходите снова — есть чем удивить! 🚀"
+            ),
+            (
+                f"🔥 {note} заряжает на весь день! "
+                f"Заказ по {item} ({order_datetime}) — и мы счастливы, что попали в ожидания. 🌟\n\n"
+                f"Качество, скорость, поддержка — три кита нашего сервиса. 💎 "
+                f"Рады, что вы это почувствовали! ✨\n\n"
+                f"Будем ждать вас снова! 🎉💫"
+            ),
+            (
+                f"💫 Отзыв {note} — музыка для нас! "
+                f"{item}, {order.sum} {order.currency}, {order_datetime} — всё сложилось как надо. 🎯\n\n"
+                f"Мы растём благодаря таким покупателям — спасибо за искренность! 🔥 "
+                f"Пишите в чат, если захотите повторить. ✨\n\n"
+                f"До скорой встречи! 🌈❤️"
+            ),
+            (
+                f"🚀 {note} — супер! "
+                f"По {item} ({order_datetime}) рады, что сервис оправдал ожидания. ⭐\n\n"
+                f"Команда работает, чтобы каждый заказ был лёгким и приятным. 💎 "
+                f"Ваши слова — лучшая награда! 🌟\n\n"
+                f"Возвращайтесь — будем только рады! 🎊✨"
+            ),
+            (
+                f"🌟 Прочитали {note} — улыбнулись! "
+                f"{item} на {order.sum} {order.currency}, заказ {order_datetime}. 🔥\n\n"
+                f"Такие отклики напоминают, зачем мы здесь: делать покупку простой и радостной. 💫 "
+                f"Всегда готовы помочь! ✨\n\n"
+                f"Ждём вас снова! 🎉❤️"
+            ),
+        ]
+        base = variants[seed % len(variants)]
         if "пив" in review_text.lower():
             base += " 🍺 Приятного отдыха!"
         return _format_for_funpay_review(
@@ -1001,6 +1185,8 @@ class Plugin:
     def _should_skip_review(self, order: Order, msg_type: MessageTypes) -> bool:
         """Пропуск только если на этот же текст отзыва уже отвечали."""
         if msg_type == MessageTypes.FEEDBACK_CHANGED:
+            return False
+        if not _has_seller_reply(order.review):
             return False
         fp = _review_fingerprint(order)
         if not fp:
@@ -1046,11 +1232,24 @@ class Plugin:
             logger.error("%s ошибка мгновенного ответа: %s", _P, exc)
             logger.debug(traceback.format_exc())
 
+    def _fetch_fresh_order(self, order_id: str) -> Order | None:
+        try:
+            order = self.cardinal.account.get_order(order_id)
+            return order if _has_buyer_review(order) else None
+        except Exception as exc:
+            logger.debug("%s get_order #%s: %s", _P, order_id, exc)
+            return None
+
     def process_order(
         self, order: Order, chat_id: Any = None,
         shortcut_date: datetime | None = None, force_update: bool = False,
+        only_if_unanswered: bool = False,
     ) -> bool:
         if not _has_buyer_review(order):
+            return False
+        order = self._fetch_fresh_order(order.id) or order
+        if only_if_unanswered and _has_seller_reply(order.review):
+            self.log("Отзыв #%s уже с ответом продавца — пропуск", order.id)
             return False
         oid = order.id
         with self._lock:
@@ -1081,7 +1280,9 @@ class Plugin:
                     self._expand_reply_to_min(reply, min_len, max_len), max_len,
                 )
             if self._is_duplicate(reply) and not force_update:
-                reply = self._fallback_reply(order, order_dt)
+                regen = self._generate_reply(order, chat_history, order_dt)
+                reply = regen or self._fallback_reply(order, order_dt)
+                reply = _format_for_funpay_review(_strip_name(reply, buyer), max_len)
             self.cardinal.account.send_review(oid, reply)
             self._remember_reply(reply, order)
             self.log("Ответ #%s отправлен (%s симв.)", oid, len(reply))
@@ -1131,18 +1332,19 @@ class Plugin:
             result.append((order, date_map.get(oid)))
         return result
 
-    def fetch_last_reviews(self, limit: int) -> list[tuple[Order, datetime | None]]:
-        """Последние N заказов с отзывом покупателя (по дате в списке продаж)."""
+    def _scan_review_candidates(
+        self, limit: int, only_unanswered: bool,
+    ) -> list[tuple[Order, datetime | None]]:
+        """Сканирует продажи и возвращает заказы с отзывами покупателя."""
         limit = max(1, min(50, limit))
-        only_unanswered = bool(self.get_cfg("batch_only_unanswered", False))
         result: list[tuple[Order, datetime | None]] = []
         pending: list[Any] = []
         start_from: str | None = None
         seen_ids: set[str] = set()
-        max_pages = 50
-        max_scan = max(limit * 25, 120)
+        max_pages = 80
+        max_scan = max(limit * 60, 200) if only_unanswered else max(limit * 25, 120)
 
-        for _ in range(max_pages):
+        for page in range(max_pages):
             if len(result) >= limit or len(seen_ids) >= max_scan:
                 break
             try:
@@ -1163,24 +1365,18 @@ class Plugin:
                     continue
                 seen_ids.add(shortcut.id)
                 pending.append(shortcut)
-                if len(pending) >= 10:
-                    for order, sdate in self._orders_from_shortcuts(pending):
-                        if only_unanswered and _seller_review_reply(order.review):
-                            continue
-                        result.append((order, sdate))
-                        if len(result) >= limit:
-                            break
+                if len(pending) >= 8:
+                    result.extend(
+                        self._filter_review_orders(pending, limit - len(result), only_unanswered),
+                    )
                     pending = []
                     if len(result) >= limit:
                         break
 
             if len(result) < limit and pending:
-                for order, sdate in self._orders_from_shortcuts(pending):
-                    if only_unanswered and _seller_review_reply(order.review):
-                        continue
-                    result.append((order, sdate))
-                    if len(result) >= limit:
-                        break
+                result.extend(
+                    self._filter_review_orders(pending, limit - len(result), only_unanswered),
+                )
                 pending = []
 
             if len(result) >= limit:
@@ -1188,51 +1384,120 @@ class Plugin:
             if not next_id:
                 break
             start_from = next_id
-            time.sleep(0.25)
+            time.sleep(0.2)
 
-        mode = "без ответа" if only_unanswered else "все"
-        self.log("Найдено %s последних отзывов (%s, запрошено %s)", len(result), mode, limit)
         return result[:limit]
 
+    def _filter_review_orders(
+        self, shortcuts: list[Any], need: int, only_unanswered: bool,
+    ) -> list[tuple[Order, datetime | None]]:
+        if need <= 0 or not shortcuts:
+            return []
+        date_map = {s.id: getattr(s, "date", None) for s in shortcuts}
+        found: list[tuple[Order, datetime | None]] = []
+        for shortcut in shortcuts:
+            order = self._fetch_fresh_order(shortcut.id)
+            if not order:
+                continue
+            if only_unanswered and _has_seller_reply(order.review):
+                continue
+            found.append((order, date_map.get(shortcut.id)))
+            if len(found) >= need:
+                break
+        return found
+
+    def fetch_last_reviews(self, limit: int) -> list[tuple[Order, datetime | None]]:
+        """Последние N заказов с отзывом покупателя."""
+        only_unanswered = bool(self.get_cfg("batch_only_unanswered", True))
+        result = self._scan_review_candidates(limit, only_unanswered)
+        mode = "без ответа" if only_unanswered else "все"
+        self.log("Найдено %s отзывов (%s, запрошено %s)", len(result), mode, limit)
+        return result
+
+    def fetch_unanswered_reviews(self, limit: int) -> list[tuple[Order, datetime | None]]:
+        """Последние N отзывов БЕЗ ответа продавца на FunPay."""
+        limit = max(1, min(50, limit))
+        result = self._scan_review_candidates(limit, only_unanswered=True)
+        self.log("Найдено %s неотвеченных отзывов (запрошено %s)", len(result), limit)
+        return result
+
+    def count_unanswered_reviews(self, scan_limit: int = 30) -> int:
+        """Подсчёт неотвеченных среди последних scan_limit отзывов."""
+        found = self._scan_review_candidates(scan_limit, only_unanswered=True)
+        return len(found)
+
     def batch_reply_recent(self, notify_chat_id: int | None = None) -> None:
-        """Ручная обработка N последних отзывов покупателей."""
+        """Ручная обработка N последних отзывов (все или только без ответа — по настройке)."""
         if self._batch_running:
             return
         self._batch_running = True
-        bot = self.cardinal.telegram.bot if self.cardinal.telegram else None
         count = int(self.get_cfg("batch_count", 5))
         count = max(1, min(50, count))
+        only_unanswered = bool(self.get_cfg("batch_only_unanswered", True))
         try:
-            self.log("Обработка %s последних отзывов…", count)
+            mode = "неотвеченных" if only_unanswered else "последних"
+            self.log("Обработка %s %s отзывов…", count, mode)
             orders = self.fetch_last_reviews(count)
-            if not orders:
-                msg = f"📭 Не найдено отзывов (запрошено: {count}). Проверьте закрытые заказы на FunPay."
-                self.log(msg)
-                if bot and notify_chat_id:
-                    bot.send_message(notify_chat_id, msg)
-                return
-            ok, fail = 0, 0
-            if bot and notify_chat_id:
-                bot.send_message(
-                    notify_chat_id,
-                    f"⏳ <b>Обрабатываю {len(orders)} последних отзыв(ов)…</b>",
-                    parse_mode="HTML",
-                )
-            for order, sdate in orders:
-                if self.process_order(order, shortcut_date=sdate):
-                    ok += 1
-                else:
-                    fail += 1
-                    logger.warning("%s не удалось обработать отзыв #%s", _P, order.id)
-                time.sleep(2)
-            summary = (
-                f"✅ <b>Готово:</b> успешно <b>{ok}</b>, ошибок <b>{fail}</b> из <b>{len(orders)}</b>"
-            )
-            self.log(summary.replace("<b>", "").replace("</b>", ""))
-            if bot and notify_chat_id:
-                bot.send_message(notify_chat_id, summary, parse_mode="HTML")
+            self._run_batch(orders, notify_chat_id, only_if_unanswered=only_unanswered)
         finally:
             self._batch_running = False
+
+    def batch_reply_unanswered(self, notify_chat_id: int | None = None) -> None:
+        """Ответить на N неотвеченных отзывов."""
+        if self._batch_running:
+            return
+        self._batch_running = True
+        count = int(self.get_cfg("batch_unanswered_count", 10))
+        count = max(1, min(50, count))
+        try:
+            self.log("Обработка %s неотвеченных отзывов…", count)
+            orders = self.fetch_unanswered_reviews(count)
+            self._run_batch(orders, notify_chat_id, only_if_unanswered=True)
+        finally:
+            self._batch_running = False
+
+    def _run_batch(
+        self,
+        orders: list[tuple[Order, datetime | None]],
+        notify_chat_id: int | None,
+        only_if_unanswered: bool = False,
+    ) -> None:
+        bot = self.cardinal.telegram.bot if self.cardinal.telegram else None
+        if not orders:
+            msg = "📭 Неотвеченных отзывов не найдено. Попробуйте увеличить N или проверьте закрытые заказы."
+            if not only_if_unanswered:
+                msg = "📭 Отзывы не найдены. Проверьте закрытые заказы на FunPay."
+            self.log(msg)
+            if bot and notify_chat_id:
+                bot.send_message(notify_chat_id, msg)
+            return
+        ok, fail, skipped = 0, 0, 0
+        if bot and notify_chat_id:
+            bot.send_message(
+                notify_chat_id,
+                f"⏳ <b>Обрабатываю {len(orders)} отзыв(ов)…</b>",
+                parse_mode="HTML",
+            )
+        for order, sdate in orders:
+            if only_if_unanswered and _has_seller_reply(order.review):
+                skipped += 1
+                continue
+            if self.process_order(
+                order, shortcut_date=sdate, force_update=not only_if_unanswered,
+                only_if_unanswered=only_if_unanswered,
+            ):
+                ok += 1
+            else:
+                fail += 1
+                logger.warning("%s не удалось обработать отзыв #%s", _P, order.id)
+            time.sleep(2)
+        summary = (
+            f"✅ <b>Готово:</b> успешно <b>{ok}</b>, ошибок <b>{fail}</b>"
+            f"{f', пропущено <b>{skipped}</b>' if skipped else ''} из <b>{len(orders)}</b>"
+        )
+        self.log(summary.replace("<b>", "").replace("</b>", ""))
+        if bot and notify_chat_id:
+            bot.send_message(notify_chat_id, summary, parse_mode="HTML")
 
     def on_settings_action(self, call: CallbackQuery, action: str) -> bool:
         bot = self.cardinal.telegram.bot
@@ -1265,7 +1530,41 @@ class Plugin:
                 target=self.batch_reply_recent, args=(chat_id,), daemon=True,
             ).start()
             return True
+        if action == "reply_unanswered":
+            if self._batch_running:
+                bot.answer_callback_query(call.id, "Уже выполняется…", show_alert=True)
+                return True
+            n = int(self.get_cfg("batch_unanswered_count", 10))
+            bot.answer_callback_query(call.id, f"Запуск: {n} неотвеченных…")
+            threading.Thread(
+                target=self.batch_reply_unanswered, args=(chat_id,), daemon=True,
+            ).start()
+            return True
+        if action == "count_unanswered":
+            bot.answer_callback_query(call.id, "Сканирую…")
+            scan_n = max(int(self.get_cfg("batch_unanswered_count", 10)) * 3, 30)
+            threading.Thread(
+                target=self._notify_unanswered_count, args=(chat_id, scan_n), daemon=True,
+            ).start()
+            return True
         return False
+
+    def _notify_unanswered_count(self, chat_id: int, scan_limit: int) -> None:
+        bot = self.cardinal.telegram.bot if self.cardinal.telegram else None
+        if not bot:
+            return
+        try:
+            count = self.count_unanswered_reviews(scan_limit)
+            n = int(self.get_cfg("batch_unanswered_count", 10))
+            bot.send_message(
+                chat_id,
+                f"🔍 <b>Неотвеченных отзывов:</b> <b>{count}</b> "
+                f"(проверено до {scan_limit} последних)\n\n"
+                f"Кнопка «📭 Ответить на N неотвеченных» обработает до <b>{n}</b>.",
+                parse_mode="HTML",
+            )
+        except Exception as exc:
+            bot.send_message(chat_id, f"❌ Ошибка сканирования: {exc}")
 
     # ── Telegram UI (schema-driven, как Starvell) ────────────────────────────
 
