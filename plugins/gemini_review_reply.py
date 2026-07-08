@@ -41,7 +41,7 @@ except ImportError:
 
 
 NAME          = "Gemini Review Reply"
-VERSION       = "3.3.0"
+VERSION       = "3.3.1"
 DESCRIPTION   = "ИИ-ответы на отзывы — 2200+ вариантов стиля, 300–600 симв. 🌈"
 CREDITS       = "Cursor AI"
 UUID          = "c4e8b2f1-9a3d-4e7b-8c6f-2d1a5e9b0c3f"
@@ -662,6 +662,14 @@ def _format_datetime(dt: datetime) -> str:
 
 def _escape(val: Any) -> str:
     return html.escape(str(val if val is not None else ""))
+
+
+def _register_priority_cbq(tg, handler, predicate) -> None:
+    """Регистрирует callback-хэндлер до catch-all default_cp в Cardinal."""
+    tg.cbq_handler(handler, predicate)
+    handlers = tg.bot.callback_query_handlers
+    if handlers:
+        handlers.insert(0, handlers.pop())
 
 
 def _clean_reply_text(text: str | None, bot_suffixes: tuple[str, ...] = ()) -> str:
@@ -1939,11 +1947,23 @@ class Plugin:
                 bot.reply_to(message, f"✅ Сохранено: <b>{field.get('label', key)}</b>", parse_mode="HTML")
 
         def on_plugin_settings(call: CallbackQuery) -> None:
-            if f"{CBT.PLUGIN_SETTINGS}:{UUID}" not in (call.data or ""):
-                if not (call.data or "").startswith(f"{CBT.EDIT_PLUGIN}:{UUID}"):
-                    return
-            show_settings(call.message.chat.id, call.message.message_id, 0)
-            bot.answer_callback_query(call.id)
+            try:
+                bot.answer_callback_query(call.id)
+            except Exception:
+                pass
+            try:
+                show_settings(call.message.chat.id, call.message.message_id, 0)
+            except Exception as exc:
+                plugin.log("ошибка открытия настроек: %s", exc)
+                logger.debug("TRACEBACK", exc_info=True)
+                try:
+                    bot.send_message(
+                        call.message.chat.id,
+                        f"⚠️ Не удалось открыть настройки: <code>{_escape(exc)[:180]}</code>",
+                        parse_mode="HTML",
+                    )
+                except Exception:
+                    pass
 
         def _is_editing(m: Message) -> bool:
             state_data = tg.get_state(m.chat.id, m.from_user.id)
@@ -1952,7 +1972,11 @@ class Plugin:
             return str(state_data["state"]).startswith(f"{CB_PREFIX}:edit:")
 
         tg.cbq_handler(on_callback, lambda c: (c.data or "").startswith(f"{CB_PREFIX}:"))
-        tg.cbq_handler(on_plugin_settings, lambda c: f"{CBT.PLUGIN_SETTINGS}:{UUID}" in (c.data or ""))
+        _register_priority_cbq(
+            tg,
+            on_plugin_settings,
+            lambda c: (c.data or "").startswith(f"{CBT.PLUGIN_SETTINGS}:{UUID}:"),
+        )
         tg.msg_handler(on_text, func=_is_editing)
         self.log("Telegram schema UI зарегистрирован ✅")
 

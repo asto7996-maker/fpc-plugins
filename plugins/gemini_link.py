@@ -34,7 +34,7 @@ except ImportError:
 
 
 NAME          = "Gemini Link Auto"
-VERSION       = "2.4.0"
+VERSION       = "2.4.1"
 DESCRIPTION   = "GPT plus 1M (NW) — авто-закупка аккаунтов и выдача на FunPay"
 CREDITS       = "Cursor AI"
 UUID          = "f7a2e8c1-4b3d-4e9f-a8c2-1d5e9b0f6a3c"
@@ -86,6 +86,14 @@ _plugin: "Plugin | None" = None
 
 def _escape(val: Any) -> str:
     return html.escape(str(val if val is not None else ""))
+
+
+def _register_priority_cbq(tg, handler, predicate) -> None:
+    """Регистрирует callback-хэндлер до catch-all default_cp в Cardinal."""
+    tg.cbq_handler(handler, predicate)
+    handlers = tg.bot.callback_query_handlers
+    if handlers:
+        handlers.insert(0, handlers.pop())
 
 
 def _dig(data: Any, *keys: str, default: Any = None) -> Any:
@@ -177,6 +185,7 @@ def _shop_headers(api_key: str) -> dict[str, str]:
 
 def _shop_request(
     api_url: str, api_key: str, method: str, path: str, body: dict | None = None,
+    timeout: float = 60,
 ) -> tuple[Any, str]:
     api_url = (api_url or "").strip().rstrip("/")
     api_key = (api_key or "").strip()
@@ -188,9 +197,9 @@ def _shop_request(
     headers = _shop_headers(api_key)
     try:
         if method.upper() == "GET":
-            resp = http_get(url, headers=headers, timeout=60)
+            resp = http_get(url, headers=headers, timeout=timeout)
         else:
-            resp = http_post(url, json=body or {}, headers=headers, timeout=90)
+            resp = http_post(url, json=body or {}, headers=headers, timeout=max(timeout, 30))
         try:
             data = resp.json()
         except Exception:
@@ -494,7 +503,16 @@ class Plugin:
         except (TypeError, ValueError):
             return default
 
-    def calc_buy_plan(self, max_qty: int | None = None) -> dict[str, Any]:
+    def calc_buy_plan(self, max_qty: int | None = None, *, fast: bool = False) -> dict[str, Any]:
+        if fast:
+            cached = getattr(self, "_buy_plan_cache", None)
+            if isinstance(cached, dict) and (time.time() - getattr(self, "_buy_plan_cache_ts", 0)) < 60:
+                return cached
+            api_key = str(self.get_cfg("shop_api_key", "") or "").strip()
+            if not api_key:
+                return {"ok": False, "error": "Не задан API-ключ. Настройки → API-ключ."}
+            return {"ok": False, "error": "нажмите «Баланс» для обновления"}
+
         api_url, api_key = self._shop_client()
         if not api_key:
             return {"ok": False, "error": "Не задан API-ключ. Настройки → API-ключ."}
@@ -537,7 +555,7 @@ class Plugin:
                 "balance": balance, "reserve": reserve, "price": price,
             }
         spend = round(qty * price, 2)
-        return {
+        result = {
             "ok": True,
             "qty": qty,
             "spend": spend,
@@ -549,6 +567,9 @@ class Plugin:
             "product_name": str(product.get("name_en") or product.get("name") or SHOP_PRODUCT_NAME),
             "shop_stock": product.get("stock_count"),
         }
+        self._buy_plan_cache = result
+        self._buy_plan_cache_ts = time.time()
+        return result
 
     def _lot_full_text(self, lot_id: int) -> str:
         chunks: list[str] = []
@@ -579,7 +600,7 @@ class Plugin:
         self._cached_lot_id = None
         self._cached_lot_ts = 0.0
 
-    def _resolve_autobuy_lot_ids(self, silent: bool = False) -> list[int]:
+    def _resolve_autobuy_lot_ids(self, silent: bool = False, fast: bool = False) -> list[int]:
         lot_id_raw = str(self.get_cfg("autobuy_lot_id", "")).strip()
         if lot_id_raw.isdigit():
             lot_id = int(lot_id_raw)
@@ -611,6 +632,8 @@ class Plugin:
                 continue
             if _lot_text_matches(desc, needle) or _lot_text_matches(title, needle):
                 matched.append(lot_id)
+                continue
+            if fast:
                 continue
             full_text = self._lot_full_text(lot_id)
             if _lot_text_matches(full_text, needle):
@@ -1281,17 +1304,19 @@ class Plugin:
             return self._settings_fields()
         return []
 
-    def _lot_stock_info(self) -> str:
-        lot_ids = self._resolve_autobuy_lot_ids(silent=True)
+    def _lot_stock_info(self, fast: bool = False) -> str:
+        lot_ids = self._resolve_autobuy_lot_ids(silent=True, fast=fast)
         if not lot_ids:
             return "лот не найден"
+        if fast:
+            return f"лот #{lot_ids[0]}"
         try:
             lf = self.cardinal.account.get_lot_fields(int(lot_ids[0]))
             return f"{len(lf.secrets)} шт. (лот #{lot_ids[0]})"
         except Exception:
             return "—"
 
-    def render_settings_text(self, page: str = "hub") -> str:
+    def render_settings_text(self, page: str = "hub", fast: bool = False) -> str:
         pages = self._ui_pages()
         page = page if page in pages else "hub"
         lines = [
@@ -1305,16 +1330,16 @@ class Plugin:
             wh_qty = int(self.get_cfg("warehouse_release_qty", 5) or 0)
             budget = self._float_cfg("buy_budget_usd")
             reserve = self._float_cfg("reserve_balance_usd", 10.0)
-            plan = self.calc_buy_plan()
+            plan = self.calc_buy_plan(fast=fast)
             lines += [
                 f"<b>Режим:</b> {self.stock_mode_label(mode)}",
-                f"📦 <b>Лот FunPay:</b> {self._lot_stock_info()}",
+                f"📦 <b>Лот FunPay:</b> {self._lot_stock_info(fast=fast)}",
                 f"🗄 <b>Склад плагина:</b> {self.warehouse_count()} шт.",
             ]
             if mode == "auto_buy":
                 auto_on = bool(self.get_cfg("auto_enabled", True))
                 min_stock = int(self.get_cfg("min_lot_stock", DEFAULT_MIN_LOT_STOCK))
-                lot_ids = self._resolve_autobuy_lot_ids(silent=True)
+                lot_ids = self._resolve_autobuy_lot_ids(silent=True, fast=fast)
                 lot_hint = f"#{lot_ids[0]}" if lot_ids else "не найден"
                 lines.append(f"🛍 <b>Товар:</b> <code>{_escape(SHOP_PRODUCT_NAME)}</code>")
                 lines.append(f"📋 <b>Формат:</b> <code>почта|пароль|2FA</code>")
@@ -1362,7 +1387,7 @@ class Plugin:
             )
         return "\n".join(lines)
 
-    def build_settings_keyboard(self, page: str = "hub") -> IKM:
+    def build_settings_keyboard(self, page: str = "hub", fast: bool = False) -> IKM:
         kb = IKM()
         page = page if page in self._ui_pages() else "hub"
 
@@ -1383,7 +1408,7 @@ class Plugin:
                 reserve = self._float_cfg("reserve_balance_usd", 10.0)
                 auto_on = bool(self.get_cfg("auto_enabled", True))
                 min_stock = int(self.get_cfg("min_lot_stock", DEFAULT_MIN_LOT_STOCK))
-                plan = self.calc_buy_plan()
+                plan = self.calc_buy_plan(fast=fast)
                 kb.row(IKB(
                     f"{'🟢' if auto_on else '🔴'} Авто: {'ВКЛ' if auto_on else 'ВЫКЛ'}",
                     callback_data=f"{CB_PREFIX}:togkey:auto_enabled",
@@ -1435,7 +1460,7 @@ class Plugin:
                     callback_data=f"{CB_PREFIX}:edit:{page}:{i}",
                 ))
             if page == "settings":
-                plan = self.calc_buy_plan()
+                plan = self.calc_buy_plan(fast=fast)
                 if plan.get("ok"):
                     kb.row(IKB(
                         f"🛒 Купить {plan['qty']} шт.",
@@ -1549,9 +1574,9 @@ class Plugin:
         bot = tg.bot
         plugin = self
 
-        def show_settings(chat_id: int, msg_id: int, page: str = "hub") -> None:
-            text = plugin.render_settings_text(page)
-            kb = plugin.build_settings_keyboard(page)
+        def show_settings(chat_id: int, msg_id: int, page: str = "hub", fast: bool = False) -> None:
+            text = plugin.render_settings_text(page, fast=fast)
+            kb = plugin.build_settings_keyboard(page, fast=fast)
             try:
                 bot.edit_message_text(text, chat_id, msg_id, reply_markup=kb, parse_mode="HTML")
             except Exception:
@@ -1805,11 +1830,23 @@ class Plugin:
                 bot.reply_to(message, f"✅ Сохранено: <b>{field.get('label', key)}</b>", parse_mode="HTML")
 
         def on_plugin_settings(call: CallbackQuery) -> None:
-            if f"{CBT.PLUGIN_SETTINGS}:{UUID}" not in (call.data or ""):
-                if not (call.data or "").startswith(f"{CBT.EDIT_PLUGIN}:{UUID}"):
-                    return
-            show_settings(call.message.chat.id, call.message.message_id, "hub")
-            bot.answer_callback_query(call.id)
+            try:
+                bot.answer_callback_query(call.id)
+            except Exception:
+                pass
+            try:
+                show_settings(call.message.chat.id, call.message.message_id, "hub", fast=True)
+            except Exception as exc:
+                plugin.log("ошибка открытия настроек: %s", exc)
+                logger.debug("TRACEBACK", exc_info=True)
+                try:
+                    bot.send_message(
+                        call.message.chat.id,
+                        f"⚠️ Не удалось открыть настройки: <code>{_escape(exc)[:180]}</code>",
+                        parse_mode="HTML",
+                    )
+                except Exception:
+                    pass
 
         def _is_editing(m: Message) -> bool:
             state_data = tg.get_state(m.chat.id, m.from_user.id)
@@ -1818,7 +1855,11 @@ class Plugin:
             return str(state_data["state"]).startswith(f"{CB_PREFIX}:edit:")
 
         tg.cbq_handler(on_callback, lambda c: (c.data or "").startswith(f"{CB_PREFIX}:"))
-        tg.cbq_handler(on_plugin_settings, lambda c: f"{CBT.PLUGIN_SETTINGS}:{UUID}" in (c.data or ""))
+        _register_priority_cbq(
+            tg,
+            on_plugin_settings,
+            lambda c: (c.data or "").startswith(f"{CBT.PLUGIN_SETTINGS}:{UUID}:"),
+        )
         tg.msg_handler(on_import_text, func=_is_importing)
         tg.msg_handler(on_import_document, content_types=["document"], func=_is_importing)
         tg.msg_handler(on_text, func=_is_editing)
