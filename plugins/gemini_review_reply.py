@@ -41,8 +41,8 @@ except ImportError:
 
 
 NAME          = "Gemini Review Reply"
-VERSION       = "3.2.1"
-DESCRIPTION   = "ИИ-ответы на отзывы FunPay — уникальные тексты 300–600 симв. + batch без ответа 🌈"
+VERSION       = "3.3.0"
+DESCRIPTION   = "ИИ-ответы на отзывы — 2200+ вариантов стиля, 300–600 симв. 🌈"
 CREDITS       = "Cursor AI"
 UUID          = "c4e8b2f1-9a3d-4e7b-8c6f-2d1a5e9b0c3f"
 SETTINGS_PAGE = True
@@ -97,21 +97,18 @@ SYSTEM_PROMPT_INTROS: Final[tuple[str, ...]] = (
     "Подготовь яркий ответ с необычной подачей ({min_review_len}–{max_review_len} симв.).",
     "Напиши ответ в неожиданном стиле — но тепло и позитивно ({min_review_len}–{max_review_len} симв.).",
     "Сгенерируй ответ, который нельзя спутать с шаблоном ({min_review_len}–{max_review_len} симв.).",
-)
-
-REPLY_STYLE_ANGLES: Final[tuple[str, ...]] = (
-    "Начни с эмоциональной реакции на слова отзыва, товар — одной короткой фразой.",
-    "Начни с благодарности за доверие, но НЕ словом «благодарность» в первых 30 символах.",
-    "Начни с риторического вопроса, потом ответь на отзыв.",
-    "Расскажи мини-историю: почему этот заказ важен для магазина.",
-    "Акцент на качестве сервиса, скорости и заботе о покупателе.",
-    "Лёгкий позитивный тон с живой энергией, без пафоса.",
-    "Поэтичная подача с метафорами и образами.",
-    "Практичный тон: что ещё можем предложить и чем помочь.",
-    "Начни с цепочки из 3–5 эмодзи, затем развёрнутый текст.",
-    "Отзовись на конкретные слова отзыва, перефразируя их творчески.",
-    "Тон «праздник в магазине» — радость, сюрприз, восторг.",
-    "Спокойный премиальный тон без крикливых клише.",
+    "Выдай свежий текст-отклик продавца, будто пишешь впервые ({min_review_len}–{max_review_len} симв.).",
+    "Собери эмоциональный ответ без клише и повторов ({min_review_len}–{max_review_len} симв.).",
+    "Напиши ответ с необычным зачином и живой подачей ({min_review_len}–{max_review_len} симв.).",
+    "Сделай ответ продавца ярким, искренним и непохожим на другие ({min_review_len}–{max_review_len} симв.).",
+    "Сформируй позитивный отклик с акцентом на уникальность формулировок ({min_review_len}–{max_review_len} симв.).",
+    "Придумай развёрнутый ответ в свободном стиле, но по правилам ({min_review_len}–{max_review_len} симв.).",
+    "Подготовь ответ, где каждое предложение звучит по-новому ({min_review_len}–{max_review_len} симв.).",
+    "Напиши сочный ответ-реакцию на отзыв покупателя ({min_review_len}–{max_review_len} симв.).",
+    "Создай тёплый и стильный ответ без шаблонных фраз ({min_review_len}–{max_review_len} симв.).",
+    "Сгенерируй живой ответ с неожиданной структурой ({min_review_len}–{max_review_len} симв.).",
+    "Составь красочный ответ, который выделяется на фоне типовых ({min_review_len}–{max_review_len} симв.).",
+    "Напиши оригинальный ответ продавца с яркими эмодзи ({min_review_len}–{max_review_len} симв.).",
 )
 
 PARAGRAPH_RULES: Final[tuple[str, ...]] = (
@@ -119,6 +116,144 @@ PARAGRAPH_RULES: Final[tuple[str, ...]] = (
     "3 абзаца разной длины",
     "4 абзаца, последний — приглашение вернуться",
     "2–3 абзаца, первый — самый длинный",
+    "3 абзаца: короткий — длинный — короткий",
+    "2 абзаца с контрастной длиной предложений",
+    "3 абзаца, средний — самый эмоциональный",
+    "4 коротких абзаца с ритмом",
+)
+
+_VARIANT_OPENINGS: Final[tuple[str, ...]] = (
+    "Начни с яркой реакции на слова отзыва",
+    "Открой ответ неожиданным комплиментом без слова «спасибо»",
+    "Начни с риторического вопроса и сразу ответь на него",
+    "Открой текст цепочкой из 3–5 эмодзи",
+    "Начни с короткой метафоры про качество сервиса",
+    "Открой ответ перефразированием отзыва покупателя",
+    "Начни с акцента на эмоции после прочтения отзыва",
+    "Открой фразой про ценность доверия покупателя",
+    "Начни с живой реакции на оценку {rating}/5",
+    "Открой ответ образом «маленького праздника» в магазине",
+    "Начни с фразы про команду и её настроение",
+    "Открой ответ лёгкой шуткой или игривым тоном",
+    "Начни с признания, что отзыв вдохновил",
+    "Открой ответ необычным сравнением (без клише)",
+    "Начни с акцента на детали заказа кратко",
+    "Открой ответ восклицанием без приветствия",
+    "Начни с благодарности за честность в отзыве",
+    "Открой текст фразой про скорость и комфорт",
+    "Начни с упоминания категории товара одной фразой",
+    "Открой ответ мини-историей из 1–2 предложений",
+    "Начни с фразы про заботу о каждом покупателе",
+    "Открой ответ нестандартным комплиментом магазину от покупателя",
+)
+
+_VARIANT_FOCUSES: Final[tuple[str, ...]] = (
+    "в центре — скорость выполнения и чёткость",
+    "в центре — качество услуги и внимание к деталям",
+    "в центре — надёжность и стабильность сервиса",
+    "в центре — забота о покупателе после заказа",
+    "в центре — радость от доверия и повторных визитов",
+    "в центре — профессионализм команды",
+    "в центре — удобство покупки от начала до конца",
+    "в центре — эмоциональный отклик на текст отзыва",
+    "в центре — готовность помочь снова в любой момент",
+    "в центре — стремление держать планку высоко",
+)
+
+_VARIANT_TONES: Final[tuple[str, ...]] = (
+    "праздничный и энергичный",
+    "спокойный премиальный",
+    "тёплый дружелюбный",
+    "восторженный но искренний",
+    "уверенный и заботливый",
+    "лёгкий с юмором",
+    "вдохновляющий и мотивирующий",
+    "ласковый и уважительный",
+    "динамичный и современный",
+    "солнечный и позитивный",
+)
+
+_EMOJI_STYLES: Final[tuple[str, ...]] = (
+    "эмодзи в каждом предложении",
+    "эмодзи через предложение",
+    "эмодзи пачками в начале абзацев",
+    "эмодзи в конце ключевых фраз",
+    "много эмодзи, но без перегруза",
+)
+
+
+def _build_reply_variants() -> tuple[str, ...]:
+    variants: list[str] = []
+    for i, opening in enumerate(_VARIANT_OPENINGS):
+        for j, focus in enumerate(_VARIANT_FOCUSES):
+            for k, tone in enumerate(_VARIANT_TONES):
+                struct = PARAGRAPH_RULES[(i + j + k) % len(PARAGRAPH_RULES)]
+                emoji = _EMOJI_STYLES[(i + j + k) % len(_EMOJI_STYLES)]
+                variants.append(
+                    f"Вариант #{len(variants) + 1}: {opening}. "
+                    f"Фокус: {focus}. Тон: {tone}. Структура: {struct}. Эмодзи: {emoji}."
+                )
+    return tuple(variants)
+
+
+REPLY_VARIANTS: Final[tuple[str, ...]] = _build_reply_variants()
+
+_FB_OPENINGS: Final[tuple[str, ...]] = (
+    "⭐ {note} — это именно то, что заряжает команду!",
+    "🌈 Услышали вас: {note} — и это круто!",
+    "🔥 {note} — прямо в точку!",
+    "💫 Отзыв {note} согрел!",
+    "🎯 {note} — лучший сигнал, что всё ок!",
+    "✨ {note} — спасибо за такие слова!",
+    "🚀 {note} — мощно и по делу!",
+    "💎 {note} — ценим искренне!",
+    "🌟 {note} — супер-отклик!",
+    "🎉 {note} — читаем и улыбаемся!",
+    "⚡ {note} — энергия в чистом виде!",
+    "🏆 {note} — для нас это важно!",
+    "🎊 {note} — отличная оценка работы!",
+    "💥 {note} — попали в десятку!",
+    "🌸 {note} — очень приятно!",
+    "🔔 {note} — услышали громко и чётко!",
+    "🛡️ {note} — доверие дороже всего!",
+    "📣 {note} — так держать!",
+    "🧡 {note} — от души ценим!",
+    "🎁 {note} — лучший подарок продавцу!",
+    "🌊 {note} — накрывает позитивом!",
+    "🏁 {note} — финиш на высоте!",
+    "🎵 {note} — как любимая мелодия!",
+    "🌺 {note} — ярко и тепло!",
+    "🔮 {note} — магия хорошего сервиса!",
+)
+
+_FB_MIDDLES: Final[tuple[str, ...]] = (
+    "По {item} ({order_datetime}, {cost} {currency}) рады, что всё прошло гладко. 💎\n\nКоманда старается делать каждый шаг простым и приятным. 🚀",
+    "Заказ {item} — и такой отклик вдохновляет работать ещё лучше. 🌟\n\nСкорость, качество и забота — наш ежедневный стандарт. ✨",
+    "Сервис {item} ({order_datetime}) — и мы счастливы, что оправдали ожидания. 🔥\n\nВсегда на связи, если понадобится помощь. 💫",
+    "Покупка {item} на {cost} {currency} — и такая оценка мотивирует! 🎯\n\nМы вкладываемся в комфорт на каждом этапе. ❤️",
+    "По {item} ({order_datetime}) всё сложилось отлично — спасибо за доверие! 🌈\n\nДля нас важен каждый отзыв и каждый покупатель. 🎉",
+    "{item} — наша гордость, а ваш отзыв — лучшее подтверждение. 💎\n\nРаботаем, чтобы каждый заказ был лёгким. 🚀",
+    "Сделка по {item} ({cost} {currency}) запомнилась как удачная. ⭐\n\nСтараемся держать планку и радовать снова. ✨",
+    "Заказ {item} {order_datetime} — и мы рады, что вы довольны! 🔥\n\nКачество и поддержка — без компромиссов. 💫",
+    "По {item} получили отличный сигнал — движемся в верном направлении. 🎯\n\nГотовы помочь снова в любой момент. ❤️",
+    "Услуга {item} ({order_datetime}) — и такой фидбек заряжает! 🌟\n\nЦеним время и выбор каждого клиента. 🎊",
+    "{item} на {cost} {currency} — и отзыв как вишенка на торте. 🍒\n\nПродолжаем делать сервис ярче. 🚀",
+    "По {item} ({order_datetime}) — кайф, когда всё складывается! 💫\n\nКоманда благодарна за искренность. ✨",
+)
+
+_FB_CLOSINGS: Final[tuple[str, ...]] = (
+    "Возвращайтесь — будем рады новым заказам! 🎉✨",
+    "Ждём снова — готовы порадовать ещё ярче! 🌟🚀",
+    "До новых встреч в магазине! 💎❤️",
+    "Заходите снова — всегда на связи! 💫🔥",
+    "Будем ждать вас снова! 🎊✨",
+    "Возвращайтесь — есть чем удивить! 🚀🌈",
+    "До скорой встречи — поможем снова! ⭐💎",
+    "Ждём вас — сервис только крепнет! 🔥❤️",
+    "Приходите ещё — рады каждому заказу! 🎯✨",
+    "До новых покупок — удачи и хорошего дня! 🌟🎉",
+    "Возвращайтесь в любое время — поможем! 💫🚀",
+    "Будем рады видеть вас снова! 🌈❤️",
 )
 
 BANNED_OPENINGS: Final[tuple[str, ...]] = (
@@ -140,12 +275,50 @@ DEFAULT_REVIEW_PROMPT = (
 )
 
 
-def _pick_system_prompt_template() -> str:
-    return random.choice(SYSTEM_PROMPT_INTROS) + _SYSTEM_PROMPT_RULES
+def _pick_system_prompt_template(variant_idx: int = -1) -> str:
+    intro = SYSTEM_PROMPT_INTROS[
+        variant_idx % len(SYSTEM_PROMPT_INTROS) if variant_idx >= 0
+        else random.randrange(len(SYSTEM_PROMPT_INTROS))
+    ]
+    return intro + _SYSTEM_PROMPT_RULES
 
 
-def _pick_style_angle() -> str:
-    return random.choice(REPLY_STYLE_ANGLES)
+def _pick_variant_index(order_id: str, recent: list[dict[str, Any]], total: int) -> int:
+    used = {r.get("variant_id") for r in recent if r.get("variant_id") is not None}
+    base = int(hashlib.md5(order_id.encode()).hexdigest()[:8], 16) % max(total, 1)
+    for offset in range(min(total, 50)):
+        idx = (base + offset * 17) % total
+        if idx not in used:
+            return idx
+    return random.randrange(total)
+
+
+def _pick_style_angle(variant_idx: int | None = None) -> str:
+    if variant_idx is not None and 0 <= variant_idx < len(REPLY_VARIANTS):
+        return REPLY_VARIANTS[variant_idx]
+    return random.choice(REPLY_VARIANTS)
+
+
+def _compose_fallback_text(
+    seed: int, note: str, item: str, order_datetime: str, cost: Any, currency: str,
+) -> str:
+    o_n, m_n, c_n = len(_FB_OPENINGS), len(_FB_MIDDLES), len(_FB_CLOSINGS)
+    total = o_n * m_n * c_n
+    idx = seed % total
+    opening = _FB_OPENINGS[idx % o_n]
+    middle = _FB_MIDDLES[(idx // o_n) % m_n]
+    closing = _FB_CLOSINGS[(idx // (o_n * m_n)) % c_n]
+    subs = {
+        "{note}": note,
+        "{item}": item,
+        "{order_datetime}": order_datetime,
+        "{cost}": str(cost),
+        "{currency}": str(currency),
+    }
+    parts = (opening, middle, closing)
+    for k, v in subs.items():
+        parts = tuple(p.replace(k, v) for p in parts)
+    return f"{parts[0]} {parts[1]}\n\n{parts[2]}"
 
 
 def _pick_paragraph_rule() -> str:
@@ -622,6 +795,7 @@ class Plugin:
         self._lock = threading.RLock()
         self._processing: set[str] = set()
         self._batch_running = False
+        self._last_variant_id: int | None = None
         self.reload_settings()
 
     def log(self, msg: str, *args) -> None:
@@ -676,10 +850,12 @@ class Plugin:
                 if old_ver < "3.2.1":
                     loaded.setdefault("batch_scan_depth", 200)
                     loaded["_cfg_version"] = "3.2.1"
+                if old_ver < "3.3.0":
+                    loaded["_cfg_version"] = "3.3.0"
                 else:
-                    loaded.setdefault("_cfg_version", "3.2.1")
+                    loaded.setdefault("_cfg_version", "3.3.0")
                 self._cfg = loaded
-                if old_ver < "3.2.1":
+                if old_ver < "3.3.0":
                     self._save_settings()
             else:
                 self._cfg = defaults
@@ -735,7 +911,7 @@ class Plugin:
             "batch_scan_depth": 200,
             "batch_only_unanswered": True,
             "recent_replies": [],
-            "_cfg_version": "3.2.1",
+            "_cfg_version": "3.3.0",
         }
 
     @staticmethod
@@ -883,7 +1059,10 @@ class Plugin:
         recent = self.get_cfg("recent_replies", [])
         lines.append(f"\n📊 История ответов: <b>{len(recent)}</b>")
         if self.get_cfg("use_system_variants", True):
-            lines.append("🎲 <b>Варианты промпта:</b> случайный стиль каждый раз")
+            lines.append(
+                f"🎲 <b>Варианты стиля:</b> {len(REPLY_VARIANTS)} шаблонов + "
+                f"{len(_FB_OPENINGS) * len(_FB_MIDDLES) * len(_FB_CLOSINGS)} fallback"
+            )
         lines.append(
             f"📏 <b>Длина ответа:</b> {self._min_review_len()}–{self._max_review_len()} симв."
         )
@@ -1120,6 +1299,7 @@ class Plugin:
             "order_id": order.id,
             "review_hash": _review_fingerprint(order),
             "text": text[:200],
+            "variant_id": getattr(self, "_last_variant_id", None),
             "datetime": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         })
         self.set_cfg("recent_replies", recent[-50:])
@@ -1140,11 +1320,16 @@ class Plugin:
             history_block = "\n\nЗАПРЕЩЕНО повторять эти ответы (другой зачин и содержание):\n"
             for i, r in enumerate(recent, 1):
                 history_block += f"{i}. {r.get('text', '')[:120]}\n"
+        self._last_variant_id: int | None = None
         for attempt in range(5):
-            style_angle = _pick_style_angle()
-            paragraph_rule = _pick_paragraph_rule()
+            variant_idx = _pick_variant_index(order.id, recent, len(REPLY_VARIANTS))
+            if attempt > 0:
+                variant_idx = (variant_idx + attempt * 31) % len(REPLY_VARIANTS)
+            self._last_variant_id = variant_idx
+            style_angle = _pick_style_angle(variant_idx)
+            paragraph_rule = PARAGRAPH_RULES[variant_idx % len(PARAGRAPH_RULES)]
             if self.get_cfg("use_system_variants", True):
-                system_tpl = _pick_system_prompt_template()
+                system_tpl = _pick_system_prompt_template(variant_idx)
             else:
                 system_tpl = str(self.get_cfg("system_prompt", DEFAULT_SYSTEM_PROMPT))
             system = self._fill(
@@ -1167,13 +1352,12 @@ class Plugin:
             elif attempt == 2:
                 extra = (
                     f"\n\nПредыдущий ответ был шаблонным. "
-                    f"Начни с ДРУГОГО зачина. Стиль: {style_angle}"
+                    f"Используй вариант #{variant_idx + 1} — другой зачин и структура."
                 )
             elif attempt >= 3:
                 extra = (
-                    f"\n\nКРИТИЧНО: текст должен быть уникальным. "
-                    f"Другая структура, другие слова, другие эмодзи. "
-                    f"Стиль: {style_angle}. Абзацы: {paragraph_rule}."
+                    f"\n\nКРИТИЧНО: вариант #{variant_idx + 1} из {len(REPLY_VARIANTS)}. "
+                    f"Другая структура, слова, эмодзи. Стиль: {style_angle[:120]}…"
                 )
             length_rule = (
                 f"\n\nДлина: {min_len}–{max_len} символов. "
@@ -1258,66 +1442,13 @@ class Plugin:
                 self._expand_reply_to_min(base, min_len, max_len), max_len,
             )
         note = f"«{review_text}»" if review_text and review_text not in (".", "…") else "ваша оценка"
-        variants = [
-            (
-                f"⭐ {note} — именно то, ради чего мы стараемся! 🔥 "
-                f"Заказ {item} ({order.sum} {order.currency}) прошёл {order_datetime} — и это вдохновляет команду! 💎\n\n"
-                f"Каждый отзыв — как заряд энергии: хочется делать сервис ещё быстрее и приятнее. 🚀 "
-                f"Если понадобится помощь — мы рядом. 🌟\n\n"
-                f"Возвращайтесь — будем рады новым заказам! 🎉✨"
-            ),
-            (
-                f"Вау, {note}! 🌈✨ {item} — и такой отклик согревает! "
-                f"Дата заказа: {order_datetime}. Ценим доверие на {order.sum} {order.currency}. 💫\n\n"
-                f"Мы вкладываемся в скорость, качество и заботу — и ваши слова подтверждают, что движемся верно. 🔥\n\n"
-                f"Ждём снова — готовы порадовать ещё ярче! 🎊❤️"
-            ),
-            (
-                f"🎯 {note} — лучший комплимент для нас! "
-                f"По {item} ({order_datetime}) рады, что всё сложилось отлично. 💎\n\n"
-                f"Для команды это не просто заказ — это мотивация держать планку высоко. 🚀 "
-                f"Всегда на связи, если что-то понадобится. ✨\n\n"
-                f"До новых встреч в магазине! 🌟🎉"
-            ),
-            (
-                f"✨ Услышали вас: {note}! "
-                f"Сервис {item} — наша гордость, а {order_datetime} запомнился как удачная сделка. 🔥\n\n"
-                f"Стараемся, чтобы каждый шаг — от оплаты до результата — был комфортным. 💫 "
-                f"Спасибо за {order.sum} {order.currency} доверия! ❤️\n\n"
-                f"Заходите снова — есть чем удивить! 🚀"
-            ),
-            (
-                f"🔥 {note} заряжает на весь день! "
-                f"Заказ по {item} ({order_datetime}) — и мы счастливы, что попали в ожидания. 🌟\n\n"
-                f"Качество, скорость, поддержка — три кита нашего сервиса. 💎 "
-                f"Рады, что вы это почувствовали! ✨\n\n"
-                f"Будем ждать вас снова! 🎉💫"
-            ),
-            (
-                f"💫 Отзыв {note} — музыка для нас! "
-                f"{item}, {order.sum} {order.currency}, {order_datetime} — всё сложилось как надо. 🎯\n\n"
-                f"Мы растём благодаря таким покупателям — спасибо за искренность! 🔥 "
-                f"Пишите в чат, если захотите повторить. ✨\n\n"
-                f"До скорой встречи! 🌈❤️"
-            ),
-            (
-                f"🚀 {note} — супер! "
-                f"По {item} ({order_datetime}) рады, что сервис оправдал ожидания. ⭐\n\n"
-                f"Команда работает, чтобы каждый заказ был лёгким и приятным. 💎 "
-                f"Ваши слова — лучшая награда! 🌟\n\n"
-                f"Возвращайтесь — будем только рады! 🎊✨"
-            ),
-            (
-                f"🌟 Прочитали {note} — улыбнулись! "
-                f"{item} на {order.sum} {order.currency}, заказ {order_datetime}. 🔥\n\n"
-                f"Такие отклики напоминают, зачем мы здесь: делать покупку простой и радостной. 💫 "
-                f"Всегда готовы помочь! ✨\n\n"
-                f"Ждём вас снова! 🎉❤️"
-            ),
-        ]
-        base = variants[seed % len(variants)]
+        fb_total = len(_FB_OPENINGS) * len(_FB_MIDDLES) * len(_FB_CLOSINGS)
+        base = _compose_fallback_text(
+            seed, note, item, order_datetime, order.sum, order.currency,
+        )
         if "пив" in review_text.lower():
             base += " 🍺 Приятного отдыха!"
+        logger.debug("%s fallback вариант %s / %s", _P, seed % fb_total, fb_total)
         return _format_for_funpay_review(
             self._expand_reply_to_min(base, min_len, max_len), max_len,
         )
