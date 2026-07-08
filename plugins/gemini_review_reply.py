@@ -41,7 +41,7 @@ except ImportError:
 
 
 NAME          = "Gemini Review Reply"
-VERSION       = "3.2.0"
+VERSION       = "3.2.1"
 DESCRIPTION   = "ИИ-ответы на отзывы FunPay — уникальные тексты 300–600 симв. + batch без ответа 🌈"
 CREDITS       = "Cursor AI"
 UUID          = "c4e8b2f1-9a3d-4e7b-8c6f-2d1a5e9b0c3f"
@@ -491,6 +491,21 @@ def _escape(val: Any) -> str:
     return html.escape(str(val if val is not None else ""))
 
 
+def _clean_reply_text(text: str | None, bot_suffixes: tuple[str, ...] = ()) -> str:
+    if not text:
+        return ""
+    cleaned = re.sub(r"<[^>]+>", "", str(text))
+    for suf in bot_suffixes:
+        if suf and cleaned.endswith(suf):
+            cleaned = cleaned[: -len(suf)]
+    cleaned = cleaned.replace("​‍‌", "").replace("\u200b", "").replace("\u200c", "").replace("\u200d", "")
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
+def _profile_reply_has_seller(reply: str | None, bot_suffixes: tuple[str, ...] = ()) -> bool:
+    return len(_clean_reply_text(reply, bot_suffixes)) >= 2
+
+
 def _seller_review_reply(review: Any) -> str | None:
     """Текст ответа продавца на отзыв (FunPayAPI: .reply, не .answer)."""
     if not review:
@@ -498,13 +513,71 @@ def _seller_review_reply(review: Any) -> str | None:
     return getattr(review, "reply", None) or getattr(review, "answer", None)
 
 
-def _has_seller_reply(review: Any) -> bool:
-    text = _seller_review_reply(review)
-    if not text:
-        return False
-    cleaned = re.sub(r"<[^>]+>", "", str(text))
-    cleaned = re.sub(r"\s+", " ", cleaned).strip()
-    return len(cleaned) >= 2
+def _has_seller_reply(review: Any, bot_suffixes: tuple[str, ...] = ()) -> bool:
+    return _profile_reply_has_seller(_seller_review_reply(review), bot_suffixes)
+
+
+def _parse_profile_reviews_page(html: str) -> tuple[list[dict[str, Any]], str | None]:
+    """Парсит HTML батча отзывов со страницы профиля (POST users/reviews)."""
+    try:
+        from bs4 import BeautifulSoup
+    except ImportError:
+        _pip("beautifulsoup4")
+        from bs4 import BeautifulSoup
+    soup = BeautifulSoup(html or "", "lxml")
+    items: list[dict[str, Any]] = []
+    for div in soup.select("div.review-container"):
+        order_id = None
+        order_div = div.select_one("div.review-item-order")
+        if order_div:
+            m = re.search(r"#([A-Z0-9]+)", order_div.get_text(" ", strip=True), re.I)
+            if m:
+                order_id = m.group(1).upper()
+        reply = None
+        reply_div = div.select_one("div.review-compiled-reply > div:not([class])")
+        if reply_div:
+            reply = reply_div.get_text(" ", strip=True) or None
+        stars = None
+        for i in range(5, 0, -1):
+            if div.select_one(f"div.rating{i}"):
+                stars = i
+                break
+        items.append({"order_id": order_id, "reply": reply, "stars": stars})
+    nxt_el = soup.find("input", {"type": "hidden", "name": "continue"})
+    next_id = (nxt_el.get("value") or "").strip() if nxt_el else ""
+    return items, next_id or None
+
+
+def _gemini_test_ping(api_key: str, proxy: str, model: str) -> tuple[bool, str]:
+    """Короткий тест API без проверок длины ответа на отзыв."""
+    if not api_key.strip():
+        return False, "API key не задан"
+    proxies = _client_proxies(proxy)
+    payload = {
+        "contents": [{"role": "user", "parts": [{"text": "Ответь одним словом: OK"}]}],
+        "generationConfig": _gemini_generation_config(model, 0.3),
+    }
+    last_err = "нет ответа"
+    for try_model in [model] + [m for m in GEMINI_MODELS if m != model]:
+        try:
+            resp = http_post(
+                _gemini_url(try_model), json=payload,
+                headers=_request_headers(api_key), proxies=proxies, timeout=60,
+            )
+            if resp.status_code != 200:
+                last_err = f"{try_model}: HTTP {resp.status_code} — {resp.text[:200]}"
+                if resp.status_code in (404, 429):
+                    continue
+                continue
+            data = resp.json()
+            parts = (data.get("candidates") or [{}])[0].get("content", {}).get("parts", [])
+            text = "".join(p.get("text", "") for p in parts).strip()
+            if text:
+                return True, f"{try_model}: {text}"
+            last_err = f"{try_model}: пустой ответ ({data})"[:200]
+        except Exception as exc:
+            last_err = f"{try_model}: {exc}"
+    return False, last_err
 
 
 def _short_product_label(order: Order, max_len: int = 45) -> str:
@@ -600,10 +673,13 @@ class Plugin:
                     loaded.setdefault("use_system_variants", True)
                     loaded.setdefault("batch_unanswered_count", loaded.get("batch_count", 5))
                     loaded["_cfg_version"] = "3.2.0"
+                if old_ver < "3.2.1":
+                    loaded.setdefault("batch_scan_depth", 200)
+                    loaded["_cfg_version"] = "3.2.1"
                 else:
-                    loaded.setdefault("_cfg_version", "3.2.0")
+                    loaded.setdefault("_cfg_version", "3.2.1")
                 self._cfg = loaded
-                if old_ver < "3.2.0":
+                if old_ver < "3.2.1":
                     self._save_settings()
             else:
                 self._cfg = defaults
@@ -656,9 +732,10 @@ class Plugin:
             "reply_on_changed": True,
             "batch_count": 5,
             "batch_unanswered_count": 10,
+            "batch_scan_depth": 200,
             "batch_only_unanswered": True,
             "recent_replies": [],
-            "_cfg_version": "3.2.0",
+            "_cfg_version": "3.2.1",
         }
 
     @staticmethod
@@ -722,6 +799,14 @@ class Plugin:
                 "default": 10,
                 "min": 1,
                 "max": 50,
+            },
+            {
+                "key": "batch_scan_depth",
+                "label": "Глубина сканирования отзывов",
+                "type": "int",
+                "default": 200,
+                "min": 25,
+                "max": 500,
             },
             {
                 "key": "batch_only_unanswered",
@@ -848,6 +933,95 @@ class Plugin:
             kb.row(*nav)
         kb.add(IKB("◀️ К плагину", callback_data=f"{CBT.EDIT_PLUGIN}:{UUID}:0"))
         return kb
+
+    def _bot_reply_suffixes(self) -> tuple[str, ...]:
+        try:
+            acc = self.cardinal.account
+            return tuple(
+                s for s in (
+                    getattr(acc, "bot_character", "") or "",
+                    getattr(acc, "zero_width_suffix", "") or "",
+                ) if s
+            )
+        except Exception:
+            return ()
+
+    def _order_has_seller_reply(self, review: Any) -> bool:
+        return _has_seller_reply(review, self._bot_reply_suffixes())
+
+    def _fetch_profile_reviews_html(self, continue_id: str = "", filter_val: str = "") -> str:
+        acc = self.cardinal.account
+        headers = {
+            "accept": "*/*",
+            "x-requested-with": "XMLHttpRequest",
+            "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
+        }
+        payload = {
+            "user_id": acc.id,
+            "continue": continue_id or "",
+            "filter": filter_val or "",
+        }
+        resp = acc.method("post", "users/reviews", headers, payload)
+        return resp.content.decode(errors="replace")
+
+    def _iter_profile_reviews(self, max_items: int) -> Any:
+        """Итератор по отзывам профиля продавца (POST users/reviews, пагинация)."""
+        max_items = max(1, min(500, max_items))
+        seen_continue: set[str] = set()
+        continue_id = ""
+        total = 0
+        while total < max_items:
+            html = self._fetch_profile_reviews_html(continue_id)
+            items, next_id = _parse_profile_reviews_page(html)
+            if not items:
+                break
+            for item in items:
+                yield item
+                total += 1
+                if total >= max_items:
+                    return
+            if not next_id or next_id in seen_continue:
+                break
+            seen_continue.add(next_id)
+            continue_id = next_id
+            time.sleep(0.25)
+
+    def _orders_from_profile_reviews(
+        self, limit: int, only_unanswered: bool,
+    ) -> list[tuple[Order, datetime | None]]:
+        """Берёт отзывы со страницы профиля FunPay (как в UI), а не из trade-списка."""
+        limit = max(1, min(50, limit))
+        scan_depth = int(self.get_cfg("batch_scan_depth", 200))
+        suffixes = self._bot_reply_suffixes()
+        result: list[tuple[Order, datetime | None]] = []
+        seen_orders: set[str] = set()
+        for item in self._iter_profile_reviews(scan_depth):
+            if only_unanswered and _profile_reply_has_seller(item.get("reply"), suffixes):
+                continue
+            oid = item.get("order_id")
+            if not oid or oid in seen_orders:
+                continue
+            seen_orders.add(oid)
+            order = self._fetch_fresh_order(oid)
+            if not order or not _has_buyer_review(order):
+                continue
+            if only_unanswered and self._order_has_seller_reply(order.review):
+                continue
+            result.append((order, None))
+            if len(result) >= limit:
+                break
+        return result
+
+    def _count_profile_unanswered(self, scan_depth: int | None = None) -> tuple[int, int]:
+        scan = scan_depth or int(self.get_cfg("batch_scan_depth", 200))
+        suffixes = self._bot_reply_suffixes()
+        scanned = 0
+        unanswered = 0
+        for item in self._iter_profile_reviews(scan):
+            scanned += 1
+            if not _profile_reply_has_seller(item.get("reply"), suffixes):
+                unanswered += 1
+        return unanswered, scanned
 
     # ── Order helpers ────────────────────────────────────────────────────────
 
@@ -1186,7 +1360,7 @@ class Plugin:
         """Пропуск только если на этот же текст отзыва уже отвечали."""
         if msg_type == MessageTypes.FEEDBACK_CHANGED:
             return False
-        if not _has_seller_reply(order.review):
+        if not _has_seller_reply(order.review, self._bot_reply_suffixes()):
             return False
         fp = _review_fingerprint(order)
         if not fp:
@@ -1248,7 +1422,7 @@ class Plugin:
         if not _has_buyer_review(order):
             return False
         order = self._fetch_fresh_order(order.id) or order
-        if only_if_unanswered and _has_seller_reply(order.review):
+        if only_if_unanswered and self._order_has_seller_reply(order.review):
             self.log("Отзыв #%s уже с ответом продавца — пропуск", order.id)
             return False
         oid = order.id
@@ -1332,99 +1506,23 @@ class Plugin:
             result.append((order, date_map.get(oid)))
         return result
 
-    def _scan_review_candidates(
-        self, limit: int, only_unanswered: bool,
-    ) -> list[tuple[Order, datetime | None]]:
-        """Сканирует продажи и возвращает заказы с отзывами покупателя."""
-        limit = max(1, min(50, limit))
-        result: list[tuple[Order, datetime | None]] = []
-        pending: list[Any] = []
-        start_from: str | None = None
-        seen_ids: set[str] = set()
-        max_pages = 80
-        max_scan = max(limit * 60, 200) if only_unanswered else max(limit * 25, 120)
-
-        for page in range(max_pages):
-            if len(result) >= limit or len(seen_ids) >= max_scan:
-                break
-            try:
-                next_id, sales, _, _ = self.cardinal.account.get_sales(
-                    start_from=start_from,
-                    include_closed=True,
-                    include_paid=True,
-                    include_refunded=False,
-                )
-            except Exception as exc:
-                logger.error("%s get_sales: %s", _P, exc)
-                break
-            if not sales:
-                break
-
-            for shortcut in sales:
-                if shortcut.id in seen_ids:
-                    continue
-                seen_ids.add(shortcut.id)
-                pending.append(shortcut)
-                if len(pending) >= 8:
-                    result.extend(
-                        self._filter_review_orders(pending, limit - len(result), only_unanswered),
-                    )
-                    pending = []
-                    if len(result) >= limit:
-                        break
-
-            if len(result) < limit and pending:
-                result.extend(
-                    self._filter_review_orders(pending, limit - len(result), only_unanswered),
-                )
-                pending = []
-
-            if len(result) >= limit:
-                break
-            if not next_id:
-                break
-            start_from = next_id
-            time.sleep(0.2)
-
-        return result[:limit]
-
-    def _filter_review_orders(
-        self, shortcuts: list[Any], need: int, only_unanswered: bool,
-    ) -> list[tuple[Order, datetime | None]]:
-        if need <= 0 or not shortcuts:
-            return []
-        date_map = {s.id: getattr(s, "date", None) for s in shortcuts}
-        found: list[tuple[Order, datetime | None]] = []
-        for shortcut in shortcuts:
-            order = self._fetch_fresh_order(shortcut.id)
-            if not order:
-                continue
-            if only_unanswered and _has_seller_reply(order.review):
-                continue
-            found.append((order, date_map.get(shortcut.id)))
-            if len(found) >= need:
-                break
-        return found
-
     def fetch_last_reviews(self, limit: int) -> list[tuple[Order, datetime | None]]:
-        """Последние N заказов с отзывом покупателя."""
+        """Последние N отзывов с профиля продавца."""
         only_unanswered = bool(self.get_cfg("batch_only_unanswered", True))
-        result = self._scan_review_candidates(limit, only_unanswered)
+        result = self._orders_from_profile_reviews(limit, only_unanswered)
         mode = "без ответа" if only_unanswered else "все"
-        self.log("Найдено %s отзывов (%s, запрошено %s)", len(result), mode, limit)
+        self.log("Найдено %s отзывов с профиля (%s, запрошено %s)", len(result), mode, limit)
         return result
 
     def fetch_unanswered_reviews(self, limit: int) -> list[tuple[Order, datetime | None]]:
-        """Последние N отзывов БЕЗ ответа продавца на FunPay."""
-        limit = max(1, min(50, limit))
-        result = self._scan_review_candidates(limit, only_unanswered=True)
-        self.log("Найдено %s неотвеченных отзывов (запрошено %s)", len(result), limit)
+        """N неотвеченных отзывов с профиля FunPay."""
+        result = self._orders_from_profile_reviews(limit, only_unanswered=True)
+        self.log("Найдено %s неотвеченных отзывов с профиля (запрошено %s)", len(result), limit)
         return result
 
-    def count_unanswered_reviews(self, scan_limit: int = 30) -> int:
-        """Подсчёт неотвеченных среди последних scan_limit отзывов."""
-        found = self._scan_review_candidates(scan_limit, only_unanswered=True)
-        return len(found)
+    def count_unanswered_reviews(self, scan_limit: int | None = None) -> tuple[int, int]:
+        """(неотвеченных, всего просмотрено) по профилю."""
+        return self._count_profile_unanswered(scan_limit)
 
     def batch_reply_recent(self, notify_chat_id: int | None = None) -> None:
         """Ручная обработка N последних отзывов (все или только без ответа — по настройке)."""
@@ -1479,7 +1577,7 @@ class Plugin:
                 parse_mode="HTML",
             )
         for order, sdate in orders:
-            if only_if_unanswered and _has_seller_reply(order.review):
+            if only_if_unanswered and self._order_has_seller_reply(order.review):
                 skipped += 1
                 continue
             if self.process_order(
@@ -1504,17 +1602,20 @@ class Plugin:
         chat_id = call.message.chat.id
         if action == "test_gemini":
             bot.answer_callback_query(call.id, "Тестирую Gemini…")
-            result = _gemini_generate(
+            ok, info = _gemini_test_ping(
                 str(self.get_cfg("gemini_api_key", "")),
                 str(self.get_cfg("gemini_proxy", "")),
                 str(self.get_cfg("gemini_model", "gemini-2.5-flash-lite")),
-                "Ты помощник. Отвечай кратко на русском.",
-                "Напиши одно предложение: Gemini Review Reply работает.",
             )
-            if result:
-                bot.send_message(chat_id, f"✅ <b>Gemini:</b>\n\n{result}", parse_mode="HTML")
+            if ok:
+                bot.send_message(chat_id, f"✅ <b>Gemini OK:</b>\n\n<code>{_escape(info)}</code>", parse_mode="HTML")
             else:
-                bot.send_message(chat_id, "❌ Ошибка Gemini. Проверьте ключ (AIza/AQ), прокси и квоту.")
+                bot.send_message(
+                    chat_id,
+                    f"❌ <b>Ошибка Gemini</b>\n\n<code>{_escape(info)}</code>\n\n"
+                    f"Прокси: <code>{_escape(_normalize_proxy(str(self.get_cfg('gemini_proxy', ''))) or '—')}</code>",
+                    parse_mode="HTML",
+                )
             return True
         if action == "check_proxy":
             ok, info = _check_proxy(str(self.get_cfg("gemini_proxy", "")))
@@ -1541,30 +1642,31 @@ class Plugin:
             ).start()
             return True
         if action == "count_unanswered":
-            bot.answer_callback_query(call.id, "Сканирую…")
-            scan_n = max(int(self.get_cfg("batch_unanswered_count", 10)) * 3, 30)
+            bot.answer_callback_query(call.id, "Сканирую профиль…")
             threading.Thread(
-                target=self._notify_unanswered_count, args=(chat_id, scan_n), daemon=True,
+                target=self._notify_unanswered_count, args=(chat_id,), daemon=True,
             ).start()
             return True
         return False
 
-    def _notify_unanswered_count(self, chat_id: int, scan_limit: int) -> None:
+    def _notify_unanswered_count(self, chat_id: int) -> None:
         bot = self.cardinal.telegram.bot if self.cardinal.telegram else None
         if not bot:
             return
         try:
-            count = self.count_unanswered_reviews(scan_limit)
+            count, scanned = self.count_unanswered_reviews()
             n = int(self.get_cfg("batch_unanswered_count", 10))
+            depth = int(self.get_cfg("batch_scan_depth", 200))
             bot.send_message(
                 chat_id,
-                f"🔍 <b>Неотвеченных отзывов:</b> <b>{count}</b> "
-                f"(проверено до {scan_limit} последних)\n\n"
+                f"🔍 <b>Неотвеченных отзывов:</b> <b>{count}</b>\n"
+                f"📋 Просмотрено с профиля: <b>{scanned}</b> (глубина до {depth})\n\n"
                 f"Кнопка «📭 Ответить на N неотвеченных» обработает до <b>{n}</b>.",
                 parse_mode="HTML",
             )
         except Exception as exc:
-            bot.send_message(chat_id, f"❌ Ошибка сканирования: {exc}")
+            logger.error("%s count unanswered: %s", _P, exc)
+            bot.send_message(chat_id, f"❌ Ошибка сканирования: {_escape(exc)}", parse_mode="HTML")
 
     # ── Telegram UI (schema-driven, как Starvell) ────────────────────────────
 
