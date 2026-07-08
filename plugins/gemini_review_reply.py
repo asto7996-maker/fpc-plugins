@@ -41,8 +41,8 @@ except ImportError:
 
 
 NAME          = "Gemini Review Reply"
-VERSION       = "3.5.0"
-DESCRIPTION   = "ИИ-отзывы + импорт закупок (ссылки) → автовыдача FunPay"
+VERSION       = "3.6.0"
+DESCRIPTION   = "ИИ-отзывы + 3 режима выдачи ссылок на FunPay"
 CREDITS       = "Cursor AI"
 UUID          = "c4e8b2f1-9a3d-4e7b-8c6f-2d1a5e9b0c3f"
 SETTINGS_PAGE = True
@@ -62,8 +62,16 @@ AUTOBUY_MAX_PARALLEL: Final[int] = 8
 SETTINGS_FILE     = f"storage/plugins/{UUID}/settings.json"
 AUTOBUY_LOG_FILE  = f"storage/plugins/{UUID}/autobuy.json"
 IMPORT_LOG_FILE   = f"storage/plugins/{UUID}/import_stock.json"
+WAREHOUSE_FILE    = f"storage/plugins/{UUID}/warehouse.json"
 CHINESE_RE        = re.compile(r"[\u4e00-\u9fff\u3000-\u303f\uff00-\uffef]")
 CB_PREFIX         = f"grv_{UUID[:8]}"
+
+STOCK_MODES: Final[dict[str, str]] = {
+    "auto_buy": "🤖 Автопокупка → лот",
+    "import_lot": "📥 Импорт закупки → лот",
+    "warehouse": "📦 Со склада → лот",
+}
+STOCK_MODE_ORDER: Final[tuple[str, ...]] = ("auto_buy", "import_lot", "warehouse")
 
 _SHOP_ORDER_RE = re.compile(
     r"Order\s*#(?P<order_id>\d+)\s*\n"
@@ -1097,6 +1105,7 @@ class Plugin:
         self._import_running = False
         self._import_buffers: dict[tuple[int, int], str] = {}
         self._import_pending: dict[int, list[dict[str, str]]] = {}
+        self._import_target: dict[int, str] = {}
         self._last_variant_id: int | None = None
         self.reload_settings()
 
@@ -1174,8 +1183,12 @@ class Plugin:
                     loaded.setdefault("import_skip_duplicates", True)
                     loaded.setdefault("imported_order_ids", [])
                     loaded["_cfg_version"] = "3.5.0"
+                if old_ver < "3.6.0":
+                    loaded.setdefault("stock_mode", "import_lot")
+                    loaded.setdefault("warehouse_release_qty", 5)
+                    loaded["_cfg_version"] = "3.6.0"
                 else:
-                    loaded.setdefault("_cfg_version", "3.5.0")
+                    loaded.setdefault("_cfg_version", "3.6.0")
                 self._cfg = loaded
                 if old_ver < "3.3.0":
                     self._save_settings()
@@ -1249,7 +1262,9 @@ class Plugin:
             "import_line_template": "{url}",
             "import_skip_duplicates": True,
             "imported_order_ids": [],
-            "_cfg_version": "3.5.0",
+            "stock_mode": "import_lot",
+            "warehouse_release_qty": 5,
+            "_cfg_version": "3.6.0",
         }
 
     # ── UI: компактные страницы вместо длинного списка кнопок ───────────────
@@ -1298,6 +1313,8 @@ class Plugin:
             {"key": "import_routes", "label": "Маршруты товар→лот", "type": "multiline", "max_len": 2000},
             {"key": "import_line_template", "label": "Шаблон ссылки в АВ", "type": "text"},
             {"key": "import_skip_duplicates", "label": "Пропускать дубли заказов", "type": "bool"},
+            {"key": "stock_mode", "label": "Режим выдачи", "type": "text"},
+            {"key": "warehouse_release_qty", "label": "Выложить со склада (шт.)", "type": "int", "min": 1, "max": 100},
         ]
 
     def _advanced_fields(self) -> list[dict[str, Any]]:
@@ -1322,6 +1339,8 @@ class Plugin:
             {"key": "reply_recent", "label": "▶ Последние", "type": "action"},
             {"key": "run_autobuy", "label": "🛒 Закупить", "type": "action"},
             {"key": "start_import", "label": "📥 Загрузить закупку", "type": "action"},
+            {"key": "start_import_wh", "label": "📥 В склад", "type": "action"},
+            {"key": "release_warehouse", "label": "📤 Со склада", "type": "action"},
             {"key": "stock_status", "label": "📊 Склад", "type": "action"},
             {"key": "test_gemini", "label": "🧪 Тест Gemini", "type": "action"},
             {"key": "check_proxy", "label": "🌐 Прокси", "type": "action"},
@@ -1538,16 +1557,15 @@ class Plugin:
             return
         try:
             lot_ids = self._resolve_autobuy_lot_ids()
-            if not lot_ids:
-                bot.send_message(
-                    chat_id,
-                    f"📊 Лот с меткой <code>{_escape(str(self.get_cfg('autobuy_lot_match', DEFAULT_LOT_MATCH)))}</code> не найден.\n"
-                    f"Задайте <b>ID лота</b> в настройках закупки.",
-                    parse_mode="HTML",
-                )
-                return
             match = str(self.get_cfg("autobuy_lot_match", DEFAULT_LOT_MATCH))
-            lines = [f"📊 <b>Склад автовыдачи</b> — <code>{_escape(match)}</code>"]
+            lines = [
+                f"📊 <b>Склад</b> — <code>{_escape(match)}</code>",
+                f"📦 <b>На лоте FunPay:</b> {self._lot_stock_info()}",
+                f"🗄 <b>Купленные (склад плагина):</b> <b>{self.warehouse_count()}</b> шт.",
+                f"<b>Режим:</b> {self.stock_mode_label()}",
+            ]
+            if not lot_ids:
+                lines.append("\n⚠️ Лот не найден — задайте <b>ID лота</b> или метку в описании.")
             for lot_id in lot_ids:
                 lf = self.cardinal.account.get_lot_fields(int(lot_id))
                 lines.append(
@@ -1632,44 +1650,59 @@ class Plugin:
         self._cfg["imported_order_ids"] = trimmed
         self._save_settings()
 
-    def _preview_import_message(self, items: list[dict[str, str]], skipped: int = 0) -> str:
+    def _preview_import_message(
+        self, items: list[dict[str, str]], skipped: int = 0, target: str = "lot",
+    ) -> str:
         by_product: dict[str, int] = {}
         for item in items:
             prod = item.get("product") or "без названия"
             by_product[prod] = by_product.get(prod, 0) + 1
-        lines = [f"📥 <b>К выкладке:</b> <b>{len(items)}</b> ссылок"]
+        dest = "на <b>склад</b>" if target == "warehouse" else "на <b>лот FunPay</b>"
+        lines = [f"📥 <b>К выкладке {dest}:</b> <b>{len(items)}</b> ссылок"]
         if skipped:
             lines.append(f"⏭ Пропущено дублей заказов: <b>{skipped}</b>")
-        for prod, cnt in sorted(by_product.items(), key=lambda x: -x[1])[:8]:
-            lot_ids = self._resolve_lot_for_product(prod)
-            lot_hint = f"→ лот #{lot_ids[0]}" if lot_ids else "→ лот не найден"
-            lines.append(f"• <code>{_escape(prod[:55])}</code>: {cnt} шт. {lot_hint}")
+        if target == "lot":
+            for prod, cnt in sorted(by_product.items(), key=lambda x: -x[1])[:8]:
+                lot_ids = self._resolve_lot_for_product(prod)
+                lot_hint = f"→ лот #{lot_ids[0]}" if lot_ids else "→ лот не найден"
+                lines.append(f"• <code>{_escape(prod[:55])}</code>: {cnt} шт. {lot_hint}")
+        else:
+            lines.append(f"📦 Сейчас на складе: <b>{self.warehouse_count()}</b> шт.")
         if items:
             sample = items[0].get("url", "")
             if len(sample) > 90:
                 sample = sample[:87] + "…"
-            lines.append(f"\n👁 Пример строки:\n<code>{_escape(sample)}</code>")
-        lines.append("\n<b>Выложить на FunPay автовыдачу?</b>")
+            lines.append(f"\n👁 Пример:\n<code>{_escape(sample)}</code>")
+        btn = "на склад" if target == "warehouse" else "на FunPay"
+        lines.append(f"\n<b>Подтвердить выкладку {btn}?</b>")
         return "\n".join(lines)
 
-    def _import_confirm_keyboard(self) -> IKM:
+    def _import_confirm_keyboard(self, target: str = "lot") -> IKM:
         kb = IKM()
+        label = "✅ На склад" if target == "warehouse" else "✅ На FunPay"
         kb.row(
-            IKB("✅ Выложить", callback_data=f"{CB_PREFIX}:import:confirm"),
+            IKB(label, callback_data=f"{CB_PREFIX}:import:confirm:{target}"),
             IKB("❌ Отмена", callback_data=f"{CB_PREFIX}:import:cancel"),
         )
         return kb
 
-    def start_import_mode(self, chat_id: int, user_id: int) -> str:
+    def start_import_mode(self, chat_id: int, user_id: int, target: str = "lot") -> str:
+        target = target if target in ("lot", "warehouse") else "lot"
         self._import_buffers[(chat_id, user_id)] = ""
+        self._import_target[chat_id] = target
+        if target == "warehouse":
+            dest = (
+                "Ссылки попадут на <b>локальный склад</b> (уже купленные).\n"
+                "Потом выложите на FunPay режимом <b>📦 Со склада → лот</b>."
+            )
+        else:
+            dest = "Ссылки сразу выложатся на <b>автовыдачу лота FunPay</b>."
         return (
             "📥 <b>Загрузка закупки</b>\n\n"
-            "Вставьте текст <b>Purchase History</b> из шопа "
-            "(можно несколькими сообщениями или файлом <code>.txt</code>).\n\n"
-            "Бот найдёт ссылки <code>serviceactivation.google.com</code> "
-            "и <code>one.google.com</code> — по одной на заказ.\n\n"
-            "Когда всё отправили — напишите <code>/done</code>\n"
-            "<code>/cancel</code> — отмена"
+            f"{dest}\n\n"
+            "Вставьте <b>Purchase History</b> (частями или файлом <code>.txt</code>).\n"
+            "Бот найдёт ссылки активации Google.\n\n"
+            "<code>/done</code> — разобрать | <code>/cancel</code> — отмена"
         )
 
     def _accumulate_import_text(self, chat_id: int, user_id: int, chunk: str) -> int:
@@ -1698,24 +1731,40 @@ class Plugin:
             )
             return
         self._import_pending[chat_id] = fresh
+        target = self._import_target.get(chat_id, "lot")
         bot.send_message(
             chat_id,
-            self._preview_import_message(fresh, skipped),
+            self._preview_import_message(fresh, skipped, target),
             parse_mode="HTML",
-            reply_markup=self._import_confirm_keyboard(),
+            reply_markup=self._import_confirm_keyboard(target),
         )
 
-    def confirm_pending_import(self, chat_id: int) -> None:
+    def confirm_pending_import(self, chat_id: int, target: str | None = None) -> None:
         if self._import_running:
             return
         self._import_running = True
         bot = self.cardinal.telegram.bot if self.cardinal.telegram else None
         items = list(self._import_pending.pop(chat_id, []) or [])
+        target = target or self._import_target.pop(chat_id, "lot")
         try:
             if not items:
                 if bot:
-                    bot.send_message(chat_id, "❌ Нет данных для выкладки. Загрузите закупку заново.")
+                    bot.send_message(chat_id, "❌ Нет данных. Загрузите закупку заново.")
                 return
+
+            if target == "warehouse":
+                added, skipped = self.add_items_to_warehouse(items)
+                self._mark_imported_orders(items)
+                msg = (
+                    f"✅ <b>На склад:</b> +<b>{added}</b> ссылок"
+                    f"{f' (дублей: {skipped})' if skipped else ''}\n"
+                    f"📦 Всего на складе: <b>{self.warehouse_count()}</b>\n\n"
+                    f"Выложите на FunPay: режим <b>📦 Со склада → лот</b>"
+                )
+                if bot:
+                    bot.send_message(chat_id, msg, parse_mode="HTML")
+                return
+
             grouped: dict[int, list[dict[str, str]]] = {}
             unresolved: list[dict[str, str]] = []
             for item in items:
@@ -1779,6 +1828,136 @@ class Plugin:
     def cancel_import(self, chat_id: int, user_id: int) -> None:
         self._import_buffers.pop((chat_id, user_id), None)
         self._import_pending.pop(chat_id, None)
+        self._import_target.pop(chat_id, None)
+
+    def stock_mode(self) -> str:
+        mode = str(self.get_cfg("stock_mode", "import_lot") or "import_lot")
+        return mode if mode in STOCK_MODES else "import_lot"
+
+    def stock_mode_label(self, mode: str | None = None) -> str:
+        return STOCK_MODES.get(mode or self.stock_mode(), mode or self.stock_mode())
+
+    def cycle_stock_mode(self) -> str:
+        cur = self.stock_mode()
+        idx = STOCK_MODE_ORDER.index(cur) if cur in STOCK_MODE_ORDER else 0
+        nxt = STOCK_MODE_ORDER[(idx + 1) % len(STOCK_MODE_ORDER)]
+        self.set_cfg("stock_mode", nxt)
+        return nxt
+
+    def _load_warehouse(self) -> list[dict[str, str]]:
+        os.makedirs(os.path.dirname(WAREHOUSE_FILE), exist_ok=True)
+        try:
+            if os.path.exists(WAREHOUSE_FILE):
+                with open(WAREHOUSE_FILE, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, list):
+                    return [x for x in data if isinstance(x, dict) and x.get("url")]
+        except Exception as exc:
+            self.log("warehouse load: %s", exc)
+        return []
+
+    def _save_warehouse(self, items: list[dict[str, str]]) -> None:
+        os.makedirs(os.path.dirname(WAREHOUSE_FILE), exist_ok=True)
+        with open(WAREHOUSE_FILE, "w", encoding="utf-8") as f:
+            json.dump(items, f, ensure_ascii=False, indent=2)
+
+    def warehouse_count(self) -> int:
+        return len(self._load_warehouse())
+
+    def add_items_to_warehouse(self, items: list[dict[str, str]]) -> tuple[int, int]:
+        wh = self._load_warehouse()
+        known_urls = {str(x.get("url", "")) for x in wh}
+        known_orders = {str(x.get("order_id", "")) for x in wh if x.get("order_id")}
+        added = 0
+        skipped = 0
+        for item in items:
+            url = str(item.get("url", "")).strip()
+            if not url:
+                continue
+            oid = str(item.get("order_id", "")).strip()
+            if url in known_urls or (oid and oid in known_orders):
+                skipped += 1
+                continue
+            wh.append({
+                "url": url,
+                "product": item.get("product", ""),
+                "order_id": oid,
+                "added_at": datetime.now().isoformat(timespec="seconds"),
+            })
+            known_urls.add(url)
+            if oid:
+                known_orders.add(oid)
+            added += 1
+        if added:
+            self._save_warehouse(wh)
+        return added, skipped
+
+    def release_warehouse_to_lot(self, notify_chat_id: int | None, count: int | None = None) -> None:
+        if self._import_running:
+            return
+        self._import_running = True
+        bot = self.cardinal.telegram.bot if self.cardinal.telegram else None
+        qty = int(count or self.get_cfg("warehouse_release_qty", 5))
+        qty = max(1, min(100, qty))
+        t0 = time.time()
+        try:
+            wh = self._load_warehouse()
+            if not wh:
+                msg = "📦 <b>Склад пуст.</b> Сначала загрузите Purchase History кнопкой «📥 В склад»."
+                if bot and notify_chat_id:
+                    bot.send_message(notify_chat_id, msg, parse_mode="HTML")
+                return
+            batch = wh[:qty]
+            grouped: dict[int, list[dict[str, str]]] = {}
+            unresolved = 0
+            for item in batch:
+                lot_ids = self._resolve_lot_for_product(item.get("product", ""))
+                if not lot_ids:
+                    unresolved += 1
+                    continue
+                grouped.setdefault(lot_ids[0], []).append(item)
+
+            if not grouped:
+                msg = (
+                    f"⚠️ Не найден лот для <b>{len(batch)}</b> ссылок со склада.\n"
+                    "Настройте <b>Маршруты товар→лот</b> или <b>ID лота</b>."
+                )
+                if bot and notify_chat_id:
+                    bot.send_message(notify_chat_id, msg, parse_mode="HTML")
+                return
+
+            results: list[str] = []
+            total_added = 0
+            released_urls: set[str] = set()
+            for lot_id, lot_items in grouped.items():
+                lines = self._format_import_lines(lot_items)
+                ok, info = self._append_stock_lines_to_lot(lot_id, lines)
+                results.append(info)
+                if ok:
+                    total_added += len(lines)
+                    for it in lot_items:
+                        released_urls.add(str(it.get("url", "")))
+                    self._mark_imported_orders(lot_items)
+
+            if released_urls:
+                remaining = [x for x in wh if str(x.get("url", "")) not in released_urls]
+                self._save_warehouse(remaining)
+
+            summary = (
+                f"✅ <b>Со склада за {int(time.time() - t0)}с</b>\n"
+                f"📤 Выложено: <b>{total_added}</b> | осталось на складе: <b>{self.warehouse_count()}</b>"
+            )
+            if unresolved:
+                summary += f"\n⚠️ Без лота: <b>{unresolved}</b>"
+            summary += "\n" + "\n".join(f"📦 {_escape(r)}" for r in results)
+            if bot and notify_chat_id:
+                bot.send_message(notify_chat_id, summary, parse_mode="HTML")
+        except Exception as exc:
+            logger.error("%s warehouse release: %s", _P, exc)
+            if bot and notify_chat_id:
+                bot.send_message(notify_chat_id, f"❌ <code>{_escape(exc)}</code>", parse_mode="HTML")
+        finally:
+            self._import_running = False
 
     def _format_setting_line(self, field: dict[str, Any], val: Any) -> str:
         label = _escape(field.get("label", ""))
@@ -1827,19 +2006,29 @@ class Plugin:
             "",
         ]
         if page == "hub":
+            mode = self.stock_mode()
+            qty = int(self.get_cfg("autobuy_quantity", 5))
+            wh_qty = int(self.get_cfg("warehouse_release_qty", 5))
             lines += [
                 f"{'🟢' if self.get_cfg('enabled') else '🔴'} <b>Автоответ</b> на отзывы",
-                f"{'🟢' if self.get_cfg('autobuy_enabled') else '🔴'} <b>Закупка</b> {match}",
-                f"📦 <b>На лоте:</b> {self._lot_stock_info()}",
-                f"🛒 <b>За раз:</b> {qty} шт.",
-                f"📏 <b>Ответы:</b> {self._min_review_len()}–{self._max_review_len()} симв.",
+                f"<b>Режим выдачи:</b> {self.stock_mode_label(mode)}",
+                f"📦 <b>На лоте FunPay:</b> {self._lot_stock_info()}",
+                f"🗄 <b>На складе (купленные):</b> {self.warehouse_count()} шт.",
             ]
+            if mode == "auto_buy":
+                lines.append(f"🤖 <b>Автопокупка:</b> {qty} шт. за раз через API")
+            elif mode == "import_lot":
+                lines.append("📥 <b>Импорт:</b> Purchase History → сразу на лот")
+            else:
+                lines.append(f"📤 <b>Со склада:</b> выложить {wh_qty} шт. на лот")
+            lines.append(f"📏 <b>Ответы:</b> {self._min_review_len()}–{self._max_review_len()} симв.")
             if self._batch_running:
                 lines.append("⏳ <i>Пакетная обработка отзывов…</i>")
             if self._autobuy_running:
                 lines.append("⏳ <i>Закупка и выкладка…</i>")
-            lines.append("\n<i>Кнопки ниже — всё основное в 1–2 нажатия.</i>")
-            lines.append("📥 <b>Импорт:</b> вставьте Purchase History — бот вытащит ссылки")
+            if self._import_running:
+                lines.append("⏳ <i>Выкладка со склада…</i>")
+            lines.append("\n<i>Выберите режим ниже — кнопка действия меняется автоматически.</i>")
             return "\n".join(lines)
 
         title = pages[page]["title"]
@@ -1848,7 +2037,9 @@ class Plugin:
             val = self.get_cfg(field["key"])
             lines.append(self._format_setting_line(field, val))
         if page == "autobuy":
-            lines.append(f"\n📦 <b>Склад сейчас:</b> {self._lot_stock_info()}")
+            lines.append(f"\n📦 <b>На лоте FunPay:</b> {self._lot_stock_info()}")
+            lines.append(f"🗄 <b>На складе:</b> {self.warehouse_count()} шт.")
+            lines.append(f"<b>Режим:</b> {self.stock_mode_label()}")
             lines.append(
                 f"🔎 Ищем лоты с меткой <code>{_escape(match)}</code> "
                 f"или ID <code>{_escape(str(self.get_cfg('autobuy_lot_id', '') or '—'))}</code>"
@@ -1861,15 +2052,43 @@ class Plugin:
 
         if page == "hub":
             on = bool(self.get_cfg("enabled"))
+            mode = self.stock_mode()
             kb.row(IKB(
                 f"{'🟢' if on else '🔴'} Автоответ: {'ВКЛ' if on else 'ВЫКЛ'}",
                 callback_data=f"{CB_PREFIX}:togkey:enabled",
             ))
+            mode_btns = []
+            for m in STOCK_MODE_ORDER:
+                mark = "• " if m == mode else ""
+                short = {"auto_buy": "🤖 API", "import_lot": "📥 Импорт", "warehouse": "📦 Склад"}[m]
+                mode_btns.append(IKB(
+                    f"{mark}{short}",
+                    callback_data=f"{CB_PREFIX}:mode:{m}",
+                ))
+            kb.row(*mode_btns)
             n_un = int(self.get_cfg("batch_unanswered_count", 10))
             kb.row(IKB(f"📭 Неотвеченные ({n_un})", callback_data=f"{CB_PREFIX}:act:reply_unanswered"))
             qty = int(self.get_cfg("autobuy_quantity", 5))
-            kb.row(IKB(f"🛒 Закупить {qty} шт → автовыдача", callback_data=f"{CB_PREFIX}:act:run_autobuy"))
-            kb.row(IKB("📥 Загрузить закупку (текст)", callback_data=f"{CB_PREFIX}:act:start_import"))
+            wh_qty = int(self.get_cfg("warehouse_release_qty", 5))
+            if mode == "auto_buy":
+                kb.row(IKB(
+                    f"🤖 Купить {qty} шт → лот",
+                    callback_data=f"{CB_PREFIX}:act:run_autobuy",
+                ))
+            elif mode == "import_lot":
+                kb.row(IKB(
+                    "📥 Загрузить закупку → лот",
+                    callback_data=f"{CB_PREFIX}:act:start_import:lot",
+                ))
+            else:
+                kb.row(IKB(
+                    f"📤 Выложить {wh_qty} шт со склада → лот",
+                    callback_data=f"{CB_PREFIX}:act:release_warehouse",
+                ))
+                kb.row(IKB(
+                    "📥 Загрузить в склад (купленные)",
+                    callback_data=f"{CB_PREFIX}:act:start_import:warehouse",
+                ))
             kb.row(
                 IKB("🧪 Тест Gemini", callback_data=f"{CB_PREFIX}:act:test_gemini"),
                 IKB("📊 Склад", callback_data=f"{CB_PREFIX}:act:stock_status"),
@@ -1907,9 +2126,12 @@ class Plugin:
                 kb.row(IKB("🌐 Прокси", callback_data=f"{CB_PREFIX}:act:check_proxy"))
             elif page == "autobuy":
                 qty = int(self.get_cfg("autobuy_quantity", 5))
-                kb.row(IKB(f"🛒 Закупить {qty} шт", callback_data=f"{CB_PREFIX}:act:run_autobuy"))
-                kb.row(IKB("📥 Загрузить закупку", callback_data=f"{CB_PREFIX}:act:start_import"))
-                kb.row(IKB("📊 Склад", callback_data=f"{CB_PREFIX}:act:stock_status"))
+                wh_qty = int(self.get_cfg("warehouse_release_qty", 5))
+                kb.row(IKB(f"🤖 API: {qty} шт", callback_data=f"{CB_PREFIX}:act:run_autobuy"))
+                kb.row(IKB("📥 Импорт → лот", callback_data=f"{CB_PREFIX}:act:start_import:lot"))
+                kb.row(IKB(f"📤 Со склада: {wh_qty} шт", callback_data=f"{CB_PREFIX}:act:release_warehouse"))
+                kb.row(IKB("📥 В склад", callback_data=f"{CB_PREFIX}:act:start_import:warehouse"))
+                kb.row(IKB("📊 Статус", callback_data=f"{CB_PREFIX}:act:stock_status"))
             kb.row(IKB("🏠 Главная", callback_data=f"{CB_PREFIX}:nav:hub"))
 
         kb.add(IKB("◀️ К плагину", callback_data=f"{CBT.EDIT_PLUGIN}:{UUID}:0"))
@@ -2530,7 +2752,7 @@ class Plugin:
         if bot and notify_chat_id:
             bot.send_message(notify_chat_id, summary, parse_mode="HTML")
 
-    def on_settings_action(self, call: CallbackQuery, action: str) -> bool:
+    def on_settings_action(self, call: CallbackQuery, action: str, arg: str = "") -> bool:
         bot = self.cardinal.telegram.bot
         chat_id = call.message.chat.id
         if action == "test_gemini":
@@ -2593,13 +2815,37 @@ class Plugin:
             threading.Thread(target=self.notify_stock_status, args=(chat_id,), daemon=True).start()
             return True
         if action == "start_import":
+            target = arg if arg in ("lot", "warehouse") else (
+                "warehouse" if self.stock_mode() == "warehouse" else "lot"
+            )
             bot.answer_callback_query(call.id)
-            prompt = self.start_import_mode(chat_id, call.from_user.id)
+            prompt = self.start_import_mode(chat_id, call.from_user.id, target)
             bot.send_message(chat_id, prompt, parse_mode="HTML")
             if self.cardinal.telegram:
                 self.cardinal.telegram.set_state(
-                    chat_id, 0, call.from_user.id, state=f"{CB_PREFIX}:import:wait",
+                    chat_id, 0, call.from_user.id,
+                    state=f"{CB_PREFIX}:import:wait:{target}",
                 )
+            return True
+        if action == "start_import_wh":
+            bot.answer_callback_query(call.id)
+            prompt = self.start_import_mode(chat_id, call.from_user.id, "warehouse")
+            bot.send_message(chat_id, prompt, parse_mode="HTML")
+            if self.cardinal.telegram:
+                self.cardinal.telegram.set_state(
+                    chat_id, 0, call.from_user.id,
+                    state=f"{CB_PREFIX}:import:wait:warehouse",
+                )
+            return True
+        if action == "release_warehouse":
+            if self._import_running:
+                bot.answer_callback_query(call.id, "Уже выполняется…", show_alert=True)
+                return True
+            wh_qty = int(self.get_cfg("warehouse_release_qty", 5))
+            bot.answer_callback_query(call.id, f"Выкладываю {wh_qty} шт…")
+            threading.Thread(
+                target=self.release_warehouse_to_lot, args=(chat_id, wh_qty), daemon=True,
+            ).start()
             return True
         return False
 
@@ -2670,19 +2916,26 @@ class Plugin:
                     show_settings(chat_id, msg_id, ui_page)
                 bot.answer_callback_query(call.id)
                 return
+            if action == "mode" and len(parts) >= 3:
+                plugin.set_cfg("stock_mode", parts[2])
+                show_settings(chat_id, msg_id, "hub")
+                bot.answer_callback_query(call.id, plugin.stock_mode_label(parts[2])[:180])
+                return
             if action == "act":
                 key = parts[2]
-                if plugin.on_settings_action(call, key):
+                arg = parts[3] if len(parts) > 3 else ""
+                if plugin.on_settings_action(call, key, arg):
                     return
                 bot.answer_callback_query(call.id)
                 return
             if action == "import":
                 sub = parts[2] if len(parts) > 2 else ""
                 uid = call.from_user.id
-                if sub == "confirm":
+                if sub.startswith("confirm"):
+                    target = parts[3] if len(parts) > 3 else plugin._import_target.get(chat_id, "lot")
                     bot.answer_callback_query(call.id, "Выкладываю…")
                     threading.Thread(
-                        target=plugin.confirm_pending_import, args=(chat_id,), daemon=True,
+                        target=plugin.confirm_pending_import, args=(chat_id, target), daemon=True,
                     ).start()
                     return
                 if sub == "cancel":
@@ -2726,10 +2979,13 @@ class Plugin:
 
         def on_import_text(message: Message) -> None:
             state_data = tg.get_state(message.chat.id, message.from_user.id)
-            if not state_data or state_data.get("state") != f"{CB_PREFIX}:import:wait":
+            state = str((state_data or {}).get("state", ""))
+            if not state.startswith(f"{CB_PREFIX}:import:wait"):
                 return
+            target = "warehouse" if state.endswith(":warehouse") else "lot"
             chat_id = message.chat.id
             uid = message.from_user.id
+            plugin._import_target[chat_id] = target
             text = message.text or ""
             low = text.strip().lower()
             if low in ("/cancel", "отмена"):
@@ -2751,8 +3007,10 @@ class Plugin:
 
         def on_import_document(message: Message) -> None:
             state_data = tg.get_state(message.chat.id, message.from_user.id)
-            if not state_data or state_data.get("state") != f"{CB_PREFIX}:import:wait":
+            state = str((state_data or {}).get("state", ""))
+            if not state.startswith(f"{CB_PREFIX}:import:wait"):
                 return
+            target = "warehouse" if state.endswith(":warehouse") else "lot"
             doc = message.document
             if not doc:
                 return
@@ -2766,13 +3024,15 @@ class Plugin:
                 bot.reply_to(message, f"❌ Не удалось прочитать файл: {_escape(exc)}", parse_mode="HTML")
                 return
             plugin._import_buffers[(chat_id, uid)] = text
+            plugin._import_target[chat_id] = target
             tg.clear_state(chat_id, uid)
             bot.reply_to(message, f"📄 Файл принят ({len(text)} симв.), разбираю…")
             plugin.process_import_buffer(chat_id, uid)
 
         def _is_importing(m: Message) -> bool:
             state_data = tg.get_state(m.chat.id, m.from_user.id)
-            return bool(state_data and state_data.get("state") == f"{CB_PREFIX}:import:wait")
+            state = str((state_data or {}).get("state", ""))
+            return state.startswith(f"{CB_PREFIX}:import:wait")
 
         def on_text(message: Message) -> None:
             state_data = tg.get_state(message.chat.id, message.from_user.id)
