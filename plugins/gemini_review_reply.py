@@ -1678,15 +1678,6 @@ class Plugin:
         self._import_buffers[key] = buf
         return len(buf)
 
-    def _finish_import_buffer(self, chat_id: int, user_id: int) -> list[dict[str, str]]:
-        key = (chat_id, user_id)
-        text = self._import_buffers.pop(key, "")
-        items = parse_shop_purchase_history(text)
-        items, _skipped = self._filter_new_import_items(items)
-        if items:
-            self._import_pending[chat_id] = items
-        return items
-
     def process_import_buffer(self, chat_id: int, user_id: int, skipped_dup: int = 0) -> None:
         bot = self.cardinal.telegram.bot if self.cardinal.telegram else None
         if not bot:
