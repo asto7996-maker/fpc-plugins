@@ -34,8 +34,8 @@ except ImportError:
 
 
 NAME          = "Gemini Link Auto"
-VERSION       = "2.2.0"
-DESCRIPTION   = "Автозакупка gemini_18m или купленные ссылки → автовыдача FunPay"
+VERSION       = "2.3.0"
+DESCRIPTION   = "GPT plus 1M (NW) — закупка по бюджету $ и купленные ссылки"
 CREDITS       = "Cursor AI"
 UUID          = "f7a2e8c1-4b3d-4e9f-a8c2-1d5e9b0f6a3c"
 SETTINGS_PAGE = True
@@ -43,9 +43,9 @@ BIND_TO_DELETE = None
 
 MAX_PROMPT_LEN:   Final[int] = 4000
 PROMPT_PREVIEW_LEN: Final[int] = 250
+DEFAULT_API_URL: Final[str] = "https://worker-production-53ca.up.railway.app"
+SHOP_PRODUCT_NAME: Final[str] = "GPT plus 1M (NW)"
 DEFAULT_LOT_MATCH: Final[str] = "GPT plus 1M (NW)"
-DEFAULT_SUPPLIER_PRODUCT: Final[str] = "gemini_18m"
-AUTOBUY_MAX_PARALLEL: Final[int] = 8
 SETTINGS_FILE     = f"storage/plugins/{UUID}/settings.json"
 AUTOBUY_LOG_FILE  = f"storage/plugins/{UUID}/autobuy.json"
 IMPORT_LOG_FILE   = f"storage/plugins/{UUID}/import_stock.json"
@@ -158,182 +158,100 @@ def _extract_accounts_from_payload(data: Any) -> list[str]:
     return [a for a in found if len(a) >= 3]
 
 
-def _supplier_request(
-    api_url: str,
-    api_key: str,
-    product_id: str,
-    product_name: str,
-    quantity: int,
-    mode: str,
-) -> tuple[list[str], str]:
-    """Закупка аккаунтов у поставщика. Возвращает (строки аккаунтов, инфо/ошибка)."""
+def _shop_headers(api_key: str) -> dict[str, str]:
+    return {"X-API-Key": api_key.strip(), "Content-Type": "application/json"}
+
+
+def _shop_request(
+    api_url: str, api_key: str, method: str, path: str, body: dict | None = None,
+) -> tuple[Any, str]:
     api_url = (api_url or "").strip().rstrip("/")
     api_key = (api_key or "").strip()
-    product_id = (product_id or "").strip()
-    product_name = (product_name or DEFAULT_SUPPLIER_PRODUCT).strip()
-    quantity = max(0, int(quantity))
-    if quantity <= 0:
-        return [], "количество 0 — закупка отключена"
-
     if not api_url:
-        return [], "URL API поставщика не задан"
+        return None, "URL API не задан"
     if not api_key:
-        return [], "API-ключ поставщика не задан"
-
-    mode = (mode or "json_post").lower()
-    last_err = "неизвестная ошибка"
-
-    if mode == "smm_v2":
-        params = {
-            "key": api_key,
-            "action": "buy",
-            "service": product_id or product_name,
-            "quantity": quantity,
-        }
-        try:
-            resp = http_get(f"{api_url}", params=params, timeout=90)
-            data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
-            accounts = _extract_accounts_from_payload(data)
-            if not accounts and isinstance(data, dict):
-                order_id = _dig(data, "order") or _dig(data, "order_id")
-                if order_id:
-                    for _ in range(30):
-                        time.sleep(2)
-                        st = http_get(
-                            api_url,
-                            params={"key": api_key, "action": "status", "order": order_id},
-                            timeout=60,
-                        )
-                        st_data = st.json()
-                        accounts = _extract_accounts_from_payload(st_data)
-                        if accounts:
-                            break
-            if accounts:
-                return accounts[:quantity], f"куплено {len(accounts[:quantity])} шт."
-            last_err = resp.text[:300] or f"HTTP {resp.status_code}"
-        except Exception as exc:
-            last_err = str(exc)
-        return [], last_err
-
-    if mode == "gemini_worker":
-        base = api_url.rstrip("/")
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "X-API-Key": api_key,
-            "Content-Type": "application/json",
-        }
-        payloads = (
-            {"product_id": product_id or product_name, "product": product_id or product_name, "quantity": quantity},
-            {"productId": product_id or product_name, "count": quantity},
-        )
-        endpoints = ("/api/purchase", "/api/buy", "/purchase", "/buy")
-        for ep in endpoints:
-            for body in payloads:
-                try:
-                    resp = http_post(f"{base}{ep}", json=body, headers=headers, timeout=90)
-                    try:
-                        data = resp.json()
-                    except Exception:
-                        data = resp.text
-                    if isinstance(data, dict) and data.get("success") is False:
-                        last_err = str(data.get("error") or data.get("message") or data)[:300]
-                        continue
-                    accounts = _extract_accounts_from_payload(data)
-                    if accounts:
-                        return accounts[:quantity], f"куплено {len(accounts[:quantity])} шт."
-                    last_err = (resp.text or str(data))[:300]
-                except Exception as exc:
-                    last_err = str(exc)
-        return [], last_err or "gemini_worker: не удалось купить"
-
-    if mode == "get_query":
-        params = {
-            "api_key": api_key,
-            "key": api_key,
-            "product_id": product_id,
-            "product": product_id or product_name,
-            "name": product_name,
-            "count": quantity,
-            "quantity": quantity,
-        }
-        try:
-            resp = http_get(api_url, params={k: v for k, v in params.items() if v}, timeout=90)
-            try:
-                data = resp.json()
-            except Exception:
-                data = resp.text
-            accounts = _extract_accounts_from_payload(data)
-            if accounts:
-                return accounts[:quantity], f"куплено {len(accounts[:quantity])} шт."
-            last_err = resp.text[:300] or f"HTTP {resp.status_code}"
-        except Exception as exc:
-            last_err = str(exc)
-        return [], last_err
-
-    body = {
-        "key": api_key,
-        "api_key": api_key,
-        "action": "buy",
-        "product_id": product_id,
-        "product": product_id or product_name,
-        "name": product_name,
-        "service": product_id or product_name,
-        "count": quantity,
-        "quantity": quantity,
-    }
+        return None, "API-ключ не задан"
+    url = f"{api_url}{path}"
+    headers = _shop_headers(api_key)
     try:
-        resp = http_post(api_url, json=body, timeout=90)
+        if method.upper() == "GET":
+            resp = http_get(url, headers=headers, timeout=60)
+        else:
+            resp = http_post(url, json=body or {}, headers=headers, timeout=90)
         try:
             data = resp.json()
         except Exception:
-            data = resp.text
-        if isinstance(data, dict) and data.get("success") is False:
-            return [], str(data.get("error") or data.get("message") or data)[:300]
-        accounts = _extract_accounts_from_payload(data)
-        if accounts:
-            return accounts[:quantity], f"куплено {len(accounts[:quantity])} шт."
-        last_err = (resp.text or str(data))[:300]
+            return None, (resp.text or f"HTTP {resp.status_code}")[:300]
+        if isinstance(data, dict) and data.get("ok") is False:
+            return None, str(data.get("error") or data.get("message") or data)[:300]
+        if resp.status_code >= 400:
+            return None, (resp.text or f"HTTP {resp.status_code}")[:300]
+        return data, ""
     except Exception as exc:
-        last_err = str(exc)
-    return [], last_err
+        return None, str(exc)
 
 
-def _supplier_buy_parallel(
-    api_url: str,
-    api_key: str,
-    product_id: str,
-    product_name: str,
-    quantity: int,
-    mode: str,
-    parallel: int,
-    bulk: bool,
-) -> tuple[list[str], str]:
-    if bulk:
-        return _supplier_request(api_url, api_key, product_id, product_name, quantity, mode)
-    accounts: list[str] = []
-    errors: list[str] = []
-    workers = max(1, min(parallel, AUTOBUY_MAX_PARALLEL, quantity))
-    lock = threading.Lock()
+def _shop_get_balance(api_url: str, api_key: str) -> tuple[float | None, str]:
+    data, err = _shop_request(api_url, api_key, "GET", "/api/me")
+    if err:
+        return None, err
+    user = _dig(data, "user")
+    if not isinstance(user, dict):
+        return None, "не удалось прочитать баланс"
+    try:
+        return float(user.get("balance", 0)), ""
+    except (TypeError, ValueError):
+        return None, "некорректный баланс в ответе API"
 
-    def buy_one() -> None:
-        got, info = _supplier_request(api_url, api_key, product_id, product_name, 1, mode)
-        with lock:
-            if got:
-                accounts.extend(got)
-            else:
-                errors.append(info)
 
-    threads = [threading.Thread(target=buy_one, daemon=True) for _ in range(quantity)]
-    batch_size = workers
-    for i in range(0, len(threads), batch_size):
-        chunk = threads[i:i + batch_size]
-        for t in chunk:
-            t.start()
-        for t in chunk:
-            t.join()
-    if accounts:
-        return accounts[:quantity], f"куплено {len(accounts[:quantity])} шт. (параллельно)"
-    return [], errors[0] if errors else "не удалось купить"
+def _shop_get_products(api_url: str, api_key: str) -> tuple[list[dict[str, Any]], str]:
+    data, err = _shop_request(api_url, api_key, "GET", "/api/products")
+    if err:
+        return [], err
+    products = data.get("products") if isinstance(data, dict) else None
+    if not isinstance(products, list):
+        return [], "список товаров пуст"
+    return [p for p in products if isinstance(p, dict)], ""
+
+
+def _shop_find_product(products: list[dict[str, Any]], name: str = SHOP_PRODUCT_NAME) -> dict[str, Any] | None:
+    needle = name.casefold()
+    for product in products:
+        for field in ("name_en", "name", "title"):
+            val = str(product.get(field, "")).strip()
+            if val and needle in val.casefold():
+                return product
+    for product in products:
+        for field in ("name_en", "name", "title"):
+            val = str(product.get(field, "")).strip()
+            if val and val.casefold() == needle:
+                return product
+    return None
+
+
+def _shop_buy(
+    api_url: str, api_key: str, product_id: int, quantity: int,
+) -> tuple[list[str], str, dict[str, Any]]:
+    quantity = max(1, int(quantity))
+    data, err = _shop_request(
+        api_url, api_key, "POST", "/api/buy",
+        {"product_id": int(product_id), "quantity": quantity},
+    )
+    if err:
+        return [], err, {}
+    items = _extract_accounts_from_payload(data)
+    if not items and isinstance(data, dict):
+        items = [str(x).strip() for x in data.get("items", []) if str(x).strip()]
+    if not items:
+        return [], (str(data)[:300] if data else "пустой ответ"), data if isinstance(data, dict) else {}
+    total = _dig(data, "total_price")
+    new_bal = _dig(data, "new_balance")
+    info = f"куплено {len(items)} шт."
+    if total is not None:
+        info += f", −${float(total):.2f}"
+    if new_bal is not None:
+        info += f", баланс ${float(new_bal):.2f}"
+    return items[:quantity], info, data if isinstance(data, dict) else {}
 
 
 def _lot_text_matches(text: str, needle: str) -> bool:
@@ -426,13 +344,13 @@ class Plugin:
                 sm = str(loaded.get("stock_mode", "stocked"))
                 if sm in _LEGACY_STOCK_MODES:
                     loaded["stock_mode"] = "stocked"
-                if not loaded.get("autobuy_enabled"):
-                    loaded["autobuy_auto_restock"] = False
-                try:
-                    if int(loaded.get("autobuy_quantity", 0)) <= 0:
-                        loaded["autobuy_auto_restock"] = False
-                except (TypeError, ValueError):
-                    pass
+                if str(loaded.get("_cfg_version", "0")) < "2.3.0":
+                    loaded.setdefault("buy_budget_usd", 0.0)
+                    loaded.setdefault("reserve_balance_usd", 10.0)
+                    if not str(loaded.get("supplier_api_url", "")).strip():
+                        loaded["supplier_api_url"] = DEFAULT_API_URL
+                    loaded["autobuy_lot_match"] = DEFAULT_LOT_MATCH
+                    loaded["_cfg_version"] = "2.3.0"
                 self._cfg = loaded
             else:
                 self._cfg = defaults
@@ -463,47 +381,23 @@ class Plugin:
         self.on_setting_change(key, value)
 
     def on_setting_change(self, key: str, value: Any) -> None:
-        if key == "autobuy_enabled" and not value:
-            self._cfg["autobuy_auto_restock"] = False
-            self._save_settings()
-        if key == "autobuy_quantity":
-            try:
-                if int(value) <= 0:
-                    self._cfg["autobuy_auto_restock"] = False
-                    self._save_settings()
-            except (TypeError, ValueError):
-                pass
         if key == "stock_mode" and str(value) == "stocked":
-            self._cfg["autobuy_auto_restock"] = False
-            self._save_settings()
+            pass
 
     @staticmethod
     def _default_cfg() -> dict[str, Any]:
         return {
-            "autobuy_enabled": False,
-            "autobuy_quantity": 0,
+            "supplier_api_url": DEFAULT_API_URL,
+            "supplier_api_key": "",
+            "buy_budget_usd": 0.0,
+            "reserve_balance_usd": 10.0,
             "autobuy_lot_match": DEFAULT_LOT_MATCH,
             "autobuy_lot_id": "",
-            "supplier_api_url": "",
-            "supplier_api_key": "",
-            "supplier_product_id": "gemini_18m",
-            "supplier_product_name": DEFAULT_SUPPLIER_PRODUCT,
-            "supplier_mode": "gemini_worker",
-            "supplier_bulk": True,
-            "supplier_parallel": 4,
-            "account_line_template": "{account}",
-            "import_routes": (
-                "Gemini 18m | GPT plus 1M (NW)\n"
-                "Gemini 18m links | GPT plus 1M (NW)"
-            ),
-            "import_line_template": "{url}",
             "import_skip_duplicates": True,
             "imported_order_ids": [],
             "stock_mode": "stocked",
             "warehouse_release_qty": 5,
-            "autobuy_auto_restock": False,
-            "autobuy_min_lot_stock": 0,
-            "_cfg_version": "2.2.0",
+            "_cfg_version": "2.3.0",
         }
 
     # ── UI: компактные страницы вместо длинного списка кнопок ───────────────
@@ -512,38 +406,25 @@ class Plugin:
     def _ui_pages() -> dict[str, dict[str, Any]]:
         return {
             "hub": {"title": "🎛 Главная", "emoji": "🏠"},
-            "autobuy": {"title": "🛒 API / лот", "emoji": "🛒"},
+            "settings": {"title": "⚙️ Настройки", "emoji": "⚙️"},
         }
 
-
-    def _autobuy_fields(self) -> list[dict[str, Any]]:
+    def _settings_fields(self) -> list[dict[str, Any]]:
         return [
-            {"key": "autobuy_enabled", "label": "Автозакупка включена", "type": "bool"},
-            {"key": "autobuy_quantity", "label": "Покупать за раз (0 = выкл.)", "type": "int", "min": 0, "max": 100},
-            {"key": "autobuy_auto_restock", "label": "Докупать при нехватке на лоте", "type": "bool"},
-            {"key": "autobuy_min_lot_stock", "label": "Мин. остаток на лоте", "type": "int", "min": 0, "max": 100},
-            {"key": "autobuy_lot_match", "label": "Метка в описании лота", "type": "text"},
-            {"key": "autobuy_lot_id", "label": "ID лота (быстрее)", "type": "text"},
-            {"key": "supplier_api_url", "label": "URL API поставщика", "type": "text"},
-            {"key": "supplier_api_key", "label": "API-ключ поставщика", "type": "text"},
-            {"key": "supplier_product_id", "label": "ID товара (gemini_18m)", "type": "text"},
-            {"key": "supplier_product_name", "label": "Название товара", "type": "text"},
-            {"key": "supplier_mode", "label": "Режим API", "type": "text"},
-            {"key": "supplier_bulk", "label": "Одним запросом (bulk)", "type": "bool"},
-            {"key": "supplier_parallel", "label": "Параллельность", "type": "int", "min": 1, "max": AUTOBUY_MAX_PARALLEL},
-            {"key": "import_routes", "label": "Маршруты товар→лот", "type": "multiline", "max_len": 2000},
-            {"key": "import_line_template", "label": "Шаблон ссылки в АВ", "type": "text"},
-            {"key": "import_skip_duplicates", "label": "Пропускать дубли заказов", "type": "bool"},
+            {"key": "supplier_api_key", "label": "API-ключ (X-API-Key)", "type": "text"},
+            {"key": "buy_budget_usd", "label": "Потратить за закупку ($)", "type": "float", "min": 0, "max": 100000},
+            {"key": "reserve_balance_usd", "label": "Оставить на балансе ($)", "type": "float", "min": 0, "max": 100000},
+            {"key": "autobuy_lot_id", "label": "ID лота FunPay", "type": "text"},
             {"key": "warehouse_release_qty", "label": "Выложить со склада (шт.)", "type": "int", "min": 0, "max": 100},
         ]
 
-
     def get_settings_schema(self) -> list[dict[str, Any]]:
         fields: list[dict[str, Any]] = []
-        for f in self._autobuy_fields():
+        for f in self._settings_fields():
             fields.append({**f, "default": self._default_cfg().get(f["key"])})
         fields.extend([
             {"key": "run_autobuy", "label": "🛒 Закупить", "type": "action"},
+            {"key": "shop_balance", "label": "💰 Баланс API", "type": "action"},
             {"key": "start_import", "label": "📥 Загрузить закупку", "type": "action"},
             {"key": "release_warehouse", "label": "📤 Со склада", "type": "action"},
             {"key": "stock_status", "label": "📊 Склад", "type": "action"},
@@ -582,6 +463,71 @@ class Plugin:
             return fields[idx]
         return None
 
+    def _shop_client(self) -> tuple[str, str]:
+        url = str(self.get_cfg("supplier_api_url", DEFAULT_API_URL)).strip().rstrip("/")
+        key = str(self.get_cfg("supplier_api_key", "")).strip()
+        return url or DEFAULT_API_URL, key
+
+    def _float_cfg(self, key: str, default: float = 0.0) -> float:
+        try:
+            return float(self.get_cfg(key, default))
+        except (TypeError, ValueError):
+            return default
+
+    def calc_buy_plan(self) -> dict[str, Any]:
+        api_url, api_key = self._shop_client()
+        if not api_key:
+            return {"ok": False, "error": "Не задан API-ключ. Настройки → API-ключ."}
+        balance, err = _shop_get_balance(api_url, api_key)
+        if err:
+            return {"ok": False, "error": f"Баланс: {err}"}
+        reserve = max(0.0, self._float_cfg("reserve_balance_usd", 10.0))
+        budget_set = max(0.0, self._float_cfg("buy_budget_usd", 0.0))
+        available = balance - reserve
+        if available <= 0:
+            return {
+                "ok": False,
+                "error": f"Баланс ${balance:.2f}, резерв ${reserve:.2f} — нечем покупать",
+                "balance": balance, "reserve": reserve,
+            }
+        spend_cap = min(budget_set, available) if budget_set > 0 else available
+        products, err = _shop_get_products(api_url, api_key)
+        if err:
+            return {"ok": False, "error": f"Товары: {err}", "balance": balance, "reserve": reserve}
+        product = _shop_find_product(products, SHOP_PRODUCT_NAME)
+        if not product:
+            return {
+                "ok": False,
+                "error": f"Товар «{SHOP_PRODUCT_NAME}» не найден в магазине",
+                "balance": balance, "reserve": reserve,
+            }
+        try:
+            price = float(product.get("price", 0))
+        except (TypeError, ValueError):
+            price = 0.0
+        if price <= 0:
+            return {"ok": False, "error": "Цена товара неизвестна", "balance": balance, "reserve": reserve}
+        qty = int(spend_cap / price)
+        if qty < 1:
+            return {
+                "ok": False,
+                "error": f"Минимум ${price:.2f} за шт., доступно ${available:.2f}",
+                "balance": balance, "reserve": reserve, "price": price,
+            }
+        spend = round(qty * price, 2)
+        return {
+            "ok": True,
+            "qty": qty,
+            "spend": spend,
+            "balance": balance,
+            "reserve": reserve,
+            "available": available,
+            "price": price,
+            "product_id": int(product["id"]),
+            "product_name": str(product.get("name_en") or product.get("name") or SHOP_PRODUCT_NAME),
+            "shop_stock": product.get("stock_count"),
+        }
+
     def _resolve_autobuy_lot_ids(self, silent: bool = False) -> list[int]:
         lot_id_raw = str(self.get_cfg("autobuy_lot_id", "")).strip()
         if lot_id_raw.isdigit():
@@ -611,25 +557,11 @@ class Plugin:
         return matched[:1] if len(matched) > 1 else matched
 
     def _format_account_lines(self, accounts: list[str]) -> list[str]:
-        tpl = str(self.get_cfg("account_line_template", "{account}") or "{account}")
         lines: list[str] = []
         for acc in accounts:
             acc = acc.strip()
-            if not acc:
-                continue
-            if "{account}" in tpl:
-                line = tpl.replace("{account}", acc)
-            elif "{login}" in tpl and ":" in acc:
-                parts = acc.split(":")
-                line = tpl.replace("{login}", parts[0])
-                if "{password}" in tpl and len(parts) > 1:
-                    line = line.replace("{password}", parts[1])
-                if "{email}" in tpl and len(parts) > 2:
-                    line = line.replace("{email}", parts[2])
-            else:
-                line = acc
-            if line not in lines:
-                lines.append(line)
+            if acc and acc not in lines:
+                lines.append(acc)
         return lines
 
     def _append_accounts_to_lot(self, lot_id: int, accounts: list[str]) -> tuple[bool, str]:
@@ -662,17 +594,10 @@ class Plugin:
                 time.sleep(1.5)
         return False, f"не удалось сохранить лот #{lot_id}"
 
-    def _purchase_accounts(self, quantity: int) -> tuple[list[str], str]:
-        return _supplier_buy_parallel(
-            str(self.get_cfg("supplier_api_url", "")),
-            str(self.get_cfg("supplier_api_key", "")),
-            str(self.get_cfg("supplier_product_id", "")),
-            str(self.get_cfg("supplier_product_name", DEFAULT_SUPPLIER_PRODUCT)),
-            quantity,
-            str(self.get_cfg("supplier_mode", "json_post")),
-            int(self.get_cfg("supplier_parallel", 4)),
-            bool(self.get_cfg("supplier_bulk", True)),
-        )
+    def _purchase_accounts(self, product_id: int, quantity: int) -> tuple[list[str], str]:
+        api_url, api_key = self._shop_client()
+        accounts, info, _ = _shop_buy(api_url, api_key, product_id, quantity)
+        return accounts, info
 
     def _log_autobuy(self, entry: dict[str, Any]) -> None:
         os.makedirs(os.path.dirname(AUTOBUY_LOG_FILE), exist_ok=True)
@@ -691,44 +616,49 @@ class Plugin:
     def run_autobuy(self, notify_chat_id: int | None = None) -> None:
         if self._autobuy_running:
             return
-        allowed, reason = self._autobuy_allowed()
-        if not allowed:
+        plan = self.calc_buy_plan()
+        if not plan.get("ok"):
             bot = self.cardinal.telegram.bot if self.cardinal.telegram else None
+            reason = str(plan.get("error", "закупка недоступна"))
             if bot and notify_chat_id:
                 bot.send_message(notify_chat_id, f"⛔ {_escape(reason)}", parse_mode="HTML")
             self.log("autobuy blocked: %s", reason)
             return
+        lot_ids = self._resolve_autobuy_lot_ids()
+        if not lot_ids:
+            bot = self.cardinal.telegram.bot if self.cardinal.telegram else None
+            msg = (
+                f"⚠️ Укажите <b>ID лота FunPay</b> или метку "
+                f"<code>{_escape(DEFAULT_LOT_MATCH)}</code> в описании лота."
+            )
+            if bot and notify_chat_id:
+                bot.send_message(notify_chat_id, msg, parse_mode="HTML")
+            return
         self._autobuy_running = True
         bot = self.cardinal.telegram.bot if self.cardinal.telegram else None
-        qty = int(self.get_cfg("autobuy_quantity", 0))
-        match = str(self.get_cfg("autobuy_lot_match", DEFAULT_LOT_MATCH))
+        qty = int(plan["qty"])
+        spend = float(plan["spend"])
+        product_id = int(plan["product_id"])
+        product_name = str(plan["product_name"])
         started = datetime.now().isoformat(timespec="seconds")
         t0 = time.time()
         try:
             if bot and notify_chat_id:
                 bot.send_message(
                     notify_chat_id,
-                    f"🛒 <b>Закупка {qty} шт.</b> <code>{_escape(match)}</code>\n⏳ Покупаю у поставщика…",
+                    f"🛒 <b>{_escape(product_name)}</b>\n"
+                    f"💵 Потратим: <b>${spend:.2f}</b> → <b>{qty}</b> шт.\n"
+                    f"💰 Баланс: ${float(plan['balance']):.2f} | резерв: ${float(plan['reserve']):.2f}\n"
+                    f"⏳ Покупаю…",
                     parse_mode="HTML",
                 )
-            accounts, buy_info = self._purchase_accounts(qty)
+            accounts, buy_info = self._purchase_accounts(product_id, qty)
             if not accounts:
                 msg = f"❌ <b>Закупка не удалась</b>\n<code>{_escape(buy_info)}</code>"
                 self.log("autobuy fail: %s", buy_info)
                 if bot and notify_chat_id:
                     bot.send_message(notify_chat_id, msg, parse_mode="HTML")
                 self._log_autobuy({"time": started, "ok": False, "error": buy_info, "qty": qty})
-                return
-
-            lot_ids = self._resolve_autobuy_lot_ids()
-            if not lot_ids:
-                msg = (
-                    f"✅ Куплено <b>{len(accounts)}</b> шт., но лот не найден.\n"
-                    f"Укажите <b>ID лота</b> или метку <code>{_escape(match)}</code> в описании."
-                )
-                if bot and notify_chat_id:
-                    bot.send_message(notify_chat_id, msg, parse_mode="HTML")
-                self._log_autobuy({"time": started, "ok": False, "bought": len(accounts), "error": "no lot"})
                 return
 
             results: list[str] = []
@@ -740,7 +670,7 @@ class Plugin:
 
             summary = (
                 f"{'✅' if ok else '⚠️'} <b>Готово за {int(time.time() - t0)}с</b>\n"
-                f"🛒 Куплено: <b>{len(accounts)}</b> — {buy_info}\n"
+                f"🛒 <b>{qty}</b> шт. — {buy_info}\n"
                 + "\n".join(f"📦 {_escape(r)}" for r in results)
             )
             self.log("autobuy ok: %s accounts -> %s", len(accounts), lot_ids)
@@ -748,7 +678,7 @@ class Plugin:
                 bot.send_message(notify_chat_id, summary, parse_mode="HTML")
             self._log_autobuy({
                 "time": started, "ok": ok, "bought": len(accounts),
-                "lots": lot_ids, "results": results,
+                "spend": spend, "lots": lot_ids, "results": results,
             })
         except Exception as exc:
             logger.error("%s autobuy: %s", _P, exc)
@@ -760,6 +690,31 @@ class Plugin:
                 )
         finally:
             self._autobuy_running = False
+
+    def notify_shop_balance(self, chat_id: int) -> None:
+        bot = self.cardinal.telegram.bot if self.cardinal.telegram else None
+        if not bot:
+            return
+        plan = self.calc_buy_plan()
+        lines = [f"💰 <b>Баланс магазина</b>", f"📦 Товар: <code>{_escape(SHOP_PRODUCT_NAME)}</code>"]
+        if "balance" in plan:
+            lines.append(f"💵 Баланс: <b>${float(plan['balance']):.2f}</b>")
+            lines.append(f"🔒 Резерв: <b>${float(plan.get('reserve', self._float_cfg('reserve_balance_usd'))):.2f}</b>")
+            budget = self._float_cfg("buy_budget_usd")
+            if budget > 0:
+                lines.append(f"🎯 Бюджет закупки: <b>${budget:.2f}</b>")
+            else:
+                lines.append("🎯 Бюджет: <i>всё доступное после резерва</i>")
+        if plan.get("ok"):
+            lines.append(
+                f"✅ Можно купить: <b>{plan['qty']}</b> шт. × ${float(plan['price']):.2f} "
+                f"= <b>${float(plan['spend']):.2f}</b>"
+            )
+            if plan.get("shop_stock") is not None:
+                lines.append(f"🏪 В магазине: <b>{plan['shop_stock']}</b> шт.")
+        else:
+            lines.append(f"⚠️ {_escape(str(plan.get('error', '—')))}")
+        bot.send_message(chat_id, "\n".join(lines), parse_mode="HTML")
 
     def notify_stock_status(self, chat_id: int) -> None:
         bot = self.cardinal.telegram.bot if self.cardinal.telegram else None
@@ -812,26 +767,14 @@ class Plugin:
         return matched[:1]
 
     def _resolve_lot_for_product(self, product: str) -> list[int]:
-        product_l = (product or "").casefold()
-        for key, lot_ref in _parse_import_routes(str(self.get_cfg("import_routes", ""))):
-            if key.casefold() in product_l or (product_l and product_l in key.casefold()):
-                lots = self._resolve_lot_by_match(lot_ref)
-                if lots:
-                    return lots
         return self._resolve_autobuy_lot_ids(silent=True)
 
     def _format_import_lines(self, items: list[dict[str, str]]) -> list[str]:
-        tpl = str(self.get_cfg("import_line_template", "{url}") or "{url}")
         lines: list[str] = []
         for item in items:
-            line = (
-                tpl.replace("{url}", item.get("url", ""))
-                .replace("{order_id}", item.get("order_id", ""))
-                .replace("{product}", item.get("product", ""))
-                .strip()
-            )
-            if line and line not in lines:
-                lines.append(line)
+            url = str(item.get("url", "")).strip()
+            if url and url not in lines:
+                lines.append(url)
         return lines
 
     def _filter_new_import_items(self, items: list[dict[str, str]]) -> tuple[list[dict[str, str]], int]:
@@ -1045,18 +988,11 @@ class Plugin:
         return mode if mode in STOCK_MODES else "stocked"
 
     def _autobuy_allowed(self) -> tuple[bool, str]:
-        if not bool(self.get_cfg("autobuy_enabled", False)):
-            return False, "Автозакупка выключена. Включите переключатель на главной."
-        try:
-            qty = int(self.get_cfg("autobuy_quantity", 0))
-        except (TypeError, ValueError):
-            qty = 0
-        if qty <= 0:
-            return False, "Количество = 0. Закупка отключена."
-        if not str(self.get_cfg("supplier_api_url", "")).strip():
-            return False, "Не задан URL API поставщика."
-        if not str(self.get_cfg("supplier_api_key", "")).strip():
-            return False, "Не задан API-ключ поставщика."
+        plan = self.calc_buy_plan()
+        if not plan.get("ok"):
+            return False, str(plan.get("error", "закупка недоступна"))
+        if not self._resolve_autobuy_lot_ids(silent=True):
+            return False, "Не найден лот FunPay — укажите ID лота"
         return True, ""
 
     def stock_mode_label(self, mode: str | None = None) -> str:
@@ -1150,7 +1086,7 @@ class Plugin:
             if not grouped:
                 msg = (
                     f"⚠️ Не найден лот для <b>{len(batch)}</b> ссылок со склада.\n"
-                    "Настройте <b>Маршруты товар→лот</b> или <b>ID лота</b>."
+                    "Укажите <b>ID лота FunPay</b> в настройках."
                 )
                 if bot and notify_chat_id:
                     bot.send_message(notify_chat_id, msg, parse_mode="HTML")
@@ -1196,7 +1132,12 @@ class Plugin:
             return f"{'🟢' if val else '🔴'} {label}"
         if ftype == "multiline":
             return f"• <b>{label}</b>: <i>{len(str(val or ''))} симв.</i>"
-        if ftype == "int":
+        if ftype in ("int", "float"):
+            if ftype == "float":
+                try:
+                    val = f"{float(val):.2f}"
+                except (TypeError, ValueError):
+                    val = "0.00"
             return f"• <b>{label}</b>: <code>{_escape(val)}</code>"
         if ftype == "action":
             return f"▶️ <b>{label}</b>"
@@ -1206,8 +1147,8 @@ class Plugin:
         return f"• <b>{label}</b>: <code>{preview or '—'}</code>"
 
     def _fields_for_page(self, page: str) -> list[dict[str, Any]]:
-        if page == "autobuy":
-            return self._autobuy_fields()
+        if page == "settings":
+            return self._settings_fields()
         return []
 
     def _lot_stock_info(self) -> str:
@@ -1223,8 +1164,6 @@ class Plugin:
     def render_settings_text(self, page: str = "hub") -> str:
         pages = self._ui_pages()
         page = page if page in pages else "hub"
-        qty = int(self.get_cfg("autobuy_quantity", 5))
-        match = str(self.get_cfg("autobuy_lot_match", DEFAULT_LOT_MATCH))
         lines = [
             f"⚙️ <b>{_escape(NAME)}</b> v{VERSION}",
             "━━━━━━━━━━━━━━━━━━",
@@ -1233,22 +1172,31 @@ class Plugin:
         ]
         if page == "hub":
             mode = self.stock_mode()
-            try:
-                ab_qty = int(self.get_cfg("autobuy_quantity", 0))
-            except (TypeError, ValueError):
-                ab_qty = 0
             wh_qty = int(self.get_cfg("warehouse_release_qty", 5) or 0)
-            ab_on = bool(self.get_cfg("autobuy_enabled"))
+            budget = self._float_cfg("buy_budget_usd")
+            reserve = self._float_cfg("reserve_balance_usd", 10.0)
+            plan = self.calc_buy_plan()
             lines += [
                 f"<b>Режим:</b> {self.stock_mode_label(mode)}",
-                f"📦 <b>На лоте FunPay:</b> {self._lot_stock_info()}",
-                f"🗄 <b>Купленные (склад):</b> {self.warehouse_count()} шт.",
+                f"📦 <b>Лот FunPay:</b> {self._lot_stock_info()}",
+                f"🗄 <b>Склад плагина:</b> {self.warehouse_count()} шт.",
             ]
             if mode == "auto_buy":
-                ab_state = "🟢 ВКЛ" if ab_on and ab_qty > 0 else "🔴 ВЫКЛ"
-                lines.append(f"🤖 <b>Автозакупка:</b> {ab_state} | за раз: <b>{ab_qty}</b> шт.")
-                if ab_qty <= 0:
-                    lines.append("⛔ <i>Количество 0 — закупка полностью отключена</i>")
+                lines.append(f"🛍 <b>Товар:</b> <code>{_escape(SHOP_PRODUCT_NAME)}</code>")
+                if "balance" in plan:
+                    lines.append(f"💵 <b>Баланс API:</b> ${float(plan['balance']):.2f}")
+                lines.append(
+                    f"🎯 <b>Потратить:</b> "
+                    f"{'всё после резерва' if budget <= 0 else f'${budget:.2f}'}"
+                    f" | <b>Резерв:</b> ${reserve:.2f}"
+                )
+                if plan.get("ok"):
+                    lines.append(
+                        f"✅ <b>К закупке:</b> {plan['qty']} шт. "
+                        f"(${float(plan['spend']):.2f} по ${float(plan['price']):.2f}/шт.)"
+                    )
+                elif plan.get("error"):
+                    lines.append(f"⚠️ <i>{_escape(str(plan['error']))}</i>")
             else:
                 lines.append(f"📤 <b>Выложить со склада:</b> {wh_qty} шт. за раз")
             if self._autobuy_running:
@@ -1262,14 +1210,11 @@ class Plugin:
         for field in self._fields_for_page(page):
             val = self.get_cfg(field["key"])
             lines.append(self._format_setting_line(field, val))
-        if page == "autobuy":
-            lines.append(f"\n📦 <b>На лоте FunPay:</b> {self._lot_stock_info()}")
-            lines.append(f"🗄 <b>На складе:</b> {self.warehouse_count()} шт.")
-            lines.append(f"<b>Режим:</b> {self.stock_mode_label()}")
-            lines.append(
-                f"🔎 Ищем лоты с меткой <code>{_escape(match)}</code> "
-                f"или ID <code>{_escape(str(self.get_cfg('autobuy_lot_id', '') or '—'))}</code>"
-            )
+        if page == "settings":
+            lines.append(f"\n📦 <b>На лоте:</b> {self._lot_stock_info()}")
+            lines.append(f"🛍 Товар магазина: <code>{_escape(SHOP_PRODUCT_NAME)}</code>")
+            lot_id = str(self.get_cfg("autobuy_lot_id", "") or "—")
+            lines.append(f"🔎 Лот: ID <code>{_escape(lot_id)}</code> или метка <code>{_escape(DEFAULT_LOT_MATCH)}</code>")
         return "\n".join(lines)
 
     def build_settings_keyboard(self, page: str = "hub") -> IKM:
@@ -1289,19 +1234,20 @@ class Plugin:
                 ),
             )
             if mode == "auto_buy":
-                ab_on = bool(self.get_cfg("autobuy_enabled"))
-                ab_qty = int(self.get_cfg("autobuy_quantity", 0) or 0)
-                kb.row(IKB(
-                    f"{'🟢' if ab_on and ab_qty > 0 else '🔴'} Автозакупка: "
-                    f"{'ВКЛ' if ab_on and ab_qty > 0 else 'ВЫКЛ'}",
-                    callback_data=f"{CB_PREFIX}:togkey:autobuy_enabled",
-                ))
-                if ab_on and ab_qty > 0:
+                budget = self._float_cfg("buy_budget_usd")
+                reserve = self._float_cfg("reserve_balance_usd", 10.0)
+                plan = self.calc_buy_plan()
+                kb.row(
+                    IKB(f"💵 Потратить: ${budget:.2f}" if budget > 0 else "💵 Потратить: всё", callback_data=f"{CB_PREFIX}:editkey:buy_budget_usd"),
+                    IKB(f"🔒 Резерв: ${reserve:.2f}", callback_data=f"{CB_PREFIX}:editkey:reserve_balance_usd"),
+                )
+                kb.row(IKB("💰 Баланс API", callback_data=f"{CB_PREFIX}:act:shop_balance"))
+                if plan.get("ok"):
                     kb.row(IKB(
-                        f"🤖 Купить {ab_qty} шт → FunPay",
+                        f"🛒 Купить {plan['qty']} шт. (${float(plan['spend']):.2f})",
                         callback_data=f"{CB_PREFIX}:act:run_autobuy",
                     ))
-                kb.row(IKB("⚙️ API поставщика", callback_data=f"{CB_PREFIX}:nav:autobuy"))
+                kb.row(IKB("⚙️ Настройки", callback_data=f"{CB_PREFIX}:nav:settings"))
             else:
                 wh_qty = int(self.get_cfg("warehouse_release_qty", 5) or 0)
                 kb.row(IKB("📥 Загрузить Purchase History", callback_data=f"{CB_PREFIX}:act:start_import:warehouse"))
@@ -1310,6 +1256,7 @@ class Plugin:
                         f"📤 Выложить {wh_qty} шт → FunPay",
                         callback_data=f"{CB_PREFIX}:act:release_warehouse",
                     ))
+                kb.row(IKB("⚙️ Настройки", callback_data=f"{CB_PREFIX}:nav:settings"))
             kb.row(IKB("📊 Остатки", callback_data=f"{CB_PREFIX}:act:stock_status"))
         else:
             fields = self._fields_for_page(page)
@@ -1317,30 +1264,30 @@ class Plugin:
                 key = field["key"]
                 label = field.get("label", key)
                 ftype = field.get("type", "str")
-                if ftype == "bool":
-                    on = bool(self.get_cfg(key))
-                    kb.add(IKB(
-                        f"{'🟢' if on else '🔴'} {label[:40]}",
-                        callback_data=f"{CB_PREFIX}:tog:{page}:{i}",
-                    ))
+                val = self.get_cfg(key, "")
+                if ftype == "float":
+                    try:
+                        disp = f"{float(val):.2f}"
+                    except (TypeError, ValueError):
+                        disp = "0.00"
+                elif ftype == "int":
+                    disp = str(val)
                 else:
-                    val = str(self.get_cfg(key, "")).replace("\n", " ")[:14]
-                    if len(str(self.get_cfg(key, ""))) > 14:
-                        val += "…"
-                    kb.add(IKB(
-                        f"✏️ {label[:24]}: {val or '—'}",
-                        callback_data=f"{CB_PREFIX}:edit:{page}:{i}",
-                    ))
-            if page == "autobuy":
-                ab_on = bool(self.get_cfg("autobuy_enabled"))
-                ab_qty = int(self.get_cfg("autobuy_quantity", 0) or 0)
-                kb.row(IKB(
-                    f"{'🟢' if ab_on else '🔴'} Автозакупка: {'ВКЛ' if ab_on else 'ВЫКЛ'}",
-                    callback_data=f"{CB_PREFIX}:togkey:autobuy_enabled",
+                    disp = str(val).replace("\n", " ")[:14]
+                    if len(str(val)) > 14:
+                        disp += "…"
+                kb.add(IKB(
+                    f"✏️ {label[:22]}: {disp or '—'}",
+                    callback_data=f"{CB_PREFIX}:edit:{page}:{i}",
                 ))
-                if ab_on and ab_qty > 0:
-                    kb.row(IKB(f"🤖 Купить {ab_qty} шт", callback_data=f"{CB_PREFIX}:act:run_autobuy"))
-                kb.row(IKB("📊 Остатки", callback_data=f"{CB_PREFIX}:act:stock_status"))
+            if page == "settings":
+                plan = self.calc_buy_plan()
+                if plan.get("ok"):
+                    kb.row(IKB(
+                        f"🛒 Купить {plan['qty']} шт.",
+                        callback_data=f"{CB_PREFIX}:act:run_autobuy",
+                    ))
+                kb.row(IKB("💰 Баланс API", callback_data=f"{CB_PREFIX}:act:shop_balance"))
             kb.row(IKB("🏠 Главная", callback_data=f"{CB_PREFIX}:nav:hub"))
 
         kb.add(IKB("◀️ К плагину", callback_data=f"{CBT.EDIT_PLUGIN}:{UUID}:0"))
@@ -1397,9 +1344,13 @@ class Plugin:
             if self._autobuy_running:
                 bot.answer_callback_query(call.id, "Уже выполняется…", show_alert=True)
                 return True
-            qty = int(self.get_cfg("autobuy_quantity", 0))
-            bot.answer_callback_query(call.id, f"Закупка {qty} шт…")
+            plan = self.calc_buy_plan()
+            bot.answer_callback_query(call.id, f"Закупка {plan.get('qty', 0)} шт…")
             threading.Thread(target=self.run_autobuy, args=(chat_id,), daemon=True).start()
+            return True
+        if action == "shop_balance":
+            bot.answer_callback_query(call.id, "Смотрю баланс…")
+            threading.Thread(target=self.notify_shop_balance, args=(chat_id,), daemon=True).start()
             return True
         if action == "stock_status":
             bot.answer_callback_query(call.id, "Смотрю склад…")
@@ -1472,6 +1423,33 @@ class Plugin:
                 if key:
                     plugin.set_cfg(key, not bool(plugin.get_cfg(key)))
                     show_settings(chat_id, msg_id, "hub")
+                bot.answer_callback_query(call.id)
+                return
+            if action == "editkey" and len(parts) >= 3:
+                key = parts[2]
+                field = plugin.get_schema_field(key)
+                if not field:
+                    bot.answer_callback_query(call.id)
+                    return
+                cur = plugin.get_cfg(key, "")
+                label = field.get("label", key)
+                hint = ""
+                if key == "buy_budget_usd":
+                    hint = "\n\n<i>0 = потратить всё доступное после резерва</i>"
+                try:
+                    preview = f"{float(cur):.2f}" if field.get("type") == "float" else str(cur)
+                except (TypeError, ValueError):
+                    preview = str(cur)
+                prompt = (
+                    f"✏️ <b>{_escape(label)}</b>\n\n"
+                    f"Сейчас: <code>{_escape(preview)}</code>{hint}\n\n"
+                    f"Введите новое значение.\n<code>/cancel</code> — отмена"
+                )
+                result = bot.send_message(chat_id, prompt, parse_mode="HTML")
+                tg.set_state(
+                    chat_id, result.id, call.from_user.id,
+                    state=f"{CB_PREFIX}:edit:settings:{key}",
+                )
                 bot.answer_callback_query(call.id)
                 return
             if action == "tog" and len(parts) >= 4:
@@ -1609,7 +1587,7 @@ class Plugin:
             if not str(state).startswith(f"{CB_PREFIX}:edit:"):
                 return
             state_parts = str(state).split(":", 3)
-            ui_page = state_parts[2] if len(state_parts) > 3 else "autobuy"
+            ui_page = state_parts[2] if len(state_parts) > 3 else "settings"
             key = state_parts[-1]
             field = plugin.get_schema_field(key)
             if not field:
@@ -1626,8 +1604,20 @@ class Plugin:
                 except ValueError:
                     bot.reply_to(message, "⚠️ Введите целое число")
                     return
-                min_v = field.get("min", 1)
-                max_v = field.get("max", 50)
+                min_v = field.get("min", 0)
+                max_v = field.get("max", 100)
+                if val < min_v or val > max_v:
+                    bot.reply_to(message, f"⚠️ Допустимо: {min_v}–{max_v}")
+                    return
+                plugin.set_cfg(key, val)
+            elif field.get("type") == "float":
+                try:
+                    val = float(text.strip().replace(",", "."))
+                except ValueError:
+                    bot.reply_to(message, "⚠️ Введите число, например 10 или 5.50")
+                    return
+                min_v = float(field.get("min", 0))
+                max_v = float(field.get("max", 100000))
                 if val < min_v or val > max_v:
                     bot.reply_to(message, f"⚠️ Допустимо: {min_v}–{max_v}")
                     return
