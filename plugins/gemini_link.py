@@ -34,8 +34,8 @@ except ImportError:
 
 
 NAME          = "Gemini Link Auto"
-VERSION       = "2.3.0"
-DESCRIPTION   = "GPT plus 1M (NW) — закупка по бюджету $ и купленные ссылки"
+VERSION       = "2.4.0"
+DESCRIPTION   = "GPT plus 1M (NW) — авто-закупка аккаунтов и выдача на FunPay"
 CREDITS       = "Cursor AI"
 UUID          = "f7a2e8c1-4b3d-4e9f-a8c2-1d5e9b0f6a3c"
 SETTINGS_PAGE = True
@@ -46,6 +46,9 @@ PROMPT_PREVIEW_LEN: Final[int] = 250
 DEFAULT_API_URL: Final[str] = "https://worker-production-53ca.up.railway.app"
 SHOP_PRODUCT_NAME: Final[str] = "GPT plus 1M (NW)"
 DEFAULT_LOT_MATCH: Final[str] = "GPT plus 1M (NW)"
+DEFAULT_MIN_LOT_STOCK: Final[int] = 3
+DEFAULT_AUTO_INTERVAL: Final[int] = 300
+LOT_CACHE_TTL: Final[int] = 600
 SETTINGS_FILE     = f"storage/plugins/{UUID}/settings.json"
 AUTOBUY_LOG_FILE  = f"storage/plugins/{UUID}/autobuy.json"
 IMPORT_LOG_FILE   = f"storage/plugins/{UUID}/import_stock.json"
@@ -94,68 +97,78 @@ def _dig(data: Any, *keys: str, default: Any = None) -> Any:
     return default if cur is None else cur
 
 
+def _normalize_account_line(raw: str) -> str:
+    """Формат выдачи: email|password|2FA."""
+    s = (raw or "").strip()
+    if not s:
+        return ""
+    if "|" in s and "@" in s.split("|", 1)[0]:
+        parts = [p.strip() for p in s.split("|")]
+        if len(parts) >= 3:
+            return f"{parts[0]}|{parts[1]}|{parts[2]}"
+        return s
+    if ":" in s and "@" in s.split(":")[0]:
+        parts = [p.strip() for p in s.split(":")]
+        if len(parts) >= 3:
+            return f"{parts[0]}|{parts[1]}|{parts[2]}"
+    return s
+
+
 def _extract_accounts_from_payload(data: Any) -> list[str]:
-    """Достаёт строки аккаунтов из типовых ответов API поставщиков."""
+    """Достаёт строки аккаунтов email|password|2FA из ответа Shop API."""
     found: list[str] = []
 
     def add_line(val: Any) -> None:
         if val is None:
             return
         if isinstance(val, str):
-            s = val.strip()
-            if s and s not in found:
-                found.append(s)
+            for chunk in re.split(r"[\r\n]+", val):
+                line = _normalize_account_line(chunk)
+                if line and line not in found:
+                    found.append(line)
             return
         if isinstance(val, dict):
+            email = str(val.get("email") or val.get("login") or val.get("user") or "").strip()
+            password = str(val.get("password") or val.get("pass") or "").strip()
+            twofa = str(
+                val.get("2fa") or val.get("two_fa") or val.get("otp") or val.get("code") or "",
+            ).strip()
+            if email and password:
+                line = _normalize_account_line(
+                    f"{email}|{password}|{twofa}" if twofa else f"{email}|{password}|",
+                )
+                if line and line not in found:
+                    found.append(line)
+                return
             parts = [
                 str(val.get(k, "")).strip()
-                for k in ("account", "data", "item", "content", "login", "email", "user")
+                for k in ("account", "data", "item", "content")
                 if val.get(k)
             ]
-            if "password" in val and parts:
-                parts.append(str(val["password"]).strip())
-            if "pass" in val and len(parts) == 1:
-                parts.append(str(val["pass"]).strip())
-            if len(parts) >= 2:
-                line = ":".join(parts[:3])
-            elif parts:
-                line = parts[0]
-            else:
-                line = ""
-            if line and line not in found:
-                found.append(line)
+            for part in parts:
+                line = _normalize_account_line(part)
+                if line and line not in found:
+                    found.append(line)
 
     def walk(node: Any) -> None:
         if node is None:
             return
         if isinstance(node, str):
-            for chunk in re.split(r"[\r\n]+", node):
-                chunk = chunk.strip()
-                if chunk and chunk not in found:
-                    found.append(chunk)
+            add_line(node)
             return
         if isinstance(node, list):
             for item in node:
                 walk(item)
             return
         if isinstance(node, dict):
-            for key in (
-                "accounts", "account", "items", "data", "goods", "products",
-                "content", "result", "secrets", "stock", "lines",
-            ):
+            for key in ("items", "accounts", "account", "data", "content", "result"):
                 if key in node:
                     walk(node[key])
             if not found:
-                for val in node.values():
-                    if isinstance(val, (list, dict, str)):
-                        walk(val)
-            if not found and {"login", "password"} <= set(node.keys()):
-                add_line(node)
-            elif not found and {"email", "password"} <= set(node.keys()):
                 add_line(node)
 
     walk(data)
-    return [a for a in found if len(a) >= 3]
+    return [a for a in found if "@" in a and "|" in a]
 
 
 def _shop_headers(api_key: str) -> dict[str, str]:
@@ -241,7 +254,12 @@ def _shop_buy(
         return [], err, {}
     items = _extract_accounts_from_payload(data)
     if not items and isinstance(data, dict):
-        items = [str(x).strip() for x in data.get("items", []) if str(x).strip()]
+        items = [
+            _normalize_account_line(str(x))
+            for x in data.get("items", [])
+            if str(x).strip()
+        ]
+    items = [x for x in items if x and "@" in x]
     if not items:
         return [], (str(data)[:300] if data else "пустой ответ"), data if isinstance(data, dict) else {}
     total = _dig(data, "total_price")
@@ -294,27 +312,8 @@ def parse_shop_purchase_history(text: str) -> list[dict[str, str]]:
     return items
 
 
-def _parse_import_routes(raw: str) -> list[tuple[str, str]]:
-    """Строки вида «Gemini 18m | GPT plus 1M (NW)» или «… | #12345»."""
-    routes: list[tuple[str, str]] = []
-    for line in (raw or "").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        if "|" in line:
-            left, right = line.split("|", 1)
-        elif "=>" in line:
-            left, right = line.split("=>", 1)
-        else:
-            continue
-        product_key = left.strip()
-        lot_ref = right.strip()
-        if product_key and lot_ref:
-            routes.append((product_key, lot_ref))
-    return routes
-
 # ═════════════════════════════════════════════════════════════════════════════
-#  Plugin (архитектура StarvellPlugin)
+#  Plugin
 # ═════════════════════════════════════════════════════════════════════════════
 
 class Plugin:
@@ -327,6 +326,10 @@ class Plugin:
         self._import_buffers: dict[tuple[int, int], str] = {}
         self._import_pending: dict[int, list[dict[str, str]]] = {}
         self._import_target: dict[int, str] = {}
+        self._cached_lot_id: int | None = None
+        self._cached_lot_ts: float = 0.0
+        self._stop_auto = False
+        self._auto_thread: threading.Thread | None = None
         self.reload_settings()
 
     def log(self, msg: str, *args) -> None:
@@ -351,6 +354,14 @@ class Plugin:
                         loaded["supplier_api_url"] = DEFAULT_API_URL
                     loaded["autobuy_lot_match"] = DEFAULT_LOT_MATCH
                     loaded["_cfg_version"] = "2.3.0"
+                if str(loaded.get("_cfg_version", "0")) < "2.4.0":
+                    loaded.setdefault("auto_enabled", True)
+                    loaded.setdefault("min_lot_stock", DEFAULT_MIN_LOT_STOCK)
+                    loaded.setdefault("auto_interval_sec", DEFAULT_AUTO_INTERVAL)
+                    loaded.setdefault("last_auto_at", "")
+                    if loaded.get("stock_mode") == "stocked" and not loaded.get("supplier_api_key"):
+                        loaded["stock_mode"] = "auto_buy"
+                    loaded["_cfg_version"] = "2.4.0"
                 self._cfg = loaded
             else:
                 self._cfg = defaults
@@ -393,11 +404,15 @@ class Plugin:
             "reserve_balance_usd": 10.0,
             "autobuy_lot_match": DEFAULT_LOT_MATCH,
             "autobuy_lot_id": "",
+            "auto_enabled": True,
+            "min_lot_stock": DEFAULT_MIN_LOT_STOCK,
+            "auto_interval_sec": DEFAULT_AUTO_INTERVAL,
+            "last_auto_at": "",
             "import_skip_duplicates": True,
             "imported_order_ids": [],
-            "stock_mode": "stocked",
+            "stock_mode": "auto_buy",
             "warehouse_release_qty": 5,
-            "_cfg_version": "2.3.0",
+            "_cfg_version": "2.4.0",
         }
 
     # ── UI: компактные страницы вместо длинного списка кнопок ───────────────
@@ -414,7 +429,9 @@ class Plugin:
             {"key": "supplier_api_key", "label": "API-ключ (X-API-Key)", "type": "text"},
             {"key": "buy_budget_usd", "label": "Потратить за закупку ($)", "type": "float", "min": 0, "max": 100000},
             {"key": "reserve_balance_usd", "label": "Оставить на балансе ($)", "type": "float", "min": 0, "max": 100000},
-            {"key": "autobuy_lot_id", "label": "ID лота FunPay", "type": "text"},
+            {"key": "min_lot_stock", "label": "Мин. аккаунтов на лоте", "type": "int", "min": 0, "max": 500},
+            {"key": "auto_interval_sec", "label": "Проверка авто (сек)", "type": "int", "min": 60, "max": 3600},
+            {"key": "autobuy_lot_id", "label": "ID лота (необяз.)", "type": "text"},
             {"key": "warehouse_release_qty", "label": "Выложить со склада (шт.)", "type": "int", "min": 0, "max": 100},
         ]
 
@@ -449,6 +466,9 @@ class Plugin:
         for field in self.get_settings_schema():
             if field.get("key") == key:
                 return field
+        for field in self._settings_fields():
+            if field.get("key") == key:
+                return field
         return None
 
     def _schema_field_by_index(self, idx: int) -> dict[str, Any] | None:
@@ -474,7 +494,7 @@ class Plugin:
         except (TypeError, ValueError):
             return default
 
-    def calc_buy_plan(self) -> dict[str, Any]:
+    def calc_buy_plan(self, max_qty: int | None = None) -> dict[str, Any]:
         api_url, api_key = self._shop_client()
         if not api_key:
             return {"ok": False, "error": "Не задан API-ключ. Настройки → API-ключ."}
@@ -508,6 +528,8 @@ class Plugin:
         if price <= 0:
             return {"ok": False, "error": "Цена товара неизвестна", "balance": balance, "reserve": reserve}
         qty = int(spend_cap / price)
+        if max_qty is not None and max_qty > 0:
+            qty = min(qty, int(max_qty))
         if qty < 1:
             return {
                 "ok": False,
@@ -528,10 +550,46 @@ class Plugin:
             "shop_stock": product.get("stock_count"),
         }
 
+    def _lot_full_text(self, lot_id: int) -> str:
+        chunks: list[str] = []
+        try:
+            lf = self.cardinal.account.get_lot_fields(int(lot_id))
+            for attr in (
+                "description", "title", "fields", "full_description",
+                "description_ru", "description_en", "html",
+            ):
+                val = getattr(lf, attr, None)
+                if val:
+                    chunks.append(str(val))
+            secrets = getattr(lf, "secrets", None)
+            if secrets:
+                chunks.append("\n".join(str(s) for s in secrets[:3]))
+        except Exception as exc:
+            logger.debug("%s lot fields #%s: %s", _P, lot_id, exc)
+        return "\n".join(chunks)
+
+    def _lot_stock_count(self, lot_id: int) -> int:
+        try:
+            lf = self.cardinal.account.get_lot_fields(int(lot_id))
+            return len(lf.secrets or [])
+        except Exception:
+            return 0
+
+    def _invalidate_lot_cache(self) -> None:
+        self._cached_lot_id = None
+        self._cached_lot_ts = 0.0
+
     def _resolve_autobuy_lot_ids(self, silent: bool = False) -> list[int]:
         lot_id_raw = str(self.get_cfg("autobuy_lot_id", "")).strip()
         if lot_id_raw.isdigit():
-            return [int(lot_id_raw)]
+            lot_id = int(lot_id_raw)
+            self._cached_lot_id = lot_id
+            self._cached_lot_ts = time.time()
+            return [lot_id]
+
+        if self._cached_lot_id and (time.time() - self._cached_lot_ts) < LOT_CACHE_TTL:
+            return [self._cached_lot_id]
+
         needle = str(self.get_cfg("autobuy_lot_match", DEFAULT_LOT_MATCH)).strip()
         if not needle:
             return []
@@ -547,21 +605,32 @@ class Plugin:
         for lot in profile.get_lots():
             desc = str(getattr(lot, "description", "") or "")
             title = str(getattr(lot, "title", "") or desc)
+            try:
+                lot_id = int(lot.id)
+            except (TypeError, ValueError):
+                continue
             if _lot_text_matches(desc, needle) or _lot_text_matches(title, needle):
-                try:
-                    matched.append(int(lot.id))
-                except (TypeError, ValueError):
-                    continue
+                matched.append(lot_id)
+                continue
+            full_text = self._lot_full_text(lot_id)
+            if _lot_text_matches(full_text, needle):
+                matched.append(lot_id)
         if not matched and not silent:
-            self.log("лоты с меткой %r не найдены", needle)
-        return matched[:1] if len(matched) > 1 else matched
+            self.log("лот с меткой %r в описании не найден", needle)
+        if len(matched) > 1 and not silent:
+            self.log("несколько лотов для %r, берём #%s", needle, matched[0])
+        result = matched[:1]
+        if result:
+            self._cached_lot_id = result[0]
+            self._cached_lot_ts = time.time()
+        return result
 
     def _format_account_lines(self, accounts: list[str]) -> list[str]:
         lines: list[str] = []
         for acc in accounts:
-            acc = acc.strip()
-            if acc and acc not in lines:
-                lines.append(acc)
+            line = _normalize_account_line(acc)
+            if line and line not in lines:
+                lines.append(line)
         return lines
 
     def _append_accounts_to_lot(self, lot_id: int, accounts: list[str]) -> tuple[bool, str]:
@@ -583,12 +652,12 @@ class Plugin:
                         lf.secrets.append(line)
                         existing.add(line)
                 lf.auto_delivery = True
-                if not lf.active and lf.secrets:
-                    lf.active = True
+                lf.active = True
                 lf.renew_fields()
                 acc.save_lot(lf)
                 added = len(lf.secrets) - before
-                return True, f"лот #{lot_id}: +{added} шт., всего {len(lf.secrets)}"
+                state = "🟢 активен + АВ" if lf.active and lf.auto_delivery else "⚠️ проверьте лот"
+                return True, f"лот #{lot_id}: +{added} шт., всего {len(lf.secrets)} ({state})"
             except Exception as exc:
                 self.log("save_lot #%s attempt %s: %s", lot_id, attempt + 1, exc)
                 time.sleep(1.5)
@@ -613,26 +682,35 @@ class Plugin:
         with open(AUTOBUY_LOG_FILE, "w", encoding="utf-8") as f:
             json.dump(history, f, ensure_ascii=False, indent=2)
 
-    def run_autobuy(self, notify_chat_id: int | None = None) -> None:
+    def run_autobuy(
+        self,
+        notify_chat_id: int | None = None,
+        max_qty: int | None = None,
+        auto: bool = False,
+    ) -> None:
         if self._autobuy_running:
             return
-        plan = self.calc_buy_plan()
+        plan = self.calc_buy_plan(max_qty=max_qty)
         if not plan.get("ok"):
-            bot = self.cardinal.telegram.bot if self.cardinal.telegram else None
-            reason = str(plan.get("error", "закупка недоступна"))
-            if bot and notify_chat_id:
-                bot.send_message(notify_chat_id, f"⛔ {_escape(reason)}", parse_mode="HTML")
-            self.log("autobuy blocked: %s", reason)
+            if not auto:
+                bot = self.cardinal.telegram.bot if self.cardinal.telegram else None
+                reason = str(plan.get("error", "закупка недоступна"))
+                if bot and notify_chat_id:
+                    bot.send_message(notify_chat_id, f"⛔ {_escape(reason)}", parse_mode="HTML")
+            self.log("autobuy blocked: %s", plan.get("error"))
             return
-        lot_ids = self._resolve_autobuy_lot_ids()
+        lot_ids = self._resolve_autobuy_lot_ids(silent=auto)
         if not lot_ids:
-            bot = self.cardinal.telegram.bot if self.cardinal.telegram else None
-            msg = (
-                f"⚠️ Укажите <b>ID лота FunPay</b> или метку "
-                f"<code>{_escape(DEFAULT_LOT_MATCH)}</code> в описании лота."
-            )
-            if bot and notify_chat_id:
-                bot.send_message(notify_chat_id, msg, parse_mode="HTML")
+            if not auto:
+                bot = self.cardinal.telegram.bot if self.cardinal.telegram else None
+                msg = (
+                    f"⚠️ Лот не найден. В <b>подробном описании</b> лота укажите:\n"
+                    f"<code>{_escape(DEFAULT_LOT_MATCH)}</code>"
+                )
+                if bot and notify_chat_id:
+                    bot.send_message(notify_chat_id, msg, parse_mode="HTML")
+            else:
+                self.log("auto: лот с %r не найден", DEFAULT_LOT_MATCH)
             return
         self._autobuy_running = True
         bot = self.cardinal.telegram.bot if self.cardinal.telegram else None
@@ -640,15 +718,18 @@ class Plugin:
         spend = float(plan["spend"])
         product_id = int(plan["product_id"])
         product_name = str(plan["product_name"])
+        lot_id = lot_ids[0]
         started = datetime.now().isoformat(timespec="seconds")
         t0 = time.time()
         try:
+            tag = "авто" if auto else "ручная"
+            self.log("%s закупка: %s шт. ($%.2f) → лот #%s", tag, qty, spend, lot_id)
             if bot and notify_chat_id:
                 bot.send_message(
                     notify_chat_id,
                     f"🛒 <b>{_escape(product_name)}</b>\n"
-                    f"💵 Потратим: <b>${spend:.2f}</b> → <b>{qty}</b> шт.\n"
-                    f"💰 Баланс: ${float(plan['balance']):.2f} | резерв: ${float(plan['reserve']):.2f}\n"
+                    f"💵 <b>${spend:.2f}</b> → <b>{qty}</b> акк.\n"
+                    f"📦 Лот <b>#{lot_id}</b> | формат <code>почта|пароль|2FA</code>\n"
                     f"⏳ Покупаю…",
                     parse_mode="HTML",
                 )
@@ -658,28 +739,24 @@ class Plugin:
                 self.log("autobuy fail: %s", buy_info)
                 if bot and notify_chat_id:
                     bot.send_message(notify_chat_id, msg, parse_mode="HTML")
-                self._log_autobuy({"time": started, "ok": False, "error": buy_info, "qty": qty})
+                self._log_autobuy({"time": started, "ok": False, "error": buy_info, "qty": qty, "auto": auto})
                 return
 
-            results: list[str] = []
-            ok = True
-            for lot_id in lot_ids:
-                success, info = self._append_accounts_to_lot(lot_id, accounts)
-                results.append(info)
-                ok = ok and success
-
+            success, info = self._append_accounts_to_lot(lot_id, accounts)
             summary = (
-                f"{'✅' if ok else '⚠️'} <b>Готово за {int(time.time() - t0)}с</b>\n"
-                f"🛒 <b>{qty}</b> шт. — {buy_info}\n"
-                + "\n".join(f"📦 {_escape(r)}" for r in results)
+                f"{'✅' if success else '⚠️'} <b>Готово за {int(time.time() - t0)}с</b>\n"
+                f"🛒 <b>{len(accounts)}</b> акк. — {buy_info}\n"
+                f"📦 {_escape(info)}"
             )
-            self.log("autobuy ok: %s accounts -> %s", len(accounts), lot_ids)
+            self.log("autobuy ok: %s accounts -> #%s", len(accounts), lot_id)
             if bot and notify_chat_id:
                 bot.send_message(notify_chat_id, summary, parse_mode="HTML")
             self._log_autobuy({
-                "time": started, "ok": ok, "bought": len(accounts),
-                "spend": spend, "lots": lot_ids, "results": results,
+                "time": started, "ok": success, "bought": len(accounts),
+                "spend": spend, "lots": lot_ids, "results": [info], "auto": auto,
             })
+            self._cfg["last_auto_at"] = started
+            self._save_settings()
         except Exception as exc:
             logger.error("%s autobuy: %s", _P, exc)
             if bot and notify_chat_id:
@@ -690,6 +767,59 @@ class Plugin:
                 )
         finally:
             self._autobuy_running = False
+
+    def _auto_tick(self) -> None:
+        if not bool(self.get_cfg("auto_enabled", True)):
+            return
+        if self.stock_mode() != "auto_buy":
+            return
+        if self._autobuy_running:
+            return
+        if not self._shop_client()[1]:
+            return
+        lot_ids = self._resolve_autobuy_lot_ids(silent=True)
+        if not lot_ids:
+            return
+        lot_id = lot_ids[0]
+        current = self._lot_stock_count(lot_id)
+        min_stock = max(0, int(self.get_cfg("min_lot_stock", DEFAULT_MIN_LOT_STOCK)))
+        if current >= min_stock:
+            return
+        needed = max(1, min_stock - current)
+        plan = self.calc_buy_plan(max_qty=needed)
+        if not plan.get("ok"):
+            self.log("auto: %s", plan.get("error"))
+            return
+        self.log("auto: лот #%s — %s/%s акк., докупаю %s", lot_id, current, min_stock, plan["qty"])
+        self.run_autobuy(notify_chat_id=None, max_qty=needed, auto=True)
+
+    def _auto_worker_loop(self) -> None:
+        self.log("фоновая автозакупка запущена")
+        time.sleep(15)
+        while not self._stop_auto:
+            try:
+                self._auto_tick()
+            except Exception as exc:
+                logger.error("%s auto worker: %s", _P, exc)
+                logger.debug(traceback.format_exc())
+            try:
+                interval = max(60, int(self.get_cfg("auto_interval_sec", DEFAULT_AUTO_INTERVAL)))
+            except (TypeError, ValueError):
+                interval = DEFAULT_AUTO_INTERVAL
+            for _ in range(interval):
+                if self._stop_auto:
+                    break
+                time.sleep(1)
+        self.log("фоновая автозакупка остановлена")
+
+    def start_auto_worker(self) -> None:
+        if self._auto_thread and self._auto_thread.is_alive():
+            return
+        self._stop_auto = False
+        self._auto_thread = threading.Thread(
+            target=self._auto_worker_loop, daemon=True, name="GeminiLinkAuto",
+        )
+        self._auto_thread.start()
 
     def notify_shop_balance(self, chat_id: int) -> None:
         bot = self.cardinal.telegram.bot if self.cardinal.telegram else None
@@ -733,9 +863,10 @@ class Plugin:
                 lines.append("\n⚠️ Лот не найден — задайте <b>ID лота</b> или метку в описании.")
             for lot_id in lot_ids:
                 lf = self.cardinal.account.get_lot_fields(int(lot_id))
+                active = "🟢 активен" if lf.active else "🔴 выключен"
+                av = "🟢 АВ" if lf.auto_delivery else "🔴 без АВ"
                 lines.append(
-                    f"• Лот <b>#{lot_id}</b>: <b>{len(lf.secrets)}</b> шт. "
-                    f"({'🟢 автовыдача' if lf.auto_delivery else '🔴 без АВ'})"
+                    f"• Лот <b>#{lot_id}</b>: <b>{len(lf.secrets)}</b> акк. | {active} | {av}"
                 )
             bot.send_message(chat_id, "\n".join(lines), parse_mode="HTML")
         except Exception as exc:
@@ -927,8 +1058,7 @@ class Plugin:
 
             if unresolved:
                 msg = (
-                    f"⚠️ <b>{len(unresolved)}</b> ссылок без лота — настройте "
-                    f"<b>Маршруты товар→лот</b> или <b>ID лота</b>."
+                    f"⚠️ <b>{len(unresolved)}</b> ссылок без лота — укажите <b>ID лота FunPay</b>."
                 )
                 if bot:
                     bot.send_message(chat_id, msg, parse_mode="HTML")
@@ -1182,7 +1312,16 @@ class Plugin:
                 f"🗄 <b>Склад плагина:</b> {self.warehouse_count()} шт.",
             ]
             if mode == "auto_buy":
+                auto_on = bool(self.get_cfg("auto_enabled", True))
+                min_stock = int(self.get_cfg("min_lot_stock", DEFAULT_MIN_LOT_STOCK))
+                lot_ids = self._resolve_autobuy_lot_ids(silent=True)
+                lot_hint = f"#{lot_ids[0]}" if lot_ids else "не найден"
                 lines.append(f"🛍 <b>Товар:</b> <code>{_escape(SHOP_PRODUCT_NAME)}</code>")
+                lines.append(f"📋 <b>Формат:</b> <code>почта|пароль|2FA</code>")
+                lines.append(
+                    f"🤖 <b>Авто:</b> {'🟢 ВКЛ' if auto_on else '🔴 ВЫКЛ'} | "
+                    f"мин. на лоте: <b>{min_stock}</b> | лот: <b>{lot_hint}</b>"
+                )
                 if "balance" in plan:
                     lines.append(f"💵 <b>Баланс API:</b> ${float(plan['balance']):.2f}")
                 lines.append(
@@ -1192,11 +1331,14 @@ class Plugin:
                 )
                 if plan.get("ok"):
                     lines.append(
-                        f"✅ <b>К закупке:</b> {plan['qty']} шт. "
-                        f"(${float(plan['spend']):.2f} по ${float(plan['price']):.2f}/шт.)"
+                        f"✅ <b>Можно купить сейчас:</b> {plan['qty']} акк. "
+                        f"(${float(plan['spend']):.2f})"
                     )
                 elif plan.get("error"):
                     lines.append(f"⚠️ <i>{_escape(str(plan['error']))}</i>")
+                last = str(self.get_cfg("last_auto_at", "") or "")
+                if last:
+                    lines.append(f"🕐 <i>Последняя закупка: {last}</i>")
             else:
                 lines.append(f"📤 <b>Выложить со склада:</b> {wh_qty} шт. за раз")
             if self._autobuy_running:
@@ -1212,9 +1354,12 @@ class Plugin:
             lines.append(self._format_setting_line(field, val))
         if page == "settings":
             lines.append(f"\n📦 <b>На лоте:</b> {self._lot_stock_info()}")
-            lines.append(f"🛍 Товар магазина: <code>{_escape(SHOP_PRODUCT_NAME)}</code>")
-            lot_id = str(self.get_cfg("autobuy_lot_id", "") or "—")
-            lines.append(f"🔎 Лот: ID <code>{_escape(lot_id)}</code> или метка <code>{_escape(DEFAULT_LOT_MATCH)}</code>")
+            lines.append(f"🛍 Товар: <code>{_escape(SHOP_PRODUCT_NAME)}</code>")
+            lines.append(f"📋 Формат автовыдачи: <code>почта|пароль|2FA</code>")
+            lines.append(
+                f"🔎 Лот ищется по тексту <code>{_escape(DEFAULT_LOT_MATCH)}</code> "
+                f"в подробном описании (ID необязателен)"
+            )
         return "\n".join(lines)
 
     def build_settings_keyboard(self, page: str = "hub") -> IKM:
@@ -1236,15 +1381,24 @@ class Plugin:
             if mode == "auto_buy":
                 budget = self._float_cfg("buy_budget_usd")
                 reserve = self._float_cfg("reserve_balance_usd", 10.0)
+                auto_on = bool(self.get_cfg("auto_enabled", True))
+                min_stock = int(self.get_cfg("min_lot_stock", DEFAULT_MIN_LOT_STOCK))
                 plan = self.calc_buy_plan()
+                kb.row(IKB(
+                    f"{'🟢' if auto_on else '🔴'} Авто: {'ВКЛ' if auto_on else 'ВЫКЛ'}",
+                    callback_data=f"{CB_PREFIX}:togkey:auto_enabled",
+                ))
+                kb.row(
+                    IKB(f"📉 Мин. на лоте: {min_stock}", callback_data=f"{CB_PREFIX}:editkey:min_lot_stock"),
+                    IKB("💰 Баланс", callback_data=f"{CB_PREFIX}:act:shop_balance"),
+                )
                 kb.row(
                     IKB(f"💵 Потратить: ${budget:.2f}" if budget > 0 else "💵 Потратить: всё", callback_data=f"{CB_PREFIX}:editkey:buy_budget_usd"),
                     IKB(f"🔒 Резерв: ${reserve:.2f}", callback_data=f"{CB_PREFIX}:editkey:reserve_balance_usd"),
                 )
-                kb.row(IKB("💰 Баланс API", callback_data=f"{CB_PREFIX}:act:shop_balance"))
                 if plan.get("ok"):
                     kb.row(IKB(
-                        f"🛒 Купить {plan['qty']} шт. (${float(plan['spend']):.2f})",
+                        f"🛒 Купить {plan['qty']} акк. (${float(plan['spend']):.2f})",
                         callback_data=f"{CB_PREFIX}:act:run_autobuy",
                     ))
                 kb.row(IKB("⚙️ Настройки", callback_data=f"{CB_PREFIX}:nav:settings"))
@@ -1436,8 +1590,14 @@ class Plugin:
                 hint = ""
                 if key == "buy_budget_usd":
                     hint = "\n\n<i>0 = потратить всё доступное после резерва</i>"
+                elif key == "min_lot_stock":
+                    hint = "\n\n<i>Если на лоте меньше — плагин докупит сам</i>"
                 try:
-                    preview = f"{float(cur):.2f}" if field.get("type") == "float" else str(cur)
+                    preview = (
+                        f"{float(cur):.2f}" if field.get("type") == "float"
+                        else str(int(cur)) if field.get("type") == "int"
+                        else str(cur)
+                    )
                 except (TypeError, ValueError):
                     preview = str(cur)
                 prompt = (
@@ -1697,7 +1857,8 @@ def init_plugin(cardinal: Cardinal) -> None:
     global _plugin
     _plugin = Plugin(cardinal)
     _plugin.setup_telegram()
-    logger.info("%s v%s загружен", _P, VERSION)
+    _plugin.start_auto_worker()
+    logger.info("%s v%s загружен (авто-режим)", _P, VERSION)
 
 
 BIND_TO_PRE_INIT = [init_plugin]
