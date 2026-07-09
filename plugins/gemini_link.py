@@ -34,7 +34,7 @@ except ImportError:
 
 
 NAME          = "Gemini Link Auto"
-VERSION       = "2.5.1"
+VERSION       = "2.5.2"
 DESCRIPTION   = "GPT plus 1M (NW) — авто-закупка аккаунтов и выдача на FunPay"
 CREDITS       = "Cursor AI"
 UUID          = "f7a2e8c1-4b3d-4e9f-a8c2-1d5e9b0f6a3c"
@@ -650,8 +650,8 @@ class Plugin:
     def _validate_buy_plan(self, plan: dict[str, Any]) -> tuple[bool, str]:
         if not plan.get("ok"):
             return False, str(plan.get("error", "закупка недоступна"))
-        pname = str(plan.get("product_name", ""))
-        if not _product_matches_name({"name": pname}, SHOP_PRODUCT_NAME):
+        pname = str(plan.get("product_name", "")).strip()
+        if pname.casefold() != SHOP_PRODUCT_NAME.casefold():
             return False, f"Товар «{pname}» ≠ «{SHOP_PRODUCT_NAME}»"
         spend = float(plan.get("spend", 0))
         reserve = max(0.0, self._float_cfg("reserve_balance_usd", 10.0))
@@ -663,23 +663,45 @@ class Plugin:
             return False, f"Закупка ${spend:.2f} превышает бюджет ${budget:.2f}"
         return True, ""
 
-    def _lot_full_text(self, lot_id: int) -> str:
+    def _lot_detailed_description(self, lot_id: int) -> str:
+        """Подробное описание лота (fields[desc]), не краткое название."""
         chunks: list[str] = []
         try:
             lf = self.cardinal.account.get_lot_fields(int(lot_id))
-            for attr in (
-                "description", "title", "fields", "full_description",
-                "description_ru", "description_en", "html",
-            ):
+            for attr in ("description_ru", "description_en"):
                 val = getattr(lf, attr, None)
                 if val:
                     chunks.append(str(val))
-            secrets = getattr(lf, "secrets", None)
-            if secrets:
-                chunks.append("\n".join(str(s) for s in secrets[:3]))
+            raw = getattr(lf, "fields", None)
+            if isinstance(raw, dict):
+                for key in ("fields[desc][ru]", "fields[desc][en]"):
+                    val = raw.get(key)
+                    if val and str(val) not in chunks:
+                        chunks.append(str(val))
         except Exception as exc:
-            logger.debug("%s lot fields #%s: %s", _P, lot_id, exc)
+            logger.debug("%s lot desc #%s: %s", _P, lot_id, exc)
         return "\n".join(chunks)
+
+    def _find_lots_by_detailed_desc(self, needle: str, *, fast: bool = False) -> list[int]:
+        needle = (needle or "").strip()
+        if not needle or fast:
+            return []
+        profile = self.cardinal.profile
+        if not profile:
+            try:
+                profile = self.cardinal.account.get_user(self.cardinal.account.id)
+            except Exception:
+                return []
+        matched: list[int] = []
+        for lot in profile.get_lots():
+            try:
+                lot_id = int(lot.id)
+            except (TypeError, ValueError):
+                continue
+            detail = self._lot_detailed_description(lot_id)
+            if _lot_text_matches(detail, needle):
+                matched.append(lot_id)
+        return matched
 
     def _lot_stock_count(self, lot_id: int) -> int:
         try:
@@ -708,32 +730,9 @@ class Plugin:
         needle = str(self.get_cfg("autobuy_lot_match", DEFAULT_LOT_MATCH)).strip()
         if not needle:
             return []
-        profile = self.cardinal.profile
-        if not profile:
-            try:
-                profile = self.cardinal.account.get_user(self.cardinal.account.id)
-            except Exception as exc:
-                if not silent:
-                    self.log("profile error: %s", exc)
-                return []
-        matched: list[int] = []
-        for lot in profile.get_lots():
-            desc = str(getattr(lot, "description", "") or "")
-            title = str(getattr(lot, "title", "") or desc)
-            try:
-                lot_id = int(lot.id)
-            except (TypeError, ValueError):
-                continue
-            if _lot_text_matches(desc, needle) or _lot_text_matches(title, needle):
-                matched.append(lot_id)
-                continue
-            if fast:
-                continue
-            full_text = self._lot_full_text(lot_id)
-            if _lot_text_matches(full_text, needle):
-                matched.append(lot_id)
+        matched = self._find_lots_by_detailed_desc(needle, fast=fast)
         if not matched and not silent:
-            self.log("лот с меткой %r в описании не найден", needle)
+            self.log("лот с меткой %r в подробном описании не найден", needle)
         if len(matched) > 1 and not silent:
             self.log("несколько лотов для %r, берём #%s", needle, matched[0])
         result = matched[:1]
@@ -1036,21 +1035,7 @@ class Plugin:
             return []
         if needle.startswith("#") and needle[1:].isdigit():
             return [int(needle[1:])]
-        profile = self.cardinal.profile
-        if not profile:
-            try:
-                profile = self.cardinal.account.get_user(self.cardinal.account.id)
-            except Exception:
-                return []
-        matched: list[int] = []
-        for lot in profile.get_lots():
-            desc = str(getattr(lot, "description", "") or "")
-            title = str(getattr(lot, "title", "") or desc)
-            if _lot_text_matches(desc, needle) or _lot_text_matches(title, needle):
-                try:
-                    matched.append(int(lot.id))
-                except (TypeError, ValueError):
-                    continue
+        matched = self._find_lots_by_detailed_desc(needle)
         if len(matched) > 1 and not silent:
             self.log("несколько лотов для %r, берём первый: %s", needle, matched[0])
         return matched[:1]
@@ -1565,7 +1550,7 @@ class Plugin:
             if instant:
                 lines.append(
                     f"🔎 Лот ищется по тексту <code>{_escape(DEFAULT_LOT_MATCH)}</code> "
-                    f"в подробном описании"
+                    f"только в <b>подробном описании</b>"
                 )
                 lines.append("<i>⏳ Загрузка остатков лота…</i>")
                 return "\n".join(lines)
@@ -1574,7 +1559,7 @@ class Plugin:
             lines.append(f"📋 Формат автовыдачи: <code>почта|пароль|2FA</code>")
             lines.append(
                 f"🔎 Лот ищется по тексту <code>{_escape(DEFAULT_LOT_MATCH)}</code> "
-                f"в подробном описании (ID необязателен)"
+                f"только в <b>подробном описании</b> лота (не в названии)"
             )
         return "\n".join(lines)
 
