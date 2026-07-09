@@ -128,4 +128,5 @@ from starvell_sdk import StarvellPlugin, on_message, MessageContext
 ## Примеры
 
 - `vexboost_autosmm.py` — автонакрутка SMM через VexBoost (нативный плагин Starvell)
+- `fts_starwell.py` — автопродажа Telegram Stars через Fragment API (FTS-Starwell)
 - `_starvell_template.py` — пустой шаблон (не загружается автоматически)

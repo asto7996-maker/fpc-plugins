@@ -23,6 +23,16 @@ USER_AGENT = (
 BASE_URL = "https://starvell.com"
 
 
+class StarvellAPIError(Exception):
+    """HTTP-ошибка Starvell API с телом ответа."""
+
+    def __init__(self, status: int, message: str, body: dict | None = None) -> None:
+        super().__init__(message)
+        self.status = status
+        self.message = message
+        self.body = body or {}
+
+
 class RateLimiter:
     """Ограничитель частоты запросов к Starvell."""
 
@@ -251,12 +261,191 @@ class StarvellAPI:
 
     # ── Лоты и бамп ───────────────────────────────────────────────────────
 
+    @staticmethod
+    def offer_id_from_order(order: dict[str, Any]) -> str:
+        """ID лота из объекта заказа."""
+        for key in ("offerId", "offer_id", "lotId", "lot_id"):
+            val = order.get(key)
+            if val is not None and str(val).strip():
+                return str(val).strip()
+        for block_key in ("offerDetails", "offer"):
+            block = order.get(block_key) or {}
+            if not isinstance(block, dict):
+                continue
+            for key in ("id", "offerId", "offer_id"):
+                val = block.get(key)
+                if val is not None and str(val).strip():
+                    return str(val).strip()
+        return ""
+
+    @staticmethod
+    def _normalize_seller_offer_row(offer: dict[str, Any]) -> dict[str, Any]:
+        category = offer.get("category") if isinstance(offer.get("category"), dict) else {}
+        game = offer.get("game") if isinstance(offer.get("game"), dict) else {}
+        if not game and isinstance(category.get("game"), dict):
+            game = category["game"]
+        desc = (offer.get("descriptions") or {}).get("rus") or {}
+        title = desc.get("briefDescription") or desc.get("description") or ""
+        cat_id = offer.get("categoryId") or category.get("id")
+        game_id = offer.get("gameId") or category.get("gameId") or game.get("id")
+        game_slug = game.get("slug") or (category.get("game") or {}).get("slug")
+        cat_slug = category.get("slug")
+        return {
+            "id": offer.get("id"),
+            "public_id": offer.get("publicId"),
+            "title": str(title).strip(),
+            "price": offer.get("price"),
+            "availability": offer.get("availability"),
+            "is_active": offer.get("isActive", True),
+            "category_id": cat_id,
+            "game_id": game_id,
+            "category_url": f"{BASE_URL}/{game_slug}/{cat_slug}/trade" if game_slug and cat_slug else None,
+        }
+
+    async def fetch_my_offers(
+        self,
+        *,
+        category_id: int | None = None,
+        limit: int = 200,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        """POST /api/offers/list-my — лоты текущего продавца."""
+        body: dict[str, Any] = {"limit": max(1, limit), "offset": max(0, offset)}
+        if category_id is not None:
+            body["categoryId"] = int(category_id)
+        try:
+            resp = await self._request(
+                "POST",
+                f"{BASE_URL}/api/offers/list-my",
+                referer=f"{BASE_URL}/account/sells",
+                json_body=body,
+            )
+            if resp.status_code >= 400:
+                logger.debug("fetch_my_offers HTTP %s: %s", resp.status_code, resp.text[:300])
+                return []
+            data = resp.json()
+        except Exception as exc:
+            logger.debug("fetch_my_offers: %s", exc)
+            return []
+
+        items: list[Any] = []
+        if isinstance(data, list):
+            items = data
+        elif isinstance(data, dict):
+            for key in ("offers", "items", "data", "results"):
+                val = data.get(key)
+                if isinstance(val, list):
+                    items = val
+                    break
+
+        lots: list[dict[str, Any]] = []
+        for offer in items:
+            if isinstance(offer, dict):
+                lots.append(self._normalize_seller_offer_row(offer))
+        return [lot for lot in lots if lot.get("id") or lot.get("public_id")]
+
+    async def partial_update_offer(
+        self,
+        offer_id: str,
+        payload: dict[str, Any],
+        *,
+        referer: str | None = None,
+    ) -> dict[str, Any]:
+        """POST /api/offers/{id}/partial-update — частичное обновление лота."""
+        oid = str(offer_id or "").strip()
+        resp = await self._request(
+            "POST",
+            f"{BASE_URL}/api/offers/{oid}/partial-update",
+            referer=referer or f"{BASE_URL}/offers/{oid}",
+            json_body=payload,
+        )
+        result: dict[str, Any] = {"status": resp.status_code, "success": 200 <= resp.status_code < 300}
+        try:
+            result["json"] = resp.json()
+        except Exception:
+            result["raw"] = resp.text[:2000]
+        if resp.status_code >= 400:
+            msg = resp.text[:500]
+            if isinstance(result.get("json"), dict):
+                msg = str(result["json"].get("message") or msg)
+            raise StarvellAPIError(resp.status_code, msg, result.get("json") if isinstance(result.get("json"), dict) else {})
+        return result.get("json") or result
+
+    @staticmethod
+    def _build_offer_ref_body(
+        offer_id: str | int | None = None,
+        *,
+        public_id: str | None = None,
+    ) -> dict[str, Any]:
+        pid = str(public_id or "").strip()
+        oid = str(offer_id or "").strip()
+        if pid:
+            return {"publicId": pid}
+        if oid.isdigit():
+            return {"id": int(oid)}
+        if oid and re.fullmatch(r"[0-9a-f-]{8,}", oid, re.IGNORECASE):
+            return {"publicId": oid}
+        if oid:
+            return {"id": oid}
+        raise ValueError("offer id required")
+
+    async def deactivate_offer(
+        self,
+        offer_id: str | int,
+        *,
+        public_id: str | None = None,
+    ) -> dict[str, Any]:
+        """POST /api/offers/deactivate — отключить лот."""
+        body = self._build_offer_ref_body(offer_id, public_id=public_id)
+        resp = await self._request(
+            "POST",
+            f"{BASE_URL}/api/offers/deactivate",
+            referer=f"{BASE_URL}/account/sells",
+            json_body=body,
+        )
+        if resp.status_code >= 400:
+            msg = resp.text[:500]
+            parsed: dict[str, Any] = {}
+            try:
+                parsed = resp.json()
+                if isinstance(parsed, dict):
+                    msg = str(parsed.get("message") or msg)
+            except Exception:
+                pass
+            raise StarvellAPIError(resp.status_code, msg, parsed)
+        try:
+            return resp.json()
+        except Exception:
+            return {"success": True}
+
+    async def activate_offer(
+        self,
+        offer_id: str | int,
+        *,
+        public_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Включить лот (partial-update isActive=true)."""
+        last_exc: StarvellAPIError | None = None
+        for oid in {str(offer_id or "").strip(), str(public_id or "").strip()} - {""}:
+            try:
+                return await self.partial_update_offer(oid, {"isActive": True})
+            except StarvellAPIError as exc:
+                last_exc = exc
+        if last_exc:
+            raise last_exc
+        raise StarvellAPIError(400, "offer id required", {})
+
     async def fetch_user_lots(self, user_id: int) -> list[dict[str, Any]]:
         """Получает лоты пользователя с категориями для бампа."""
-        data = await self._next_data_get(
-            f"users/{user_id}.json?user_id={user_id}",
-            f"{BASE_URL}/users/{user_id}",
-        )
+        try:
+            data = await self._next_data_get(
+                f"users/{user_id}.json?user_id={user_id}",
+                f"{BASE_URL}/users/{user_id}",
+            )
+        except Exception as exc:
+            logger.warning("fetch_user_lots %s: %s", user_id, exc)
+            return []
+
         props = data.get("pageProps", {})
         offers_block = props.get("userProfileOffers") or (props.get("bff") or {}).get("userProfileOffers")
         categories = offers_block or props.get("categoriesWithOffers") or []
@@ -267,22 +456,17 @@ class StarvellAPI:
                 continue
             cat_id = category.get("id")
             game_id = category.get("gameId") or (category.get("game") or {}).get("id")
-            game_slug = (category.get("game") or {}).get("slug")
-            cat_slug = category.get("slug")
             for offer in category.get("offers") or []:
                 if not isinstance(offer, dict):
                     continue
-                desc = (offer.get("descriptions") or {}).get("rus") or {}
-                title = desc.get("briefDescription") or desc.get("description") or ""
-                lots.append({
-                    "id": offer.get("id"),
-                    "title": str(title).strip(),
-                    "price": offer.get("price"),
-                    "availability": offer.get("availability"),
-                    "category_id": cat_id,
-                    "game_id": game_id,
-                    "category_url": f"{BASE_URL}/{game_slug}/{cat_slug}/trade" if game_slug and cat_slug else None,
+                row = self._normalize_seller_offer_row({
+                    **offer,
+                    "categoryId": cat_id,
+                    "gameId": game_id,
+                    "category": category,
                 })
+                if row.get("id"):
+                    lots.append(row)
         return lots
 
     async def bump_offers(self, game_id: int, category_ids: list[int], referer: str | None = None) -> dict[str, Any]:
