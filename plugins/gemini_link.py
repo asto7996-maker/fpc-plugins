@@ -34,7 +34,7 @@ except ImportError:
 
 
 NAME          = "Gemini Link Auto"
-VERSION       = "2.5.2"
+VERSION       = "2.5.3"
 DESCRIPTION   = "GPT plus 1M (NW) — авто-закупка аккаунтов и выдача на FunPay"
 CREDITS       = "Cursor AI"
 UUID          = "f7a2e8c1-4b3d-4e9f-a8c2-1d5e9b0f6a3c"
@@ -263,7 +263,7 @@ def _shop_find_product(
 ) -> dict[str, Any] | None:
     needle = name.strip().casefold()
     exact: list[dict[str, Any]] = []
-    partial: list[dict[str, Any]] = []
+    contains: list[dict[str, Any]] = []
     for product in products:
         disp = _product_display_name(product).casefold()
         if not disp:
@@ -271,12 +271,15 @@ def _shop_find_product(
         if disp == needle:
             exact.append(product)
         elif needle in disp:
-            partial.append(product)
+            contains.append(product)
     if exact:
         return exact[0]
+    if contains:
+        contains.sort(key=lambda p: len(_product_display_name(p)))
+        return contains[0]
     if exact_only:
         return None
-    return partial[0] if partial else None
+    return None
 
 
 def _shop_buy(
@@ -315,10 +318,19 @@ def _shop_buy(
     return items[:quantity], info, data if isinstance(data, dict) else {}
 
 
+def _normalize_search_text(text: str) -> str:
+    """Текст для поиска: без HTML, лишних пробелов и zero-width символов."""
+    s = html.unescape(str(text or ""))
+    s = re.sub(r"<[^>]+>", " ", s)
+    s = s.replace("\u200b", "").replace("\u200c", "").replace("\u200d", "").replace("​", "")
+    s = re.sub(r"\s+", " ", s).strip()
+    return s.casefold()
+
+
 def _lot_text_matches(text: str, needle: str) -> bool:
     if not text or not needle:
         return False
-    return needle.casefold() in text.casefold()
+    return needle.strip().casefold() in _normalize_search_text(text)
 
 
 def _normalize_activation_url(url: str) -> str:
@@ -556,11 +568,14 @@ class Plugin:
         products, err = _shop_get_products(api_url, api_key, timeout=timeout)
         if err:
             return None, f"Товары: {err}"
-        product = _shop_find_product(products, SHOP_PRODUCT_NAME, exact_only=True)
+        product = _shop_find_product(products, SHOP_PRODUCT_NAME)
         if not product:
-            return None, f"Товар «{SHOP_PRODUCT_NAME}» не найден (нужно точное имя)"
+            return None, f"Товар с меткой «{SHOP_PRODUCT_NAME}» не найден в магазине"
         if not _product_matches_name(product, SHOP_PRODUCT_NAME):
-            return None, f"Товар магазина «{_product_display_name(product)}» ≠ «{SHOP_PRODUCT_NAME}»"
+            return None, (
+                f"Товар магазина «{_product_display_name(product)}» "
+                f"не содержит «{SHOP_PRODUCT_NAME}»"
+            )
         self._product_cache = product
         self._product_cache_ts = time.time()
         return product, ""
@@ -651,8 +666,8 @@ class Plugin:
         if not plan.get("ok"):
             return False, str(plan.get("error", "закупка недоступна"))
         pname = str(plan.get("product_name", "")).strip()
-        if pname.casefold() != SHOP_PRODUCT_NAME.casefold():
-            return False, f"Товар «{pname}» ≠ «{SHOP_PRODUCT_NAME}»"
+        if SHOP_PRODUCT_NAME.casefold() not in pname.casefold():
+            return False, f"Товар «{pname}» не содержит «{SHOP_PRODUCT_NAME}»"
         spend = float(plan.get("spend", 0))
         reserve = max(0.0, self._float_cfg("reserve_balance_usd", 10.0))
         balance = float(plan.get("balance", 0))
@@ -674,33 +689,71 @@ class Plugin:
                     chunks.append(str(val))
             raw = getattr(lf, "fields", None)
             if isinstance(raw, dict):
-                for key in ("fields[desc][ru]", "fields[desc][en]"):
-                    val = raw.get(key)
-                    if val and str(val) not in chunks:
+                for key, val in raw.items():
+                    if not val:
+                        continue
+                    key_l = str(key).casefold()
+                    if "[desc]" in key_l or key_l.endswith("desc][ru]") or key_l.endswith("desc][en]"):
                         chunks.append(str(val))
         except Exception as exc:
             logger.debug("%s lot desc #%s: %s", _P, lot_id, exc)
         return "\n".join(chunks)
 
+    def _ensure_profile(self):
+        profile = self.cardinal.profile
+        if profile and profile.get_lots():
+            return profile
+        try:
+            profile = self.cardinal.account.get_user(self.cardinal.account.id)
+            return profile
+        except Exception as exc:
+            self.log("не удалось обновить профиль FunPay: %s", exc)
+            return self.cardinal.profile
+
+    def _iter_profile_lot_ids(self) -> list[int]:
+        ids: list[int] = []
+        seen: set[int] = set()
+        profile = self._ensure_profile()
+        if profile:
+            for lot in profile.get_lots():
+                try:
+                    lot_id = int(lot.id)
+                except (TypeError, ValueError):
+                    continue
+                if lot_id not in seen:
+                    seen.add(lot_id)
+                    ids.append(lot_id)
+        for raw_id in getattr(self.cardinal, "lots_ids", []) or []:
+            try:
+                lot_id = int(raw_id)
+            except (TypeError, ValueError):
+                continue
+            if lot_id not in seen:
+                seen.add(lot_id)
+                ids.append(lot_id)
+        return ids
+
     def _find_lots_by_detailed_desc(self, needle: str, *, fast: bool = False) -> list[int]:
         needle = (needle or "").strip()
         if not needle or fast:
             return []
-        profile = self.cardinal.profile
-        if not profile:
-            try:
-                profile = self.cardinal.account.get_user(self.cardinal.account.id)
-            except Exception:
-                return []
+        lot_ids = self._iter_profile_lot_ids()
+        if not lot_ids:
+            self.log("в профиле FunPay нет лотов для поиска %r", needle)
+            return []
         matched: list[int] = []
-        for lot in profile.get_lots():
-            try:
-                lot_id = int(lot.id)
-            except (TypeError, ValueError):
-                continue
+        for idx, lot_id in enumerate(lot_ids):
+            if idx > 0:
+                time.sleep(0.2)
             detail = self._lot_detailed_description(lot_id)
             if _lot_text_matches(detail, needle):
                 matched.append(lot_id)
+                self.log("лот #%s найден по метке %r в подробном описании", lot_id, needle)
+        if not matched:
+            self.log(
+                "метка %r не найдена в подробном описании ни одного из %s лотов",
+                needle, len(lot_ids),
+            )
         return matched
 
     def _lot_stock_count(self, lot_id: int) -> int:
@@ -718,16 +771,38 @@ class Plugin:
 
     def _resolve_autobuy_lot_ids(self, silent: bool = False, fast: bool = False) -> list[int]:
         lot_id_raw = str(self.get_cfg("autobuy_lot_id", "")).strip()
+        needle = str(self.get_cfg("autobuy_lot_match", DEFAULT_LOT_MATCH)).strip()
+
         if lot_id_raw.isdigit():
             lot_id = int(lot_id_raw)
-            self._cached_lot_id = lot_id
-            self._cached_lot_ts = time.time()
-            return [lot_id]
+            if needle:
+                detail = self._lot_detailed_description(lot_id)
+                if _lot_text_matches(detail, needle):
+                    self._cached_lot_id = lot_id
+                    self._cached_lot_ts = time.time()
+                    return [lot_id]
+                if not silent:
+                    self.log(
+                        "сохранённый лот #%s не содержит %r в подробном описании — ищу заново",
+                        lot_id, needle,
+                    )
+                if str(self._cfg.get("autobuy_lot_id", "")).strip() == lot_id_raw:
+                    self._cfg["autobuy_lot_id"] = ""
+                    self._save_settings()
+                self._invalidate_lot_cache()
+            else:
+                self._cached_lot_id = lot_id
+                self._cached_lot_ts = time.time()
+                return [lot_id]
 
         if self._cached_lot_id and (time.time() - self._cached_lot_ts) < LOT_CACHE_TTL:
-            return [self._cached_lot_id]
+            if not needle:
+                return [self._cached_lot_id]
+            detail = self._lot_detailed_description(self._cached_lot_id)
+            if _lot_text_matches(detail, needle):
+                return [self._cached_lot_id]
+            self._invalidate_lot_cache()
 
-        needle = str(self.get_cfg("autobuy_lot_match", DEFAULT_LOT_MATCH)).strip()
         if not needle:
             return []
         matched = self._find_lots_by_detailed_desc(needle, fast=fast)
@@ -1786,7 +1861,7 @@ class Plugin:
                     plan_box: list[Any] = [None]
 
                     def _fetch_lot() -> None:
-                        lot_box[0] = plugin._resolve_autobuy_lot_ids(silent=True, fast=True)
+                        lot_box[0] = plugin._resolve_autobuy_lot_ids(silent=True, fast=False)
 
                     def _fetch_plan() -> None:
                         plan_box[0] = plugin.calc_buy_plan(timeout=UI_API_TIMEOUT)
@@ -1795,11 +1870,12 @@ class Plugin:
                     t_plan = threading.Thread(target=_fetch_plan, daemon=True)
                     t_lot.start()
                     t_plan.start()
-                    t_lot.join(timeout=UI_API_TIMEOUT + 1)
-                    t_plan.join(timeout=UI_API_TIMEOUT + 1)
+                    lot_timeout = max(UI_API_TIMEOUT + 2, len(plugin._iter_profile_lot_ids()) * 0.35 + 5)
+                    t_lot.join(timeout=lot_timeout)
+                    t_plan.join(timeout=UI_API_TIMEOUT + 2)
                 elif page == "settings":
                     plugin._lot_stock_info(fast=True)
-                show_settings(chat_id, msg_id, page, fast=True, instant=False)
+                show_settings(chat_id, msg_id, page, fast=False, instant=False)
             except Exception as exc:
                 plugin.log("refresh UI error: %s", exc)
                 logger.debug(traceback.format_exc())
