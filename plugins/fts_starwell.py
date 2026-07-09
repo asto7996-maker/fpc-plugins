@@ -46,7 +46,7 @@ from starvell_sdk import (
 # ═══════════════════════════════════════════════════════════════════════════════
 
 NAME: Final[str] = "FTS-Starwell"
-VERSION: Final[str] = "1.0.0"
+VERSION: Final[str] = "1.1.0"
 DESCRIPTION: Final[str] = "Автопродажа Telegram Stars через Fragment API для Starvell"
 UUID: Final[str] = "FTS-Starwell"
 SETTINGS_PAGE: Final[bool] = True
@@ -151,9 +151,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "autodump_interval_sec": 900,
     "autodump_min_price": 0.5,
     "balance_check_interval_sec": 120,
-    "fragment_jwt": "",
-    "fragment_api_base": FRAGMENT_API_BASE,
-    "tonapi_key": "",
+    "api_token": "",
     "category_url": "",
     "templates": copy.deepcopy(DEFAULT_TEMPLATES),
     "lots": {},
@@ -358,6 +356,9 @@ async def _get_settings() -> dict[str, Any]:
     data = await _settings_store.load()
     merged = copy.deepcopy(DEFAULT_SETTINGS)
     merged.update({k: v for k, v in data.items() if k in DEFAULT_SETTINGS or k == "lots"})
+    # Миграция: старый fragment_jwt → api_token
+    if not merged.get("api_token"):
+        merged["api_token"] = str(data.get("fragment_jwt") or data.get("api_token") or "").strip()
     if "templates" in data and isinstance(data["templates"], dict):
         tpl = copy.deepcopy(DEFAULT_TEMPLATES)
         tpl.update(data["templates"])
@@ -373,6 +374,11 @@ async def _get_settings() -> dict[str, Any]:
 
 async def _save_settings(settings: dict[str, Any]) -> None:
     await _settings_store.save(settings)
+
+
+def _api_token(settings: dict[str, Any]) -> str:
+    """Единый API-токен Fragment — все запросы только через него."""
+    return str(settings.get("api_token") or settings.get("fragment_jwt") or "").strip()
 
 
 def _strip_invisible(text: str) -> str:
@@ -467,7 +473,7 @@ def _classify_send_failure(err: str | Exception, status: str = "") -> str:
     if "limit" in text or "minimum" in text:
         return "количество Stars вне допустимых лимитов Fragment"
     if "jwt" in text or "token" in text or "unauthorized" in text or "401" in text:
-        return "ошибка авторизации Fragment API — проверьте JWT-токен"
+        return "ошибка авторизации Fragment API — проверьте API токен"
     if "timeout" in text or "timed out" in text:
         return "таймаут соединения с Fragment API"
     if status.upper() in FRAGMENT_PENDING:
@@ -482,6 +488,10 @@ class FragmentWalletInfo:
     usdt_balance: float = 0.0
     address: str = ""
     valid: bool = False
+    token_ok: bool = False
+    error: str = ""
+    cached: bool = False
+    updated_at: float = 0.0
     raw: dict = field(default_factory=dict)
 
 
@@ -496,19 +506,102 @@ class FragmentOrderResult:
     raw: dict = field(default_factory=dict)
 
 
-class AsyncFragmentClient:
-    """Асинхронный клиент Fragment-API (JWT)."""
+def _parse_wallet_payload(data: dict[str, Any]) -> FragmentWalletInfo:
+    info = FragmentWalletInfo(raw=data)
+    payload = data.get("data") or data.get("wallet") or data.get("result") or data
+    if not isinstance(payload, dict):
+        return info
+    info.valid = True
+    info.token_ok = True
+    info.wallet_version = str(
+        payload.get("version") or payload.get("walletVersion") or payload.get("wallet_version") or ""
+    )
+    info.address = str(payload.get("address") or payload.get("walletAddress") or "")
+    info.ton_balance = float(
+        payload.get("ton") or payload.get("tonBalance") or payload.get("balance_ton")
+        or payload.get("balanceTon") or payload.get("ton_balance") or 0
+    )
+    info.usdt_balance = float(
+        payload.get("usdt") or payload.get("usdtBalance") or payload.get("balance_usdt")
+        or payload.get("balanceUsdt") or payload.get("usdt_balance") or 0
+    )
+    rates = payload.get("rates") or payload.get("exchangeRates") or {}
+    if isinstance(rates, dict):
+        info.raw.setdefault("_rates", rates)
+    return info
 
-    def __init__(self, jwt: str, base_url: str = FRAGMENT_API_BASE, timeout: float = 45.0) -> None:
-        self.jwt = (jwt or "").strip()
-        self.base_url = (base_url or FRAGMENT_API_BASE).rstrip("/")
-        self.timeout = timeout
+
+class FragmentApiHub:
+    """
+    Единый клиент Fragment API на одном токене.
+    - один keep-alive httpx клиент
+    - кэш кошелька/цен для мгновенного UI
+    - закрепление рабочих endpoint после первого успешного ответа
+    """
+
+    WALLET_TTL = 20.0
+    PRICES_TTL = 90.0
+    RATES_TTL = 300.0
+
+    _WALLET_PATHS = ("/api/v1/wallet", "/api/v1/wallet/balance", "/api/v1/account/wallet", "/wallet")
+    _PRICE_PATHS = ("/api/v1/stars/prices", "/api/v1/prices", "/prices")
+    _ORDER_PATHS = ("/api/v1/stars/order", "/api/v1/order/stars", "/api/v1/stars/buy")
+    _ORDER_STATUS_TMPL = ("/api/v1/stars/order/{id}", "/api/v1/order/{id}", "/api/v1/orders/{id}")
+    _USERNAME_PATHS = (
+        ("/api/v1/username/check", "post"),
+        ("/api/v1/stars/recipient", "post"),
+        ("/api/v1/recipient/check", "post"),
+    )
+
+    def __init__(self, token: str) -> None:
+        self.token = (token or "").strip()
+        self._client: httpx.AsyncClient | None = None
+        self._lock = asyncio.Lock()
+        self._wallet: FragmentWalletInfo | None = None
+        self._wallet_ts = 0.0
+        self._prices: dict[str, Any] = {}
+        self._prices_ts = 0.0
+        self._ton_rub = 0.0
+        self._usdt_rub = 0.0
+        self._rates_ts = 0.0
+        self._route_wallet: str | None = None
+        self._route_prices: str | None = None
+        self._route_order: str | None = None
+        self._route_order_status: str | None = None
+        self._route_username: str | None = None
+
+    async def aclose(self) -> None:
+        if self._client and not self._client.is_closed:
+            await self._client.aclose()
+        self._client = None
+
+    def invalidate(self) -> None:
+        self._wallet = None
+        self._wallet_ts = 0.0
+        self._prices = {}
+        self._prices_ts = 0.0
+        self._route_wallet = None
+        self._route_prices = None
+        self._route_order = None
+        self._route_order_status = None
+        self._route_username = None
+
+    async def _http(self) -> httpx.AsyncClient:
+        if self._client is None or self._client.is_closed:
+            self._client = httpx.AsyncClient(
+                base_url=FRAGMENT_API_BASE,
+                timeout=httpx.Timeout(20.0, connect=4.0),
+                limits=httpx.Limits(max_connections=12, max_keepalive_connections=8),
+            )
+        return self._client
 
     def _headers(self) -> dict[str, str]:
-        h = {"Content-Type": "application/json", "Accept": "application/json"}
-        if self.jwt:
-            h["Authorization"] = f"Bearer {self.jwt}"
-        return h
+        return {
+            "Authorization": f"Bearer {self.token}",
+            "X-API-Key": self.token,
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
 
     async def _request(
         self,
@@ -518,140 +611,194 @@ class AsyncFragmentClient:
         json_body: dict | None = None,
         params: dict | None = None,
     ) -> tuple[int, dict[str, Any]]:
-        url = path if path.startswith("http") else f"{self.base_url}{path}"
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            resp = await client.request(
-                method, url, headers=self._headers(), json=json_body, params=params,
-            )
-            try:
-                data = resp.json()
-            except Exception:
-                data = {"raw": resp.text[:2000]}
-            if not isinstance(data, dict):
-                data = {"data": data}
-            return resp.status_code, data
+        if not self.token:
+            return 401, {"error": "API токен не задан"}
+        client = await self._http()
+        resp = await client.request(method, path, headers=self._headers(), json=json_body, params=params)
+        try:
+            data = resp.json()
+        except Exception:
+            data = {"raw": resp.text[:2000]}
+        if not isinstance(data, dict):
+            data = {"data": data}
+        return resp.status_code, data
 
-    async def validate_jwt(self) -> tuple[bool, str]:
-        for path in ("/api/v1/auth/me", "/api/v1/user", "/api/v1/wallet", "/v1/auth/me", "/wallet"):
+    async def _first_ok_get(self, paths: tuple[str, ...]) -> tuple[str | None, dict[str, Any]]:
+        for path in paths:
             code, data = await self._request("GET", path)
             if code == 401:
-                return False, data.get("message") or data.get("error") or "JWT недействителен"
+                return None, data
             if code < 400:
-                return True, ""
-        return False, "Не удалось проверить JWT"
+                return path, data
+        return None, {}
 
-    async def get_wallet(self) -> FragmentWalletInfo:
-        info = FragmentWalletInfo()
-        for path in ("/api/v1/wallet", "/api/v1/wallet/balance", "/v1/wallet", "/wallet"):
-            code, data = await self._request("GET", path)
-            if code >= 400:
-                continue
-            info.raw = data
-            info.valid = True
-            payload = data.get("data") or data.get("wallet") or data
+    def wallet_cached(self) -> FragmentWalletInfo | None:
+        if self._wallet and time.monotonic() - self._wallet_ts < self.WALLET_TTL:
+            out = copy.copy(self._wallet)
+            out.cached = True
+            return out
+        return None
+
+    async def get_wallet(self, *, force: bool = False) -> FragmentWalletInfo:
+        if not force:
+            cached = self.wallet_cached()
+            if cached:
+                return cached
+        async with self._lock:
+            if not force:
+                cached = self.wallet_cached()
+                if cached:
+                    return cached
+            paths = (self._route_wallet,) if self._route_wallet else self._WALLET_PATHS
+            path, data = await self._first_ok_get(paths)  # type: ignore[arg-type]
+            if path:
+                self._route_wallet = path
+            if not path:
+                err = data.get("message") or data.get("error") or "Не удалось получить баланс"
+                info = FragmentWalletInfo(valid=False, token_ok=False, error=str(err), raw=data)
+                self._wallet = info
+                self._wallet_ts = time.monotonic()
+                return info
+            info = _parse_wallet_payload(data)
+            info.updated_at = time.time()
+            self._wallet = info
+            self._wallet_ts = time.monotonic()
+            self._extract_rates_from_wallet(info)
+            return info
+
+    def _extract_rates_from_wallet(self, info: FragmentWalletInfo) -> None:
+        rates = info.raw.get("_rates") or {}
+        if isinstance(rates, dict):
+            ton = rates.get("ton") or rates.get("TON") or {}
+            usdt = rates.get("usdt") or rates.get("USDT") or {}
+            if isinstance(ton, dict) and ton.get("rub"):
+                self._ton_rub = float(ton["rub"])
+                self._rates_ts = time.monotonic()
+            if isinstance(usdt, dict) and usdt.get("rub"):
+                self._usdt_rub = float(usdt["rub"])
+                self._rates_ts = time.monotonic()
+
+    async def validate_token(self) -> tuple[bool, str, FragmentWalletInfo]:
+        """Один запрос: проверка токена + баланс кошелька Fragment."""
+        info = await self.get_wallet(force=True)
+        if info.token_ok and info.valid:
+            return True, "", info
+        if info.error:
+            return False, info.error, info
+        return False, "API токен недействителен или кошелёк недоступен", info
+
+    async def warm_cache(self) -> None:
+        await asyncio.gather(
+            self.get_wallet(force=True),
+            self.get_star_prices(force=True),
+            return_exceptions=True,
+        )
+
+    async def get_star_prices(self, *, force: bool = False) -> dict[str, Any]:
+        if not force and self._prices and time.monotonic() - self._prices_ts < self.PRICES_TTL:
+            return self._prices
+        paths = (self._route_prices,) if self._route_prices else self._PRICE_PATHS
+        path, data = await self._first_ok_get(paths)  # type: ignore[arg-type]
+        if path:
+            self._route_prices = path
+            payload = data.get("data") or data.get("prices") or data
             if isinstance(payload, dict):
-                info.wallet_version = str(
-                    payload.get("version") or payload.get("walletVersion") or payload.get("wallet_version") or ""
-                )
-                info.address = str(payload.get("address") or payload.get("walletAddress") or "")
-                info.ton_balance = float(payload.get("ton") or payload.get("tonBalance") or payload.get("balance_ton") or 0)
-                info.usdt_balance = float(payload.get("usdt") or payload.get("usdtBalance") or payload.get("balance_usdt") or 0)
-            break
-        return info
-
-    async def get_star_prices(self) -> dict[str, Any]:
-        for path in ("/api/v1/stars/prices", "/api/v1/prices", "/v1/stars/prices", "/prices"):
-            code, data = await self._request("GET", path)
-            if code < 400:
-                return data.get("data") or data
-        return {}
+                self._prices = payload
+                self._prices_ts = time.monotonic()
+                return payload
+        return self._prices
 
     async def check_username(self, username: str, quantity: int = 50) -> tuple[bool, str]:
         username = username.lstrip("@").lower()
-        for path, body in (
-            ("/api/v1/username/check", {"username": username, "quantity": quantity}),
-            ("/api/v1/stars/recipient", {"username": username, "amount": quantity}),
-            ("/api/v1/recipient/check", {"username": username}),
-        ):
-            code, data = await self._request("POST", path, json_body=body)
-            if code >= 400:
-                continue
-            ok = data.get("ok", data.get("valid", data.get("success", True)))
-            if isinstance(ok, bool):
-                if ok:
-                    return True, ""
-                return False, data.get("message") or data.get("error") or "ник недоступен"
-            if data.get("found") is False:
-                return False, data.get("message") or "ник не найден"
-            return True, ""
-        return True, ""
-
-    async def _order_stars_once(
-        self,
-        username: str,
-        amount: int,
-        currency: str = "TON",
-    ) -> FragmentOrderResult:
-        username = username.lstrip("@").lower()
         bodies = [
-            {"username": username, "quantity": amount, "amount": amount, "currency": currency, "payment_method": currency},
-            {"username": username, "stars": amount, "paymentCurrency": currency},
+            {"username": username, "quantity": quantity, "amount": quantity},
+            {"username": username, "stars": quantity},
         ]
-        paths = ("/api/v1/stars/order", "/api/v1/order/stars", "/api/v1/stars/buy", "/v1/stars/order")
-        last_err = ""
-        for path in paths:
+        if self._route_username:
+            for body in bodies:
+                code, data = await self._request("POST", self._route_username, json_body=body)
+                if code == 401:
+                    return False, "API токен недействителен"
+                if code < 400:
+                    return self._parse_username_ok(data)
+        for path, _method in self._USERNAME_PATHS:
             for body in bodies:
                 code, data = await self._request("POST", path, json_body=body)
                 if code == 401:
-                    return FragmentOrderResult(False, error="JWT недействителен", raw=data)
-                if code >= 500:
-                    last_err = data.get("message") or data.get("error") or f"HTTP {code}"
-                    continue
-                payload = data.get("data") or data.get("order") or data
-                if not isinstance(payload, dict):
-                    payload = data
-                status = str(payload.get("status") or data.get("status") or "").upper()
-                order_id = str(payload.get("id") or payload.get("orderId") or payload.get("order_id") or "")
-                if code < 400 or status in FRAGMENT_OK | FRAGMENT_SENT | FRAGMENT_PENDING:
-                    ok = status in FRAGMENT_OK or data.get("success") is True
-                    pending = status in FRAGMENT_PENDING
-                    return FragmentOrderResult(
-                        ok=ok or pending,
-                        status=status,
-                        order_id=order_id,
-                        tx_hash=str(payload.get("txHash") or payload.get("tx_hash") or ""),
-                        pending=pending,
-                        raw=data,
-                    )
-                last_err = data.get("message") or data.get("error") or f"HTTP {code}"
-        return FragmentOrderResult(False, error=last_err or "Fragment API не ответил", raw={})
+                    return False, "API токен недействителен"
+                if code < 400:
+                    self._route_username = path
+                    return self._parse_username_ok(data)
+        return True, ""
+
+    @staticmethod
+    def _parse_username_ok(data: dict[str, Any]) -> tuple[bool, str]:
+        ok = data.get("ok", data.get("valid", data.get("success", True)))
+        if isinstance(ok, bool):
+            if ok:
+                return True, ""
+            return False, str(data.get("message") or data.get("error") or "ник недоступен")
+        if data.get("found") is False:
+            return False, str(data.get("message") or "ник не найден")
+        return True, ""
+
+    async def _order_stars_once(self, username: str, amount: int, currency: str = "TON") -> FragmentOrderResult:
+        username = username.lstrip("@").lower()
+        body = {
+            "username": username,
+            "quantity": amount,
+            "amount": amount,
+            "currency": currency,
+            "payment_method": currency,
+            "paymentMethod": currency,
+        }
+        paths = (self._route_order,) if self._route_order else self._ORDER_PATHS
+        last_err = ""
+        for path in paths:
+            code, data = await self._request("POST", path, json_body=body)
+            if code == 401:
+                return FragmentOrderResult(False, error="API токен недействителен", raw=data)
+            if code < 400:
+                self._route_order = path
+                return self._parse_order_response(data)
+            last_err = str(data.get("message") or data.get("error") or f"HTTP {code}")
+        return FragmentOrderResult(False, error=last_err or "Fragment API не ответил")
+
+    def _parse_order_response(self, data: dict[str, Any]) -> FragmentOrderResult:
+        payload = data.get("data") or data.get("order") or data
+        if not isinstance(payload, dict):
+            payload = data
+        status = str(payload.get("status") or data.get("status") or "").upper()
+        order_id = str(payload.get("id") or payload.get("orderId") or payload.get("order_id") or "")
+        ok = status in FRAGMENT_OK or data.get("success") is True
+        pending = status in FRAGMENT_PENDING | FRAGMENT_SENT
+        return FragmentOrderResult(
+            ok=ok or pending,
+            status=status,
+            order_id=order_id,
+            tx_hash=str(payload.get("txHash") or payload.get("tx_hash") or ""),
+            pending=pending and not ok,
+            error="" if ok or pending else str(payload.get("error") or data.get("message") or status),
+            raw=data,
+        )
 
     async def get_order_status(self, order_id: str) -> FragmentOrderResult:
-        for path in (
-            f"/api/v1/stars/order/{order_id}",
-            f"/api/v1/order/{order_id}",
-            f"/api/v1/orders/{order_id}",
-        ):
-            code, data = await self._request("GET", path)
-            if code >= 404:
-                continue
-            payload = data.get("data") or data.get("order") or data
-            if not isinstance(payload, dict):
-                payload = data
-            status = str(payload.get("status") or "").upper()
-            ok = status in FRAGMENT_OK
-            pending = status in FRAGMENT_PENDING or status in FRAGMENT_SENT
-            err = "" if ok or pending else str(payload.get("error") or data.get("message") or status)
-            return FragmentOrderResult(
-                ok=ok,
-                status=status,
-                order_id=order_id,
-                tx_hash=str(payload.get("txHash") or payload.get("tx_hash") or ""),
-                pending=pending,
-                error=err,
-                raw=data,
-            )
-        return FragmentOrderResult(False, error="Статус заказа не получен")
+        tmpl = self._route_order_status or self._ORDER_STATUS_TMPL[0]
+        path = tmpl.format(id=order_id)
+        code, data = await self._request("GET", path)
+        if code >= 404 and not self._route_order_status:
+            for alt in self._ORDER_STATUS_TMPL[1:]:
+                code, data = await self._request("GET", alt.format(id=order_id))
+                if code < 404:
+                    self._route_order_status = alt
+                    break
+        elif code < 400:
+            self._route_order_status = tmpl
+        if code >= 404:
+            return FragmentOrderResult(False, error="Статус заказа не получен")
+        result = self._parse_order_response(data)
+        result.order_id = order_id
+        return result
 
     async def order_stars(
         self,
@@ -662,7 +809,6 @@ class AsyncFragmentClient:
         usdt_fallback: bool = True,
         max_retries: int = LITESERVER_RETRY,
     ) -> FragmentOrderResult:
-        """Покупка Stars с ретраями LiteServer и fallback USDT→TON."""
         currencies = ["USDT", "TON"] if usdt_fallback else ["TON"]
         attempt = 0
         last_result = FragmentOrderResult(False, error="не удалось отправить")
@@ -675,9 +821,7 @@ class AsyncFragmentClient:
                     return result
                 if result.pending and result.order_id:
                     polled = await self._poll_order(result.order_id)
-                    if polled.ok:
-                        return polled
-                    if polled.pending:
+                    if polled.ok or not polled.pending:
                         return polled
                     result = polled
                     last_result = result
@@ -698,12 +842,30 @@ class AsyncFragmentClient:
         last = FragmentOrderResult(False, pending=True, order_id=order_id)
         while time.monotonic() < deadline:
             last = await self.get_order_status(order_id)
-            if last.ok:
-                return last
-            if not last.pending:
+            if last.ok or not last.pending:
                 return last
             await asyncio.sleep(interval)
         return last
+
+    async def ton_to_rub(self) -> float:
+        if self._ton_rub and time.monotonic() - self._rates_ts < self.RATES_TTL:
+            return self._ton_rub
+        await self.get_wallet()
+        if self._ton_rub:
+            return self._ton_rub
+        return await RateService.ton_to_rub()
+
+    async def usdt_to_rub(self) -> float:
+        if self._usdt_rub and time.monotonic() - self._rates_ts < self.RATES_TTL:
+            return self._usdt_rub
+        await self.get_wallet()
+        if self._usdt_rub:
+            return self._usdt_rub
+        return await RateService.usdt_to_rub()
+
+
+# Обратная совместимость
+AsyncFragmentClient = FragmentApiHub
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -712,17 +874,17 @@ class AsyncFragmentClient:
 
 
 class RateService:
-    """Конвертация TON/USDT → RUB через TonAPI / CoinGecko."""
+    """Fallback-курсы TON/USDT → RUB (если Fragment API не отдал rates)."""
 
     _cache: dict[str, tuple[float, float]] = {}
-    _cache_ttl = 300.0
+    _cache_ttl = 600.0
 
     @classmethod
-    async def ton_to_rub(cls, tonapi_key: str = "") -> float:
+    async def ton_to_rub(cls) -> float:
         cached = cls._cache.get("ton_rub")
         if cached and time.monotonic() - cached[1] < cls._cache_ttl:
             return cached[0]
-        rate = await cls._fetch_ton_rub(tonapi_key)
+        rate = await cls._fetch_ton_rub()
         cls._cache["ton_rub"] = (rate, time.monotonic())
         return rate
 
@@ -736,26 +898,9 @@ class RateService:
         return rate
 
     @classmethod
-    async def _fetch_ton_rub(cls, tonapi_key: str) -> float:
-        headers = {"Accept": "application/json"}
-        if tonapi_key:
-            headers["Authorization"] = f"Bearer {tonapi_key}"
+    async def _fetch_ton_rub(cls) -> float:
         try:
-            async with httpx.AsyncClient(timeout=15.0) as client:
-                resp = await client.get(
-                    "https://tonapi.io/v2/rates?tokens=ton&currencies=rub",
-                    headers=headers,
-                )
-                if resp.status_code < 400:
-                    data = resp.json()
-                    rates = (data.get("rates") or {}).get("TON") or (data.get("rates") or {}).get("ton") or {}
-                    val = rates.get("prices", {}).get("RUB") or rates.get("price", {}).get("RUB")
-                    if val:
-                        return float(val)
-        except Exception:
-            pass
-        try:
-            async with httpx.AsyncClient(timeout=15.0) as client:
+            async with httpx.AsyncClient(timeout=8.0) as client:
                 resp = await client.get(
                     "https://api.coingecko.com/api/v3/simple/price",
                     params={"ids": "the-open-network", "vs_currencies": "rub"},
@@ -768,7 +913,7 @@ class RateService:
     @classmethod
     async def _fetch_usdt_rub(cls) -> float:
         try:
-            async with httpx.AsyncClient(timeout=15.0) as client:
+            async with httpx.AsyncClient(timeout=8.0) as client:
                 resp = await client.get(
                     "https://api.coingecko.com/api/v3/simple/price",
                     params={"ids": "tether", "vs_currencies": "rub"},
@@ -787,12 +932,12 @@ class AutopriceService:
         stars: int,
         fragment_prices: dict[str, Any],
         markup_percent: float,
-        tonapi_key: str = "",
+        hub: FragmentApiHub | None = None,
     ) -> float | None:
         if stars <= 0:
             return None
-        ton_rub = await RateService.ton_to_rub(tonapi_key)
-        usdt_rub = await RateService.usdt_to_rub()
+        ton_rub = await hub.ton_to_rub() if hub else await RateService.ton_to_rub()
+        usdt_rub = await hub.usdt_to_rub() if hub else await RateService.usdt_to_rub()
         cost_ton = None
         cost_usdt = None
         if isinstance(fragment_prices, dict):
@@ -900,7 +1045,7 @@ class LotManager:
 
     @staticmethod
     async def estimate_lot_cost(
-        client: AsyncFragmentClient,
+        client: FragmentApiHub,
         stars: int,
         fragment_prices: dict[str, Any],
     ) -> tuple[float, float]:
@@ -912,23 +1057,22 @@ class LotManager:
                 ton_cost = float(entry.get("ton") or entry.get("TON") or 0)
                 usdt_cost = float(entry.get("usdt") or entry.get("USDT") or 0)
         if ton_cost <= 0 and usdt_cost <= 0:
-            wallet = await client.get_wallet()
-            ton_cost = stars * 0.015
-            usdt_cost = ton_cost * 2.5
-            if wallet.ton_balance > 0:
-                ton_cost = min(ton_cost, wallet.ton_balance * 0.01 + stars * 0.01)
+            cached = client.wallet_cached()
+            if cached and cached.valid:
+                ton_cost = stars * 0.015
+                usdt_cost = ton_cost * 2.5
         return ton_cost, usdt_cost
 
     @staticmethod
     async def sync_lots(
         api: StarvellAPI,
-        client: AsyncFragmentClient,
+        client: FragmentApiHub,
         settings: dict[str, Any],
         human_log: _HumanLog,
     ) -> None:
         if not settings.get("plugin_enabled"):
             return
-        wallet = await client.get_wallet()
+        wallet = client.wallet_cached() or await client.get_wallet()
         lots = settings.get("lots") or {}
         if not lots:
             return
@@ -1183,12 +1327,8 @@ class OrderProcessor:
     async def settings(self) -> dict[str, Any]:
         return await _get_settings()
 
-    async def fragment_client(self) -> AsyncFragmentClient | None:
-        s = await self.settings()
-        jwt = s.get("fragment_jwt") or ""
-        if not jwt:
-            return None
-        return AsyncFragmentClient(jwt, s.get("fragment_api_base") or FRAGMENT_API_BASE)
+    async def fragment_hub(self) -> FragmentApiHub | None:
+        return await self.plugin.get_fragment_hub()
 
     async def stv_api(self):
         return self.plugin.core.get_api()
@@ -1290,9 +1430,9 @@ class OrderProcessor:
         if username:
             active.username = username
             if settings.get("check_username"):
-                client = await self.fragment_client()
-                if client:
-                    ok, err = await client.check_username(username, active.stars)
+                hub = await self.fragment_hub()
+                if hub:
+                    ok, err = await hub.check_username(username, active.stars)
                     if not ok:
                         api = await self.stv_api()
                         if api and active.chat_id:
@@ -1353,17 +1493,17 @@ class OrderProcessor:
             await self._send_stars(item, settings)
 
     async def _send_stars(self, item: QueuedOrder, settings: dict[str, Any]) -> None:
-        client = await self.fragment_client()
+        hub = await self.fragment_hub()
         api = await self.stv_api()
-        if not client:
-            self.plugin.hlog.error("Fragment JWT не настроен")
+        if not hub:
+            self.plugin.hlog.error("Fragment API токен не настроен")
             return
         if api and item.chat_id:
             await api.send_message(
                 item.chat_id,
                 _tpl(settings, "sending", stars=item.stars, username=item.username),
             )
-        result = await client.order_stars(
+        result = await hub.order_stars(
             item.username,
             item.stars,
             liteserver_retry=bool(settings.get("liteserver_retry")),
@@ -1395,7 +1535,7 @@ class OrderProcessor:
             return
 
         if result.pending:
-            polled = await client._poll_order(result.order_id)
+            polled = await hub._poll_order(result.order_id)
             if polled.ok:
                 item.sent = True
                 item.status = "completed"
@@ -1544,30 +1684,29 @@ class BackgroundWorkers:
 
     async def _balance_worker(self) -> None:
         settings = await _get_settings()
-        interval = float(settings.get("balance_check_interval_sec") or 120)
-        client = await self.plugin.processor.fragment_client()
+        hub = await self.plugin.get_fragment_hub()
         api = self.plugin.core.get_api()
-        if client and api:
-            await LotManager.sync_lots(api, client, settings, self.plugin.hlog)
+        if hub and api:
+            await hub.get_wallet(force=True)
+            await LotManager.sync_lots(api, hub, settings, self.plugin.hlog)
             await _save_settings(settings)
 
     async def _autoprice_worker(self) -> None:
         settings = await _get_settings()
         if not settings.get("autoprice_enabled"):
             return
-        client = await self.plugin.processor.fragment_client()
+        hub = await self.plugin.get_fragment_hub()
         api = self.plugin.core.get_api()
-        if not client or not api:
+        if not hub or not api:
             return
-        prices = await client.get_star_prices()
+        prices = await hub.get_star_prices()
         markup = float(settings.get("markup_percent") or 15)
-        tonapi_key = settings.get("tonapi_key") or ""
         lots = settings.get("lots") or {}
         for lot_id, cfg in lots.items():
             stars = int(cfg.get("stars") or 0)
             if stars <= 0 or not cfg.get("enabled", True):
                 continue
-            price = await AutopriceService.compute_lot_price_rub(stars, prices, markup, tonapi_key)
+            price = await AutopriceService.compute_lot_price_rub(stars, prices, markup, hub)
             if price is None:
                 continue
             try:
@@ -1637,7 +1776,7 @@ class TelegramUI:
             [self._btn(f"{flag('back_command_enabled')} Команда !бэк", "toggle:back_command_enabled")],
             [self._btn(f"{flag('preorder_username')} Ник из заказа", "toggle:preorder_username")],
             [
-                self._btn("🔑 JWT", "menu:jwt"),
+                self._btn("🔑 API токен", "menu:token"),
                 self._btn("📦 Лоты", "menu:lots"),
             ],
             [
@@ -1657,14 +1796,30 @@ class TelegramUI:
         ]
         return InlineKeyboardMarkup(inline_keyboard=rows)
 
-    async def render_main(self) -> tuple[str, InlineKeyboardMarkup]:
+    async def render_main(self, *, force_balance: bool = False) -> tuple[str, InlineKeyboardMarkup]:
         settings = await _get_settings()
-        wallet_txt = "—"
-        client = await self.p.processor.fragment_client()
-        if client:
-            w = await client.get_wallet()
-            if w.valid:
-                wallet_txt = f"TON {w.ton_balance:.4f} · USDT {w.usdt_balance:.2f} ({w.wallet_version or '?'})"
+        wallet_txt = "токен не задан"
+        age_hint = ""
+        hub = await self.p.get_fragment_hub()
+        if hub:
+            w = hub.wallet_cached()
+            if w and w.valid and not force_balance:
+                wallet_txt = (
+                    f"TON {w.ton_balance:.4f} · USDT {w.usdt_balance:.2f}"
+                    f" ({w.wallet_version or 'wallet'})"
+                )
+                age_hint = " · кэш"
+            else:
+                w = await hub.get_wallet(force=force_balance)
+                if w.valid:
+                    wallet_txt = (
+                        f"TON {w.ton_balance:.4f} · USDT {w.usdt_balance:.2f}"
+                        f" ({w.wallet_version or 'wallet'})"
+                    )
+                elif w.error:
+                    wallet_txt = w.error[:60]
+            if not force_balance and hub.token:
+                asyncio.create_task(hub.get_wallet(force=True))
         queue_len = len(await self.p.processor.queue.get_queue())
         stats = settings.get("stats") or {}
         text = (
@@ -1672,7 +1827,7 @@ class TelegramUI:
             f"━━━━━━━━━━━━━━━━━━\n"
             f"{'🟢' if settings.get('plugin_enabled') else '🔴'} "
             f"{'Работает' if settings.get('plugin_enabled') else 'Выключен'}\n"
-            f"💎 Fragment: <code>{wallet_txt}</code>\n"
+            f"💎 Fragment: <code>{html.escape(wallet_txt)}{age_hint}</code>\n"
             f"📋 Очередь: <b>{queue_len}</b>\n"
             f"✅ Выполнено: <b>{stats.get('completed', 0)}</b> · "
             f"⭐ Stars: <b>{stats.get('stars_sent', 0)}</b>\n"
@@ -1684,9 +1839,9 @@ class TelegramUI:
 
     async def handle_callback(self, call: CallbackQuery, action: str) -> bool:
         if action == "refresh":
-            text, kb = await self.render_main()
+            text, kb = await self.render_main(force_balance=True)
             await call.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
-            await call.answer("Обновлено")
+            await call.answer("Баланс обновлён")
             return True
         if action.startswith("toggle:"):
             key = action.split(":", 1)[1]
@@ -1697,8 +1852,8 @@ class TelegramUI:
             await call.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
             await call.answer(f"{'🟢' if settings[key] else '🔴'} {key}")
             return True
-        if action == "menu:jwt":
-            return await self._show_jwt(call)
+        if action == "menu:token" or action == "menu:jwt":
+            return await self._show_token(call)
         if action == "menu:lots":
             return await self._show_lots(call)
         if action == "menu:mini":
@@ -1721,25 +1876,34 @@ class TelegramUI:
             return await self._tpl_action(call, action)
         return False
 
-    async def _show_jwt(self, call: CallbackQuery) -> bool:
+    async def _show_token(self, call: CallbackQuery) -> bool:
         settings = await _get_settings()
-        jwt = settings.get("fragment_jwt") or ""
-        masked = f"{jwt[:8]}…{jwt[-4:]}" if len(jwt) > 16 else ("—" if not jwt else "***")
+        token = _api_token(settings)
+        masked = f"{token[:8]}…{token[-4:]}" if len(token) > 16 else ("—" if not token else "***")
         valid_txt = "—"
-        client = AsyncFragmentClient(jwt, settings.get("fragment_api_base") or FRAGMENT_API_BASE)
-        if jwt:
-            ok, err = await client.validate_jwt()
-            valid_txt = "✅ OK" if ok else f"❌ {err}"
-            wallet = await client.get_wallet()
-            if wallet.valid:
-                valid_txt += f"\nTON {wallet.ton_balance:.4f} · USDT {wallet.usdt_balance:.2f}"
+        hub = await self.p.get_fragment_hub()
+        if hub and token:
+            ok, err, wallet = await hub.validate_token()
+            if ok and wallet.valid:
+                valid_txt = (
+                    f"✅ Токен активен\n"
+                    f"TON <b>{wallet.ton_balance:.4f}</b> · USDT <b>{wallet.usdt_balance:.2f}</b>"
+                )
+                if wallet.wallet_version:
+                    valid_txt += f"\nКошелёк: <code>{html.escape(wallet.wallet_version)}</code>"
+                if wallet.address:
+                    valid_txt += f"\nАдрес: <code>{html.escape(wallet.address[:20])}…</code>"
+            else:
+                valid_txt = f"❌ {html.escape(err or 'ошибка токена')}"
         kb = InlineKeyboardMarkup(inline_keyboard=[
-            [self._btn("✅ Проверить JWT", "jwt:validate")],
+            [self._btn("✅ Проверить баланс", "token:validate")],
             [self._btn("◀️ Назад", "refresh")],
         ])
         await call.message.edit_text(
-            f"🔑 <b>Fragment JWT</b>\n\nТокен: <code>{html.escape(masked)}</code>\n{valid_txt}\n\n"
-            f"Настройте <code>fragment_jwt</code> в ⚙️ Настройках плагина.",
+            f"🔑 <b>Fragment API токен</b>\n\n"
+            f"Токен: <code>{html.escape(masked)}</code>\n{valid_txt}\n\n"
+            f"Один токен используется для баланса, заказов Stars и всех настроек.\n"
+            f"Задайте <code>api_token</code> в ⚙️ Настройках плагина.",
             parse_mode="HTML", reply_markup=kb,
         )
         await call.answer()
@@ -1907,7 +2071,7 @@ class TelegramUI:
 
     async def _show_export(self, call: CallbackQuery) -> bool:
         settings = await _get_settings()
-        export_data = {k: settings.get(k) for k in DEFAULT_SETTINGS if k not in ("fragment_jwt",)}
+        export_data = {k: settings.get(k) for k in DEFAULT_SETTINGS if k not in ("api_token", "fragment_jwt")}
         payload = json.dumps(export_data, ensure_ascii=False, indent=2)
         if len(payload) > 3500:
             payload = payload[:3500] + "\n…"
@@ -1943,26 +2107,48 @@ class Plugin(StarvellPlugin):
         self.processor = OrderProcessor(self)
         self.workers = BackgroundWorkers(self)
         self.tg_ui = TelegramUI(self)
-        self._pending_cb: dict[int, str] = {}
+        self._fragment_hub: FragmentApiHub | None = None
+        self._fragment_token: str = ""
         self.log("%s v%s loaded", NAME, VERSION)
+
+    async def get_fragment_hub(self) -> FragmentApiHub | None:
+        settings = await _get_settings()
+        token = _api_token(settings)
+        if not token:
+            if self._fragment_hub:
+                await self._fragment_hub.aclose()
+            self._fragment_hub = None
+            self._fragment_token = ""
+            return None
+        if self._fragment_hub and self._fragment_token == token:
+            return self._fragment_hub
+        if self._fragment_hub:
+            await self._fragment_hub.aclose()
+        self._fragment_hub = FragmentApiHub(token)
+        self._fragment_token = token
+        return self._fragment_hub
 
     async def on_startup(self) -> None:
         await self.hlog.start()
         await self.workers.start()
+        hub = await self.get_fragment_hub()
+        if hub:
+            asyncio.create_task(hub.warm_cache())
         self.hlog.info("%s v%s started", NAME, VERSION)
 
     async def on_shutdown(self) -> None:
         await self.workers.stop()
+        if self._fragment_hub:
+            await self._fragment_hub.aclose()
         await self.hlog.stop()
 
     def get_settings_schema(self) -> list[dict[str, Any]]:
         return [
+            {"key": "api_token", "label": "Fragment API токен", "type": "multiline", "default": ""},
             {"key": "plugin_enabled", "label": "Плагин вкл", "type": "bool", "default": True},
             {"key": "lots_enabled", "label": "Лоты вкл", "type": "bool", "default": True},
             {"key": "auto_refund", "label": "Автовозврат", "type": "bool", "default": True},
             {"key": "auto_deactivate", "label": "Автодеактивация", "type": "bool", "default": True},
-            {"key": "fragment_jwt", "label": "Fragment JWT", "type": "multiline", "default": ""},
-            {"key": "fragment_api_base", "label": "Fragment API URL", "type": "text", "default": FRAGMENT_API_BASE},
             {"key": "markup_percent", "label": "Наценка %", "type": "int", "default": 15},
             {"key": "queue_mode", "label": "Режим очереди", "type": "select", "default": "strict",
              "options": list(QUEUE_MODES)},
@@ -1970,30 +2156,40 @@ class Plugin(StarvellPlugin):
             {"key": "min_balance_ton", "label": "Мин. TON", "type": "text", "default": "0.5"},
             {"key": "min_balance_usdt", "label": "Мин. USDT", "type": "text", "default": "1.0"},
             {"key": "category_url", "label": "URL категории (автодемп)", "type": "text", "default": ""},
-            {"key": "tonapi_key", "label": "TonAPI ключ", "type": "text", "default": ""},
             {"key": "autoprice_enabled", "label": "Автоцены", "type": "bool", "default": False},
             {"key": "autodump_enabled", "label": "Автодемп", "type": "bool", "default": False},
         ]
 
     async def on_setting_change(self, key: str, value: Any) -> None:
         settings = await _get_settings()
-        settings[key] = value
+        if key in ("api_token", "fragment_jwt"):
+            settings["api_token"] = str(value or "").strip()
+            settings.pop("fragment_jwt", None)
+        else:
+            settings[key] = value
         await _save_settings(settings)
+        if key in ("api_token", "fragment_jwt"):
+            if self._fragment_hub:
+                await self._fragment_hub.aclose()
+            self._fragment_hub = None
+            self._fragment_token = ""
+            hub = await self.get_fragment_hub()
+            if hub:
+                asyncio.create_task(hub.warm_cache())
         self.hlog.info("Настройка %s изменена", key)
 
     async def render_plugin_panel(self) -> tuple[str, InlineKeyboardMarkup]:
         return await self.tg_ui.render_main()
 
     async def on_panel_action(self, call: CallbackQuery, action: str) -> bool:
-        if action == "jwt:validate":
-            settings = await _get_settings()
-            client = AsyncFragmentClient(
-                settings.get("fragment_jwt") or "",
-                settings.get("fragment_api_base") or FRAGMENT_API_BASE,
-            )
-            ok, err = await client.validate_jwt()
-            await call.answer("JWT OK" if ok else err, show_alert=not ok)
-            return await self.tg_ui._show_jwt(call)
+        if action in ("token:validate", "jwt:validate"):
+            hub = await self.get_fragment_hub()
+            if not hub:
+                await call.answer("API токен не задан", show_alert=True)
+                return True
+            ok, err, _wallet = await hub.validate_token()
+            await call.answer("✅ Баланс получен" if ok else err, show_alert=not ok)
+            return await self.tg_ui._show_token(call)
         return await self.tg_ui.handle_callback(call, action)
 
     async def on_telegram_command(self, call, command: str) -> bool:
@@ -2005,19 +2201,20 @@ class Plugin(StarvellPlugin):
                 await call.message.answer(text, parse_mode="HTML", reply_markup=kb)
             return True
         if command == "fts_balance":
-            settings = await _get_settings()
-            client = AsyncFragmentClient(
-                settings.get("fragment_jwt") or "",
-                settings.get("fragment_api_base") or FRAGMENT_API_BASE,
-            )
-            w = await client.get_wallet()
+            hub = await self.get_fragment_hub()
+            if not hub:
+                await call.message.answer("❌ Задайте Fragment API токен в настройках плагина")
+                return True
+            w = await hub.get_wallet(force=True)
             if w.valid:
                 await call.message.answer(
-                    f"💎 Fragment: TON <b>{w.ton_balance:.4f}</b> · USDT <b>{w.usdt_balance:.2f}</b>",
+                    f"💎 Fragment кошелёк\n"
+                    f"TON <b>{w.ton_balance:.4f}</b> · USDT <b>{w.usdt_balance:.2f}</b>\n"
+                    f"Версия: <code>{html.escape(w.wallet_version or '—')}</code>",
                     parse_mode="HTML",
                 )
             else:
-                await call.message.answer("❌ JWT не настроен или кошелёк недоступен")
+                await call.message.answer(f"❌ {html.escape(w.error or 'кошелёк недоступен')}")
             return True
         if command == "fts_stats":
             settings = await _get_settings()
