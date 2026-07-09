@@ -46,12 +46,12 @@ from starvell_sdk import (
 # ═══════════════════════════════════════════════════════════════════════════════
 
 NAME: Final[str] = "FTS-Starwell"
-VERSION: Final[str] = "1.1.0"
+VERSION: Final[str] = "1.2.0"
 DESCRIPTION: Final[str] = "Автопродажа Telegram Stars через Fragment API для Starvell"
 UUID: Final[str] = "FTS-Starwell"
 SETTINGS_PAGE: Final[bool] = True
 
-_META_AUTHOR: Final[str] = "@xvimp"
+_META_AUTHOR: Final[str] = "@xei1y"
 _META_UUID: Final[str] = "FTS-Starwell"
 _META_VERSION: Final[str] = VERSION
 CREDITS: Final[str] = _META_AUTHOR
@@ -63,10 +63,44 @@ STV_ORDER_URL: Final[str] = "https://starvell.com/order/{order_id}"
 CB_PREFIX: Final[str] = f"fts_{UUID[:8]}"
 
 TELEGRAM_COMMANDS = [
-    {"command": "fts", "description": "панель FTS-Starwell"},
-    {"command": "fts_stats", "description": "статистика FTS-Starwell"},
-    {"command": "fts_balance", "description": "баланс Fragment кошелька"},
+    {"command": "fts", "description": "⭐ панель FTS-Starwell"},
+    {"command": "fts_balance", "description": "💎 баланс Fragment"},
+    {"command": "fts_queue", "description": "📋 очередь заказов"},
+    {"command": "fts_stats", "description": "📊 статистика продаж"},
 ]
+
+TOGGLE_LABELS: dict[str, str] = {
+    "plugin_enabled": "Плагин",
+    "lots_enabled": "Лоты на Starvell",
+    "auto_refund": "Автовозврат",
+    "auto_deactivate": "Автодеактивация",
+    "back_command_enabled": "Команда !бэк",
+    "preorder_username": "Ник из заказа",
+    "back_priority": "Приоритет !бэк",
+    "auto_send_without_plus": "Отправка без «+»",
+    "check_username": "Проверка @username",
+    "liteserver_retry": "LiteServer-ретрай",
+    "usdt_fallback_to_ton": "USDT → TON",
+    "autoprice_enabled": "Автоцены",
+    "autodump_enabled": "Автодемп",
+}
+
+TEMPLATE_LABELS: dict[str, str] = {
+    "welcome": "Приветствие",
+    "ask_username": "Запрос @username",
+    "confirm_username": "Подтверждение ника",
+    "sending": "Отправка Stars",
+    "success": "Успешная выдача",
+    "error": "Ошибка выдачи",
+    "refunded": "Возврат средств",
+    "queue_position": "Позиция в очереди",
+    "timeout_moved": "Таймаут очереди",
+    "invalid_username": "Неверный ник",
+    "back_ok": "Успешный !бэк",
+    "back_denied": "Отказ !бэк",
+    "reminder": "Напоминание",
+    "review_request": "Просьба об отзыве",
+}
 
 QUEUE_MODES = ("strict", "skip_ready", "timeout_end")
 QUEUE_MODE_LABELS = {
@@ -1755,8 +1789,30 @@ class BackgroundWorkers:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
+def _flag(on: bool) -> str:
+    return "🟢" if on else "🔴"
+
+
+def _sep() -> str:
+    return "━━━━━━━━━━━━━━━━━━"
+
+
+async def _safe_edit(call: CallbackQuery, text: str, kb: InlineKeyboardMarkup) -> None:
+    """Безопасное обновление сообщения без падений на «message is not modified»."""
+    try:
+        await call.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+    except Exception as exc:
+        err = str(exc).lower()
+        if "message is not modified" in err or "exactly the same" in err:
+            return
+        try:
+            await call.message.answer(text, parse_mode="HTML", reply_markup=kb)
+        except Exception:
+            pass
+
+
 class TelegramUI:
-    """Inline-меню продавца (идентичная структура FTS-Plugin)."""
+    """Удобная панель продавца: быстрая навигация, понятные подписи, без сбоев."""
 
     def __init__(self, plugin: "Plugin") -> None:
         self.p = plugin
@@ -1764,167 +1820,310 @@ class TelegramUI:
     def _btn(self, text: str, action: str) -> InlineKeyboardButton:
         return self.p.panel_btn(text, self.p.UUID, action)
 
-    async def main_menu_kb(self, settings: dict[str, Any]) -> InlineKeyboardMarkup:
-        def flag(key: str) -> str:
-            return "🟢" if settings.get(key) else "🔴"
+    def _back_home(self) -> InlineKeyboardButton:
+        return self._btn("🏠 Главная", "nav:home")
 
+    def _back(self, action: str = "nav:home") -> list[InlineKeyboardButton]:
+        return [self._btn("◀️ Назад", action), self._back_home()]
+
+    async def _wallet_line(self, *, force: bool = False) -> tuple[str, bool]:
+        hub = await self.p.get_fragment_hub()
+        if not hub:
+            return "⚠️ API токен не задан — откройте 💎 Баланс", False
+        cached = hub.wallet_cached()
+        if cached and cached.valid and not force:
+            asyncio.create_task(hub.get_wallet(force=True))
+            return (
+                f"💎 TON <b>{cached.ton_balance:.4f}</b> · USDT <b>{cached.usdt_balance:.2f}</b>"
+                f" · <i>{html.escape(cached.wallet_version or 'wallet')}</i>",
+                True,
+            )
+        w = await hub.get_wallet(force=force)
+        if w.valid:
+            return (
+                f"💎 TON <b>{w.ton_balance:.4f}</b> · USDT <b>{w.usdt_balance:.2f}</b>"
+                f" · <i>{html.escape(w.wallet_version or 'wallet')}</i>",
+                True,
+            )
+        return f"⚠️ {html.escape(w.error or 'кошелёк недоступен')}", False
+
+    async def _queue_summary(self) -> tuple[int, int, list[QueuedOrder]]:
+        items = await self.p.processor.queue.get_queue()
+        waiting = sum(1 for x in items if not x.username and not x.sent)
+        return len(items), waiting, items
+
+    async def format_queue_text(self, *, limit: int = 12) -> str:
+        q_total, q_wait, items = await self._queue_summary()
+        settings = await _get_settings()
+        mode = QUEUE_MODE_LABELS.get(settings.get("queue_mode") or "strict", "—")
+        lines = [
+            f"📋 <b>Очередь заказов</b>\n{_sep()}",
+            f"Всего: <b>{q_total}</b> · Ждут @username: <b>{q_wait}</b>",
+            f"Режим: <i>{mode}</i>\n",
+        ]
+        if not items:
+            lines.append("<i>Очередь пуста — всё обработано.</i>")
+        else:
+            for i, item in enumerate(items[:limit], 1):
+                st = "✅" if item.sent else ("⏳" if item.username else "💬")
+                nick = f"@{item.username}" if item.username else "—"
+                lines.append(
+                    f"{i}. {st} <code>#{html.escape(item.order_id)}</code> · "
+                    f"{item.stars}⭐ · {nick} · {html.escape(item.buyer)}"
+                )
+            if q_total > limit:
+                lines.append(f"\n<i>…ещё {q_total - limit} в очереди</i>")
+        return "\n".join(lines)
+
+    async def main_menu_kb(self, settings: dict[str, Any]) -> InlineKeyboardMarkup:
         rows = [
-            [self._btn(f"{flag('plugin_enabled')} Плагин", "toggle:plugin_enabled")],
-            [self._btn(f"{flag('lots_enabled')} Лоты", "toggle:lots_enabled")],
-            [self._btn(f"{flag('auto_refund')} Автовозврат", "toggle:auto_refund")],
-            [self._btn(f"{flag('auto_deactivate')} Автодеактивация", "toggle:auto_deactivate")],
-            [self._btn(f"{flag('back_command_enabled')} Команда !бэк", "toggle:back_command_enabled")],
-            [self._btn(f"{flag('preorder_username')} Ник из заказа", "toggle:preorder_username")],
             [
-                self._btn("🔑 API токен", "menu:token"),
-                self._btn("📦 Лоты", "menu:lots"),
+                self._btn(f"{_flag(settings.get('plugin_enabled'))} Плагин", "toggle:plugin_enabled"),
+                self._btn(f"{_flag(settings.get('lots_enabled'))} Лоты", "toggle:lots_enabled"),
             ],
             [
-                self._btn("⚙️ Мини-настройки", "menu:mini"),
-                self._btn("💬 Сообщения", "menu:templates"),
+                self._btn("💎 Баланс", "menu:token"),
+                self._btn("📋 Очередь", "menu:queue"),
+            ],
+            [
+                self._btn("📦 Сетка лотов", "menu:lots"),
+                self._btn("⚙️ Настройки", "menu:settings"),
             ],
             [
                 self._btn("💰 Цены", "menu:pricing"),
                 self._btn("📊 Статистика", "menu:stats"),
             ],
             [
+                self._btn("💬 Сообщения", "menu:templates"),
                 self._btn("📜 Логи", "menu:logs"),
-                self._btn("📤 Экспорт", "menu:export"),
             ],
-            [self._btn("🔄 Обновить", "refresh")],
+            [
+                self._btn("🔄 Обновить", "action:refresh"),
+                self._btn("⚡ Синхр.", "action:sync"),
+            ],
             [self.p.panel_back_btn(self.p.UUID)],
         ]
         return InlineKeyboardMarkup(inline_keyboard=rows)
 
     async def render_main(self, *, force_balance: bool = False) -> tuple[str, InlineKeyboardMarkup]:
         settings = await _get_settings()
-        wallet_txt = "токен не задан"
-        age_hint = ""
-        hub = await self.p.get_fragment_hub()
-        if hub:
-            w = hub.wallet_cached()
-            if w and w.valid and not force_balance:
-                wallet_txt = (
-                    f"TON {w.ton_balance:.4f} · USDT {w.usdt_balance:.2f}"
-                    f" ({w.wallet_version or 'wallet'})"
-                )
-                age_hint = " · кэш"
-            else:
-                w = await hub.get_wallet(force=force_balance)
-                if w.valid:
-                    wallet_txt = (
-                        f"TON {w.ton_balance:.4f} · USDT {w.usdt_balance:.2f}"
-                        f" ({w.wallet_version or 'wallet'})"
-                    )
-                elif w.error:
-                    wallet_txt = w.error[:60]
-            if not force_balance and hub.token:
-                asyncio.create_task(hub.get_wallet(force=True))
-        queue_len = len(await self.p.processor.queue.get_queue())
+        wallet_line, wallet_ok = await self._wallet_line(force=force_balance)
+        q_total, q_wait, _ = await self._queue_summary()
         stats = settings.get("stats") or {}
+        lots_n = len(settings.get("lots") or {})
+        token_ok = bool(_api_token(settings))
+
+        status = "🟢 Активен" if settings.get("plugin_enabled") else "🔴 Выключен"
+        if settings.get("plugin_enabled") and not token_ok:
+            status = "🟡 Нужен API токен"
+        elif settings.get("plugin_enabled") and token_ok and not wallet_ok:
+            status = "🟡 Проблема с кошельком"
+
         text = (
-            f"⭐ <b>{NAME}</b> v{VERSION}\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"{'🟢' if settings.get('plugin_enabled') else '🔴'} "
-            f"{'Работает' if settings.get('plugin_enabled') else 'Выключен'}\n"
-            f"💎 Fragment: <code>{html.escape(wallet_txt)}{age_hint}</code>\n"
-            f"📋 Очередь: <b>{queue_len}</b>\n"
-            f"✅ Выполнено: <b>{stats.get('completed', 0)}</b> · "
-            f"⭐ Stars: <b>{stats.get('stars_sent', 0)}</b>\n"
-            f"💵 Выручка: <b>{_format_rub(stats.get('revenue_rub', 0))}</b>\n\n"
-            f"<i>{DESCRIPTION}</i>\n"
+            f"⭐ <b>{NAME}</b> <code>v{VERSION}</code>\n"
+            f"{_sep()}\n"
+            f"Статус: <b>{status}</b>\n"
+            f"{wallet_line}\n"
+            f"📋 Очередь: <b>{q_total}</b>"
+            + (f" · ⏳ ждут @username: <b>{q_wait}</b>" if q_wait else "")
+            + f"\n📦 Лотов: <b>{lots_n}</b> · ✅ <b>{stats.get('completed', 0)}</b> · "
+            f"💵 <b>{_format_rub(stats.get('revenue_rub', 0))}</b>\n\n"
+            f"<i>Автопродажа Telegram Stars через Fragment API</i>\n"
             f"👤 {CREDITS}"
         )
         return text, await self.main_menu_kb(settings)
 
     async def handle_callback(self, call: CallbackQuery, action: str) -> bool:
-        if action == "refresh":
-            text, kb = await self.render_main(force_balance=True)
-            await call.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
-            await call.answer("Баланс обновлён")
+        try:
+            if action == "nav:home":
+                text, kb = await self.render_main()
+                await _safe_edit(call, text, kb)
+                await call.answer()
+                return True
+            if action == "action:refresh":
+                text, kb = await self.render_main(force_balance=True)
+                await _safe_edit(call, text, kb)
+                await call.answer("✅ Данные обновлены")
+                return True
+            if action == "action:sync":
+                await call.answer("⏳ Синхронизация…")
+                await self._run_sync(force=True)
+                text, kb = await self.render_main(force_balance=True)
+                await _safe_edit(call, text, kb)
+                return True
+            if action.startswith("set:toggle:"):
+                return await self._toggle(call, action.split(":", 2)[2], screen="settings")
+            if action.startswith("price:toggle:"):
+                return await self._toggle(call, action.split(":", 2)[2], screen="pricing")
+            if action.startswith("toggle:"):
+                return await self._toggle(call, action.split(":", 1)[1])
+            if action == "menu:token":
+                return await self._show_token(call)
+            if action in ("menu:jwt",):
+                return await self._show_token(call)
+            if action == "menu:queue":
+                return await self._show_queue(call)
+            if action == "menu:lots":
+                return await self._show_lots(call, page=0)
+            if action == "menu:settings":
+                return await self._show_settings(call)
+            if action == "menu:mini":
+                return await self._show_settings(call)
+            if action == "menu:templates":
+                return await self._show_templates(call)
+            if action == "menu:pricing":
+                return await self._show_pricing(call)
+            if action == "menu:stats":
+                return await self._show_stats(call)
+            if action == "menu:logs":
+                return await self._show_logs(call)
+            if action == "menu:export":
+                return await self._show_export(call)
+            if action.startswith("lots:"):
+                return await self._lots_action(call, action)
+            if action.startswith("mini:"):
+                return await self._mini_action(call, action)
+            if action.startswith("tpl:"):
+                return await self._tpl_action(call, action)
+            if action.startswith("queue:"):
+                return await self._queue_action(call, action)
+            if action.startswith("pricing:"):
+                return await self._pricing_action(call, action)
+            if action.startswith("lots:page:"):
+                page = int(action.rsplit(":", 1)[-1])
+                return await self._show_lots(call, page=page)
+        except Exception as exc:
+            self.p.hlog.exception("UI callback %s: %s", action, exc)
+            await call.answer("⚠️ Ошибка интерфейса", show_alert=True)
             return True
-        if action.startswith("toggle:"):
-            key = action.split(":", 1)[1]
-            settings = await _get_settings()
-            settings[key] = not bool(settings.get(key))
-            await _save_settings(settings)
-            text, kb = await self.render_main()
-            await call.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
-            await call.answer(f"{'🟢' if settings[key] else '🔴'} {key}")
-            return True
-        if action == "menu:token" or action == "menu:jwt":
-            return await self._show_token(call)
-        if action == "menu:lots":
-            return await self._show_lots(call)
-        if action == "menu:mini":
-            return await self._show_mini(call)
-        if action == "menu:templates":
-            return await self._show_templates(call)
-        if action == "menu:pricing":
-            return await self._show_pricing(call)
-        if action == "menu:stats":
-            return await self._show_stats(call)
-        if action == "menu:logs":
-            return await self._show_logs(call)
-        if action == "menu:export":
-            return await self._show_export(call)
-        if action.startswith("lots:"):
-            return await self._lots_action(call, action)
-        if action.startswith("mini:"):
-            return await self._mini_action(call, action)
-        if action.startswith("tpl:"):
-            return await self._tpl_action(call, action)
         return False
+
+    async def _run_sync(self, *, force: bool = False) -> None:
+        settings = await _get_settings()
+        hub = await self.p.get_fragment_hub()
+        api = self.p.core.get_api()
+        if hub:
+            await hub.warm_cache()
+        if hub and api and settings.get("plugin_enabled"):
+            await LotManager.sync_lots(api, hub, settings, self.p.hlog)
+            await _save_settings(settings)
+        if settings.get("autoprice_enabled") and hub and api:
+            await BackgroundWorkers(self.p)._autoprice_worker()
+        await self.p.processor.process_next()
+
+    async def _toggle(
+        self,
+        call: CallbackQuery,
+        key: str,
+        *,
+        screen: str = "main",
+    ) -> bool:
+        if key not in TOGGLE_LABELS and key not in DEFAULT_SETTINGS:
+            await call.answer("Неизвестная настройка", show_alert=True)
+            return True
+        settings = await _get_settings()
+        settings[key] = not bool(settings.get(key))
+        await _save_settings(settings)
+        label = TOGGLE_LABELS.get(key, key)
+        await call.answer(f"{_flag(settings[key])} {label}")
+        if screen == "settings":
+            return await self._show_settings(call)
+        if screen == "pricing":
+            return await self._show_pricing(call)
+        text, kb = await self.render_main()
+        await _safe_edit(call, text, kb)
+        return True
 
     async def _show_token(self, call: CallbackQuery) -> bool:
         settings = await _get_settings()
         token = _api_token(settings)
-        masked = f"{token[:8]}…{token[-4:]}" if len(token) > 16 else ("—" if not token else "***")
-        valid_txt = "—"
-        hub = await self.p.get_fragment_hub()
-        if hub and token:
-            ok, err, wallet = await hub.validate_token()
-            if ok and wallet.valid:
-                valid_txt = (
-                    f"✅ Токен активен\n"
-                    f"TON <b>{wallet.ton_balance:.4f}</b> · USDT <b>{wallet.usdt_balance:.2f}</b>"
-                )
-                if wallet.wallet_version:
-                    valid_txt += f"\nКошелёк: <code>{html.escape(wallet.wallet_version)}</code>"
-                if wallet.address:
-                    valid_txt += f"\nАдрес: <code>{html.escape(wallet.address[:20])}…</code>"
-            else:
-                valid_txt = f"❌ {html.escape(err or 'ошибка токена')}"
+        masked = f"{token[:6]}•••{token[-4:]}" if len(token) > 12 else ("не задан" if not token else "•••")
+        body = "Задайте токен в ⚙️ Настройках плагина → <b>Fragment API токен</b>."
+        if token:
+            hub = await self.p.get_fragment_hub()
+            if hub:
+                ok, err, wallet = await hub.validate_token()
+                if ok and wallet.valid:
+                    body = (
+                        f"✅ <b>Токен рабочий</b>\n"
+                        f"TON <b>{wallet.ton_balance:.4f}</b> · USDT <b>{wallet.usdt_balance:.2f}</b>\n"
+                        f"Кошелёк: <code>{html.escape(wallet.wallet_version or '—')}</code>"
+                    )
+                    if wallet.address:
+                        body += f"\nАдрес: <code>{html.escape(wallet.address)}</code>"
+                else:
+                    body = f"❌ {html.escape(err or 'ошибка токена')}"
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [self._btn("✅ Проверить баланс", "token:validate")],
-            [self._btn("◀️ Назад", "refresh")],
+            self._back(),
         ])
-        await call.message.edit_text(
-            f"🔑 <b>Fragment API токен</b>\n\n"
-            f"Токен: <code>{html.escape(masked)}</code>\n{valid_txt}\n\n"
-            f"Один токен используется для баланса, заказов Stars и всех настроек.\n"
-            f"Задайте <code>api_token</code> в ⚙️ Настройках плагина.",
-            parse_mode="HTML", reply_markup=kb,
+        await _safe_edit(
+            call,
+            f"🔑 <b>Fragment API токен</b>\n{_sep()}\n"
+            f"Токен: <code>{html.escape(masked)}</code>\n\n{body}\n\n"
+            f"<i>Один токен — баланс, заказы, проверка @username, автоцены.</i>",
+            kb,
         )
         await call.answer()
         return True
 
-    async def _show_lots(self, call: CallbackQuery) -> bool:
+    async def _show_queue(self, call: CallbackQuery) -> bool:
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [self._btn("⚡ Обработать следующий", "queue:process")],
+            self._back(),
+        ])
+        await _safe_edit(call, await self.format_queue_text(), kb)
+        await call.answer()
+        return True
+
+    async def _queue_action(self, call: CallbackQuery, action: str) -> bool:
+        if action == "queue:process":
+            await call.answer("⏳ Обработка…")
+            await self.p.processor.process_next()
+            return await self._show_queue(call)
+        return False
+
+    async def _show_lots(self, call: CallbackQuery, *, page: int = 0) -> bool:
         settings = await _get_settings()
         lots = settings.get("lots") or {}
-        lines = [f"📦 <b>Лоты ({len(lots)})</b>\n"]
-        for lid, cfg in list(lots.items())[:20]:
-            icon = "🟢" if cfg.get("enabled", True) else "🔴"
+        entries = list(lots.items())
+        per_page = 8
+        total_pages = max(1, (len(entries) + per_page - 1) // per_page)
+        page = max(0, min(page, total_pages - 1))
+        chunk = entries[page * per_page:(page + 1) * per_page]
+        lines = [f"📦 <b>Сетка лотов</b> ({len(lots)})\n{_sep()}"]
+        if not chunk:
             lines.append(
-                f"{icon} <code>{lid}</code> — {cfg.get('stars', '?')}⭐ · "
-                f"{_format_rub(cfg.get('price', 0))}"
+                "<i>Лотов пока нет.</i>\n\n"
+                "Добавьте в <code>settings.json</code>:\n"
+                "<pre>\"lots\": {\n  \"OFFER_ID\": {\"stars\": 500, \"price\": 450, \"enabled\": true}\n}</pre>"
             )
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [self._btn("➕ Добавить лот", "lots:add")],
-            [self._btn("🟢 Вкл все", "lots:enable_all"), self._btn("🔴 Выкл все", "lots:disable_all")],
-            [self._btn("◀️ Назад", "refresh")],
+        else:
+            for lid, cfg in chunk:
+                icon = _flag(cfg.get("enabled", True))
+                bal = "🔒" if cfg.get("_hidden_by_balance") else ""
+                lines.append(
+                    f"{icon}{bal} <code>{lid}</code>\n"
+                    f"   ⭐ {cfg.get('stars', '?')} · 💵 {_format_rub(cfg.get('price', 0))}"
+                )
+        nav: list[InlineKeyboardButton] = []
+        if page > 0:
+            nav.append(self._btn("◀️", f"lots:page:{page - 1}"))
+        nav.append(self._btn(f"{page + 1}/{total_pages}", "menu:lots"))
+        if page < total_pages - 1:
+            nav.append(self._btn("▶️", f"lots:page:{page + 1}"))
+        rows: list[list[InlineKeyboardButton]] = []
+        if len(nav) > 1:
+            rows.append(nav)
+        rows.extend([
+            [
+                self._btn("🟢 Вкл все", "lots:enable_all"),
+                self._btn("🔴 Выкл все", "lots:disable_all"),
+            ],
+            [self._btn("⚡ Синхр. по балансу", "lots:sync_balance")],
+            self._back(),
         ])
-        await call.message.edit_text("\n".join(lines) or "📦 Лотов нет", parse_mode="HTML", reply_markup=kb)
+        await _safe_edit(call, "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows))
         await call.answer()
         return True
 
@@ -1935,40 +2134,55 @@ class TelegramUI:
             for cfg in lots.values():
                 cfg["enabled"] = True
             await _save_settings(settings)
-            await call.answer("Все лоты включены")
+            await call.answer("✅ Все лоты включены")
             return await self._show_lots(call)
         if action == "lots:disable_all":
             for cfg in lots.values():
                 cfg["enabled"] = False
             await _save_settings(settings)
-            await call.answer("Все лоты выключены")
+            await call.answer("🔴 Все лоты выключены")
+            return await self._show_lots(call)
+        if action == "lots:sync_balance":
+            await call.answer("⏳ Синхронизация…")
+            await self._run_sync(force=True)
             return await self._show_lots(call)
         if action == "lots:add":
-            await call.answer(
-                "Добавьте лот через settings.json: lots → offer_id → {stars, price, enabled}",
-                show_alert=True,
-            )
+            await call.answer("Добавьте лот в settings.json → lots", show_alert=True)
             return True
         return False
 
-    async def _show_mini(self, call: CallbackQuery) -> bool:
-        settings = await _get_settings()
-        mode = settings.get("queue_mode") or "strict"
+    async def _show_settings(self, call: CallbackQuery) -> bool:
+        s = await _get_settings()
+        mode = QUEUE_MODE_LABELS.get(s.get("queue_mode") or "strict", "—")
         kb = InlineKeyboardMarkup(inline_keyboard=[
-            [self._btn(f"{'🟢' if settings.get('back_priority') else '🔴'} Приоритет !бэк", "mini:toggle:back_priority")],
-            [self._btn(f"📋 Очередь: {QUEUE_MODE_LABELS.get(mode, mode)}", "mini:cycle:queue_mode")],
-            [self._btn(f"{'🟢' if settings.get('auto_send_without_plus') else '🔴'} Без '+'", "mini:toggle:auto_send_without_plus")],
-            [self._btn(f"{'🟢' if settings.get('check_username') else '🔴'} Проверка @username", "mini:toggle:check_username")],
-            [self._btn(f"{'🟢' if settings.get('liteserver_retry') else '🔴'} LiteServer-ретрай", "mini:toggle:liteserver_retry")],
-            [self._btn(f"{'🟢' if settings.get('usdt_fallback_to_ton') else '🔴'} USDT→TON fallback", "mini:toggle:usdt_fallback_to_ton")],
-            [self._btn("◀️ Назад", "refresh")],
+            [
+                self._btn(f"{_flag(s.get('auto_refund'))} Автовозврат", "set:toggle:auto_refund"),
+                self._btn(f"{_flag(s.get('auto_deactivate'))} Автодеакт.", "set:toggle:auto_deactivate"),
+            ],
+            [
+                self._btn(f"{_flag(s.get('back_command_enabled'))} !бэк", "set:toggle:back_command_enabled"),
+                self._btn(f"{_flag(s.get('preorder_username'))} Ник из заказа", "set:toggle:preorder_username"),
+            ],
+            [self._btn(f"📋 Очередь: {mode[:18]}", "mini:cycle:queue_mode")],
+            [
+                self._btn(f"{_flag(s.get('auto_send_without_plus'))} Без «+»", "set:toggle:auto_send_without_plus"),
+                self._btn(f"{_flag(s.get('check_username'))} Проверка @", "set:toggle:check_username"),
+            ],
+            [
+                self._btn(f"{_flag(s.get('liteserver_retry'))} LiteServer", "set:toggle:liteserver_retry"),
+                self._btn(f"{_flag(s.get('usdt_fallback_to_ton'))} USDT→TON", "set:toggle:usdt_fallback_to_ton"),
+            ],
+            [self._btn(f"{_flag(s.get('back_priority'))} Приоритет !бэк", "set:toggle:back_priority")],
+            [self._btn("📤 Экспорт настроек", "menu:export")],
+            self._back(),
         ])
-        await call.message.edit_text(
-            f"⚙️ <b>Мини-настройки</b>\n\n"
-            f"Таймаут очереди: <b>{settings.get('queue_timeout_sec')}с</b>\n"
-            f"Мин. баланс TON: <b>{settings.get('min_balance_ton')}</b>\n"
-            f"Мин. баланс USDT: <b>{settings.get('min_balance_usdt')}</b>",
-            parse_mode="HTML", reply_markup=kb,
+        await _safe_edit(
+            call,
+            f"⚙️ <b>Настройки</b>\n{_sep()}\n"
+            f"⏱ Таймаут очереди: <b>{s.get('queue_timeout_sec')} сек</b>\n"
+            f"📉 Мин. баланс TON: <b>{s.get('min_balance_ton')}</b> · USDT: <b>{s.get('min_balance_usdt')}</b>\n\n"
+            f"<i>Токен и наценка — в ⚙️ Настройках плагина Cardinal.</i>",
+            kb,
         )
         await call.answer()
         return True
@@ -1979,28 +2193,30 @@ class TelegramUI:
             key = action.split(":", 2)[2]
             settings[key] = not bool(settings.get(key))
             await _save_settings(settings)
-            return await self._show_mini(call)
+            await call.answer(f"{_flag(settings[key])} {TOGGLE_LABELS.get(key, key)}")
+            return await self._show_settings(call)
         if action == "mini:cycle:queue_mode":
             modes = list(QUEUE_MODES)
             cur = settings.get("queue_mode") or "strict"
             idx = modes.index(cur) if cur in modes else 0
             settings["queue_mode"] = modes[(idx + 1) % len(modes)]
             await _save_settings(settings)
-            return await self._show_mini(call)
+            await call.answer(QUEUE_MODE_LABELS.get(settings["queue_mode"], ""))
+            return await self._show_settings(call)
         return False
 
     async def _show_templates(self, call: CallbackQuery) -> bool:
         settings = await _get_settings()
         templates = settings.get("templates") or {}
-        lines = ["💬 <b>Шаблоны сообщений</b>\n"]
-        for key in DEFAULT_TEMPLATES:
-            preview = (templates.get(key) or "")[:40].replace("\n", " ")
-            lines.append(f"• <b>{key}</b>: {html.escape(preview)}…")
+        lines = [f"💬 <b>Шаблоны сообщений</b>\n{_sep()}"]
+        for key, label in TEMPLATE_LABELS.items():
+            preview = (templates.get(key) or DEFAULT_TEMPLATES.get(key, ""))[:36].replace("\n", " ")
+            lines.append(f"• <b>{label}</b>\n  <i>{html.escape(preview)}…</i>")
         kb = InlineKeyboardMarkup(inline_keyboard=[
-            [self._btn("🔄 Сбросить все", "tpl:reset")],
-            [self._btn("◀️ Назад", "refresh")],
+            [self._btn("🔄 Сбросить к стандартным", "tpl:reset")],
+            self._back(),
         ])
-        await call.message.edit_text("\n".join(lines), parse_mode="HTML", reply_markup=kb)
+        await _safe_edit(call, "\n".join(lines), kb)
         await call.answer()
         return True
 
@@ -2009,63 +2225,77 @@ class TelegramUI:
             settings = await _get_settings()
             settings["templates"] = copy.deepcopy(DEFAULT_TEMPLATES)
             await _save_settings(settings)
-            await call.answer("Шаблоны сброшены")
+            await call.answer("✅ Шаблоны восстановлены")
             return await self._show_templates(call)
         return False
 
     async def _show_pricing(self, call: CallbackQuery) -> bool:
         settings = await _get_settings()
         kb = InlineKeyboardMarkup(inline_keyboard=[
-            [self._btn(
-                f"{'🟢' if settings.get('autoprice_enabled') else '🔴'} Автоцены",
-                "mini:toggle:autoprice_enabled",
-            )],
-            [self._btn(
-                f"{'🟢' if settings.get('autodump_enabled') else '🔴'} Автодемп",
-                "mini:toggle:autodump_enabled",
-            )],
-            [self._btn(f"📈 Наценка: {settings.get('markup_percent')}%", "pricing:markup")],
-            [self._btn("◀️ Назад", "refresh")],
+            [
+                self._btn(f"{_flag(settings.get('autoprice_enabled'))} Автоцены", "price:toggle:autoprice_enabled"),
+                self._btn(f"{_flag(settings.get('autodump_enabled'))} Автодемп", "price:toggle:autodump_enabled"),
+            ],
+            [self._btn("⚡ Обновить цены сейчас", "pricing:sync_prices")],
+            self._back(),
         ])
-        await call.message.edit_text(
-            f"💰 <b>Ценообразование</b>\n\n"
-            f"Наценка: <b>{settings.get('markup_percent')}%</b>\n"
-            f"Шаг демпа: <b>{FTS_AUTODUMP_STEP_RUB} ₽</b>\n"
-            f"Мин. цена демпа: <b>{settings.get('autodump_min_price')} ₽</b>",
-            parse_mode="HTML", reply_markup=kb,
+        await _safe_edit(
+            call,
+            f"💰 <b>Ценообразование</b>\n{_sep()}\n"
+            f"📈 Наценка: <b>{settings.get('markup_percent')}%</b>\n"
+            f"📉 Шаг демпа: <b>{FTS_AUTODUMP_STEP_RUB} ₽</b>\n"
+            f"🛡 Мин. цена демпа: <b>{settings.get('autodump_min_price')} ₽</b>\n\n"
+            f"<i>Курсы берутся из Fragment API по вашему токену.</i>",
+            kb,
         )
         await call.answer()
         return True
+
+    async def _pricing_action(self, call: CallbackQuery, action: str) -> bool:
+        if action == "pricing:sync_prices":
+            await call.answer("⏳ Обновляю цены…")
+            await BackgroundWorkers(self.p)._autoprice_worker()
+            return await self._show_pricing(call)
+        return False
 
     async def _show_stats(self, call: CallbackQuery) -> bool:
         settings = await _get_settings()
         stats = settings.get("stats") or {}
         conv = Statistics.conversion(stats)
         lines = [
-            f"📊 <b>Статистика FTS-Starwell</b>\n",
+            f"📊 <b>Статистика</b>\n{_sep()}",
             f"📦 Заказов: <b>{stats.get('total_orders', 0)}</b>",
-            f"✅ Выполнено: <b>{stats.get('completed', 0)}</b> ({conv}%)",
-            f"❌ Ошибок: <b>{stats.get('failed', 0)}</b>",
-            f"💸 Возвратов: <b>{stats.get('refunded', 0)}</b>",
-            f"⭐ Stars отправлено: <b>{stats.get('stars_sent', 0)}</b>",
-            f"💵 Выручка: <b>{_format_rub(stats.get('revenue_rub', 0))}</b>",
-            f"💎 Расход TON: <b>{stats.get('cost_ton', 0):.4f}</b>\n",
-            "<b>Топ покупателей:</b>",
+            f"✅ Выполнено: <b>{stats.get('completed', 0)}</b> · конверсия <b>{conv}%</b>",
+            f"❌ Ошибок: <b>{stats.get('failed', 0)}</b> · 💸 Возвратов: <b>{stats.get('refunded', 0)}</b>",
+            f"⭐ Stars: <b>{stats.get('stars_sent', 0)}</b> · 💵 {_format_rub(stats.get('revenue_rub', 0))}",
+            f"💎 Расход TON: <b>{float(stats.get('cost_ton', 0)):.4f}</b>\n",
+            "<b>🏆 Топ покупателей</b>",
         ]
-        for buyer, cnt in Statistics.top_buyers(stats):
-            lines.append(f"• {html.escape(buyer)} — {cnt}")
-        lines.append("\n<b>Главные ошибки:</b>")
-        for err, cnt in Statistics.top_errors(stats):
-            lines.append(f"• {html.escape(err)} — {cnt}")
-        kb = InlineKeyboardMarkup(inline_keyboard=[[self._btn("◀️ Назад", "refresh")]])
-        await call.message.edit_text("\n".join(lines), parse_mode="HTML", reply_markup=kb)
+        buyers = Statistics.top_buyers(stats)
+        if buyers:
+            for buyer, cnt in buyers:
+                lines.append(f"  • {html.escape(buyer)} — <b>{cnt}</b>")
+        else:
+            lines.append("  <i>пока нет данных</i>")
+        lines.append("\n<b>⚠️ Частые ошибки</b>")
+        errors = Statistics.top_errors(stats)
+        if errors:
+            for err, cnt in errors:
+                lines.append(f"  • {html.escape(err)} — <b>{cnt}</b>")
+        else:
+            lines.append("  <i>ошибок не было</i>")
+        kb = InlineKeyboardMarkup(inline_keyboard=[self._back()])
+        await _safe_edit(call, "\n".join(lines), kb)
         await call.answer()
         return True
 
     async def _show_logs(self, call: CallbackQuery) -> bool:
-        tail = await self.p.hlog.read_tail(60)
-        kb = InlineKeyboardMarkup(inline_keyboard=[[self._btn("◀️ Назад", "refresh")]])
-        await call.message.edit_text(f"📜 <b>Логи</b>\n\n<pre>{tail}</pre>", parse_mode="HTML", reply_markup=kb)
+        tail = await self.p.hlog.read_tail(45)
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [self._btn("🔄 Обновить", "menu:logs")],
+            self._back(),
+        ])
+        await _safe_edit(call, f"📜 <b>Логи</b>\n{_sep()}\n<pre>{tail}</pre>", kb)
         await call.answer()
         return True
 
@@ -2073,14 +2303,13 @@ class TelegramUI:
         settings = await _get_settings()
         export_data = {k: settings.get(k) for k in DEFAULT_SETTINGS if k not in ("api_token", "fragment_jwt")}
         payload = json.dumps(export_data, ensure_ascii=False, indent=2)
-        if len(payload) > 3500:
-            payload = payload[:3500] + "\n…"
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [self._btn("◀️ Назад", "refresh")],
-        ])
-        await call.message.edit_text(
-            f"📤 <b>Экспорт settings</b> (без JWT)\n\n<pre>{html.escape(payload)}</pre>",
-            parse_mode="HTML", reply_markup=kb,
+        if len(payload) > 3200:
+            payload = payload[:3200] + "\n… (обрезано)"
+        kb = InlineKeyboardMarkup(inline_keyboard=[self._back("menu:settings")])
+        await _safe_edit(
+            call,
+            f"📤 <b>Экспорт</b> (без токена)\n{_sep()}\n<pre>{html.escape(payload)}</pre>",
+            kb,
         )
         await call.answer()
         return True
@@ -2216,13 +2445,32 @@ class Plugin(StarvellPlugin):
             else:
                 await call.message.answer(f"❌ {html.escape(w.error or 'кошелёк недоступен')}")
             return True
+        if command == "fts_queue":
+            text = await self.tg_ui.format_queue_text()
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [self.tg_ui._btn("⚡ Обработать следующий", "queue:process")],
+                [self.tg_ui._btn("🏠 Панель FTS", "nav:home")],
+            ])
+            await call.message.answer(text, parse_mode="HTML", reply_markup=kb)
+            return True
         if command == "fts_stats":
             settings = await _get_settings()
             stats = settings.get("stats") or {}
+            conv = Statistics.conversion(stats)
+            buyers = Statistics.top_buyers(stats)
+            buyer_lines = (
+                "\n".join(f"  • {html.escape(b)} — <b>{c}</b>" for b, c in buyers[:5])
+                if buyers
+                else "  <i>пока нет данных</i>"
+            )
             await call.message.answer(
-                f"📊 Заказов: {stats.get('total_orders', 0)} · "
-                f"✅ {stats.get('completed', 0)} · ⭐ {stats.get('stars_sent', 0)} · "
-                f"💵 {_format_rub(stats.get('revenue_rub', 0))}",
+                f"📊 <b>Статистика FTS-Starwell</b>\n{_sep()}\n"
+                f"📦 Заказов: <b>{stats.get('total_orders', 0)}</b>\n"
+                f"✅ Выполнено: <b>{stats.get('completed', 0)}</b> · конверсия <b>{conv}%</b>\n"
+                f"❌ Ошибок: <b>{stats.get('failed', 0)}</b> · 💸 Возвратов: <b>{stats.get('refunded', 0)}</b>\n"
+                f"⭐ Stars: <b>{stats.get('stars_sent', 0)}</b> · 💵 {_format_rub(stats.get('revenue_rub', 0))}\n"
+                f"💎 Расход TON: <b>{float(stats.get('cost_ton', 0)):.4f}</b>\n\n"
+                f"<b>🏆 Топ покупателей</b>\n{buyer_lines}",
                 parse_mode="HTML",
             )
             return True
