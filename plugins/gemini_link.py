@@ -35,7 +35,7 @@ except ImportError:
 
 
 NAME          = "Gemini Link Auto"
-VERSION       = "3.0.1"
+VERSION       = "3.0.2"
 DESCRIPTION   = "ChatGPT автозакупка + выдача Gemini-ссылок из архива"
 CREDITS       = "Cursor AI"
 UUID          = "f7a2e8c1-4b3d-4e9f-a8c2-1d5e9b0f6a3c"
@@ -91,38 +91,88 @@ logger = logging.getLogger("FPC.GeminiLink")
 _P = "[GeminiLink]"
 
 _plugin: "Plugin | None" = None
-_tg_registered_for: int | None = None
+_tg_ui_registered_for: int | None = None
 
 
-def _is_plugin_settings_cb(call: CallbackQuery) -> bool:
-    data = call.data or ""
-    return (
-        data.startswith(f"{CBT.PLUGIN_SETTINGS}:{UUID}:")
-        or data.startswith(f"{CBT.EDIT_PLUGIN}:{UUID}:")
-    )
+def _match_gemini_plugin_settings(call: CallbackQuery) -> bool:
+    """Фильтр кнопки «Настройки» в карточке плагина Cardinal."""
+    data = (call.data or "").strip()
+    parts = data.split(":")
+    if len(parts) < 3:
+        return False
+    if parts[1] != UUID:
+        return False
+    return parts[0] in ("47", "45", str(CBT.PLUGIN_SETTINGS), str(CBT.EDIT_PLUGIN))
 
 
-def _register_priority_cbq(tg, handler, predicate, store: list | None = None) -> None:
-    """Регистрирует callback-хэндлер до catch-all default_cp в Cardinal."""
+_match_gemini_plugin_settings.__gemini_link_settings__ = True  # type: ignore[attr-defined]
+
+
+def _is_catch_all_cbq_filter(func) -> bool:
+    if func is None:
+        return False
+    samples = ("", "x", f"47:{UUID}:0", "noop")
+    for sample in samples:
+        probe = type("CbProbe", (), {"data": sample})()
+        try:
+            if not func(probe):
+                return False
+        except Exception:
+            return False
+    return True
+
+
+def _remove_gemini_settings_handlers(bot) -> None:
+    handlers = bot.callback_query_handlers
+    bot.callback_query_handlers[:] = [
+        h for h in handlers
+        if not getattr(h.get("filters", {}).get("func"), "__gemini_link_settings__", False)
+    ]
+
+
+def _normalize_cbq_handler_order(bot) -> None:
+    """Хэндлер настроек плагина — в начало, catch-all default_cp — в конец."""
+    handlers = bot.callback_query_handlers
+    if not handlers:
+        return
+    settings_h: list = []
+    catch_all_h: list = []
+    rest: list = []
+    for entry in handlers:
+        func = entry.get("filters", {}).get("func")
+        if getattr(func, "__gemini_link_settings__", False):
+            settings_h.append(entry)
+        elif _is_catch_all_cbq_filter(func):
+            catch_all_h.append(entry)
+        else:
+            rest.append(entry)
+    bot.callback_query_handlers[:] = settings_h + rest + catch_all_h
+
+
+def _ensure_gemini_settings_handler(bot, handler) -> None:
+    _remove_gemini_settings_handlers(bot)
+
+    @bot.callback_query_handler(func=_match_gemini_plugin_settings)
+    def _gemini_settings_cb_entry(call: CallbackQuery) -> None:
+        handler(call)
+
+    _normalize_cbq_handler_order(bot)
+    logger.info("%s PLUGIN_SETTINGS handler зарегистрирован (всего cbq: %s)", _P, len(bot.callback_query_handlers))
+
+
+def _gemini_link_open_settings(call: CallbackQuery) -> None:
+    if _plugin is None:
+        return
+    _plugin.open_settings_card(call)
+
+
+def _register_priority_cbq(tg, handler, predicate) -> None:
+    """Регистрирует callback-хэндлер плагина в начало очереди."""
     tg.cbq_handler(handler, predicate)
     handlers = tg.bot.callback_query_handlers
     if handlers:
-        entry = handlers.pop()
-        handlers.insert(0, entry)
-        if store is not None:
-            store.append(entry)
-
-
-def _repin_cbq_handlers(tg, entries: list) -> None:
-    """Возвращает хэндлеры плагина в начало очереди (после default_cp и др.)."""
-    handlers = tg.bot.callback_query_handlers
-    if not handlers or not entries:
-        return
-    for entry in reversed(entries):
-        for idx, item in enumerate(handlers):
-            if item is entry:
-                handlers.insert(0, handlers.pop(idx))
-                break
+        handlers.insert(0, handlers.pop())
+    _normalize_cbq_handler_order(tg.bot)
 
 
 def _escape(val: Any) -> str:
@@ -453,8 +503,95 @@ class Plugin:
         self._lot_stock_cache_ts: float = 0.0
         self._stop_auto = False
         self._auto_thread: threading.Thread | None = None
-        self._tg_cbq_entries: list = []
         self.reload_settings()
+
+    def open_settings_card(self, call: CallbackQuery) -> None:
+        """Открывает панель настроек из карточки плагина (кнопка ⚙️ Настройки)."""
+        tg = self.cardinal.telegram
+        if not tg:
+            return
+        bot = tg.bot
+        try:
+            bot.answer_callback_query(call.id)
+        except Exception:
+            pass
+        chat_id = call.message.chat.id
+        msg_id = call.message.message_id
+        try:
+            text = self.render_settings_text("hub", instant=True)
+            kb = self.build_settings_keyboard("hub", instant=True)
+            try:
+                bot.edit_message_text(text, chat_id, msg_id, reply_markup=kb, parse_mode="HTML")
+            except Exception:
+                bot.send_message(chat_id, text, reply_markup=kb, parse_mode="HTML")
+            threading.Thread(
+                target=self._refresh_settings_ui_bg, args=(chat_id, msg_id, "hub"), daemon=True,
+            ).start()
+            self.log("открыты настройки из карточки плагина")
+        except Exception as exc:
+            self.log("ошибка открытия настроек: %s", exc)
+            logger.debug(traceback.format_exc())
+            try:
+                bot.send_message(
+                    chat_id,
+                    f"⚠️ Не удалось открыть настройки: <code>{_escape(exc)[:180]}</code>",
+                    parse_mode="HTML",
+                )
+            except Exception:
+                pass
+
+    def _refresh_settings_ui_bg(self, chat_id: int, msg_id: int, page: str = "hub") -> None:
+        if not self.cardinal.telegram:
+            return
+        bot = self.cardinal.telegram.bot
+        try:
+            if page == "hub":
+                if self.stock_mode() == "gemini_links":
+                    self.find_gemini_link_lot_ids(fast=False)
+                else:
+                    lot_box: list[Any] = [None]
+                    plan_box: list[Any] = [None]
+
+                    def _fetch_lot() -> None:
+                        lot_box[0] = self._resolve_autobuy_lot_ids(silent=True, fast=False)
+
+                    def _fetch_plan() -> None:
+                        plan_box[0] = self.calc_buy_plan(timeout=UI_API_TIMEOUT)
+
+                    t_lot = threading.Thread(target=_fetch_lot, daemon=True)
+                    t_plan = threading.Thread(target=_fetch_plan, daemon=True)
+                    t_lot.start()
+                    t_plan.start()
+                    lot_timeout = max(UI_API_TIMEOUT + 2, len(self._iter_profile_lot_ids()) * 0.35 + 5)
+                    t_lot.join(timeout=lot_timeout)
+                    t_plan.join(timeout=UI_API_TIMEOUT + 2)
+            elif page == "settings":
+                if self.stock_mode() == "gemini_links":
+                    self.find_gemini_link_lot_ids(fast=False)
+                else:
+                    self._lot_stock_info(fast=True)
+            text = self.render_settings_text(page, fast=False, instant=False)
+            kb = self.build_settings_keyboard(page, fast=False, instant=False)
+            try:
+                bot.edit_message_text(text, chat_id, msg_id, reply_markup=kb, parse_mode="HTML")
+            except Exception:
+                bot.send_message(chat_id, text, reply_markup=kb, parse_mode="HTML")
+        except Exception as exc:
+            self.log("refresh UI error: %s", exc)
+            logger.debug(traceback.format_exc())
+
+    def ensure_telegram_handlers(self) -> None:
+        """Регистрирует UI и гарантирует приоритет кнопки «Настройки» в карточке."""
+        global _tg_ui_registered_for
+        if not self.cardinal.telegram:
+            self.log("Telegram недоступен — UI не зарегистрирован")
+            return
+        bot = self.cardinal.telegram.bot
+        bot_id = id(bot)
+        if _tg_ui_registered_for != bot_id:
+            self.setup_telegram()
+            _tg_ui_registered_for = bot_id
+        _ensure_gemini_settings_handler(bot, _gemini_link_open_settings)
 
     def log(self, msg: str, *args) -> None:
         logger.info("%s " + msg, _P, *args)
@@ -2284,18 +2421,12 @@ class Plugin:
     # ── Telegram UI (schema-driven, как Starvell) ────────────────────────────
 
     def setup_telegram(self) -> None:
-        global _tg_registered_for
         if not self.cardinal.telegram:
             self.log("Telegram недоступен — UI не зарегистрирован")
             return
         tg = self.cardinal.telegram
         bot = tg.bot
-        bot_id = id(bot)
-        if self._tg_cbq_entries and _tg_registered_for == bot_id:
-            _repin_cbq_handlers(tg, self._tg_cbq_entries)
-            return
         plugin = self
-        self._tg_cbq_entries = []
 
         def show_settings(
             chat_id: int, msg_id: int, page: str = "hub",
@@ -2309,44 +2440,7 @@ class Plugin:
                 bot.send_message(chat_id, text, reply_markup=kb, parse_mode="HTML")
 
         def refresh_settings_ui(chat_id: int, msg_id: int, page: str = "hub") -> None:
-            try:
-                if page == "hub":
-                    if plugin.stock_mode() == "gemini_links":
-                        lot_box: list[Any] = [None]
-
-                        def _fetch_gemini_lots() -> None:
-                            lot_box[0] = plugin.find_gemini_link_lot_ids(fast=False)
-
-                        t_lot = threading.Thread(target=_fetch_gemini_lots, daemon=True)
-                        t_lot.start()
-                        lot_timeout = max(UI_API_TIMEOUT + 2, len(plugin._iter_profile_lot_ids()) * 0.35 + 5)
-                        t_lot.join(timeout=lot_timeout)
-                    else:
-                        lot_box: list[Any] = [None]
-                        plan_box: list[Any] = [None]
-
-                        def _fetch_lot() -> None:
-                            lot_box[0] = plugin._resolve_autobuy_lot_ids(silent=True, fast=False)
-
-                        def _fetch_plan() -> None:
-                            plan_box[0] = plugin.calc_buy_plan(timeout=UI_API_TIMEOUT)
-
-                        t_lot = threading.Thread(target=_fetch_lot, daemon=True)
-                        t_plan = threading.Thread(target=_fetch_plan, daemon=True)
-                        t_lot.start()
-                        t_plan.start()
-                        lot_timeout = max(UI_API_TIMEOUT + 2, len(plugin._iter_profile_lot_ids()) * 0.35 + 5)
-                        t_lot.join(timeout=lot_timeout)
-                        t_plan.join(timeout=UI_API_TIMEOUT + 2)
-                elif page == "settings":
-                    if plugin.stock_mode() == "gemini_links":
-                        plugin.find_gemini_link_lot_ids(fast=False)
-                    else:
-                        plugin._lot_stock_info(fast=True)
-                show_settings(chat_id, msg_id, page, fast=False, instant=False)
-            except Exception as exc:
-                plugin.log("refresh UI error: %s", exc)
-                logger.debug(traceback.format_exc())
+            plugin._refresh_settings_ui_bg(chat_id, msg_id, page)
 
         def open_page_settings(chat_id: int, msg_id: int, page: str) -> None:
             show_settings(chat_id, msg_id, page, instant=True)
@@ -2642,45 +2736,17 @@ class Plugin:
             else:
                 bot.reply_to(message, f"✅ Сохранено: <b>{field.get('label', key)}</b>", parse_mode="HTML")
 
-        def on_plugin_settings(call: CallbackQuery) -> None:
-            try:
-                bot.answer_callback_query(call.id)
-            except Exception:
-                pass
-            chat_id = call.message.chat.id
-            msg_id = call.message.message_id
-            try:
-                show_settings(chat_id, msg_id, "hub", instant=True)
-                threading.Thread(
-                    target=refresh_settings_ui, args=(chat_id, msg_id, "hub"), daemon=True,
-                ).start()
-            except Exception as exc:
-                plugin.log("ошибка открытия настроек: %s", exc)
-                logger.debug(traceback.format_exc())
-                try:
-                    bot.send_message(
-                        chat_id,
-                        f"⚠️ Не удалось открыть настройки: <code>{_escape(exc)[:180]}</code>",
-                        parse_mode="HTML",
-                    )
-                except Exception:
-                    pass
-
         def _is_editing(m: Message) -> bool:
             state_data = tg.get_state(m.chat.id, m.from_user.id)
             if not state_data or "state" not in state_data:
                 return False
             return str(state_data["state"]).startswith(f"{CB_PREFIX}:edit:")
 
-        tg.cbq_handler(on_callback, lambda c: (c.data or "").startswith(f"{CB_PREFIX}:"))
         _register_priority_cbq(
             tg,
-            on_plugin_settings,
-            _is_plugin_settings_cb,
-            self._tg_cbq_entries,
+            on_callback,
+            lambda c: (c.data or "").startswith(f"{CB_PREFIX}:"),
         )
-        _repin_cbq_handlers(tg, self._tg_cbq_entries)
-        _tg_registered_for = bot_id
         tg.msg_handler(on_import_text, func=_is_importing)
         tg.msg_handler(on_import_document, content_types=["document"], func=_is_importing)
         tg.msg_handler(on_text, func=_is_editing)
@@ -2741,12 +2807,19 @@ def init_plugin(cardinal: Cardinal) -> None:
 def post_init_plugin(cardinal: Cardinal) -> None:
     if _plugin is None:
         return
-    _plugin.setup_telegram()
+    _plugin.ensure_telegram_handlers()
     if _plugin.stock_mode() == "auto_buy":
         _plugin.start_auto_worker()
     logger.info("%s v%s загружен (%s)", _P, VERSION, _plugin.stock_mode_label())
 
 
+def pre_start_plugin(cardinal: Cardinal) -> None:
+    if _plugin is None:
+        return
+    _plugin.ensure_telegram_handlers()
+
+
 BIND_TO_PRE_INIT = [init_plugin]
 BIND_TO_POST_INIT = [post_init_plugin]
+BIND_TO_PRE_START = [pre_start_plugin]
 BIND_TO_NEW_ORDER = [bind_to_new_order]
