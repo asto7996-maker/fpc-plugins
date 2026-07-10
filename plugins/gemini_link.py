@@ -47,7 +47,7 @@ except ImportError:
 
 
 NAME          = "Gemini Link Auto"
-VERSION       = "3.2.5"
+VERSION       = "3.2.6"
 DESCRIPTION   = "ChatGPT автозакупка + выдача Gemini-ссылок из архива"
 CREDITS       = "Cursor AI"
 UUID          = "f7a2e8c1-4b3d-4e9f-a8c2-1d5e9b0f6a3c"
@@ -64,7 +64,10 @@ DEFAULT_AUTO_INTERVAL: Final[int] = 300
 DEFAULT_GEMINI_LOT_MATCH: Final[str] = "gemini link"
 DEFAULT_DELIVERY_PARTS: Final[int] = 3
 DEFAULT_REDELIVERY_PARTS: Final[int] = 4
-LINK_PART_DELAY: Final[float] = 2.0
+LINK_PART_DELAY: Final[float] = 3.0
+WELCOME_PARTS_DELAY: Final[float] = 2.5
+FP_SEND_MAX_ATTEMPTS: Final[int] = 3
+FP_SEND_RETRY_COUNT: Final[int] = 2
 CONFIRM_REMINDER_DELAY: Final[int] = 300
 DEFAULT_CONFIRM_REMINDER: Final[str] = (
     "Заказ выполнен. Пожалуйста, зайдите в раздел «Покупки», "
@@ -1945,7 +1948,14 @@ class Plugin:
         data[str(order_id)] = rec
         self._save_gemini_deliveries(data)
 
-    def _schedule_confirm_reminder(self, order_id: str, chat_id: int, buyer: str) -> None:
+    def _schedule_confirm_reminder(
+        self,
+        order_id: str,
+        chat_id: int | str,
+        buyer: str,
+        *,
+        chat_candidates: list[int | str] | None = None,
+    ) -> None:
         if not bool(self.get_cfg("confirm_reminder_enabled", True)):
             return
         if self._is_confirm_reminder_sent(order_id):
@@ -1962,13 +1972,15 @@ class Plugin:
                     self._confirm_reminder_text(),
                     buyer,
                     watermark=False,
+                    chat_candidates=chat_candidates,
+                    order_id=order_id,
                 )
                 self._mark_confirm_reminder_sent(order_id)
                 self.log("заказ #%s: напоминание о подтверждении отправлено", order_id)
                 _boot_log(f"CONFIRM #{order_id} sent after {delay}s")
             except Exception as exc:
                 self.log("заказ #%s: напоминание о подтверждении: %s", order_id, exc)
-                _boot_log(f"CONFIRM #{order_id} fail: {exc}")
+                _boot_log(f"CONFIRM #{order_id} fail: {self._format_fp_error(exc)}")
 
         threading.Thread(
             target=_run, daemon=True, name=f"GeminiConfirm-{order_id}",
@@ -2267,25 +2279,27 @@ class Plugin:
             return f"users-{int(acc_id)}-{buyer_id}"
         return None
 
-    def _resolve_order_chat_id(
+    def _resolve_order_chat_id_candidates(
         self,
         full_order: Any,
         event: Any = None,
         buyer: str = "",
         order_id: str = "",
-    ) -> int | str | None:
+    ) -> list[int | str]:
         buyer = (buyer or "").strip()
-        candidates: list[Any] = []
+        seen: set[int | str] = set()
+        result: list[int | str] = []
+
+        def _add(cid: Any) -> None:
+            parsed = self._normalize_chat_id(cid)
+            if parsed is not None and parsed not in seen:
+                seen.add(parsed)
+                result.append(parsed)
+
         for src in (full_order, getattr(event, "order", None) if event else None, event):
             if src is None:
                 continue
-            cid = getattr(src, "chat_id", None)
-            if cid is not None:
-                candidates.append(cid)
-        for cid in candidates:
-            parsed = self._normalize_chat_id(cid)
-            if parsed is not None:
-                return parsed
+            _add(getattr(src, "chat_id", None))
         buyer_id = None
         for src in (full_order, getattr(event, "order", None) if event else None):
             if src is None:
@@ -2293,15 +2307,12 @@ class Plugin:
             buyer_id = getattr(src, "buyer_id", None)
             if buyer_id is not None:
                 break
-        node = self._private_chat_node(buyer_id)
-        if node:
-            return node
         if buyer:
             for make_req in (True, False):
                 try:
                     chat = self.cardinal.account.get_chat_by_name(buyer, make_req)
                     if chat and getattr(chat, "id", None) is not None:
-                        return self._normalize_chat_id(chat.id)
+                        _add(chat.id)
                 except Exception as exc:
                     logger.debug("%s get_chat_by_name(%s): %s", _P, buyer, exc)
             try:
@@ -2311,22 +2322,58 @@ class Plugin:
                     for attr in ("name", "username", "interlocutor_username"):
                         name = str(getattr(chat, attr, "") or "").strip()
                         if name and name.casefold() == buyer_l:
-                            return self._normalize_chat_id(chat.id)
+                            _add(chat.id)
             except Exception as exc:
                 logger.debug("%s get_chats for %s: %s", _P, buyer, exc)
+        _add(self._private_chat_node(buyer_id))
         if order_id:
             try:
                 full = full_order or self.cardinal.account.get_order(order_id)
-                cid = getattr(full, "chat_id", None)
-                parsed = self._normalize_chat_id(cid)
-                if parsed is not None:
-                    return parsed
-                node = self._private_chat_node(getattr(full, "buyer_id", None))
-                if node:
-                    return node
+                _add(getattr(full, "chat_id", None))
+                _add(self._private_chat_node(getattr(full, "buyer_id", None)))
             except Exception as exc:
                 logger.debug("%s get_order chat #%s: %s", _P, order_id, exc)
-        return None
+        return result
+
+    def _resolve_order_chat_id(
+        self,
+        full_order: Any,
+        event: Any = None,
+        buyer: str = "",
+        order_id: str = "",
+    ) -> int | str | None:
+        candidates = self._resolve_order_chat_id_candidates(
+            full_order, event, buyer, order_id,
+        )
+        return candidates[0] if candidates else None
+
+    def _refresh_fp_account(self) -> None:
+        try:
+            self.cardinal.account.get(update_phpsessid=True)
+            _boot_log("FP session refreshed (update_phpsessid=True)")
+        except Exception as exc:
+            _boot_log(f"FP session refresh fail: {exc}")
+            logger.debug("%s refresh account: %s", _P, exc)
+
+    def _format_fp_error(self, exc: Exception) -> str:
+        err_msg = getattr(exc, "error_message", None)
+        if err_msg:
+            return str(err_msg)
+        short = getattr(exc, "short_str", None)
+        if callable(short):
+            try:
+                return str(short())
+            except Exception:
+                pass
+        resp = getattr(exc, "response", None)
+        if resp is not None:
+            try:
+                body = (resp.text or "")[:400]
+                if body:
+                    _boot_log(f"FP runner body: {body}")
+            except Exception:
+                pass
+        return str(exc)
 
     def _account_send_message(self, chat_id: int | str, text: str, chat_name: str | None) -> Any:
         return self.cardinal.account.send_message(
@@ -2338,89 +2385,186 @@ class Plugin:
             update_last_saved_message=False,
         )
 
-    def _fp_send(self, chat_id: Any, text: str, buyer: str, *, watermark: bool = False) -> None:
-        cid = self._normalize_chat_id(chat_id)
-        if cid is None and buyer:
-            cid = self._resolve_order_chat_id(None, None, buyer, "")
-        if cid is None:
-            raise ValueError(f"chat_id пуст (buyer={buyer!r})")
+    def _fp_send(
+        self,
+        chat_id: Any,
+        text: str,
+        buyer: str,
+        *,
+        watermark: bool = False,
+        chat_candidates: list[int | str] | None = None,
+        full_order: Any = None,
+        event: Any = None,
+        order_id: str = "",
+    ) -> int | str:
         buyer_name = (buyer or "").strip() or None
         text = (text or "").strip()
         if not text:
             raise ValueError("пустой текст сообщения")
 
-        last_err: Exception | None = None
-        for attempt in range(1, 5):
-            try:
-                msg = self._account_send_message(cid, text, buyer_name)
-                mid = getattr(msg, "id", None)
-                _boot_log(f"FP send OK chat={cid} try={attempt} len={len(text)} msg_id={mid}")
-                return
-            except Exception as exc:
-                last_err = exc
-                _boot_log(f"FP send FAIL chat={cid} try={attempt}: {exc}")
-                logger.debug("%s send chat=%s: %s", _P, cid, exc)
-                time.sleep(1.5 * attempt)
+        candidates: list[int | str] = []
+        seen: set[int | str] = set()
 
-        raise RuntimeError(str(last_err) if last_err else "FunPay send failed")
+        def _push(cid: Any) -> None:
+            parsed = self._normalize_chat_id(cid)
+            if parsed is not None and parsed not in seen:
+                seen.add(parsed)
+                candidates.append(parsed)
+
+        for cid in chat_candidates or []:
+            _push(cid)
+        _push(chat_id)
+        if not candidates:
+            for cid in self._resolve_order_chat_id_candidates(
+                full_order, event, buyer, order_id,
+            ):
+                _push(cid)
+        if not candidates:
+            raise ValueError(f"chat_id пуст (buyer={buyer!r})")
+
+        last_err: Exception | None = None
+        for attempt in range(1, FP_SEND_MAX_ATTEMPTS + 1):
+            if attempt > 1:
+                self._refresh_fp_account()
+                time.sleep(1.2 * attempt)
+            for cid in candidates:
+                try:
+                    msg = self._account_send_message(cid, text, buyer_name)
+                    mid = getattr(msg, "id", None)
+                    _boot_log(
+                        f"FP send OK chat={cid} try={attempt}/{FP_SEND_MAX_ATTEMPTS} "
+                        f"len={len(text)} msg_id={mid}"
+                    )
+                    return cid
+                except Exception as exc:
+                    last_err = exc
+                    err_text = self._format_fp_error(exc)
+                    _boot_log(
+                        f"FP send FAIL chat={cid} try={attempt}/{FP_SEND_MAX_ATTEMPTS}: {err_text}"
+                    )
+                    logger.debug("%s send chat=%s: %s", _P, cid, err_text)
+                    time.sleep(0.8)
+
+        raise RuntimeError(self._format_fp_error(last_err) if last_err else "FunPay send failed")
 
     def _fp_send_retry(
-        self, chat_id: Any, text: str, buyer: str, *, tries: int = 4, watermark: bool = False,
-    ) -> None:
+        self,
+        chat_id: Any,
+        text: str,
+        buyer: str,
+        *,
+        tries: int = FP_SEND_RETRY_COUNT,
+        watermark: bool = False,
+        chat_candidates: list[int | str] | None = None,
+        full_order: Any = None,
+        event: Any = None,
+        order_id: str = "",
+    ) -> int | str:
         last_exc: Exception | None = None
+        active_chat = chat_id
         for n in range(1, tries + 1):
             try:
-                self._fp_send(chat_id, text, buyer, watermark=watermark)
-                return
+                return self._fp_send(
+                    active_chat,
+                    text,
+                    buyer,
+                    watermark=watermark,
+                    chat_candidates=chat_candidates,
+                    full_order=full_order,
+                    event=event,
+                    order_id=order_id,
+                )
             except Exception as exc:
                 last_exc = exc
                 if n < tries:
-                    time.sleep(1.2 * n)
-        raise RuntimeError(str(last_exc) if last_exc else "send failed")
+                    time.sleep(1.5 * n)
+        raise RuntimeError(self._format_fp_error(last_exc) if last_exc else "send failed")
 
-    def _deliver_link_in_parts(self, chat_id: Any, buyer: str, url: str, parts: int) -> None:
+    def _deliver_link_in_parts(
+        self,
+        chat_id: Any,
+        buyer: str,
+        url: str,
+        parts: int,
+        *,
+        chat_candidates: list[int | str] | None = None,
+        full_order: Any = None,
+        event: Any = None,
+        order_id: str = "",
+    ) -> int | str:
         """N отдельных сообщений с фрагментами ссылки + финальная инструкция."""
         chunks = split_link_parts(url, parts)
         _boot_log(f"split link len={len(url)} parts={parts} chunks={[len(c) for c in chunks]}")
+        active_chat = chat_id
+        send_kw = {
+            "chat_candidates": chat_candidates,
+            "full_order": full_order,
+            "event": event,
+            "order_id": order_id,
+        }
         for idx, chunk in enumerate(chunks):
             if idx > 0:
-                time.sleep(LINK_PART_DELAY + 0.4 * idx)
-            self._fp_send_retry(chat_id, chunk, buyer, watermark=False)
+                time.sleep(LINK_PART_DELAY + 0.5 * idx)
+            active_chat = self._fp_send_retry(
+                active_chat, chunk, buyer, watermark=False, **send_kw,
+            )
         time.sleep(LINK_PART_DELAY)
-        self._fp_send_retry(
-            chat_id,
+        active_chat = self._fp_send_retry(
+            active_chat,
             "Склейте все части в одну ссылку и вставьте её в браузер.",
             buyer,
             watermark=False,
+            **send_kw,
         )
+        return active_chat
 
-    def _deliver_single_gemini_link(self, chat_id: Any, buyer: str, url: str) -> tuple[bool, str]:
+    def _deliver_single_gemini_link(
+        self,
+        chat_id: Any,
+        buyer: str,
+        url: str,
+        *,
+        chat_candidates: list[int | str] | None = None,
+        full_order: Any = None,
+        event: Any = None,
+        order_id: str = "",
+    ) -> tuple[bool, str, int | str | None]:
         primary = max(2, int(self.get_cfg("gemini_delivery_parts", DEFAULT_DELIVERY_PARTS)))
         fallback = max(2, int(self.get_cfg("gemini_redelivery_parts", DEFAULT_REDELIVERY_PARTS)))
         if fallback <= primary:
             fallback = primary + 1
         plans = [primary] if fallback == primary else [primary, fallback]
         last_err = ""
+        send_kw = {
+            "chat_candidates": chat_candidates,
+            "full_order": full_order,
+            "event": event,
+            "order_id": order_id,
+        }
+        active_chat = chat_id
         for attempt, n_parts in enumerate(plans):
             try:
                 if attempt > 0:
                     try:
-                        self._fp_send(
-                            chat_id,
+                        active_chat = self._fp_send(
+                            active_chat,
                             "Повторная отправка ссылки в 4 части…",
                             buyer,
                             watermark=False,
+                            **send_kw,
                         )
                     except Exception:
                         pass
-                    time.sleep(1.0)
-                self._deliver_link_in_parts(chat_id, buyer, url, n_parts)
-                return True, ""
+                    time.sleep(WELCOME_PARTS_DELAY)
+                active_chat = self._deliver_link_in_parts(
+                    active_chat, buyer, url, n_parts, **send_kw,
+                )
+                return True, "", active_chat
             except Exception as exc:
-                last_err = str(exc)
+                last_err = self._format_fp_error(exc)
                 self.log("выдача %s частями не удалась: %s", n_parts, last_err)
                 _boot_log(f"deliver parts={n_parts} fail: {last_err}")
-        return False, last_err or "send failed"
+        return False, last_err or "send failed", active_chat
 
     def deliver_gemini_order(
         self,
@@ -2484,20 +2628,34 @@ class Plugin:
             return False, f"Заказ #{order_id} не Gemini-link лот (lot_id={lot_id})"
         buyer = str(getattr(full_order, "buyer_username", "") or getattr(event.order, "buyer_username", "") or "")
         qty = max(1, int(getattr(full_order, "amount", None) or getattr(event.order, "amount", 1) or 1))
-        chat_id = self._resolve_order_chat_id(full_order, event, buyer, order_id)
+        chat_candidates = self._resolve_order_chat_id_candidates(
+            full_order, event, buyer, order_id,
+        )
+        chat_id = chat_candidates[0] if chat_candidates else None
         if not chat_id:
             return False, f"Заказ #{order_id}: chat_id не найден (buyer={buyer or '?'})"
-        _boot_log(f"DELIVER #{order_id} chat_id={chat_id} buyer={buyer} qty={qty}")
+        send_kw = {
+            "chat_candidates": chat_candidates,
+            "full_order": full_order,
+            "event": event,
+            "order_id": order_id,
+        }
+        _boot_log(
+            f"DELIVER #{order_id} chat_id={chat_id} candidates={chat_candidates} "
+            f"buyer={buyer} qty={qty}"
+        )
         try:
-            self._fp_send(
+            chat_id = self._fp_send(
                 chat_id,
                 "Выдаю ссылку активации Gemini…",
                 buyer,
                 watermark=False,
+                **send_kw,
             )
+            time.sleep(WELCOME_PARTS_DELAY)
         except Exception as exc:
-            self.log("заказ #%s: приветствие: %s", order_id, exc)
-            _boot_log(f"DELIVER #{order_id} welcome fail: {exc}")
+            self.log("заказ #%s: приветствие: %s", order_id, self._format_fp_error(exc))
+            _boot_log(f"DELIVER #{order_id} welcome fail: {self._format_fp_error(exc)}")
         urls = self.take_urls_from_gemini_archive(qty)
         if len(urls) < qty:
             self.return_urls_to_gemini_archive(urls)
@@ -2507,6 +2665,7 @@ class Plugin:
                     f"Недостаточно ссылок в архиве ({len(urls)}/{qty}). Позовите продавца.",
                     buyer,
                     watermark=False,
+                    **send_kw,
                 )
             except Exception:
                 pass
@@ -2518,7 +2677,11 @@ class Plugin:
         last_err = ""
         try:
             for i, url in enumerate(urls, 1):
-                ok_link, err_link = self._deliver_single_gemini_link(chat_id, buyer, url)
+                ok_link, err_link, new_chat = self._deliver_single_gemini_link(
+                    chat_id, buyer, url, **send_kw,
+                )
+                if new_chat is not None:
+                    chat_id = new_chat
                 if ok_link:
                     delivered.append(url)
                     if qty > 1 and i < len(urls):
@@ -2527,8 +2690,8 @@ class Plugin:
                     failed.append(url)
                     last_err = err_link or "send failed"
         except Exception as exc:
-            last_err = str(exc)
-            _boot_log(f"DELIVER #{order_id} loop EXC: {exc}")
+            last_err = self._format_fp_error(exc)
+            _boot_log(f"DELIVER #{order_id} loop EXC: {last_err}")
             for url in urls:
                 if url not in delivered and url not in failed:
                     failed.append(url)
@@ -2538,7 +2701,9 @@ class Plugin:
                 _boot_log(f"DELIVER #{order_id} archive restored {len(failed)} url(s)")
         if delivered and len(delivered) == len(urls):
             self._mark_gemini_order_delivered(order_id, buyer, delivered, manual=manual)
-            self._schedule_confirm_reminder(order_id, chat_id, buyer)
+            self._schedule_confirm_reminder(
+                order_id, chat_id, buyer, chat_candidates=chat_candidates,
+            )
             self.set_cfg("last_delivery_error", "")
             self.log("заказ #%s: выдано %s ссылок (manual=%s)", order_id, len(delivered), manual)
             _boot_log(f"DELIVER #{order_id} OK delivered={len(delivered)} manual={manual}")
@@ -2561,6 +2726,7 @@ class Plugin:
                 "Не удалось отправить ссылку автоматически. Позовите продавца.",
                 buyer,
                 watermark=False,
+                **send_kw,
             )
         except Exception:
             pass
