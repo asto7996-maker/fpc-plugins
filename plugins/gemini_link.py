@@ -47,7 +47,7 @@ except ImportError:
 
 
 NAME          = "Gemini Link Auto"
-VERSION       = "3.2.2"
+VERSION       = "3.2.3"
 DESCRIPTION   = "ChatGPT автозакупка + выдача Gemini-ссылок из архива"
 CREDITS       = "Cursor AI"
 UUID          = "f7a2e8c1-4b3d-4e9f-a8c2-1d5e9b0f6a3c"
@@ -62,9 +62,9 @@ DEFAULT_LOT_MATCH: Final[str] = "GPT plus 1M (NW)"
 DEFAULT_MIN_LOT_STOCK: Final[int] = 3
 DEFAULT_AUTO_INTERVAL: Final[int] = 300
 DEFAULT_GEMINI_LOT_MATCH: Final[str] = "gemini link"
-DEFAULT_DELIVERY_PARTS: Final[int] = 3
-DEFAULT_REDELIVERY_PARTS: Final[int] = 4
-LINK_PART_DELAY: Final[float] = 1.8
+DEFAULT_DELIVERY_PARTS: Final[int] = 4
+DEFAULT_REDELIVERY_PARTS: Final[int] = 5
+LINK_PART_DELAY: Final[float] = 2.0
 CONFIRM_REMINDER_DELAY: Final[int] = 300
 DEFAULT_CONFIRM_REMINDER: Final[str] = (
     "Заказ выполнен. Пожалуйста, зайдите в раздел «Покупки», "
@@ -537,8 +537,23 @@ def split_link_parts(url: str, parts: int) -> list[str]:
     parts = max(1, int(parts))
     if parts == 1:
         return [url]
-    size = (len(url) + parts - 1) // parts
-    return [url[i:i + size] for i in range(0, len(url), size)]
+    n = len(url)
+    if n == 0:
+        raise ValueError("пустая ссылка")
+    if n < parts:
+        parts = n
+    base, rem = divmod(n, parts)
+    chunks: list[str] = []
+    pos = 0
+    for i in range(parts):
+        size = base + (1 if i < rem else 0)
+        if size <= 0:
+            break
+        chunks.append(url[pos:pos + size])
+        pos += size
+    if len(chunks) != parts or pos != n:
+        raise ValueError(f"не удалось разбить ссылку на {parts} частей (len={n})")
+    return chunks
 
 
 def parse_shop_purchase_history(text: str) -> list[dict[str, str]]:
@@ -2321,18 +2336,30 @@ class Plugin:
 
         raise RuntimeError(str(last_err) if last_err else "FunPay send failed")
 
+    def _fp_send_retry(
+        self, chat_id: Any, text: str, buyer: str, *, tries: int = 4, watermark: bool = False,
+    ) -> None:
+        last_exc: Exception | None = None
+        for n in range(1, tries + 1):
+            try:
+                self._fp_send(chat_id, text, buyer, watermark=watermark)
+                return
+            except Exception as exc:
+                last_exc = exc
+                if n < tries:
+                    time.sleep(1.2 * n)
+        raise RuntimeError(str(last_exc) if last_exc else "send failed")
+
     def _deliver_link_in_parts(self, chat_id: Any, buyer: str, url: str, parts: int) -> None:
-        """3 отдельных сообщения — только фрагмент ссылки, без нумерации; в конце — инструкция."""
+        """N отдельных сообщений с фрагментами ссылки + финальная инструкция."""
         chunks = split_link_parts(url, parts)
+        _boot_log(f"split link len={len(url)} parts={parts} chunks={[len(c) for c in chunks]}")
         for idx, chunk in enumerate(chunks):
-            chunk = (chunk or "").strip()
-            if not chunk:
-                raise ValueError(f"пустая часть ссылки ({idx + 1}/{len(chunks)})")
-            self._fp_send(chat_id, chunk, buyer, watermark=False)
-            if idx < len(chunks) - 1:
-                time.sleep(LINK_PART_DELAY)
+            if idx > 0:
+                time.sleep(LINK_PART_DELAY + 0.4 * idx)
+            self._fp_send_retry(chat_id, chunk, buyer, watermark=False)
         time.sleep(LINK_PART_DELAY)
-        self._fp_send(
+        self._fp_send_retry(
             chat_id,
             "Склейте все части в одну ссылку и вставьте её в браузер.",
             buyer,
@@ -2342,28 +2369,30 @@ class Plugin:
     def _deliver_single_gemini_link(self, chat_id: Any, buyer: str, url: str) -> tuple[bool, str]:
         parts = max(2, int(self.get_cfg("gemini_delivery_parts", DEFAULT_DELIVERY_PARTS)))
         redelivery_parts = max(parts + 1, int(self.get_cfg("gemini_redelivery_parts", DEFAULT_REDELIVERY_PARTS)))
-        try:
-            self._deliver_link_in_parts(chat_id, buyer, url, parts)
-            return True, ""
-        except Exception as exc:
-            err = str(exc)
-            self.log("выдача %s частями не удалась: %s — перевыдача", parts, err)
-            _boot_log(f"deliver parts={parts} fail: {err}")
+        plans = [parts]
+        if redelivery_parts != parts:
+            plans.append(redelivery_parts)
+        last_err = ""
+        for attempt, n_parts in enumerate(plans):
             try:
-                self._fp_send(
-                    chat_id,
-                    "Перевыдача — отправляю ссылку другими частями:",
-                    buyer,
-                    watermark=False,
-                )
-                time.sleep(0.8)
-                self._deliver_link_in_parts(chat_id, buyer, url, redelivery_parts)
+                if attempt > 0:
+                    try:
+                        self._fp_send(
+                            chat_id,
+                            "Повторная отправка ссылки другими частями…",
+                            buyer,
+                            watermark=False,
+                        )
+                    except Exception:
+                        pass
+                    time.sleep(1.0)
+                self._deliver_link_in_parts(chat_id, buyer, url, n_parts)
                 return True, ""
-            except Exception as exc2:
-                err2 = str(exc2)
-                self.log("перевыдача %s частями не удалась: %s", redelivery_parts, err2)
-                _boot_log(f"redeliver parts={redelivery_parts} fail: {err2}")
-                return False, err2 or err
+            except Exception as exc:
+                last_err = str(exc)
+                self.log("выдача %s частями не удалась: %s", n_parts, last_err)
+                _boot_log(f"deliver parts={n_parts} fail: {last_err}")
+        return False, last_err or "send failed"
 
     def deliver_gemini_order(
         self,
@@ -2459,18 +2488,27 @@ class Plugin:
         delivered: list[str] = []
         failed: list[str] = []
         last_err = ""
-        for i, url in enumerate(urls, 1):
-            ok_link, err_link = self._deliver_single_gemini_link(chat_id, buyer, url)
-            if ok_link:
-                delivered.append(url)
-                if qty > 1 and i < len(urls):
-                    time.sleep(LINK_PART_DELAY)
-            else:
-                failed.append(url)
-                last_err = err_link or "send failed"
-        if failed:
-            self.return_urls_to_gemini_archive(failed)
-        if delivered:
+        try:
+            for i, url in enumerate(urls, 1):
+                ok_link, err_link = self._deliver_single_gemini_link(chat_id, buyer, url)
+                if ok_link:
+                    delivered.append(url)
+                    if qty > 1 and i < len(urls):
+                        time.sleep(LINK_PART_DELAY)
+                else:
+                    failed.append(url)
+                    last_err = err_link or "send failed"
+        except Exception as exc:
+            last_err = str(exc)
+            _boot_log(f"DELIVER #{order_id} loop EXC: {exc}")
+            for url in urls:
+                if url not in delivered and url not in failed:
+                    failed.append(url)
+        finally:
+            if failed:
+                self.return_urls_to_gemini_archive(failed)
+                _boot_log(f"DELIVER #{order_id} archive restored {len(failed)} url(s)")
+        if delivered and len(delivered) == len(urls):
             self._mark_gemini_order_delivered(order_id, buyer, delivered, manual=manual)
             self._schedule_confirm_reminder(order_id, chat_id, buyer)
             self.set_cfg("last_delivery_error", "")
@@ -2478,6 +2516,13 @@ class Plugin:
             _boot_log(f"DELIVER #{order_id} OK delivered={len(delivered)} manual={manual}")
             note = f" ({len(delivered)} ссылок)" if len(delivered) > 1 else ""
             return True, f"✅ Заказ #{order_id}: выдано{note}"
+        if delivered:
+            err_msg = (
+                f"Заказ #{order_id}: выдано {len(delivered)}/{len(urls)} — "
+                f"остальные ссылки возвращены в архив"
+            )
+            self.set_cfg("last_delivery_error", err_msg)
+            return False, err_msg
         err_msg = f"Заказ #{order_id}: не удалось отправить в чат FunPay"
         if last_err:
             err_msg += f"\n<code>{_escape(last_err[:200])}</code>"
@@ -2744,7 +2789,8 @@ class Plugin:
                         f"{'🟢' if auto_on else '🔴'} <b>Автовыдача:</b> {'ВКЛ' if auto_on else 'ВЫКЛ'}",
                         f"📋 <b>Лотов с</b> <code>{_escape(match)}</code>: {lot_hint}",
                         f"🗄 <b>Архив ссылок:</b> {self.gemini_archive_count()} шт.",
-                        f"📨 <b>Формат:</b> приветствие + 3 части ссылки + инструкция",
+                        f"📨 <b>Формат:</b> приветствие + "
+                        f"{int(self.get_cfg('gemini_delivery_parts', DEFAULT_DELIVERY_PARTS))} части ссылки + инструкция",
                         "<i>⏳ Обновление списка лотов…</i>",
                     ]
                 return "\n".join(lines)
@@ -2762,7 +2808,7 @@ class Plugin:
                     f"{'🟢' if auto_on else '🔴'} <b>Автовыдача:</b> {'ВКЛ' if auto_on else 'ВЫКЛ'}",
                     f"📋 <b>Лотов с</b> <code>{_escape(match)}</code>: <b>{len(lot_ids)}</b>{cache_age}",
                     f"🗄 <b>Архив ссылок:</b> {self.gemini_archive_count()} шт.",
-                    f"📨 <b>Выдача:</b> приветствие + <b>3 части</b> ссылки + инструкция",
+                    f"📨 <b>Выдача:</b> приветствие + <b>{int(self.get_cfg('gemini_delivery_parts', DEFAULT_DELIVERY_PARTS))} части</b> ссылки + инструкция",
                 ]
                 last_err = str(self.get_cfg("last_delivery_error", "") or "").strip()
                 if last_err:
