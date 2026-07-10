@@ -47,7 +47,7 @@ except ImportError:
 
 
 NAME          = "Gemini Link Auto"
-VERSION       = "3.2.1"
+VERSION       = "3.2.2"
 DESCRIPTION   = "ChatGPT автозакупка + выдача Gemini-ссылок из архива"
 CREDITS       = "Cursor AI"
 UUID          = "f7a2e8c1-4b3d-4e9f-a8c2-1d5e9b0f6a3c"
@@ -65,6 +65,11 @@ DEFAULT_GEMINI_LOT_MATCH: Final[str] = "gemini link"
 DEFAULT_DELIVERY_PARTS: Final[int] = 3
 DEFAULT_REDELIVERY_PARTS: Final[int] = 4
 LINK_PART_DELAY: Final[float] = 1.8
+CONFIRM_REMINDER_DELAY: Final[int] = 300
+DEFAULT_CONFIRM_REMINDER: Final[str] = (
+    "Заказ выполнен. Пожалуйста, зайдите в раздел «Покупки», "
+    "выберите его в списке и нажмите кнопку «Подтвердить выполнение заказа»."
+)
 LOT_CACHE_TTL: Final[int] = 600
 GEMINI_LOT_CACHE_TTL: Final[int] = 300
 GEMINI_LOT_SCAN_TIMEOUT: Final[float] = 8.0
@@ -709,6 +714,11 @@ class Plugin:
                 sm = str(loaded.get("stock_mode", "auto_buy"))
                 if sm in _LEGACY_STOCK_MODES:
                     loaded["stock_mode"] = "gemini_links" if sm in ("stocked", "warehouse", "import_lot") else "auto_buy"
+                if str(loaded.get("_cfg_version", "0")) < "3.2.2":
+                    loaded.setdefault("confirm_reminder_enabled", True)
+                    loaded.setdefault("confirm_reminder_delay_sec", CONFIRM_REMINDER_DELAY)
+                    loaded.setdefault("confirm_reminder_text", "")
+                    loaded["_cfg_version"] = "3.2.2"
                 if str(loaded.get("_cfg_version", "0")) < "3.2.0":
                     loaded.setdefault("gemini_auto_enabled", True)
                     loaded.setdefault("last_delivery_error", "")
@@ -800,8 +810,11 @@ class Plugin:
             "gemini_delivery_parts": DEFAULT_DELIVERY_PARTS,
             "gemini_redelivery_parts": DEFAULT_REDELIVERY_PARTS,
             "gemini_auto_enabled": True,
+            "confirm_reminder_enabled": True,
+            "confirm_reminder_delay_sec": CONFIRM_REMINDER_DELAY,
+            "confirm_reminder_text": "",
             "last_delivery_error": "",
-            "_cfg_version": "3.2.0",
+            "_cfg_version": "3.2.2",
         }
 
     # ── UI: компактные страницы вместо длинного списка кнопок ───────────────
@@ -1889,6 +1902,54 @@ class Plugin:
         trimmed = dict(list(data.items())[-500:])
         self._save_gemini_deliveries(trimmed)
 
+    def _confirm_reminder_text(self) -> str:
+        custom = str(self.get_cfg("confirm_reminder_text", "") or "").strip()
+        return custom or DEFAULT_CONFIRM_REMINDER
+
+    def _is_confirm_reminder_sent(self, order_id: str | int) -> bool:
+        rec = self._load_gemini_deliveries().get(str(order_id), {})
+        return bool(rec.get("confirm_sent"))
+
+    def _mark_confirm_reminder_sent(self, order_id: str | int) -> None:
+        data = self._load_gemini_deliveries()
+        rec = data.get(str(order_id), {})
+        if not rec:
+            return
+        rec["confirm_sent"] = True
+        rec["confirm_sent_at"] = datetime.now().isoformat(timespec="seconds")
+        data[str(order_id)] = rec
+        self._save_gemini_deliveries(data)
+
+    def _schedule_confirm_reminder(self, order_id: str, chat_id: int, buyer: str) -> None:
+        if not bool(self.get_cfg("confirm_reminder_enabled", True)):
+            return
+        if self._is_confirm_reminder_sent(order_id):
+            return
+        delay = max(60, int(self.get_cfg("confirm_reminder_delay_sec", CONFIRM_REMINDER_DELAY)))
+
+        def _run() -> None:
+            time.sleep(delay)
+            if self._is_confirm_reminder_sent(order_id):
+                return
+            try:
+                self._fp_send(
+                    chat_id,
+                    self._confirm_reminder_text(),
+                    buyer,
+                    watermark=False,
+                )
+                self._mark_confirm_reminder_sent(order_id)
+                self.log("заказ #%s: напоминание о подтверждении отправлено", order_id)
+                _boot_log(f"CONFIRM #{order_id} sent after {delay}s")
+            except Exception as exc:
+                self.log("заказ #%s: напоминание о подтверждении: %s", order_id, exc)
+                _boot_log(f"CONFIRM #{order_id} fail: {exc}")
+
+        threading.Thread(
+            target=_run, daemon=True, name=f"GeminiConfirm-{order_id}",
+        ).start()
+        _boot_log(f"CONFIRM #{order_id} scheduled in {delay}s")
+
     def _gemini_lot_match(self) -> str:
         return str(self.get_cfg("gemini_lot_match", DEFAULT_GEMINI_LOT_MATCH)).strip()
 
@@ -2411,6 +2472,7 @@ class Plugin:
             self.return_urls_to_gemini_archive(failed)
         if delivered:
             self._mark_gemini_order_delivered(order_id, buyer, delivered, manual=manual)
+            self._schedule_confirm_reminder(order_id, chat_id, buyer)
             self.set_cfg("last_delivery_error", "")
             self.log("заказ #%s: выдано %s ссылок (manual=%s)", order_id, len(delivered), manual)
             _boot_log(f"DELIVER #{order_id} OK delivered={len(delivered)} manual={manual}")
@@ -3515,11 +3577,6 @@ def bind_to_new_order(cardinal: Cardinal, event: NewOrderEvent) -> None:
         logger.error("%s bind_to_new_order: %s", _P, exc)
         logger.debug(traceback.format_exc())
 
-
-def bind_to_init_order(cardinal: Cardinal, event: NewOrderEvent) -> None:
-    """Не выдаём по INIT_ORDER — только новые заказы (NEW_ORDER) и ручная /gl_deliver."""
-    oid = getattr(getattr(event, "order", None), "id", "?")
-    _boot_log(f"INIT_ORDER #{oid} skip: автовыдача только для NEW_ORDER")
 
 
 def init_plugin(cardinal: Cardinal) -> None:
