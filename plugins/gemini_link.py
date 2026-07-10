@@ -35,7 +35,7 @@ except ImportError:
 
 
 NAME          = "Gemini Link Auto"
-VERSION       = "3.0.0"
+VERSION       = "3.0.1"
 DESCRIPTION   = "ChatGPT автозакупка + выдача Gemini-ссылок из архива"
 CREDITS       = "Cursor AI"
 UUID          = "f7a2e8c1-4b3d-4e9f-a8c2-1d5e9b0f6a3c"
@@ -91,18 +91,42 @@ logger = logging.getLogger("FPC.GeminiLink")
 _P = "[GeminiLink]"
 
 _plugin: "Plugin | None" = None
+_tg_registered_for: int | None = None
 
 
-def _escape(val: Any) -> str:
-    return html.escape(str(val if val is not None else ""))
+def _is_plugin_settings_cb(call: CallbackQuery) -> bool:
+    data = call.data or ""
+    return (
+        data.startswith(f"{CBT.PLUGIN_SETTINGS}:{UUID}:")
+        or data.startswith(f"{CBT.EDIT_PLUGIN}:{UUID}:")
+    )
 
 
-def _register_priority_cbq(tg, handler, predicate) -> None:
+def _register_priority_cbq(tg, handler, predicate, store: list | None = None) -> None:
     """Регистрирует callback-хэндлер до catch-all default_cp в Cardinal."""
     tg.cbq_handler(handler, predicate)
     handlers = tg.bot.callback_query_handlers
     if handlers:
-        handlers.insert(0, handlers.pop())
+        entry = handlers.pop()
+        handlers.insert(0, entry)
+        if store is not None:
+            store.append(entry)
+
+
+def _repin_cbq_handlers(tg, entries: list) -> None:
+    """Возвращает хэндлеры плагина в начало очереди (после default_cp и др.)."""
+    handlers = tg.bot.callback_query_handlers
+    if not handlers or not entries:
+        return
+    for entry in reversed(entries):
+        for idx, item in enumerate(handlers):
+            if item is entry:
+                handlers.insert(0, handlers.pop(idx))
+                break
+
+
+def _escape(val: Any) -> str:
+    return html.escape(str(val if val is not None else ""))
 
 
 def _dig(data: Any, *keys: str, default: Any = None) -> Any:
@@ -429,6 +453,7 @@ class Plugin:
         self._lot_stock_cache_ts: float = 0.0
         self._stop_auto = False
         self._auto_thread: threading.Thread | None = None
+        self._tg_cbq_entries: list = []
         self.reload_settings()
 
     def log(self, msg: str, *args) -> None:
@@ -2259,11 +2284,18 @@ class Plugin:
     # ── Telegram UI (schema-driven, как Starvell) ────────────────────────────
 
     def setup_telegram(self) -> None:
+        global _tg_registered_for
         if not self.cardinal.telegram:
+            self.log("Telegram недоступен — UI не зарегистрирован")
             return
         tg = self.cardinal.telegram
         bot = tg.bot
+        bot_id = id(bot)
+        if self._tg_cbq_entries and _tg_registered_for == bot_id:
+            _repin_cbq_handlers(tg, self._tg_cbq_entries)
+            return
         plugin = self
+        self._tg_cbq_entries = []
 
         def show_settings(
             chat_id: int, msg_id: int, page: str = "hub",
@@ -2615,11 +2647,24 @@ class Plugin:
                 bot.answer_callback_query(call.id)
             except Exception:
                 pass
-            threading.Thread(
-                target=open_hub_settings,
-                args=(call.message.chat.id, call.message.message_id),
-                daemon=True,
-            ).start()
+            chat_id = call.message.chat.id
+            msg_id = call.message.message_id
+            try:
+                show_settings(chat_id, msg_id, "hub", instant=True)
+                threading.Thread(
+                    target=refresh_settings_ui, args=(chat_id, msg_id, "hub"), daemon=True,
+                ).start()
+            except Exception as exc:
+                plugin.log("ошибка открытия настроек: %s", exc)
+                logger.debug(traceback.format_exc())
+                try:
+                    bot.send_message(
+                        chat_id,
+                        f"⚠️ Не удалось открыть настройки: <code>{_escape(exc)[:180]}</code>",
+                        parse_mode="HTML",
+                    )
+                except Exception:
+                    pass
 
         def _is_editing(m: Message) -> bool:
             state_data = tg.get_state(m.chat.id, m.from_user.id)
@@ -2627,16 +2672,15 @@ class Plugin:
                 return False
             return str(state_data["state"]).startswith(f"{CB_PREFIX}:edit:")
 
-        _register_priority_cbq(
-            tg,
-            on_callback,
-            lambda c: (c.data or "").startswith(f"{CB_PREFIX}:"),
-        )
+        tg.cbq_handler(on_callback, lambda c: (c.data or "").startswith(f"{CB_PREFIX}:"))
         _register_priority_cbq(
             tg,
             on_plugin_settings,
-            lambda c: (c.data or "").startswith(f"{CBT.PLUGIN_SETTINGS}:{UUID}:"),
+            _is_plugin_settings_cb,
+            self._tg_cbq_entries,
         )
+        _repin_cbq_handlers(tg, self._tg_cbq_entries)
+        _tg_registered_for = bot_id
         tg.msg_handler(on_import_text, func=_is_importing)
         tg.msg_handler(on_import_document, content_types=["document"], func=_is_importing)
         tg.msg_handler(on_text, func=_is_editing)
@@ -2692,12 +2736,17 @@ def bind_to_new_order(cardinal: Cardinal, event: NewOrderEvent) -> None:
 def init_plugin(cardinal: Cardinal) -> None:
     global _plugin
     _plugin = Plugin(cardinal)
+
+
+def post_init_plugin(cardinal: Cardinal) -> None:
+    if _plugin is None:
+        return
     _plugin.setup_telegram()
     if _plugin.stock_mode() == "auto_buy":
         _plugin.start_auto_worker()
-    mode = _plugin.stock_mode_label()
-    logger.info("%s v%s загружен (%s)", _P, VERSION, mode)
+    logger.info("%s v%s загружен (%s)", _P, VERSION, _plugin.stock_mode_label())
 
 
 BIND_TO_PRE_INIT = [init_plugin]
+BIND_TO_POST_INIT = [post_init_plugin]
 BIND_TO_NEW_ORDER = [bind_to_new_order]
