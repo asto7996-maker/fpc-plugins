@@ -47,7 +47,7 @@ except ImportError:
 
 
 NAME          = "Gemini Link Auto"
-VERSION       = "3.2.0"
+VERSION       = "3.2.1"
 DESCRIPTION   = "ChatGPT автозакупка + выдача Gemini-ссылок из архива"
 CREDITS       = "Cursor AI"
 UUID          = "f7a2e8c1-4b3d-4e9f-a8c2-1d5e9b0f6a3c"
@@ -594,6 +594,7 @@ class Plugin:
         self._gemini_lots_cache_ts: float = 0.0
         self._gemini_lots_scan_lock = threading.Lock()
         self._gemini_lots_scan_running = False
+        self._delivery_in_progress: set[str] = set()
         self.reload_settings()
 
     def open_settings_card(self, call: CallbackQuery) -> None:
@@ -1875,11 +1876,14 @@ class Plugin:
     def _is_gemini_order_delivered(self, order_id: str | int) -> bool:
         return str(order_id) in self._load_gemini_deliveries()
 
-    def _mark_gemini_order_delivered(self, order_id: str | int, buyer: str, urls: list[str]) -> None:
+    def _mark_gemini_order_delivered(
+        self, order_id: str | int, buyer: str, urls: list[str], *, manual: bool = False,
+    ) -> None:
         data = self._load_gemini_deliveries()
         data[str(order_id)] = {
             "buyer": buyer,
             "urls": urls,
+            "manual": bool(manual),
             "time": datetime.now().isoformat(timespec="seconds"),
         }
         trimmed = dict(list(data.items())[-500:])
@@ -2137,7 +2141,7 @@ class Plugin:
             return True
         detail = self._lot_detailed_description(lot_id)
         matched = _lot_text_matches(detail, needle)
-        if not matched and _order_looks_like_gemini_activation(order_text):
+        if not matched and relaxed and _order_looks_like_gemini_activation(order_text):
             matched = True
         if matched:
             if lot_id not in self._gemini_lots_cache:
@@ -2257,23 +2261,22 @@ class Plugin:
         raise RuntimeError(str(last_err) if last_err else "FunPay send failed")
 
     def _deliver_link_in_parts(self, chat_id: Any, buyer: str, url: str, parts: int) -> None:
-        """3 (или N) отдельных сообщения в чат FunPay — по одной части ссылки в каждом."""
+        """3 отдельных сообщения — только фрагмент ссылки, без нумерации; в конце — инструкция."""
         chunks = split_link_parts(url, parts)
-        total = len(chunks)
-        for idx, chunk in enumerate(chunks, 1):
+        for idx, chunk in enumerate(chunks):
             chunk = (chunk or "").strip()
             if not chunk:
-                raise ValueError(f"пустая часть {idx}/{total}")
-            if idx < total:
-                msg = f"Часть {idx} из {total}:\n{chunk}"
-            else:
-                msg = (
-                    f"Часть {idx} из {total}:\n{chunk}\n\n"
-                    "Склейте все части в одну ссылку и откройте в браузере."
-                )
-            self._fp_send(chat_id, msg, buyer, watermark=False)
-            if idx < total:
+                raise ValueError(f"пустая часть ссылки ({idx + 1}/{len(chunks)})")
+            self._fp_send(chat_id, chunk, buyer, watermark=False)
+            if idx < len(chunks) - 1:
                 time.sleep(LINK_PART_DELAY)
+        time.sleep(LINK_PART_DELAY)
+        self._fp_send(
+            chat_id,
+            "Склейте все части в одну ссылку и вставьте её в браузер.",
+            buyer,
+            watermark=False,
+        )
 
     def _deliver_single_gemini_link(self, chat_id: Any, buyer: str, url: str) -> tuple[bool, str]:
         parts = max(2, int(self.get_cfg("gemini_delivery_parts", DEFAULT_DELIVERY_PARTS)))
@@ -2318,6 +2321,29 @@ class Plugin:
             return False, f"Режим {mode} — переключите на 🔗 Gemini"
         if not force and self._is_gemini_order_delivered(order_id):
             return False, f"Заказ #{order_id} уже выдан (добавьте force)"
+        if order_id in self._delivery_in_progress:
+            return False, f"Заказ #{order_id} уже обрабатывается"
+        self._delivery_in_progress.add(order_id)
+        try:
+            return self._deliver_gemini_order_impl(
+                order_id,
+                event=event,
+                full_order=full_order,
+                force=force,
+                manual=manual,
+            )
+        finally:
+            self._delivery_in_progress.discard(order_id)
+
+    def _deliver_gemini_order_impl(
+        self,
+        order_id: str,
+        *,
+        event: NewOrderEvent | None = None,
+        full_order: Any = None,
+        force: bool = False,
+        manual: bool = False,
+    ) -> tuple[bool, str]:
         if full_order is None:
             try:
                 full_order = self.cardinal.account.get_order(order_id)
@@ -2331,7 +2357,7 @@ class Plugin:
             )
         lot_id = self._resolve_order_lot_id(event, full_order)
         order_text = self._order_text_blob(event, full_order)
-        relaxed = manual or _order_looks_like_gemini_activation(order_text)
+        relaxed = manual
         _boot_log(
             f"DELIVER #{order_id} lot_id={lot_id} archive={self.gemini_archive_count()} "
             f"force={force} manual={manual} relaxed={relaxed}"
@@ -2347,7 +2373,7 @@ class Plugin:
         try:
             self._fp_send(
                 chat_id,
-                f"Заказ #{order_id} оплачен. Отправляю ссылку активации Gemini…",
+                "Выдаю ссылку активации Gemini…",
                 buyer,
                 watermark=False,
             )
@@ -2384,11 +2410,11 @@ class Plugin:
         if failed:
             self.return_urls_to_gemini_archive(failed)
         if delivered:
-            self._mark_gemini_order_delivered(order_id, buyer, delivered)
+            self._mark_gemini_order_delivered(order_id, buyer, delivered, manual=manual)
             self.set_cfg("last_delivery_error", "")
             self.log("заказ #%s: выдано %s ссылок (manual=%s)", order_id, len(delivered), manual)
-            _boot_log(f"DELIVER #{order_id} OK delivered={len(delivered)} msgs_per_link=3")
-            note = f" ({len(delivered)} ссылок × 3 сообщения)" if len(delivered) > 1 else " (3 сообщения в чат)"
+            _boot_log(f"DELIVER #{order_id} OK delivered={len(delivered)} manual={manual}")
+            note = f" ({len(delivered)} ссылок)" if len(delivered) > 1 else ""
             return True, f"✅ Заказ #{order_id}: выдано{note}"
         err_msg = f"Заказ #{order_id}: не удалось отправить в чат FunPay"
         if last_err:
@@ -2446,11 +2472,10 @@ class Plugin:
             if lot_id:
                 _boot_log(f"ORDER #{order_id} lot_id retry={lot_id}")
         if not self._order_matches_gemini_link(event, full_order, relaxed=False):
-            if not _order_looks_like_gemini_activation(self._order_text_blob(event, full_order)):
-                _boot_log(f"ORDER #{order_id} skip: не gemini link лот")
-                return
+            _boot_log(f"ORDER #{order_id} skip: не gemini link лот")
+            return
         ok, msg = self.deliver_gemini_order(
-            order_id, event=event, full_order=full_order, force=False,
+            order_id, event=event, full_order=full_order, force=False, manual=False,
         )
         if not ok:
             _boot_log(f"ORDER #{order_id} FAIL: {msg}")
@@ -2657,7 +2682,7 @@ class Plugin:
                         f"{'🟢' if auto_on else '🔴'} <b>Автовыдача:</b> {'ВКЛ' if auto_on else 'ВЫКЛ'}",
                         f"📋 <b>Лотов с</b> <code>{_escape(match)}</code>: {lot_hint}",
                         f"🗄 <b>Архив ссылок:</b> {self.gemini_archive_count()} шт.",
-                        f"📨 <b>Формат:</b> 3 отдельных сообщения в чат FunPay",
+                        f"📨 <b>Формат:</b> приветствие + 3 части ссылки + инструкция",
                         "<i>⏳ Обновление списка лотов…</i>",
                     ]
                 return "\n".join(lines)
@@ -2675,7 +2700,7 @@ class Plugin:
                     f"{'🟢' if auto_on else '🔴'} <b>Автовыдача:</b> {'ВКЛ' if auto_on else 'ВЫКЛ'}",
                     f"📋 <b>Лотов с</b> <code>{_escape(match)}</code>: <b>{len(lot_ids)}</b>{cache_age}",
                     f"🗄 <b>Архив ссылок:</b> {self.gemini_archive_count()} шт.",
-                    f"📨 <b>Выдача:</b> <b>3 отдельных сообщения</b> (по 1 части ссылки)",
+                    f"📨 <b>Выдача:</b> приветствие + <b>3 части</b> ссылки + инструкция",
                 ]
                 last_err = str(self.get_cfg("last_delivery_error", "") or "").strip()
                 if last_err:
@@ -2945,7 +2970,7 @@ class Plugin:
                 "📤 <b>Выдача заказа вручную</b>\n\n"
                 "Введите номер заказа FunPay, например:\n"
                 "<code>Z8U62P1Z</code>\n\n"
-                "Плагин отправит покупателю <b>3 отдельных сообщения</b> с частями ссылки.\n"
+                "Плагин отправит покупателю ссылку частями (3 сообщения + инструкция).\n"
                 "<code>/cancel</code> — отмена"
             )
             result = bot.send_message(chat_id, prompt, parse_mode="HTML")
@@ -3492,7 +3517,9 @@ def bind_to_new_order(cardinal: Cardinal, event: NewOrderEvent) -> None:
 
 
 def bind_to_init_order(cardinal: Cardinal, event: NewOrderEvent) -> None:
-    bind_to_new_order(cardinal, event)
+    """Не выдаём по INIT_ORDER — только новые заказы (NEW_ORDER) и ручная /gl_deliver."""
+    oid = getattr(getattr(event, "order", None), "id", "?")
+    _boot_log(f"INIT_ORDER #{oid} skip: автовыдача только для NEW_ORDER")
 
 
 def init_plugin(cardinal: Cardinal) -> None:
@@ -3542,7 +3569,7 @@ BIND_TO_PRE_INIT = [init_plugin]
 BIND_TO_POST_INIT = [post_init_plugin]
 BIND_TO_PRE_START = [pre_start_plugin]
 BIND_TO_NEW_ORDER = [bind_to_new_order] if _HAS_NEW_ORDER_EVENT else []
-BIND_TO_INIT_ORDER = [bind_to_init_order] if _HAS_NEW_ORDER_EVENT else []
+BIND_TO_INIT_ORDER: list = []  # только NEW_ORDER; ручная выдача — /gl_deliver
 
 
 _boot_log(f"module imported v{VERSION} new_order={_HAS_NEW_ORDER_EVENT}")
