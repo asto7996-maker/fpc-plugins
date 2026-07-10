@@ -47,7 +47,7 @@ except ImportError:
 
 
 NAME          = "Gemini Link Auto"
-VERSION       = "3.2.3"
+VERSION       = "3.2.4"
 DESCRIPTION   = "ChatGPT автозакупка + выдача Gemini-ссылок из архива"
 CREDITS       = "Cursor AI"
 UUID          = "f7a2e8c1-4b3d-4e9f-a8c2-1d5e9b0f6a3c"
@@ -729,6 +729,12 @@ class Plugin:
                 sm = str(loaded.get("stock_mode", "auto_buy"))
                 if sm in _LEGACY_STOCK_MODES:
                     loaded["stock_mode"] = "gemini_links" if sm in ("stocked", "warehouse", "import_lot") else "auto_buy"
+                if str(loaded.get("_cfg_version", "0")) < "3.2.3":
+                    if int(loaded.get("gemini_delivery_parts", DEFAULT_DELIVERY_PARTS)) == 3:
+                        loaded["gemini_delivery_parts"] = DEFAULT_DELIVERY_PARTS
+                    if int(loaded.get("gemini_redelivery_parts", DEFAULT_REDELIVERY_PARTS)) == 4:
+                        loaded["gemini_redelivery_parts"] = DEFAULT_REDELIVERY_PARTS
+                    loaded["_cfg_version"] = "3.2.3"
                 if str(loaded.get("_cfg_version", "0")) < "3.2.2":
                     loaded.setdefault("confirm_reminder_enabled", True)
                     loaded.setdefault("confirm_reminder_delay_sec", CONFIRM_REMINDER_DELAY)
@@ -2230,13 +2236,32 @@ class Plugin:
         )
         return False
 
-    def _resolve_chat_id_int(self, chat_id: Any) -> int | None:
-        if chat_id is None:
+    def _normalize_chat_id(self, chat_id: Any) -> int | str | None:
+        if chat_id is None or isinstance(chat_id, bool):
             return None
+        if isinstance(chat_id, int):
+            return chat_id
+        s = str(chat_id).strip()
+        if not s:
+            return None
+        if s.isdigit():
+            return int(s)
+        if re.match(r"users-\d+-\d+$", s):
+            return s
         try:
-            return int(chat_id)
+            return int(s)
+        except (TypeError, ValueError):
+            return s
+
+    def _private_chat_node(self, buyer_id: Any) -> str | None:
+        try:
+            buyer_id = int(buyer_id)
         except (TypeError, ValueError):
             return None
+        acc_id = getattr(self.cardinal.account, "id", None)
+        if acc_id:
+            return f"users-{int(acc_id)}-{buyer_id}"
+        return None
 
     def _resolve_order_chat_id(
         self,
@@ -2244,7 +2269,7 @@ class Plugin:
         event: Any = None,
         buyer: str = "",
         order_id: str = "",
-    ) -> int | None:
+    ) -> int | str | None:
         buyer = (buyer or "").strip()
         candidates: list[Any] = []
         for src in (full_order, getattr(event, "order", None) if event else None, event):
@@ -2254,15 +2279,25 @@ class Plugin:
             if cid is not None:
                 candidates.append(cid)
         for cid in candidates:
-            parsed = self._resolve_chat_id_int(cid)
+            parsed = self._normalize_chat_id(cid)
             if parsed is not None:
                 return parsed
+        buyer_id = None
+        for src in (full_order, getattr(event, "order", None) if event else None):
+            if src is None:
+                continue
+            buyer_id = getattr(src, "buyer_id", None)
+            if buyer_id is not None:
+                break
+        node = self._private_chat_node(buyer_id)
+        if node:
+            return node
         if buyer:
             for make_req in (True, False):
                 try:
                     chat = self.cardinal.account.get_chat_by_name(buyer, make_req)
                     if chat and getattr(chat, "id", None) is not None:
-                        return int(chat.id)
+                        return self._normalize_chat_id(chat.id)
                 except Exception as exc:
                     logger.debug("%s get_chat_by_name(%s): %s", _P, buyer, exc)
             try:
@@ -2272,36 +2307,37 @@ class Plugin:
                     for attr in ("name", "username", "interlocutor_username"):
                         name = str(getattr(chat, attr, "") or "").strip()
                         if name and name.casefold() == buyer_l:
-                            return int(chat.id)
+                            return self._normalize_chat_id(chat.id)
             except Exception as exc:
                 logger.debug("%s get_chats for %s: %s", _P, buyer, exc)
         if order_id:
             try:
                 full = full_order or self.cardinal.account.get_order(order_id)
                 cid = getattr(full, "chat_id", None)
-                parsed = self._resolve_chat_id_int(cid)
+                parsed = self._normalize_chat_id(cid)
                 if parsed is not None:
                     return parsed
+                node = self._private_chat_node(getattr(full, "buyer_id", None))
+                if node:
+                    return node
             except Exception as exc:
                 logger.debug("%s get_order chat #%s: %s", _P, order_id, exc)
         return None
 
-    def _account_send_message(self, chat_id: int, text: str, chat_name: str | None) -> Any:
-        acc = self.cardinal.account
-        old_mode = bool(getattr(self.cardinal, "old_mode_enabled", False))
-        keep_unread = bool(getattr(self.cardinal, "keep_sent_messages_unread", False)) and old_mode
-        try:
-            return acc.send_message(
-                chat_id, text, chat_name,
-                None, not old_mode, old_mode, keep_unread,
-            )
-        except TypeError:
-            return acc.send_message(chat_id, text, chat_name)
+    def _account_send_message(self, chat_id: int | str, text: str, chat_name: str | None) -> Any:
+        return self.cardinal.account.send_message(
+            chat_id,
+            text,
+            chat_name,
+            image_id=None,
+            add_to_ignore_list=True,
+            update_last_saved_message=False,
+        )
 
     def _fp_send(self, chat_id: Any, text: str, buyer: str, *, watermark: bool = False) -> None:
-        cid = self._resolve_chat_id_int(chat_id)
-        if cid is None:
-            cid = self._resolve_order_chat_id(None, None, buyer)
+        cid = self._normalize_chat_id(chat_id)
+        if cid is None and buyer:
+            cid = self._resolve_order_chat_id(None, None, buyer, "")
         if cid is None:
             raise ValueError(f"chat_id пуст (buyer={buyer!r})")
         buyer_name = (buyer or "").strip() or None
@@ -2310,29 +2346,17 @@ class Plugin:
             raise ValueError("пустой текст сообщения")
 
         last_err: Exception | None = None
-        for attempt in range(1, 4):
+        for attempt in range(1, 5):
             try:
                 msg = self._account_send_message(cid, text, buyer_name)
-                if msg is not None:
-                    _boot_log(f"FP send OK chat={cid} try={attempt} len={len(text)}")
-                    return
-                last_err = RuntimeError("account.send_message вернул None")
+                mid = getattr(msg, "id", None)
+                _boot_log(f"FP send OK chat={cid} try={attempt} len={len(text)} msg_id={mid}")
+                return
             except Exception as exc:
                 last_err = exc
                 _boot_log(f"FP send FAIL chat={cid} try={attempt}: {exc}")
-            time.sleep(1.5 * attempt)
-
-        try:
-            result = self.cardinal.send_message(
-                cid, text, buyer_name, watermark=watermark, attempts=3,
-            )
-            if result:
-                _boot_log(f"FP send OK via cardinal chat={cid} len={len(text)}")
-                return
-            last_err = RuntimeError("cardinal.send_message вернул пустой результат")
-        except Exception as exc:
-            last_err = exc
-            _boot_log(f"FP send FAIL cardinal chat={cid}: {exc}")
+                logger.debug("%s send chat=%s: %s", _P, cid, exc)
+                time.sleep(1.5 * attempt)
 
         raise RuntimeError(str(last_err) if last_err else "FunPay send failed")
 
