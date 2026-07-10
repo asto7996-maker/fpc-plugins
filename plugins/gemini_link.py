@@ -16,8 +16,19 @@ from datetime import datetime
 from typing import Any, Final
 
 from cardinal import Cardinal
-from FunPayAPI.updater.events import NewOrderEvent
-from tg_bot import CBT
+try:
+    from FunPayAPI.updater.events import NewOrderEvent
+    _HAS_NEW_ORDER_EVENT = True
+except Exception:
+    NewOrderEvent = None  # type: ignore[misc, assignment]
+    _HAS_NEW_ORDER_EVENT = False
+try:
+    from tg_bot import CBT
+except ImportError:
+    class CBT:  # type: ignore[no-redef]
+        PLUGIN_SETTINGS = "47"
+        EDIT_PLUGIN = "45"
+        PLUGINS_LIST = "46"
 from telebot.types import CallbackQuery, InlineKeyboardButton as IKB, InlineKeyboardMarkup as IKM, Message
 import telebot
 
@@ -35,7 +46,7 @@ except ImportError:
 
 
 NAME          = "Gemini Link Auto"
-VERSION       = "3.0.2"
+VERSION       = "3.0.3"
 DESCRIPTION   = "ChatGPT автозакупка + выдача Gemini-ссылок из архива"
 CREDITS       = "Cursor AI"
 UUID          = "f7a2e8c1-4b3d-4e9f-a8c2-1d5e9b0f6a3c"
@@ -62,6 +73,7 @@ IMPORT_LOG_FILE   = f"storage/plugins/{UUID}/import_stock.json"
 WAREHOUSE_FILE    = f"storage/plugins/{UUID}/warehouse.json"
 GEMINI_ARCHIVE_FILE = f"storage/plugins/{UUID}/gemini_archive.json"
 GEMINI_DELIVERY_FILE = f"storage/plugins/{UUID}/gemini_deliveries.json"
+BOOT_LOG_FILE        = f"storage/plugins/{UUID}/boot.log"
 CB_PREFIX         = f"glnk_{UUID[:8]}"
 
 STOCK_MODES: Final[dict[str, str]] = {
@@ -92,6 +104,17 @@ _P = "[GeminiLink]"
 
 _plugin: "Plugin | None" = None
 _tg_ui_registered_for: int | None = None
+
+
+def _boot_log(msg: str) -> None:
+    line = f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} {_P} {msg}"
+    logger.info("%s %s", _P, msg)
+    try:
+        os.makedirs(os.path.dirname(BOOT_LOG_FILE), exist_ok=True)
+        with open(BOOT_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
 
 
 def _match_gemini_plugin_settings(call: CallbackQuery) -> bool:
@@ -149,15 +172,47 @@ def _normalize_cbq_handler_order(bot) -> None:
     bot.callback_query_handlers[:] = settings_h + rest + catch_all_h
 
 
+def _patch_catch_all_handlers(bot) -> int:
+    """default_cp (lambda c: True) не должен перехватывать PLUGIN_SETTINGS этого плагина."""
+    patched = 0
+    for entry in bot.callback_query_handlers:
+        func = entry.get("filters", {}).get("func")
+        if func is None or getattr(func, "__gemini_link_patched__", False):
+            continue
+        if not _is_catch_all_cbq_filter(func):
+            continue
+
+        def _make_wrapper(original):
+            def _wrapped(call, _orig=original):
+                if _match_gemini_plugin_settings(call):
+                    return False
+                return _orig(call)
+            _wrapped.__gemini_link_patched__ = True  # type: ignore[attr-defined]
+            return _wrapped
+
+        entry["filters"]["func"] = _make_wrapper(func)
+        patched += 1
+    return patched
+
+
 def _ensure_gemini_settings_handler(bot, handler) -> None:
     _remove_gemini_settings_handlers(bot)
 
-    @bot.callback_query_handler(func=_match_gemini_plugin_settings)
-    def _gemini_settings_cb_entry(call: CallbackQuery) -> None:
+    def _run_settings(call: CallbackQuery) -> None:
+        _boot_log(f"PLUGIN_SETTINGS click data={call.data!r}")
         handler(call)
 
+    bot.callback_query_handlers.insert(0, {
+        "function": _run_settings,
+        "pass_bot": False,
+        "filters": {"func": _match_gemini_plugin_settings},
+    })
+    patched = _patch_catch_all_handlers(bot)
     _normalize_cbq_handler_order(bot)
-    logger.info("%s PLUGIN_SETTINGS handler зарегистрирован (всего cbq: %s)", _P, len(bot.callback_query_handlers))
+    _boot_log(
+        f"PLUGIN_SETTINGS registered | cbq={len(bot.callback_query_handlers)} "
+        f"catch_all_patched={patched}"
+    )
 
 
 def _gemini_link_open_settings(call: CallbackQuery) -> None:
@@ -2777,7 +2832,36 @@ class Plugin:
         tg.msg_handler(send_panel, func=lambda m: _tg_matches(m, "gemini_link", "gl"))
         tg.msg_handler(send_stock_cmd, func=lambda m: _tg_matches(m, "gl_stock"))
 
-        self.log("Telegram UI зарегистрирован (/gemini_link, /gl_stock)")
+        def send_debug(message: Message) -> None:
+            bot = tg.bot
+            lines = [
+                f"🔧 <b>Gemini Link debug</b> v{VERSION}",
+                f"UUID: <code>{UUID}</code>",
+                f"new_order_event: <code>{_HAS_NEW_ORDER_EVENT}</code>",
+                f"cbq_handlers: <b>{len(bot.callback_query_handlers)}</b>",
+                f"boot_log: <code>{BOOT_LOG_FILE}</code>",
+            ]
+            if _plugin:
+                lines.append(f"mode: <code>{_plugin.stock_mode()}</code>")
+            patched = _patch_catch_all_handlers(bot)
+            lines.append(f"catch_all_patched: <b>{patched}</b>")
+            _ensure_gemini_settings_handler(bot, _gemini_link_open_settings)
+            lines.append("settings_handler: <b>re-registered</b>")
+            bot.reply_to(message, "\n".join(lines), parse_mode="HTML")
+            _boot_log("gl_debug command")
+
+        tg.msg_handler(send_debug, func=lambda m: _tg_matches(m, "gl_debug"))
+
+        try:
+            plugin.cardinal.add_telegram_commands(UUID, [
+                ("gemini_link", "панель Gemini Link Auto", True),
+                ("gl_stock", "склад Gemini Link", True),
+                ("gl_debug", "диагностика Gemini Link", True),
+            ])
+        except Exception as exc:
+            plugin.log("add_telegram_commands: %s", exc)
+
+        self.log("Telegram UI зарегистрирован (/gemini_link, /gl_stock, /gl_debug)")
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -2801,25 +2885,49 @@ def bind_to_new_order(cardinal: Cardinal, event: NewOrderEvent) -> None:
 
 def init_plugin(cardinal: Cardinal) -> None:
     global _plugin
-    _plugin = Plugin(cardinal)
+    _boot_log(f"PRE_INIT start v{VERSION}")
+    try:
+        _plugin = Plugin(cardinal)
+        _plugin.ensure_telegram_handlers()
+        _boot_log("PRE_INIT ensure_telegram_handlers OK")
+    except Exception as exc:
+        _boot_log(f"PRE_INIT FAIL: {exc}")
+        logger.error("%s PRE_INIT: %s", _P, exc)
+        logger.debug(traceback.format_exc())
+        raise
 
 
 def post_init_plugin(cardinal: Cardinal) -> None:
     if _plugin is None:
+        _boot_log("POST_INIT skip: _plugin is None")
         return
-    _plugin.ensure_telegram_handlers()
-    if _plugin.stock_mode() == "auto_buy":
-        _plugin.start_auto_worker()
-    logger.info("%s v%s загружен (%s)", _P, VERSION, _plugin.stock_mode_label())
+    try:
+        _plugin.ensure_telegram_handlers()
+        if _plugin.stock_mode() == "auto_buy":
+            _plugin.start_auto_worker()
+        _boot_log(f"POST_INIT OK mode={_plugin.stock_mode()}")
+        logger.info("%s v%s загружен (%s)", _P, VERSION, _plugin.stock_mode_label())
+    except Exception as exc:
+        _boot_log(f"POST_INIT FAIL: {exc}")
+        logger.error("%s POST_INIT: %s", _P, exc)
+        logger.debug(traceback.format_exc())
 
 
 def pre_start_plugin(cardinal: Cardinal) -> None:
     if _plugin is None:
         return
-    _plugin.ensure_telegram_handlers()
+    try:
+        _plugin.ensure_telegram_handlers()
+        _boot_log("PRE_START ensure_telegram_handlers OK")
+    except Exception as exc:
+        _boot_log(f"PRE_START FAIL: {exc}")
+        logger.error("%s PRE_START: %s", _P, exc)
 
 
 BIND_TO_PRE_INIT = [init_plugin]
 BIND_TO_POST_INIT = [post_init_plugin]
 BIND_TO_PRE_START = [pre_start_plugin]
-BIND_TO_NEW_ORDER = [bind_to_new_order]
+BIND_TO_NEW_ORDER = [bind_to_new_order] if _HAS_NEW_ORDER_EVENT else []
+
+
+_boot_log(f"module imported v{VERSION} new_order={_HAS_NEW_ORDER_EVENT}")
