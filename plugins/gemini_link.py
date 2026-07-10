@@ -16,6 +16,7 @@ from datetime import datetime
 from typing import Any, Final
 
 from cardinal import Cardinal
+from FunPayAPI.updater.events import NewOrderEvent
 from tg_bot import CBT
 from telebot.types import CallbackQuery, InlineKeyboardButton as IKB, InlineKeyboardMarkup as IKM, Message
 import telebot
@@ -34,8 +35,8 @@ except ImportError:
 
 
 NAME          = "Gemini Link Auto"
-VERSION       = "2.5.3"
-DESCRIPTION   = "GPT plus 1M (NW) — авто-закупка аккаунтов и выдача на FunPay"
+VERSION       = "3.0.0"
+DESCRIPTION   = "ChatGPT автозакупка + выдача Gemini-ссылок из архива"
 CREDITS       = "Cursor AI"
 UUID          = "f7a2e8c1-4b3d-4e9f-a8c2-1d5e9b0f6a3c"
 SETTINGS_PAGE = True
@@ -47,7 +48,10 @@ DEFAULT_API_URL: Final[str] = "https://worker-production-53ca.up.railway.app"
 SHOP_PRODUCT_NAME: Final[str] = "GPT plus 1M (NW)"
 DEFAULT_LOT_MATCH: Final[str] = "GPT plus 1M (NW)"
 DEFAULT_MIN_LOT_STOCK: Final[int] = 3
-DEFAULT_AUTO_INTERVAL: Final[int] = 300
+DEFAULT_GEMINI_LOT_MATCH: Final[str] = "gemini link"
+DEFAULT_DELIVERY_PARTS: Final[int] = 3
+DEFAULT_REDELIVERY_PARTS: Final[int] = 4
+LINK_PART_DELAY: Final[float] = 1.2
 LOT_CACHE_TTL: Final[int] = 600
 PRODUCT_CACHE_TTL: Final[int] = 300
 UI_API_TIMEOUT: Final[float] = 5.0
@@ -56,14 +60,16 @@ SETTINGS_FILE     = f"storage/plugins/{UUID}/settings.json"
 AUTOBUY_LOG_FILE  = f"storage/plugins/{UUID}/autobuy.json"
 IMPORT_LOG_FILE   = f"storage/plugins/{UUID}/import_stock.json"
 WAREHOUSE_FILE    = f"storage/plugins/{UUID}/warehouse.json"
+GEMINI_ARCHIVE_FILE = f"storage/plugins/{UUID}/gemini_archive.json"
+GEMINI_DELIVERY_FILE = f"storage/plugins/{UUID}/gemini_deliveries.json"
 CB_PREFIX         = f"glnk_{UUID[:8]}"
 
 STOCK_MODES: Final[dict[str, str]] = {
-    "auto_buy": "🤖 Автозакупка → FunPay",
-    "stocked": "📦 Купленные ссылки → FunPay",
+    "auto_buy": "🤖 ChatGPT — автозакупка",
+    "gemini_links": "🔗 Gemini — ссылки из архива",
 }
-STOCK_MODE_ORDER: Final[tuple[str, ...]] = ("auto_buy", "stocked")
-_LEGACY_STOCK_MODES: Final[frozenset[str]] = frozenset({"import_lot", "warehouse"})
+STOCK_MODE_ORDER: Final[tuple[str, ...]] = ("auto_buy", "gemini_links")
+_LEGACY_STOCK_MODES: Final[frozenset[str]] = frozenset({"import_lot", "warehouse", "stocked"})
 
 _SHOP_ORDER_RE = re.compile(
     r"Order\s*#(?P<order_id>\d+)\s*\n"
@@ -334,7 +340,39 @@ def _lot_text_matches(text: str, needle: str) -> bool:
 
 
 def _normalize_activation_url(url: str) -> str:
-    return url.strip().rstrip("-").rstrip("=")
+    u = (url or "").strip()
+    if u.lower().startswith("https://"):
+        u = "https://" + u[8:]
+    elif u.lower().startswith("http://"):
+        u = "http://" + u[7:]
+    return u
+
+
+def _import_target_from_state(state: str) -> str:
+    state = str(state or "")
+    if state.endswith(":gemini_archive"):
+        return "gemini_archive"
+    if state.endswith(":warehouse"):
+        return "warehouse"
+    return "lot"
+
+
+def extract_activation_urls(text: str) -> list[str]:
+    found: list[str] = []
+    for raw in _ACTIVATION_LINK_RE.findall(text or ""):
+        url = _normalize_activation_url(raw)
+        if url and url not in found:
+            found.append(url)
+    return found
+
+
+def split_link_parts(url: str, parts: int) -> list[str]:
+    url = (url or "").strip()
+    parts = max(1, int(parts))
+    if parts == 1:
+        return [url]
+    size = (len(url) + parts - 1) // parts
+    return [url[i:i + size] for i in range(0, len(url), size)]
 
 
 def parse_shop_purchase_history(text: str) -> list[dict[str, str]]:
@@ -405,9 +443,16 @@ class Plugin:
                     loaded = json.load(f)
                 for k, v in defaults.items():
                     loaded.setdefault(k, v)
-                sm = str(loaded.get("stock_mode", "stocked"))
+                sm = str(loaded.get("stock_mode", "auto_buy"))
                 if sm in _LEGACY_STOCK_MODES:
-                    loaded["stock_mode"] = "stocked"
+                    loaded["stock_mode"] = "gemini_links" if sm in ("stocked", "warehouse", "import_lot") else "auto_buy"
+                if str(loaded.get("_cfg_version", "0")) < "3.0.0":
+                    loaded.setdefault("gemini_lot_match", DEFAULT_GEMINI_LOT_MATCH)
+                    loaded.setdefault("gemini_delivery_parts", DEFAULT_DELIVERY_PARTS)
+                    loaded.setdefault("gemini_redelivery_parts", DEFAULT_REDELIVERY_PARTS)
+                    if loaded.get("stock_mode") == "stocked":
+                        loaded["stock_mode"] = "gemini_links"
+                    loaded["_cfg_version"] = "3.0.0"
                 if str(loaded.get("_cfg_version", "0")) < "2.3.0":
                     loaded.setdefault("buy_budget_usd", 0.0)
                     loaded.setdefault("reserve_balance_usd", 10.0)
@@ -477,7 +522,10 @@ class Plugin:
             "imported_order_ids": [],
             "stock_mode": "auto_buy",
             "warehouse_release_qty": 5,
-            "_cfg_version": "2.5.0",
+            "gemini_lot_match": DEFAULT_GEMINI_LOT_MATCH,
+            "gemini_delivery_parts": DEFAULT_DELIVERY_PARTS,
+            "gemini_redelivery_parts": DEFAULT_REDELIVERY_PARTS,
+            "_cfg_version": "3.0.0",
         }
 
     # ── UI: компактные страницы вместо длинного списка кнопок ───────────────
@@ -497,6 +545,9 @@ class Plugin:
             {"key": "min_lot_stock", "label": "Мин. аккаунтов на лоте", "type": "int", "min": 0, "max": 500},
             {"key": "auto_interval_sec", "label": "Проверка авто (сек)", "type": "int", "min": 60, "max": 3600},
             {"key": "autobuy_lot_id", "label": "ID лота (необяз.)", "type": "text"},
+            {"key": "gemini_lot_match", "label": "Метка лота Gemini", "type": "text"},
+            {"key": "gemini_delivery_parts", "label": "Частей при выдаче", "type": "int", "min": 2, "max": 6},
+            {"key": "gemini_redelivery_parts", "label": "Частей при перевыдаче", "type": "int", "min": 2, "max": 8},
             {"key": "warehouse_release_qty", "label": "Выложить со склада (шт.)", "type": "int", "min": 0, "max": 100},
         ]
 
@@ -1079,6 +1130,9 @@ class Plugin:
         bot.send_message(chat_id, "\n".join(lines), parse_mode="HTML")
 
     def notify_stock_status(self, chat_id: int) -> None:
+        if self.stock_mode() == "gemini_links":
+            self.notify_gemini_status(chat_id)
+            return
         bot = self.cardinal.telegram.bot if self.cardinal.telegram else None
         if not bot:
             return
@@ -1157,7 +1211,9 @@ class Plugin:
         for item in items:
             prod = item.get("product") or "без названия"
             by_product[prod] = by_product.get(prod, 0) + 1
-        dest = "на <b>склад</b>" if target == "warehouse" else "на <b>лот FunPay</b>"
+        dest = "в <b>архив Gemini</b>" if target == "gemini_archive" else (
+            "на <b>склад</b>" if target == "warehouse" else "на <b>лот FunPay</b>"
+        )
         lines = [f"📥 <b>К выкладке {dest}:</b> <b>{len(items)}</b> ссылок"]
         if skipped:
             lines.append(f"⏭ Пропущено дублей заказов: <b>{skipped}</b>")
@@ -1173,13 +1229,20 @@ class Plugin:
             if len(sample) > 90:
                 sample = sample[:87] + "…"
             lines.append(f"\n👁 Пример:\n<code>{_escape(sample)}</code>")
-        btn = "на склад" if target == "warehouse" else "на FunPay"
+        if target == "gemini_archive":
+            btn = "в архив"
+        elif target == "warehouse":
+            btn = "на склад"
+        else:
+            btn = "на FunPay"
         lines.append(f"\n<b>Подтвердить выкладку {btn}?</b>")
         return "\n".join(lines)
 
     def _import_confirm_keyboard(self, target: str = "lot") -> IKM:
         kb = IKM()
-        label = "✅ На склад" if target == "warehouse" else "✅ На FunPay"
+        label = "✅ В архив" if target == "gemini_archive" else (
+            "✅ На склад" if target == "warehouse" else "✅ На FunPay"
+        )
         kb.row(
             IKB(label, callback_data=f"{CB_PREFIX}:import:confirm:{target}"),
             IKB("❌ Отмена", callback_data=f"{CB_PREFIX}:import:cancel"),
@@ -1187,10 +1250,17 @@ class Plugin:
         return kb
 
     def start_import_mode(self, chat_id: int, user_id: int, target: str = "lot") -> str:
-        target = target if target in ("lot", "warehouse") else "lot"
+        valid = ("lot", "warehouse", "gemini_archive")
+        target = target if target in valid else "lot"
         self._import_buffers[(chat_id, user_id)] = ""
         self._import_target[chat_id] = target
-        if target == "warehouse":
+        if target == "gemini_archive":
+            dest = (
+                "Ссылки попадут в <b>архив Gemini</b>.\n"
+                "При оплате лота с меткой <code>gemini link</code> в подробном описании "
+                "плагин выдаст ссылку покупателю частями."
+            )
+        elif target == "warehouse":
             dest = (
                 "Ссылки попадут на <b>локальный склад</b> (уже купленные).\n"
                 "Потом выложите на FunPay режимом <b>📦 Со склада → лот</b>."
@@ -1198,10 +1268,11 @@ class Plugin:
         else:
             dest = "Ссылки сразу выложатся на <b>автовыдачу лота FunPay</b>."
         return (
-            "📥 <b>Загрузка закупки</b>\n\n"
+            "📥 <b>Загрузка ссылок</b>\n\n"
             f"{dest}\n\n"
-            "Вставьте <b>Purchase History</b> (частями или файлом <code>.txt</code>).\n"
-            "Бот найдёт ссылки активации Google.\n\n"
+            "Вставьте ссылки <code>one.google.com/activate-plan/…</code> "
+            "(по одной на строку) или <b>Purchase History</b>.\n"
+            "Можно файлом <code>.txt</code>.\n\n"
             "<code>/done</code> — разобрать | <code>/cancel</code> — отмена"
         )
 
@@ -1218,15 +1289,24 @@ class Plugin:
         key = (chat_id, user_id)
         raw = self._import_buffers.get(key, "")
         all_items = parse_shop_purchase_history(raw)
+        if not all_items:
+            urls = extract_activation_urls(raw)
+            all_items = [{"order_id": "", "product": "", "url": u} for u in urls]
         fresh, skipped = self._filter_new_import_items(all_items)
         skipped += skipped_dup
         self._import_buffers.pop(key, None)
         if not fresh:
+            hint = (
+                "Вставьте ссылки <code>one.google.com/activate-plan/…</code> "
+                "(по одной на строку)"
+                if target == "gemini_archive"
+                else "Проверьте формат: блоки <code>Order #…</code> и строка <code>Data: https://…</code>"
+            )
             bot.send_message(
                 chat_id,
                 f"❌ Ссылки не найдены"
                 f"{f' (дублей: {skipped})' if skipped else ''}.\n"
-                "Проверьте формат: блоки <code>Order #…</code> и строка <code>Data: https://…</code>",
+                f"{hint}",
                 parse_mode="HTML",
             )
             return
@@ -1250,6 +1330,20 @@ class Plugin:
             if not items:
                 if bot:
                     bot.send_message(chat_id, "❌ Нет данных. Загрузите закупку заново.")
+                return
+
+            if target == "gemini_archive":
+                urls = [str(it.get("url", "")) for it in items]
+                added, skipped_dup = self.add_urls_to_gemini_archive(urls)
+                self._mark_imported_orders(items)
+                msg = (
+                    f"✅ <b>В архив Gemini:</b> +<b>{added}</b> ссылок"
+                    f"{f' (дублей: {skipped_dup})' if skipped_dup else ''}\n"
+                    f"🗄 Всего в архиве: <b>{self.gemini_archive_count()}</b>\n"
+                    f"📋 Лотов с меткой: <b>{self.count_gemini_link_lots()}</b>"
+                )
+                if bot:
+                    bot.send_message(chat_id, msg, parse_mode="HTML")
                 return
 
             if target == "warehouse":
@@ -1330,10 +1424,10 @@ class Plugin:
         self._import_target.pop(chat_id, None)
 
     def stock_mode(self) -> str:
-        mode = str(self.get_cfg("stock_mode", "stocked") or "stocked")
+        mode = str(self.get_cfg("stock_mode", "auto_buy") or "auto_buy")
         if mode in _LEGACY_STOCK_MODES:
-            return "stocked"
-        return mode if mode in STOCK_MODES else "stocked"
+            return "gemini_links"
+        return mode if mode in STOCK_MODES else "auto_buy"
 
     def _autobuy_allowed_quick(self) -> tuple[bool, str]:
         if not str(self.get_cfg("supplier_api_key", "")).strip():
@@ -1409,6 +1503,284 @@ class Plugin:
         if added:
             self._save_warehouse(wh)
         return added, skipped
+
+    # ── Gemini link archive + выдача по заказу ────────────────────────────────
+
+    def _load_gemini_archive(self) -> list[dict[str, str]]:
+        os.makedirs(os.path.dirname(GEMINI_ARCHIVE_FILE), exist_ok=True)
+        try:
+            if os.path.exists(GEMINI_ARCHIVE_FILE):
+                with open(GEMINI_ARCHIVE_FILE, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, list):
+                    return [x for x in data if isinstance(x, dict) and x.get("url")]
+        except Exception as exc:
+            self.log("gemini archive load: %s", exc)
+        return []
+
+    def _save_gemini_archive(self, items: list[dict[str, str]]) -> None:
+        os.makedirs(os.path.dirname(GEMINI_ARCHIVE_FILE), exist_ok=True)
+        with open(GEMINI_ARCHIVE_FILE, "w", encoding="utf-8") as f:
+            json.dump(items, f, ensure_ascii=False, indent=2)
+
+    def gemini_archive_count(self) -> int:
+        return len(self._load_gemini_archive())
+
+    def add_urls_to_gemini_archive(self, urls: list[str]) -> tuple[int, int]:
+        archive = self._load_gemini_archive()
+        known = {str(x.get("url", "")) for x in archive}
+        added = 0
+        skipped = 0
+        for raw in urls:
+            url = _normalize_activation_url(raw)
+            if not url or not url.startswith("http"):
+                skipped += 1
+                continue
+            if url in known:
+                skipped += 1
+                continue
+            archive.append({
+                "url": url,
+                "added_at": datetime.now().isoformat(timespec="seconds"),
+            })
+            known.add(url)
+            added += 1
+        if added:
+            self._save_gemini_archive(archive)
+        return added, skipped
+
+    def take_urls_from_gemini_archive(self, count: int) -> list[str]:
+        count = max(0, int(count))
+        if count <= 0:
+            return []
+        with self._lock:
+            archive = self._load_gemini_archive()
+            taken = archive[:count]
+            rest = archive[count:]
+            if taken:
+                self._save_gemini_archive(rest)
+            return [str(x.get("url", "")) for x in taken if x.get("url")]
+
+    def return_urls_to_gemini_archive(self, urls: list[str]) -> None:
+        urls = [_normalize_activation_url(u) for u in urls if u]
+        if not urls:
+            return
+        with self._lock:
+            archive = self._load_gemini_archive()
+            known = {str(x.get("url", "")) for x in archive}
+            for url in reversed(urls):
+                if url and url not in known:
+                    archive.insert(0, {
+                        "url": url,
+                        "added_at": datetime.now().isoformat(timespec="seconds"),
+                    })
+                    known.add(url)
+            self._save_gemini_archive(archive)
+
+    def _load_gemini_deliveries(self) -> dict[str, Any]:
+        os.makedirs(os.path.dirname(GEMINI_DELIVERY_FILE), exist_ok=True)
+        try:
+            if os.path.exists(GEMINI_DELIVERY_FILE):
+                with open(GEMINI_DELIVERY_FILE, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, dict):
+                    return data
+        except Exception:
+            pass
+        return {}
+
+    def _save_gemini_deliveries(self, data: dict[str, Any]) -> None:
+        os.makedirs(os.path.dirname(GEMINI_DELIVERY_FILE), exist_ok=True)
+        with open(GEMINI_DELIVERY_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+
+    def _is_gemini_order_delivered(self, order_id: str | int) -> bool:
+        return str(order_id) in self._load_gemini_deliveries()
+
+    def _mark_gemini_order_delivered(self, order_id: str | int, buyer: str, urls: list[str]) -> None:
+        data = self._load_gemini_deliveries()
+        data[str(order_id)] = {
+            "buyer": buyer,
+            "urls": urls,
+            "time": datetime.now().isoformat(timespec="seconds"),
+        }
+        trimmed = dict(list(data.items())[-500:])
+        self._save_gemini_deliveries(trimmed)
+
+    def _gemini_lot_match(self) -> str:
+        return str(self.get_cfg("gemini_lot_match", DEFAULT_GEMINI_LOT_MATCH)).strip()
+
+    def find_gemini_link_lot_ids(self, *, fast: bool = False) -> list[int]:
+        return self._find_lots_by_detailed_desc(self._gemini_lot_match(), fast=fast)
+
+    def count_gemini_link_lots(self, *, fast: bool = False) -> int:
+        return len(self.find_gemini_link_lot_ids(fast=fast))
+
+    def _order_text_blob(self, event: NewOrderEvent, full_order: Any = None) -> str:
+        chunks: list[str] = []
+        order = full_order or event.order
+        for attr in ("full_description", "description", "short_description", "title", "lot_params_text"):
+            val = getattr(order, attr, None)
+            if val:
+                chunks.append(str(val))
+        if not chunks:
+            chunks.append(str(getattr(event.order, "description", "") or ""))
+        subcat = getattr(order, "subcategory", None)
+        if subcat:
+            for attr in ("fullname", "name"):
+                val = getattr(subcat, attr, None)
+                if val:
+                    chunks.append(str(val))
+        return "\n".join(chunks)
+
+    def _order_matches_gemini_link(self, event: NewOrderEvent, full_order: Any = None) -> bool:
+        needle = self._gemini_lot_match()
+        if not needle:
+            return False
+        blob = self._order_text_blob(event, full_order)
+        if _lot_text_matches(blob, needle):
+            return True
+        lot_id = getattr(full_order or event.order, "lot_id", None)
+        if lot_id:
+            try:
+                detail = self._lot_detailed_description(int(lot_id))
+                if _lot_text_matches(detail, needle):
+                    return True
+            except (TypeError, ValueError):
+                pass
+        return False
+
+    def _fp_send(self, chat_id: Any, text: str, buyer: str) -> None:
+        if not chat_id:
+            raise ValueError("chat_id пуст")
+        self.cardinal.send_message(int(chat_id), text, buyer)
+
+    def _deliver_link_in_parts(self, chat_id: Any, buyer: str, url: str, parts: int) -> None:
+        chunks = split_link_parts(url, parts)
+        total = len(chunks)
+        for idx, chunk in enumerate(chunks, 1):
+            msg = f"🔗 Часть {idx}/{total} ссылки активации Gemini:\n\n{chunk}"
+            if idx == total:
+                msg += (
+                    "\n\nСоберите все части в одну ссылку и откройте в браузере."
+                    "\nЕсли ссылка не работает — позовите продавца."
+                )
+            self._fp_send(chat_id, msg, buyer)
+            if idx < total:
+                time.sleep(LINK_PART_DELAY)
+
+    def _deliver_single_gemini_link(self, chat_id: Any, buyer: str, url: str) -> bool:
+        parts = max(2, int(self.get_cfg("gemini_delivery_parts", DEFAULT_DELIVERY_PARTS)))
+        redelivery_parts = max(parts + 1, int(self.get_cfg("gemini_redelivery_parts", DEFAULT_REDELIVERY_PARTS)))
+        try:
+            self._deliver_link_in_parts(chat_id, buyer, url, parts)
+            return True
+        except Exception as exc:
+            self.log("выдача %s частями не удалась: %s — перевыдача", parts, exc)
+            try:
+                self._fp_send(
+                    chat_id,
+                    "🔄 Перевыдача — отправляю ту же ссылку другими частями:",
+                    buyer,
+                )
+                time.sleep(0.6)
+                self._deliver_link_in_parts(chat_id, buyer, url, redelivery_parts)
+                return True
+            except Exception as exc2:
+                self.log("перевыдача %s частями не удалась: %s", redelivery_parts, exc2)
+                return False
+
+    def handle_new_order(self, event: NewOrderEvent) -> None:
+        if self.stock_mode() != "gemini_links":
+            return
+        order_id = str(event.order.id)
+        if self._is_gemini_order_delivered(order_id):
+            self.log("заказ #%s уже обработан", order_id)
+            return
+        full_order = None
+        try:
+            full_order = self.cardinal.account.get_order(order_id)
+        except Exception as exc:
+            self.log("get_order #%s: %s", order_id, exc)
+        if not self._order_matches_gemini_link(event, full_order):
+            return
+        buyer = str(getattr(event.order, "buyer_username", "") or "")
+        qty = max(1, int(getattr(event.order, "amount", 1) or 1))
+        lot_count = self.count_gemini_link_lots()
+        self.log(
+            "новый заказ #%s buyer=%s qty=%s | лотов с %r: %s | архив: %s",
+            order_id, buyer, qty, self._gemini_lot_match(), lot_count, self.gemini_archive_count(),
+        )
+        chat_id = getattr(event.order, "chat_id", None)
+        if not chat_id and buyer:
+            try:
+                chat = self.cardinal.account.get_chat_by_name(buyer, True)
+                chat_id = chat.id if chat else None
+            except Exception as exc:
+                self.log("chat lookup %s: %s", buyer, exc)
+        if not chat_id:
+            self.log("заказ #%s: не найден chat_id", order_id)
+            return
+        urls = self.take_urls_from_gemini_archive(qty)
+        if len(urls) < qty:
+            self.return_urls_to_gemini_archive(urls)
+            try:
+                self._fp_send(
+                    chat_id,
+                    f"⚠️ Недостаточно ссылок в архиве ({len(urls)}/{qty}). "
+                    f"Позовите продавца — он выдаст вручную.",
+                    buyer,
+                )
+            except Exception:
+                pass
+            return
+        delivered: list[str] = []
+        failed: list[str] = []
+        for url in urls:
+            if self._deliver_single_gemini_link(chat_id, buyer, url):
+                delivered.append(url)
+            else:
+                failed.append(url)
+        if failed:
+            self.return_urls_to_gemini_archive(failed)
+        if delivered:
+            self._mark_gemini_order_delivered(order_id, buyer, delivered)
+            self.log("заказ #%s: выдано %s ссылок", order_id, len(delivered))
+        elif failed:
+            try:
+                self._fp_send(
+                    chat_id,
+                    "⚠️ Не удалось отправить ссылку автоматически. Позовите продавца.",
+                    buyer,
+                )
+            except Exception:
+                pass
+
+    def notify_gemini_status(self, chat_id: int) -> None:
+        bot = self.cardinal.telegram.bot if self.cardinal.telegram else None
+        if not bot:
+            return
+        try:
+            match = self._gemini_lot_match()
+            lot_ids = self.find_gemini_link_lot_ids()
+            lines = [
+                f"📊 <b>Gemini Link</b> — <code>{_escape(match)}</code>",
+                f"📋 <b>Лотов на FunPay:</b> <b>{len(lot_ids)}</b>",
+                f"🗄 <b>Архив ссылок:</b> <b>{self.gemini_archive_count()}</b> шт.",
+                f"<b>Режим:</b> {self.stock_mode_label()}",
+            ]
+            for lot_id in lot_ids[:15]:
+                detail = self._lot_detailed_description(lot_id)[:80].replace("\n", " ")
+                lines.append(f"• Лот <b>#{lot_id}</b>: <code>{_escape(detail)}…</code>")
+            if len(lot_ids) > 15:
+                lines.append(f"<i>…и ещё {len(lot_ids) - 15} лотов</i>")
+            if not lot_ids:
+                lines.append(
+                    f"\n⚠️ Добавьте <code>{_escape(match)}</code> в <b>подробное описание</b> лота."
+                )
+            bot.send_message(chat_id, "\n".join(lines), parse_mode="HTML")
+        except Exception as exc:
+            bot.send_message(chat_id, f"❌ {_escape(exc)}", parse_mode="HTML")
 
     def release_warehouse_to_lot(self, notify_chat_id: int | None, count: int | None = None) -> None:
         if self._import_running:
@@ -1550,10 +1922,12 @@ class Plugin:
             if instant:
                 lines += [
                     f"<b>Режим:</b> {self.stock_mode_label(mode)}",
-                    f"📦 <b>Лот FunPay:</b> {self._lot_hint_instant()}",
-                    f"🗄 <b>Склад плагина:</b> {self.warehouse_count()} шт.",
                 ]
                 if mode == "auto_buy":
+                    lines += [
+                        f"📦 <b>Лот FunPay:</b> {self._lot_hint_instant()}",
+                        f"🗄 <b>Склад плагина:</b> {self.warehouse_count()} шт.",
+                    ]
                     auto_on = bool(self.get_cfg("auto_enabled", True))
                     min_stock = int(self.get_cfg("min_lot_stock", DEFAULT_MIN_LOT_STOCK))
                     lines += [
@@ -1571,16 +1945,44 @@ class Plugin:
                         "<i>⏳ Загрузка баланса и лота…</i>",
                     ]
                 else:
-                    lines.append(f"📤 <b>Выложить со склада:</b> {wh_qty} шт. за раз")
+                    match = self._gemini_lot_match()
+                    lines += [
+                        f"📋 <b>Лотов с</b> <code>{_escape(match)}</code>: …",
+                        f"🗄 <b>Архив ссылок:</b> {self.gemini_archive_count()} шт.",
+                        f"📤 <b>Выдача:</b> {int(self.get_cfg('gemini_delivery_parts', DEFAULT_DELIVERY_PARTS))} части",
+                        "<i>⏳ Сканирование лотов…</i>",
+                    ]
+                return "\n".join(lines)
+
+            if mode == "gemini_links":
+                match = self._gemini_lot_match()
+                lot_ids = self.find_gemini_link_lot_ids(fast=fast)
+                lines += [
+                    f"<b>Режим:</b> {self.stock_mode_label(mode)}",
+                    f"📋 <b>Лотов с</b> <code>{_escape(match)}</code>: <b>{len(lot_ids)}</b>",
+                    f"🗄 <b>Архив ссылок:</b> {self.gemini_archive_count()} шт.",
+                    f"📤 <b>Выдача:</b> {int(self.get_cfg('gemini_delivery_parts', DEFAULT_DELIVERY_PARTS))} части "
+                    f"(перевыдача: {int(self.get_cfg('gemini_redelivery_parts', DEFAULT_REDELIVERY_PARTS))})",
+                ]
+                if lot_ids:
+                    lines.append(f"🎯 Лот: <b>#{lot_ids[0]}</b>" + (f" (+{len(lot_ids)-1})" if len(lot_ids) > 1 else ""))
+                else:
+                    lines.append(
+                        f"⚠️ Добавьте <code>{_escape(match)}</code> в <b>подробное описание</b> лота"
+                    )
+                if self._import_running:
+                    lines.append("⏳ <i>Загрузка в архив…</i>")
                 return "\n".join(lines)
 
             plan = self.calc_buy_plan(fast=fast, timeout=UI_API_TIMEOUT)
             lines += [
                 f"<b>Режим:</b> {self.stock_mode_label(mode)}",
-                f"📦 <b>Лот FunPay:</b> {self._lot_stock_info(fast=fast)}",
-                f"🗄 <b>Склад плагина:</b> {self.warehouse_count()} шт.",
             ]
             if mode == "auto_buy":
+                lines += [
+                    f"📦 <b>Лот FunPay:</b> {self._lot_stock_info(fast=fast)}",
+                    f"🗄 <b>Склад плагина:</b> {self.warehouse_count()} шт.",
+                ]
                 auto_on = bool(self.get_cfg("auto_enabled", True))
                 min_stock = int(self.get_cfg("min_lot_stock", DEFAULT_MIN_LOT_STOCK))
                 lot_ids = self._resolve_autobuy_lot_ids(silent=True, fast=fast)
@@ -1608,12 +2010,10 @@ class Plugin:
                 last = str(self.get_cfg("last_auto_at", "") or "")
                 if last:
                     lines.append(f"🕐 <i>Последняя закупка: {last}</i>")
-            else:
-                lines.append(f"📤 <b>Выложить со склада:</b> {wh_qty} шт. за раз")
             if self._autobuy_running:
                 lines.append("⏳ <i>Закупка…</i>")
             if self._import_running:
-                lines.append("⏳ <i>Выкладка…</i>")
+                lines.append("⏳ <i>Загрузка…</i>")
             return "\n".join(lines)
 
         title = pages[page]["title"]
@@ -1623,19 +2023,38 @@ class Plugin:
             lines.append(self._format_setting_line(field, val))
         if page == "settings":
             if instant:
+                if self.stock_mode() == "gemini_links":
+                    match = self._gemini_lot_match()
+                    lines.append(
+                        f"🔎 Лот ищется по тексту <code>{_escape(match)}</code> "
+                        f"только в <b>подробном описании</b>"
+                    )
+                    lines.append(f"🗄 <b>Архив:</b> {self.gemini_archive_count()} ссылок")
+                    lines.append("<i>⏳ Сканирование лотов…</i>")
+                else:
+                    lines.append(
+                        f"🔎 Лот ищется по тексту <code>{_escape(DEFAULT_LOT_MATCH)}</code> "
+                        f"только в <b>подробном описании</b>"
+                    )
+                    lines.append("<i>⏳ Загрузка остатков лота…</i>")
+                return "\n".join(lines)
+            if self.stock_mode() == "gemini_links":
+                match = self._gemini_lot_match()
+                lot_ids = self.find_gemini_link_lot_ids(fast=fast)
+                lines.append(f"\n📋 <b>Лотов с</b> <code>{_escape(match)}</code>: <b>{len(lot_ids)}</b>")
+                lines.append(f"🗄 <b>Архив ссылок:</b> {self.gemini_archive_count()} шт.")
+                lines.append(
+                    f"📤 <b>Выдача:</b> {int(self.get_cfg('gemini_delivery_parts', DEFAULT_DELIVERY_PARTS))} части "
+                    f"(перевыдача: {int(self.get_cfg('gemini_redelivery_parts', DEFAULT_REDELIVERY_PARTS))})"
+                )
+            else:
+                lines.append(f"\n📦 <b>На лоте:</b> {self._lot_stock_info(fast=True)}")
+                lines.append(f"🛍 Товар: <code>{_escape(SHOP_PRODUCT_NAME)}</code>")
+                lines.append(f"📋 Формат автовыдачи: <code>почта|пароль|2FA</code>")
                 lines.append(
                     f"🔎 Лот ищется по тексту <code>{_escape(DEFAULT_LOT_MATCH)}</code> "
-                    f"только в <b>подробном описании</b>"
+                    f"только в <b>подробном описании</b> лота (не в названии)"
                 )
-                lines.append("<i>⏳ Загрузка остатков лота…</i>")
-                return "\n".join(lines)
-            lines.append(f"\n📦 <b>На лоте:</b> {self._lot_stock_info(fast=True)}")
-            lines.append(f"🛍 Товар: <code>{_escape(SHOP_PRODUCT_NAME)}</code>")
-            lines.append(f"📋 Формат автовыдачи: <code>почта|пароль|2FA</code>")
-            lines.append(
-                f"🔎 Лот ищется по тексту <code>{_escape(DEFAULT_LOT_MATCH)}</code> "
-                f"только в <b>подробном описании</b> лота (не в названии)"
-            )
         return "\n".join(lines)
 
     def build_settings_keyboard(self, page: str = "hub", fast: bool = False, instant: bool = False) -> IKM:
@@ -1646,12 +2065,12 @@ class Plugin:
             mode = self.stock_mode()
             kb.row(
                 IKB(
-                    f"{'• ' if mode == 'auto_buy' else ''}🤖 Автозакупка",
+                    f"{'• ' if mode == 'auto_buy' else ''}🤖 ChatGPT",
                     callback_data=f"{CB_PREFIX}:mode:auto_buy",
                 ),
                 IKB(
-                    f"{'• ' if mode == 'stocked' else ''}📦 Купленные",
-                    callback_data=f"{CB_PREFIX}:mode:stocked",
+                    f"{'• ' if mode == 'gemini_links' else ''}🔗 Gemini",
+                    callback_data=f"{CB_PREFIX}:mode:gemini_links",
                 ),
             )
             if mode == "auto_buy":
@@ -1683,15 +2102,12 @@ class Plugin:
                     ))
                 kb.row(IKB("⚙️ Настройки", callback_data=f"{CB_PREFIX}:nav:settings"))
             else:
-                wh_qty = int(self.get_cfg("warehouse_release_qty", 5) or 0)
-                kb.row(IKB("📥 Загрузить Purchase History", callback_data=f"{CB_PREFIX}:act:start_import:warehouse"))
-                if wh_qty > 0:
-                    kb.row(IKB(
-                        f"📤 Выложить {wh_qty} шт → FunPay",
-                        callback_data=f"{CB_PREFIX}:act:release_warehouse",
-                    ))
+                kb.row(IKB(
+                    "📥 Загрузить ссылки в архив",
+                    callback_data=f"{CB_PREFIX}:act:start_import:gemini_archive",
+                ))
                 kb.row(IKB("⚙️ Настройки", callback_data=f"{CB_PREFIX}:nav:settings"))
-            kb.row(IKB("📊 Остатки", callback_data=f"{CB_PREFIX}:act:stock_status"))
+            kb.row(IKB("📊 Статус", callback_data=f"{CB_PREFIX}:act:stock_status"))
         else:
             fields = self._fields_for_page(page)
             for i, field in enumerate(fields):
@@ -1714,7 +2130,7 @@ class Plugin:
                     f"✏️ {label[:22]}: {disp or '—'}",
                     callback_data=f"{CB_PREFIX}:edit:{page}:{i}",
                 ))
-            if page == "settings":
+            if page == "settings" and self.stock_mode() == "auto_buy":
                 plan = (
                     {"ok": False}
                     if instant
@@ -1796,9 +2212,15 @@ class Plugin:
             threading.Thread(target=self.notify_stock_status, args=(chat_id,), daemon=True).start()
             return True
         if action == "start_import":
-            target = arg if arg in ("lot", "warehouse") else "warehouse"
-            if self.stock_mode() == "stocked":
+            mode = self.stock_mode()
+            if arg in ("lot", "warehouse", "gemini_archive"):
+                target = arg
+            elif mode == "gemini_links":
+                target = "gemini_archive"
+            elif mode == "auto_buy":
                 target = "warehouse"
+            else:
+                target = "lot"
             bot.answer_callback_query(call.id)
             prompt = self.start_import_mode(chat_id, call.from_user.id, target)
             bot.send_message(chat_id, prompt, parse_mode="HTML")
@@ -1857,24 +2279,38 @@ class Plugin:
         def refresh_settings_ui(chat_id: int, msg_id: int, page: str = "hub") -> None:
             try:
                 if page == "hub":
-                    lot_box: list[Any] = [None]
-                    plan_box: list[Any] = [None]
+                    if plugin.stock_mode() == "gemini_links":
+                        lot_box: list[Any] = [None]
 
-                    def _fetch_lot() -> None:
-                        lot_box[0] = plugin._resolve_autobuy_lot_ids(silent=True, fast=False)
+                        def _fetch_gemini_lots() -> None:
+                            lot_box[0] = plugin.find_gemini_link_lot_ids(fast=False)
 
-                    def _fetch_plan() -> None:
-                        plan_box[0] = plugin.calc_buy_plan(timeout=UI_API_TIMEOUT)
+                        t_lot = threading.Thread(target=_fetch_gemini_lots, daemon=True)
+                        t_lot.start()
+                        lot_timeout = max(UI_API_TIMEOUT + 2, len(plugin._iter_profile_lot_ids()) * 0.35 + 5)
+                        t_lot.join(timeout=lot_timeout)
+                    else:
+                        lot_box: list[Any] = [None]
+                        plan_box: list[Any] = [None]
 
-                    t_lot = threading.Thread(target=_fetch_lot, daemon=True)
-                    t_plan = threading.Thread(target=_fetch_plan, daemon=True)
-                    t_lot.start()
-                    t_plan.start()
-                    lot_timeout = max(UI_API_TIMEOUT + 2, len(plugin._iter_profile_lot_ids()) * 0.35 + 5)
-                    t_lot.join(timeout=lot_timeout)
-                    t_plan.join(timeout=UI_API_TIMEOUT + 2)
+                        def _fetch_lot() -> None:
+                            lot_box[0] = plugin._resolve_autobuy_lot_ids(silent=True, fast=False)
+
+                        def _fetch_plan() -> None:
+                            plan_box[0] = plugin.calc_buy_plan(timeout=UI_API_TIMEOUT)
+
+                        t_lot = threading.Thread(target=_fetch_lot, daemon=True)
+                        t_plan = threading.Thread(target=_fetch_plan, daemon=True)
+                        t_lot.start()
+                        t_plan.start()
+                        lot_timeout = max(UI_API_TIMEOUT + 2, len(plugin._iter_profile_lot_ids()) * 0.35 + 5)
+                        t_lot.join(timeout=lot_timeout)
+                        t_plan.join(timeout=UI_API_TIMEOUT + 2)
                 elif page == "settings":
-                    plugin._lot_stock_info(fast=True)
+                    if plugin.stock_mode() == "gemini_links":
+                        plugin.find_gemini_link_lot_ids(fast=False)
+                    else:
+                        plugin._lot_stock_info(fast=True)
                 show_settings(chat_id, msg_id, page, fast=False, instant=False)
             except Exception as exc:
                 plugin.log("refresh UI error: %s", exc)
@@ -1982,9 +2418,14 @@ class Plugin:
                         ).start()
                 return
             if action == "mode" and len(parts) >= 3:
-                plugin.set_cfg("stock_mode", parts[2])
+                new_mode = parts[2]
+                if new_mode in _LEGACY_STOCK_MODES:
+                    new_mode = "gemini_links"
+                plugin.set_cfg("stock_mode", new_mode)
+                if new_mode == "auto_buy":
+                    plugin.start_auto_worker()
                 try:
-                    bot.answer_callback_query(call.id, plugin.stock_mode_label(parts[2])[:180])
+                    bot.answer_callback_query(call.id, plugin.stock_mode_label(new_mode)[:180])
                 except Exception:
                     pass
                 threading.Thread(
@@ -2052,7 +2493,7 @@ class Plugin:
             state = str((state_data or {}).get("state", ""))
             if not state.startswith(f"{CB_PREFIX}:import:wait"):
                 return
-            target = "warehouse" if state.endswith(":warehouse") else "lot"
+            target = _import_target_from_state(state)
             chat_id = message.chat.id
             uid = message.from_user.id
             plugin._import_target[chat_id] = target
@@ -2080,7 +2521,7 @@ class Plugin:
             state = str((state_data or {}).get("state", ""))
             if not state.startswith(f"{CB_PREFIX}:import:wait"):
                 return
-            target = "warehouse" if state.endswith(":warehouse") else "lot"
+            target = _import_target_from_state(state)
             doc = message.document
             if not doc:
                 return
@@ -2233,12 +2674,30 @@ class Plugin:
 #  FunPay Cardinal bindings
 # ═════════════════════════════════════════════════════════════════════════════
 
+def bind_to_new_order(cardinal: Cardinal, event: NewOrderEvent) -> None:
+    if _plugin is None:
+        return
+    try:
+        threading.Thread(
+            target=_plugin.handle_new_order,
+            args=(event,),
+            daemon=True,
+            name=f"GeminiLinkOrder-{event.order.id}",
+        ).start()
+    except Exception as exc:
+        logger.error("%s bind_to_new_order: %s", _P, exc)
+        logger.debug(traceback.format_exc())
+
+
 def init_plugin(cardinal: Cardinal) -> None:
     global _plugin
     _plugin = Plugin(cardinal)
     _plugin.setup_telegram()
-    _plugin.start_auto_worker()
-    logger.info("%s v%s загружен (авто-режим)", _P, VERSION)
+    if _plugin.stock_mode() == "auto_buy":
+        _plugin.start_auto_worker()
+    mode = _plugin.stock_mode_label()
+    logger.info("%s v%s загружен (%s)", _P, VERSION, mode)
 
 
 BIND_TO_PRE_INIT = [init_plugin]
+BIND_TO_NEW_ORDER = [bind_to_new_order]
