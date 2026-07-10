@@ -13,6 +13,7 @@ import threading
 import time
 import traceback
 from datetime import datetime
+from types import SimpleNamespace
 from typing import Any, Final
 
 from cardinal import Cardinal
@@ -46,7 +47,7 @@ except ImportError:
 
 
 NAME          = "Gemini Link Auto"
-VERSION       = "3.1.1"
+VERSION       = "3.1.2"
 DESCRIPTION   = "ChatGPT автозакупка + выдача Gemini-ссылок из архива"
 CREDITS       = "Cursor AI"
 UUID          = "f7a2e8c1-4b3d-4e9f-a8c2-1d5e9b0f6a3c"
@@ -468,6 +469,33 @@ def _lot_text_matches(text: str, needle: str) -> bool:
     if not text or not needle:
         return False
     return needle.strip().casefold() in _normalize_search_text(text)
+
+
+def _normalize_lot_desc_key(text: str) -> str:
+    """Ключ для сопоставления заказа с лотом (без emoji / fancy unicode)."""
+    s = _normalize_search_text(text)
+    s = re.sub(r"[^\w\s]", " ", s, flags=re.UNICODE)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def _desc_contains_lot_key(order_desc: str, lot_key: str) -> bool:
+    if not order_desc or not lot_key:
+        return False
+    if lot_key in order_desc:
+        return True
+    norm_order = _normalize_lot_desc_key(order_desc)
+    norm_key = _normalize_lot_desc_key(lot_key)
+    if not norm_key or len(norm_key) < 8:
+        return False
+    return norm_key in norm_order
+
+
+def _order_looks_like_gemini_activation(order_text: str) -> bool:
+    blob = _normalize_lot_desc_key(order_text)
+    if "gemini" not in blob:
+        return False
+    markers = ("активац", "ссылк", "activate", "activation", "link")
+    return any(m in blob for m in markers)
 
 
 def _normalize_activation_url(url: str) -> str:
@@ -1902,6 +1930,8 @@ class Plugin:
         desc = (desc or "").strip()
         if not desc or not profile:
             return None
+        best_id: int | None = None
+        best_len = 0
         try:
             for lots_map in profile.get_sorted_lots(2).values():
                 lots = sorted(
@@ -1911,10 +1941,51 @@ class Plugin:
                 )
                 for lot in lots:
                     temp_desc = self._lot_temp_desc(lot)
-                    if temp_desc and temp_desc in desc:
-                        return int(lot.id)
+                    if not temp_desc:
+                        continue
+                    if temp_desc in desc or _desc_contains_lot_key(desc, temp_desc):
+                        key_len = len(_normalize_lot_desc_key(temp_desc))
+                        if key_len > best_len:
+                            best_len = key_len
+                            best_id = int(lot.id)
         except Exception as exc:
             logger.debug("%s match lot by desc: %s", _P, exc)
+        return best_id
+
+    def _match_gemini_lot_from_order_text(self, order_text: str) -> int | None:
+        order_text = (order_text or "").strip()
+        if not order_text:
+            return None
+        gemini_ids = self._gemini_lots_cached() or list(self._gemini_lots_cache)
+        if not gemini_ids:
+            gemini_ids = self._scan_gemini_lots()
+        if not gemini_ids:
+            return None
+        profile = self._ensure_profile()
+        best_id: int | None = None
+        best_len = 0
+        if profile:
+            try:
+                for lots_map in profile.get_sorted_lots(2).values():
+                    for lot in lots_map.values():
+                        try:
+                            lot_id = int(lot.id)
+                        except (TypeError, ValueError):
+                            continue
+                        if lot_id not in gemini_ids:
+                            continue
+                        temp_desc = self._lot_temp_desc(lot)
+                        if temp_desc and _desc_contains_lot_key(order_text, temp_desc):
+                            key_len = len(_normalize_lot_desc_key(temp_desc))
+                            if key_len > best_len:
+                                best_len = key_len
+                                best_id = lot_id
+            except Exception as exc:
+                logger.debug("%s match gemini lot text: %s", _P, exc)
+        if best_id:
+            return best_id
+        if len(gemini_ids) == 1 and _order_looks_like_gemini_activation(order_text):
+            return int(gemini_ids[0])
         return None
 
     def _resolve_order_lot_id(self, event: Any, full_order: Any = None) -> int | None:
@@ -1934,11 +2005,12 @@ class Plugin:
                 except (TypeError, ValueError):
                     pass
         order = full_order or getattr(event, "order", None)
+        order_text = self._order_text_blob(event, full_order) if event is not None else ""
+        if order is not None and not order_text:
+            order_text = str(getattr(order, "description", "") or "")
         cfg_lot = str(self.get_cfg("gemini_lot_id", "")).strip()
-        if cfg_lot.isdigit():
-            return int(cfg_lot)
         if order is None:
-            return None
+            return int(cfg_lot) if cfg_lot.isdigit() else None
         desc = str(getattr(order, "description", "") or "")
         profile = self._ensure_profile()
         if profile and desc:
@@ -1953,15 +2025,22 @@ class Plugin:
                     )
                     for lot in lots:
                         temp_desc = self._lot_temp_desc(lot)
-                        if temp_desc and temp_desc in desc:
+                        if temp_desc and (
+                            temp_desc in desc or _desc_contains_lot_key(desc, temp_desc)
+                        ):
                             return int(lot.id)
                 except Exception as exc:
                     logger.debug("%s resolve order lot subcat: %s", _P, exc)
             lot_id = self._match_lot_id_by_order_desc(desc, profile)
             if lot_id:
                 return lot_id
+        matched = self._match_gemini_lot_from_order_text(order_text or desc)
+        if matched:
+            return matched
+        if cfg_lot.isdigit():
+            return int(cfg_lot)
         cached = self._gemini_lots_cached() or list(self._gemini_lots_cache)
-        if len(cached) == 1 and "gemini" in desc.casefold():
+        if len(cached) == 1 and _order_looks_like_gemini_activation(order_text or desc):
             return int(cached[0])
         return None
 
@@ -1987,16 +2066,26 @@ class Plugin:
         if not needle:
             return False
         lot_id = self._resolve_order_lot_id(event, full_order)
+        order_id = getattr(getattr(event, "order", None), "id", "?")
+        if not lot_id:
+            order_text = self._order_text_blob(event, full_order)
+            if _order_looks_like_gemini_activation(order_text):
+                lot_id = self._match_gemini_lot_from_order_text(order_text)
         if not lot_id:
             self.log(
                 "заказ #%s: lot_id не найден (нужна метка %r в подробном описании лота)",
-                getattr(event.order, "id", "?"), needle,
+                order_id, needle,
             )
             return False
         if lot_id in self._gemini_lots_cache:
             return True
         detail = self._lot_detailed_description(lot_id)
         matched = _lot_text_matches(detail, needle)
+        if not matched and detail:
+            order_text = self._order_text_blob(event, full_order)
+            matched = _order_looks_like_gemini_activation(order_text) and lot_id in (
+                self._gemini_lots_cached() or self._scan_gemini_lots()
+            )
         if matched:
             if lot_id not in self._gemini_lots_cache:
                 self._gemini_lots_cache.append(lot_id)
@@ -2004,7 +2093,7 @@ class Plugin:
             return True
         self.log(
             "заказ #%s лот #%s: в подробном описании нет %r",
-            getattr(event.order, "id", "?"), lot_id, needle,
+            order_id, lot_id, needle,
         )
         return False
 
@@ -2048,6 +2137,97 @@ class Plugin:
                 self.log("перевыдача %s частями не удалась: %s", redelivery_parts, exc2)
                 return False
 
+    def deliver_gemini_order(
+        self,
+        order_id: str,
+        *,
+        event: NewOrderEvent | None = None,
+        full_order: Any = None,
+        force: bool = False,
+    ) -> tuple[bool, str]:
+        order_id = str(order_id).strip().lstrip("#")
+        if not order_id:
+            return False, "Не указан номер заказа"
+        mode = self.stock_mode()
+        if mode != "gemini_links":
+            return False, f"Режим {mode} — переключите на 🔗 Gemini"
+        if not force and self._is_gemini_order_delivered(order_id):
+            return False, f"Заказ #{order_id} уже выдан (добавьте force)"
+        if not self._gemini_lots_cached():
+            self._scan_gemini_lots()
+        if full_order is None:
+            try:
+                full_order = self.cardinal.account.get_order(order_id)
+            except Exception as exc:
+                return False, f"get_order #{order_id}: {exc}"
+        if event is None:
+            event = SimpleNamespace(
+                order=full_order,
+                lot_id=getattr(full_order, "lot_id", None),
+                lot_shortcut=getattr(full_order, "lot_shortcut", None),
+            )
+        lot_id = self._resolve_order_lot_id(event, full_order)
+        _boot_log(
+            f"DELIVER #{order_id} lot_id={lot_id} archive={self.gemini_archive_count()} force={force}"
+        )
+        if not self._order_matches_gemini_link(event, full_order):
+            return False, f"Заказ #{order_id} не Gemini-link лот (lot_id={lot_id})"
+        buyer = str(getattr(full_order, "buyer_username", "") or getattr(event.order, "buyer_username", "") or "")
+        qty = max(1, int(getattr(full_order, "amount", None) or getattr(event.order, "amount", 1) or 1))
+        chat_id = getattr(full_order, "chat_id", None) or getattr(event.order, "chat_id", None)
+        if not chat_id and buyer:
+            try:
+                chat = self.cardinal.account.get_chat_by_name(buyer, True)
+                chat_id = chat.id if chat else None
+            except Exception as exc:
+                self.log("chat lookup %s: %s", buyer, exc)
+        if not chat_id:
+            return False, f"Заказ #{order_id}: chat_id не найден"
+        try:
+            self._fp_send(
+                chat_id,
+                f"✅ Заказ #{order_id} оплачен.\nОтправляю ссылку активации Gemini…",
+                buyer,
+            )
+        except Exception as exc:
+            self.log("заказ #%s: приветствие: %s", order_id, exc)
+        urls = self.take_urls_from_gemini_archive(qty)
+        if len(urls) < qty:
+            self.return_urls_to_gemini_archive(urls)
+            try:
+                self._fp_send(
+                    chat_id,
+                    f"⚠️ Недостаточно ссылок в архиве ({len(urls)}/{qty}). "
+                    f"Позовите продавца — он выдаст вручную.",
+                    buyer,
+                )
+            except Exception:
+                pass
+            return False, f"Архив пуст ({len(urls)}/{qty} ссылок)"
+        delivered: list[str] = []
+        failed: list[str] = []
+        for url in urls:
+            if self._deliver_single_gemini_link(chat_id, buyer, url):
+                delivered.append(url)
+            else:
+                failed.append(url)
+        if failed:
+            self.return_urls_to_gemini_archive(failed)
+        if delivered:
+            self._mark_gemini_order_delivered(order_id, buyer, delivered)
+            self.log("заказ #%s: выдано %s ссылок (manual=%s)", order_id, len(delivered), force)
+            _boot_log(f"DELIVER #{order_id} OK delivered={len(delivered)}")
+            return True, f"✅ Заказ #{order_id}: выдано {len(delivered)} ссылок"
+        try:
+            self._fp_send(
+                chat_id,
+                "⚠️ Не удалось отправить ссылку автоматически. Позовите продавца.",
+                buyer,
+            )
+        except Exception:
+            pass
+        return False, f"Заказ #{order_id}: не удалось отправить ссылку в чат"
+
     def handle_new_order(self, event: NewOrderEvent) -> None:
         order_id = str(event.order.id)
         mode = self.stock_mode()
@@ -2070,69 +2250,24 @@ class Plugin:
             f"ORDER #{order_id} lot_id={lot_id} event.lot_id={getattr(event, 'lot_id', None)} "
             f"archive={self.gemini_archive_count()}"
         )
+        if not lot_id:
+            time.sleep(2.5)
+            try:
+                full_order = self.cardinal.account.get_order(order_id)
+            except Exception:
+                pass
+            lot_id = self._resolve_order_lot_id(event, full_order)
+            if lot_id:
+                _boot_log(f"ORDER #{order_id} lot_id retry={lot_id}")
         if not self._order_matches_gemini_link(event, full_order):
             _boot_log(f"ORDER #{order_id} skip: не gemini link лот")
             return
-        buyer = str(getattr(event.order, "buyer_username", "") or "")
-        qty = max(1, int(getattr(event.order, "amount", 1) or 1))
-        lot_id = self._resolve_order_lot_id(event, full_order)
-        self.log(
-            "новый заказ #%s buyer=%s qty=%s lot=#%s | архив: %s ссылок",
-            order_id, buyer, qty, lot_id or "?", self.gemini_archive_count(),
+        ok, msg = self.deliver_gemini_order(
+            order_id, event=event, full_order=full_order, force=False,
         )
-        chat_id = getattr(event.order, "chat_id", None)
-        if not chat_id and buyer:
-            try:
-                chat = self.cardinal.account.get_chat_by_name(buyer, True)
-                chat_id = chat.id if chat else None
-            except Exception as exc:
-                self.log("chat lookup %s: %s", buyer, exc)
-        if not chat_id:
-            self.log("заказ #%s: не найден chat_id", order_id)
-            return
-        try:
-            self._fp_send(
-                chat_id,
-                f"✅ Заказ #{order_id} оплачен.\nОтправляю ссылку активации Gemini…",
-                buyer,
-            )
-        except Exception as exc:
-            self.log("заказ #%s: не удалось отправить приветствие: %s", order_id, exc)
-        urls = self.take_urls_from_gemini_archive(qty)
-        if len(urls) < qty:
-            self.return_urls_to_gemini_archive(urls)
-            try:
-                self._fp_send(
-                    chat_id,
-                    f"⚠️ Недостаточно ссылок в архиве ({len(urls)}/{qty}). "
-                    f"Позовите продавца — он выдаст вручную.",
-                    buyer,
-                )
-            except Exception:
-                pass
-            return
-        delivered: list[str] = []
-        failed: list[str] = []
-        for url in urls:
-            if self._deliver_single_gemini_link(chat_id, buyer, url):
-                delivered.append(url)
-            else:
-                failed.append(url)
-        if failed:
-            self.return_urls_to_gemini_archive(failed)
-        if delivered:
-            self._mark_gemini_order_delivered(order_id, buyer, delivered)
-            self.log("заказ #%s: выдано %s ссылок", order_id, len(delivered))
-            _boot_log(f"ORDER #{order_id} OK delivered={len(delivered)}")
-        elif failed:
-            try:
-                self._fp_send(
-                    chat_id,
-                    "⚠️ Не удалось отправить ссылку автоматически. Позовите продавца.",
-                    buyer,
-                )
-            except Exception:
-                pass
+        if not ok:
+            _boot_log(f"ORDER #{order_id} FAIL: {msg}")
+            self.log("%s", msg)
 
     def notify_gemini_status(self, chat_id: int) -> None:
         bot = self.cardinal.telegram.bot if self.cardinal.telegram else None
@@ -3009,6 +3144,30 @@ class Plugin:
         tg.msg_handler(send_panel, func=lambda m: _tg_matches(m, "gemini_link", "gl"))
         tg.msg_handler(send_stock_cmd, func=lambda m: _tg_matches(m, "gl_stock"))
 
+        def send_deliver_cmd(message: Message) -> None:
+            parts = (message.text or "").split()
+            if len(parts) < 2:
+                bot.reply_to(
+                    message,
+                    "Использование: <code>/gl_deliver NRWWY843</code>\n"
+                    "Повтор: <code>/gl_deliver NRWWY843 force</code>",
+                    parse_mode="HTML",
+                )
+                return
+            order_id = parts[1].strip().lstrip("#")
+            force = len(parts) > 2 and parts[2].casefold() in ("force", "f", "повтор")
+
+            def _run() -> None:
+                ok, msg = plugin.deliver_gemini_order(order_id, force=force)
+                try:
+                    bot.reply_to(message, msg, parse_mode="HTML")
+                except Exception:
+                    bot.reply_to(message, msg)
+
+            threading.Thread(target=_run, daemon=True, name=f"GlDeliver-{order_id}").start()
+
+        tg.msg_handler(send_deliver_cmd, func=lambda m: _tg_matches(m, "gl_deliver"))
+
         def send_debug(message: Message) -> None:
             bot = tg.bot
             lines = [
@@ -3033,12 +3192,13 @@ class Plugin:
             plugin.cardinal.add_telegram_commands(UUID, [
                 ("gemini_link", "панель Gemini Link Auto", True),
                 ("gl_stock", "склад Gemini Link", True),
+                ("gl_deliver", "выдать ссылку по номеру заказа", True),
                 ("gl_debug", "диагностика Gemini Link", True),
             ])
         except Exception as exc:
             plugin.log("add_telegram_commands: %s", exc)
 
-        self.log("Telegram UI зарегистрирован (/gemini_link, /gl_stock, /gl_debug)")
+        self.log("Telegram UI зарегистрирован (/gemini_link, /gl_stock, /gl_deliver, /gl_debug)")
 
 
 # ═════════════════════════════════════════════════════════════════════════════
