@@ -47,7 +47,7 @@ except ImportError:
 
 
 NAME          = "Gemini Link Auto"
-VERSION       = "3.2.4"
+VERSION       = "3.2.5"
 DESCRIPTION   = "ChatGPT автозакупка + выдача Gemini-ссылок из архива"
 CREDITS       = "Cursor AI"
 UUID          = "f7a2e8c1-4b3d-4e9f-a8c2-1d5e9b0f6a3c"
@@ -62,8 +62,8 @@ DEFAULT_LOT_MATCH: Final[str] = "GPT plus 1M (NW)"
 DEFAULT_MIN_LOT_STOCK: Final[int] = 3
 DEFAULT_AUTO_INTERVAL: Final[int] = 300
 DEFAULT_GEMINI_LOT_MATCH: Final[str] = "gemini link"
-DEFAULT_DELIVERY_PARTS: Final[int] = 4
-DEFAULT_REDELIVERY_PARTS: Final[int] = 5
+DEFAULT_DELIVERY_PARTS: Final[int] = 3
+DEFAULT_REDELIVERY_PARTS: Final[int] = 4
 LINK_PART_DELAY: Final[float] = 2.0
 CONFIRM_REMINDER_DELAY: Final[int] = 300
 DEFAULT_CONFIRM_REMINDER: Final[str] = (
@@ -729,6 +729,10 @@ class Plugin:
                 sm = str(loaded.get("stock_mode", "auto_buy"))
                 if sm in _LEGACY_STOCK_MODES:
                     loaded["stock_mode"] = "gemini_links" if sm in ("stocked", "warehouse", "import_lot") else "auto_buy"
+                if str(loaded.get("_cfg_version", "0")) < "3.2.5":
+                    loaded["gemini_delivery_parts"] = DEFAULT_DELIVERY_PARTS
+                    loaded["gemini_redelivery_parts"] = DEFAULT_REDELIVERY_PARTS
+                    loaded["_cfg_version"] = "3.2.5"
                 if str(loaded.get("_cfg_version", "0")) < "3.2.3":
                     if int(loaded.get("gemini_delivery_parts", DEFAULT_DELIVERY_PARTS)) == 3:
                         loaded["gemini_delivery_parts"] = DEFAULT_DELIVERY_PARTS
@@ -2391,11 +2395,11 @@ class Plugin:
         )
 
     def _deliver_single_gemini_link(self, chat_id: Any, buyer: str, url: str) -> tuple[bool, str]:
-        parts = max(2, int(self.get_cfg("gemini_delivery_parts", DEFAULT_DELIVERY_PARTS)))
-        redelivery_parts = max(parts + 1, int(self.get_cfg("gemini_redelivery_parts", DEFAULT_REDELIVERY_PARTS)))
-        plans = [parts]
-        if redelivery_parts != parts:
-            plans.append(redelivery_parts)
+        primary = max(2, int(self.get_cfg("gemini_delivery_parts", DEFAULT_DELIVERY_PARTS)))
+        fallback = max(2, int(self.get_cfg("gemini_redelivery_parts", DEFAULT_REDELIVERY_PARTS)))
+        if fallback <= primary:
+            fallback = primary + 1
+        plans = [primary] if fallback == primary else [primary, fallback]
         last_err = ""
         for attempt, n_parts in enumerate(plans):
             try:
@@ -2403,7 +2407,7 @@ class Plugin:
                     try:
                         self._fp_send(
                             chat_id,
-                            "Повторная отправка ссылки другими частями…",
+                            "Повторная отправка ссылки в 4 части…",
                             buyer,
                             watermark=False,
                         )
