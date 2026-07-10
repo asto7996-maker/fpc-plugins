@@ -47,7 +47,7 @@ except ImportError:
 
 
 NAME          = "Gemini Link Auto"
-VERSION       = "3.1.2"
+VERSION       = "3.1.3"
 DESCRIPTION   = "ChatGPT автозакупка + выдача Gemini-ссылок из архива"
 CREDITS       = "Cursor AI"
 UUID          = "f7a2e8c1-4b3d-4e9f-a8c2-1d5e9b0f6a3c"
@@ -67,6 +67,8 @@ DEFAULT_REDELIVERY_PARTS: Final[int] = 4
 LINK_PART_DELAY: Final[float] = 1.2
 LOT_CACHE_TTL: Final[int] = 600
 GEMINI_LOT_CACHE_TTL: Final[int] = 300
+GEMINI_LOT_SCAN_TIMEOUT: Final[float] = 8.0
+GEMINI_LOT_SCAN_MAX_API: Final[int] = 30
 PRODUCT_CACHE_TTL: Final[int] = 300
 UI_API_TIMEOUT: Final[float] = 5.0
 BUY_API_TIMEOUT: Final[float] = 60.0
@@ -591,6 +593,7 @@ class Plugin:
         self._gemini_lots_cache: list[int] = []
         self._gemini_lots_cache_ts: float = 0.0
         self._gemini_lots_scan_lock = threading.Lock()
+        self._gemini_lots_scan_running = False
         self.reload_settings()
 
     def open_settings_card(self, call: CallbackQuery) -> None:
@@ -635,12 +638,16 @@ class Plugin:
         try:
             if page == "hub":
                 if self.stock_mode() == "gemini_links":
-                    if not self._gemini_lots_cached():
-                        scan_t = threading.Thread(target=self._scan_gemini_lots, daemon=True)
-                        scan_t.start()
-                        scan_t.join(timeout=5)
-                    else:
-                        self.refresh_gemini_lots_async()
+                    self.refresh_gemini_lots_async()
+                    scan_t = threading.Thread(
+                        target=lambda: self._scan_gemini_lots(
+                            timeout=GEMINI_LOT_SCAN_TIMEOUT, blocking=True,
+                        ),
+                        daemon=True,
+                        name="GeminiLotScanUI",
+                    )
+                    scan_t.start()
+                    scan_t.join(timeout=GEMINI_LOT_SCAN_TIMEOUT + 1)
                 else:
                     lot_box: list[Any] = [None]
                     plan_box: list[Any] = [None]
@@ -660,13 +667,10 @@ class Plugin:
                     t_plan.join(timeout=UI_API_TIMEOUT + 2)
             elif page == "settings":
                 if self.stock_mode() == "gemini_links":
-                    if not self._gemini_lots_cached():
-                        self._scan_gemini_lots()
-                    else:
-                        self.refresh_gemini_lots_async()
+                    self.refresh_gemini_lots_async()
                 else:
                     self._lot_stock_info(fast=True)
-            text = self.render_settings_text(page, fast=False, instant=False)
+            text = self.render_settings_text(page, fast=True, instant=False)
             kb = self.build_settings_keyboard(page, fast=False, instant=False)
             try:
                 bot.edit_message_text(text, chat_id, msg_id, reply_markup=kb, parse_mode="HTML")
@@ -1883,26 +1887,61 @@ class Plugin:
             return list(self._gemini_lots_cache)
         return []
 
-    def _scan_gemini_lots(self) -> list[int]:
-        with self._gemini_lots_scan_lock:
+    def _scan_gemini_lots(self, *, timeout: float | None = None, blocking: bool = True) -> list[int]:
+        if not blocking:
+            if self._gemini_lots_scan_lock.acquire(blocking=False):
+                try:
+                    if self._gemini_lots_scan_running:
+                        return list(self._gemini_lots_cache)
+                finally:
+                    self._gemini_lots_scan_lock.release()
+            return list(self._gemini_lots_cache)
+
+        acquired = self._gemini_lots_scan_lock.acquire(blocking=blocking)
+        if not acquired:
+            return list(self._gemini_lots_cache)
+        try:
+            if self._gemini_lots_scan_running:
+                return list(self._gemini_lots_cache)
+            self._gemini_lots_scan_running = True
             needle = self._gemini_lot_match()
             lot_ids = self._iter_profile_lot_ids()
-            matched: list[int] = []
+            matched: list[int] = list(self._gemini_lots_cache)
+            known = set(matched)
+            deadline = time.time() + float(timeout or GEMINI_LOT_SCAN_TIMEOUT)
+            api_calls = 0
             for lot_id in lot_ids:
+                if time.time() >= deadline or api_calls >= GEMINI_LOT_SCAN_MAX_API:
+                    self.log(
+                        "скан gemini: таймаут (%s лот(ов), api=%s/%s)",
+                        len(matched), api_calls, GEMINI_LOT_SCAN_MAX_API,
+                    )
+                    break
+                if lot_id in known:
+                    continue
                 detail = self._lot_detailed_description(lot_id)
+                api_calls += 1
                 if _lot_text_matches(detail, needle):
                     matched.append(lot_id)
+                    known.add(lot_id)
             self._gemini_lots_cache = matched
             self._gemini_lots_cache_ts = time.time()
             self.log(
-                "скан gemini: %s лот(ов) с %r из %s",
-                len(matched), needle, len(lot_ids),
+                "скан gemini: %s лот(ов) с %r из %s (api=%s)",
+                len(matched), needle, len(lot_ids), api_calls,
             )
             return list(matched)
+        finally:
+            self._gemini_lots_scan_running = False
+            self._gemini_lots_scan_lock.release()
 
     def refresh_gemini_lots_async(self) -> None:
+        if self._gemini_lots_scan_running:
+            return
         threading.Thread(
-            target=self._scan_gemini_lots, daemon=True, name="GeminiLotScan",
+            target=lambda: self._scan_gemini_lots(timeout=GEMINI_LOT_SCAN_TIMEOUT, blocking=True),
+            daemon=True,
+            name="GeminiLotScan",
         ).start()
 
     def find_gemini_link_lot_ids(self, *, fast: bool = False) -> list[int]:
@@ -1912,7 +1951,9 @@ class Plugin:
         if cached:
             self.refresh_gemini_lots_async()
             return cached
-        return self._scan_gemini_lots()
+        if self._gemini_lots_scan_running:
+            return list(self._gemini_lots_cache)
+        return self._scan_gemini_lots(timeout=GEMINI_LOT_SCAN_TIMEOUT, blocking=True)
 
     def count_gemini_link_lots(self, *, fast: bool = False) -> int:
         return len(self.find_gemini_link_lot_ids(fast=fast))
@@ -1956,36 +1997,32 @@ class Plugin:
         order_text = (order_text or "").strip()
         if not order_text:
             return None
-        gemini_ids = self._gemini_lots_cached() or list(self._gemini_lots_cache)
-        if not gemini_ids:
-            gemini_ids = self._scan_gemini_lots()
-        if not gemini_ids:
-            return None
         profile = self._ensure_profile()
-        best_id: int | None = None
-        best_len = 0
         if profile:
+            lot_id = self._match_lot_id_by_order_desc(order_text, profile)
+            if lot_id:
+                return lot_id
+            best_id: int | None = None
+            best_len = 0
             try:
                 for lots_map in profile.get_sorted_lots(2).values():
                     for lot in lots_map.values():
-                        try:
-                            lot_id = int(lot.id)
-                        except (TypeError, ValueError):
-                            continue
-                        if lot_id not in gemini_ids:
-                            continue
                         temp_desc = self._lot_temp_desc(lot)
                         if temp_desc and _desc_contains_lot_key(order_text, temp_desc):
                             key_len = len(_normalize_lot_desc_key(temp_desc))
                             if key_len > best_len:
                                 best_len = key_len
-                                best_id = lot_id
+                                best_id = int(lot.id)
             except Exception as exc:
                 logger.debug("%s match gemini lot text: %s", _P, exc)
-        if best_id:
-            return best_id
-        if len(gemini_ids) == 1 and _order_looks_like_gemini_activation(order_text):
-            return int(gemini_ids[0])
+            if best_id:
+                return best_id
+        cfg_lot = str(self.get_cfg("gemini_lot_id", "")).strip()
+        if cfg_lot.isdigit():
+            return int(cfg_lot)
+        cached = list(self._gemini_lots_cache)
+        if len(cached) == 1 and _order_looks_like_gemini_activation(order_text):
+            return int(cached[0])
         return None
 
     def _resolve_order_lot_id(self, event: Any, full_order: Any = None) -> int | None:
@@ -2011,7 +2048,7 @@ class Plugin:
         cfg_lot = str(self.get_cfg("gemini_lot_id", "")).strip()
         if order is None:
             return int(cfg_lot) if cfg_lot.isdigit() else None
-        desc = str(getattr(order, "description", "") or "")
+        desc = order_text or str(getattr(order, "description", "") or "")
         profile = self._ensure_profile()
         if profile and desc:
             subcat = getattr(order, "subcategory", None)
@@ -2061,16 +2098,27 @@ class Plugin:
                     chunks.append(str(val))
         return "\n".join(chunks)
 
-    def _order_matches_gemini_link(self, event: NewOrderEvent, full_order: Any = None) -> bool:
+    def _order_matches_gemini_link(
+        self,
+        event: Any,
+        full_order: Any = None,
+        *,
+        relaxed: bool = False,
+    ) -> bool:
         needle = self._gemini_lot_match()
         if not needle:
             return False
+        order_text = self._order_text_blob(event, full_order)
         lot_id = self._resolve_order_lot_id(event, full_order)
         order_id = getattr(getattr(event, "order", None), "id", "?")
-        if not lot_id:
-            order_text = self._order_text_blob(event, full_order)
-            if _order_looks_like_gemini_activation(order_text):
-                lot_id = self._match_gemini_lot_from_order_text(order_text)
+        if not lot_id and _order_looks_like_gemini_activation(order_text):
+            lot_id = self._match_gemini_lot_from_order_text(order_text)
+        cfg_lot = str(self.get_cfg("gemini_lot_id", "")).strip()
+        if not lot_id and cfg_lot.isdigit():
+            lot_id = int(cfg_lot)
+        if relaxed and _order_looks_like_gemini_activation(order_text):
+            if lot_id or cfg_lot.isdigit() or self.gemini_archive_count() > 0:
+                return True
         if not lot_id:
             self.log(
                 "заказ #%s: lot_id не найден (нужна метка %r в подробном описании лота)",
@@ -2079,13 +2127,12 @@ class Plugin:
             return False
         if lot_id in self._gemini_lots_cache:
             return True
+        if cfg_lot.isdigit() and int(cfg_lot) == lot_id:
+            return True
         detail = self._lot_detailed_description(lot_id)
         matched = _lot_text_matches(detail, needle)
-        if not matched and detail:
-            order_text = self._order_text_blob(event, full_order)
-            matched = _order_looks_like_gemini_activation(order_text) and lot_id in (
-                self._gemini_lots_cached() or self._scan_gemini_lots()
-            )
+        if not matched and _order_looks_like_gemini_activation(order_text):
+            matched = True
         if matched:
             if lot_id not in self._gemini_lots_cache:
                 self._gemini_lots_cache.append(lot_id)
@@ -2144,6 +2191,7 @@ class Plugin:
         event: NewOrderEvent | None = None,
         full_order: Any = None,
         force: bool = False,
+        manual: bool = False,
     ) -> tuple[bool, str]:
         order_id = str(order_id).strip().lstrip("#")
         if not order_id:
@@ -2153,8 +2201,6 @@ class Plugin:
             return False, f"Режим {mode} — переключите на 🔗 Gemini"
         if not force and self._is_gemini_order_delivered(order_id):
             return False, f"Заказ #{order_id} уже выдан (добавьте force)"
-        if not self._gemini_lots_cached():
-            self._scan_gemini_lots()
         if full_order is None:
             try:
                 full_order = self.cardinal.account.get_order(order_id)
@@ -2167,10 +2213,13 @@ class Plugin:
                 lot_shortcut=getattr(full_order, "lot_shortcut", None),
             )
         lot_id = self._resolve_order_lot_id(event, full_order)
+        order_text = self._order_text_blob(event, full_order)
+        relaxed = manual or _order_looks_like_gemini_activation(order_text)
         _boot_log(
-            f"DELIVER #{order_id} lot_id={lot_id} archive={self.gemini_archive_count()} force={force}"
+            f"DELIVER #{order_id} lot_id={lot_id} archive={self.gemini_archive_count()} "
+            f"force={force} manual={manual} relaxed={relaxed}"
         )
-        if not self._order_matches_gemini_link(event, full_order):
+        if not self._order_matches_gemini_link(event, full_order, relaxed=relaxed):
             return False, f"Заказ #{order_id} не Gemini-link лот (lot_id={lot_id})"
         buyer = str(getattr(full_order, "buyer_username", "") or getattr(event.order, "buyer_username", "") or "")
         qty = max(1, int(getattr(full_order, "amount", None) or getattr(event.order, "amount", 1) or 1))
@@ -2238,8 +2287,7 @@ class Plugin:
         if self._is_gemini_order_delivered(order_id):
             self.log("заказ #%s уже обработан", order_id)
             return
-        if not self._gemini_lots_cached():
-            self._scan_gemini_lots()
+        self.refresh_gemini_lots_async()
         full_order = None
         try:
             full_order = self.cardinal.account.get_order(order_id)
@@ -2259,9 +2307,10 @@ class Plugin:
             lot_id = self._resolve_order_lot_id(event, full_order)
             if lot_id:
                 _boot_log(f"ORDER #{order_id} lot_id retry={lot_id}")
-        if not self._order_matches_gemini_link(event, full_order):
-            _boot_log(f"ORDER #{order_id} skip: не gemini link лот")
-            return
+        if not self._order_matches_gemini_link(event, full_order, relaxed=False):
+            if not _order_looks_like_gemini_activation(self._order_text_blob(event, full_order)):
+                _boot_log(f"ORDER #{order_id} skip: не gemini link лот")
+                return
         ok, msg = self.deliver_gemini_order(
             order_id, event=event, full_order=full_order, force=False,
         )
@@ -2277,7 +2326,7 @@ class Plugin:
             match = self._gemini_lot_match()
             lot_ids = self.find_gemini_link_lot_ids(fast=True)
             if not lot_ids:
-                lot_ids = self._scan_gemini_lots()
+                lot_ids = self._scan_gemini_lots(timeout=GEMINI_LOT_SCAN_TIMEOUT, blocking=True)
             else:
                 self.refresh_gemini_lots_async()
             lines = [
@@ -3156,13 +3205,24 @@ class Plugin:
                 return
             order_id = parts[1].strip().lstrip("#")
             force = len(parts) > 2 and parts[2].casefold() in ("force", "f", "повтор")
+            try:
+                bot.reply_to(message, f"⏳ Выдаю заказ <b>#{_escape(order_id)}</b>…", parse_mode="HTML")
+            except Exception:
+                pass
 
             def _run() -> None:
-                ok, msg = plugin.deliver_gemini_order(order_id, force=force)
+                try:
+                    ok, msg = plugin.deliver_gemini_order(order_id, force=force, manual=True)
+                except Exception as exc:
+                    _boot_log(f"DELIVER #{order_id} EXC: {exc}")
+                    ok, msg = False, f"❌ Ошибка: {exc}"
                 try:
                     bot.reply_to(message, msg, parse_mode="HTML")
                 except Exception:
-                    bot.reply_to(message, msg)
+                    try:
+                        bot.reply_to(message, msg)
+                    except Exception:
+                        pass
 
             threading.Thread(target=_run, daemon=True, name=f"GlDeliver-{order_id}").start()
 
