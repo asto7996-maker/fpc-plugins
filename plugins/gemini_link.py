@@ -46,7 +46,7 @@ except ImportError:
 
 
 NAME          = "Gemini Link Auto"
-VERSION       = "3.0.3"
+VERSION       = "3.0.4"
 DESCRIPTION   = "ChatGPT автозакупка + выдача Gemini-ссылок из архива"
 CREDITS       = "Cursor AI"
 UUID          = "f7a2e8c1-4b3d-4e9f-a8c2-1d5e9b0f6a3c"
@@ -59,6 +59,7 @@ DEFAULT_API_URL: Final[str] = "https://worker-production-53ca.up.railway.app"
 SHOP_PRODUCT_NAME: Final[str] = "GPT plus 1M (NW)"
 DEFAULT_LOT_MATCH: Final[str] = "GPT plus 1M (NW)"
 DEFAULT_MIN_LOT_STOCK: Final[int] = 3
+DEFAULT_AUTO_INTERVAL: Final[int] = 300
 DEFAULT_GEMINI_LOT_MATCH: Final[str] = "gemini link"
 DEFAULT_DELIVERY_PARTS: Final[int] = 3
 DEFAULT_REDELIVERY_PARTS: Final[int] = 4
