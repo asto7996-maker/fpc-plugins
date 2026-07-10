@@ -46,7 +46,7 @@ except ImportError:
 
 
 NAME          = "Gemini Link Auto"
-VERSION       = "3.1.0"
+VERSION       = "3.1.1"
 DESCRIPTION   = "ChatGPT автозакупка + выдача Gemini-ссылок из архива"
 CREDITS       = "Cursor AI"
 UUID          = "f7a2e8c1-4b3d-4e9f-a8c2-1d5e9b0f6a3c"
@@ -1889,7 +1889,41 @@ class Plugin:
     def count_gemini_link_lots(self, *, fast: bool = False) -> int:
         return len(self.find_gemini_link_lot_ids(fast=fast))
 
+    def _lot_temp_desc(self, lot: Any) -> str:
+        return ", ".join(
+            i for i in (
+                getattr(lot, "server", None),
+                getattr(lot, "side", None),
+                getattr(lot, "description", None),
+            ) if i
+        )
+
+    def _match_lot_id_by_order_desc(self, desc: str, profile: Any) -> int | None:
+        desc = (desc or "").strip()
+        if not desc or not profile:
+            return None
+        try:
+            for lots_map in profile.get_sorted_lots(2).values():
+                lots = sorted(
+                    lots_map.values(),
+                    key=lambda lot: len(self._lot_temp_desc(lot)),
+                    reverse=True,
+                )
+                for lot in lots:
+                    temp_desc = self._lot_temp_desc(lot)
+                    if temp_desc and temp_desc in desc:
+                        return int(lot.id)
+        except Exception as exc:
+            logger.debug("%s match lot by desc: %s", _P, exc)
+        return None
+
     def _resolve_order_lot_id(self, event: Any, full_order: Any = None) -> int | None:
+        shortcut = getattr(event, "lot_shortcut", None)
+        if shortcut is not None:
+            try:
+                return int(shortcut.id)
+            except (TypeError, ValueError, AttributeError):
+                pass
         for src in (event, full_order):
             if src is None:
                 continue
@@ -1900,38 +1934,35 @@ class Plugin:
                 except (TypeError, ValueError):
                     pass
         order = full_order or getattr(event, "order", None)
-        if order is None:
-            cfg_lot = str(self.get_cfg("gemini_lot_id", "")).strip()
-            return int(cfg_lot) if cfg_lot.isdigit() else None
-        desc = str(getattr(order, "description", "") or "")
-        subcat = getattr(order, "subcategory", None)
-        profile = self._ensure_profile()
-        if subcat and profile:
-            try:
-                lots_map = profile.get_sorted_lots(2).get(subcat, {})
-                lots = sorted(
-                    lots_map.values(),
-                    key=lambda lot: len(
-                        f"{getattr(lot, 'server', '')}, {getattr(lot, 'side', '')}, "
-                        f"{getattr(lot, 'description', '')}"
-                    ),
-                    reverse=True,
-                )
-                for lot in lots:
-                    temp_desc = ", ".join(
-                        i for i in (
-                            getattr(lot, "server", None),
-                            getattr(lot, "side", None),
-                            getattr(lot, "description", None),
-                        ) if i
-                    )
-                    if temp_desc and temp_desc in desc:
-                        return int(lot.id)
-            except Exception as exc:
-                logger.debug("%s resolve order lot: %s", _P, exc)
         cfg_lot = str(self.get_cfg("gemini_lot_id", "")).strip()
         if cfg_lot.isdigit():
             return int(cfg_lot)
+        if order is None:
+            return None
+        desc = str(getattr(order, "description", "") or "")
+        profile = self._ensure_profile()
+        if profile and desc:
+            subcat = getattr(order, "subcategory", None)
+            if subcat:
+                try:
+                    lots_map = profile.get_sorted_lots(2).get(subcat, {})
+                    lots = sorted(
+                        lots_map.values(),
+                        key=lambda lot: len(self._lot_temp_desc(lot)),
+                        reverse=True,
+                    )
+                    for lot in lots:
+                        temp_desc = self._lot_temp_desc(lot)
+                        if temp_desc and temp_desc in desc:
+                            return int(lot.id)
+                except Exception as exc:
+                    logger.debug("%s resolve order lot subcat: %s", _P, exc)
+            lot_id = self._match_lot_id_by_order_desc(desc, profile)
+            if lot_id:
+                return lot_id
+        cached = self._gemini_lots_cached() or list(self._gemini_lots_cache)
+        if len(cached) == 1 and "gemini" in desc.casefold():
+            return int(cached[0])
         return None
 
     def _order_text_blob(self, event: NewOrderEvent, full_order: Any = None) -> str:
@@ -2018,18 +2049,29 @@ class Plugin:
                 return False
 
     def handle_new_order(self, event: NewOrderEvent) -> None:
-        if self.stock_mode() != "gemini_links":
-            return
         order_id = str(event.order.id)
+        mode = self.stock_mode()
+        _boot_log(f"ORDER #{order_id} event mode={mode}")
+        if mode != "gemini_links":
+            _boot_log(f"ORDER #{order_id} skip: режим {mode}, нужен gemini_links")
+            return
         if self._is_gemini_order_delivered(order_id):
             self.log("заказ #%s уже обработан", order_id)
             return
+        if not self._gemini_lots_cached():
+            self._scan_gemini_lots()
         full_order = None
         try:
             full_order = self.cardinal.account.get_order(order_id)
         except Exception as exc:
             self.log("get_order #%s: %s", order_id, exc)
+        lot_id = self._resolve_order_lot_id(event, full_order)
+        _boot_log(
+            f"ORDER #{order_id} lot_id={lot_id} event.lot_id={getattr(event, 'lot_id', None)} "
+            f"archive={self.gemini_archive_count()}"
+        )
         if not self._order_matches_gemini_link(event, full_order):
+            _boot_log(f"ORDER #{order_id} skip: не gemini link лот")
             return
         buyer = str(getattr(event.order, "buyer_username", "") or "")
         qty = max(1, int(getattr(event.order, "amount", 1) or 1))
@@ -2081,6 +2123,7 @@ class Plugin:
         if delivered:
             self._mark_gemini_order_delivered(order_id, buyer, delivered)
             self.log("заказ #%s: выдано %s ссылок", order_id, len(delivered))
+            _boot_log(f"ORDER #{order_id} OK delivered={len(delivered)}")
         elif failed:
             try:
                 self._fp_send(
@@ -2309,6 +2352,8 @@ class Plugin:
                     f"📤 <b>Выдача:</b> {int(self.get_cfg('gemini_delivery_parts', DEFAULT_DELIVERY_PARTS))} части "
                     f"(перевыдача: {int(self.get_cfg('gemini_redelivery_parts', DEFAULT_REDELIVERY_PARTS))})",
                 ]
+                if self.gemini_archive_count() <= 0:
+                    lines.append("⚠️ <b>Архив пуст</b> — загрузите ссылки кнопкой «📥 Загрузить ссылки в архив»")
                 if lot_ids:
                     lines.append(f"🎯 Лот: <b>#{lot_ids[0]}</b>" + (f" (+{len(lot_ids)-1})" if len(lot_ids) > 1 else ""))
                 else:
@@ -2323,6 +2368,10 @@ class Plugin:
             lines += [
                 f"<b>Режим:</b> {self.stock_mode_label(mode)}",
             ]
+            if mode != "gemini_links":
+                lines.append(
+                    "⚠️ <i>Для выдачи Gemini-ссылок переключите режим на <b>🔗 Gemini</b></i>"
+                )
             if mode == "auto_buy":
                 lines += [
                     f"📦 <b>Лот FunPay:</b> {self._lot_stock_info(fast=fast)}",
@@ -2999,16 +3048,29 @@ class Plugin:
 def bind_to_new_order(cardinal: Cardinal, event: NewOrderEvent) -> None:
     if _plugin is None:
         return
+
+    def _run() -> None:
+        try:
+            _plugin.handle_new_order(event)
+        except Exception as exc:
+            oid = getattr(getattr(event, "order", None), "id", "?")
+            _boot_log(f"ORDER #{oid} handler FAIL: {exc}")
+            logger.error("%s handle_new_order #%s: %s", _P, oid, exc)
+            logger.debug(traceback.format_exc())
+
     try:
         threading.Thread(
-            target=_plugin.handle_new_order,
-            args=(event,),
+            target=_run,
             daemon=True,
             name=f"GeminiLinkOrder-{event.order.id}",
         ).start()
     except Exception as exc:
         logger.error("%s bind_to_new_order: %s", _P, exc)
         logger.debug(traceback.format_exc())
+
+
+def bind_to_init_order(cardinal: Cardinal, event: NewOrderEvent) -> None:
+    bind_to_new_order(cardinal, event)
 
 
 def init_plugin(cardinal: Cardinal) -> None:
@@ -3058,6 +3120,7 @@ BIND_TO_PRE_INIT = [init_plugin]
 BIND_TO_POST_INIT = [post_init_plugin]
 BIND_TO_PRE_START = [pre_start_plugin]
 BIND_TO_NEW_ORDER = [bind_to_new_order] if _HAS_NEW_ORDER_EVENT else []
+BIND_TO_INIT_ORDER = [bind_to_init_order] if _HAS_NEW_ORDER_EVENT else []
 
 
 _boot_log(f"module imported v{VERSION} new_order={_HAS_NEW_ORDER_EVENT}")
