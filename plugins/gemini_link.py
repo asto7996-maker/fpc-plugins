@@ -3184,7 +3184,8 @@ class Plugin:
                 lines.append(f"🗄 <b>Архив ссылок:</b> {self.gemini_archive_count()} шт.")
                 lines.append(
                     f"📤 <b>Выдача:</b> {int(self.get_cfg('gemini_delivery_parts', DEFAULT_DELIVERY_PARTS))} части "
-                    f"(перевыдача: {int(self.get_cfg('gemini_redelivery_parts', DEFAULT_REDELIVERY_PARTS))})"
+                    f"(перевыдача: {int(self.get_cfg('gemini_redelivery_parts', DEFAULT_REDELIVERY_PARTS))}, "
+                    f"запас: по {int(self.get_cfg('gemini_fallback_chunk_len', DEFAULT_FALLBACK_CHUNK_LEN))} симв.)"
                 )
             else:
                 lines.append(f"\n📦 <b>На лоте:</b> {self._lot_stock_info(fast=True)}")
