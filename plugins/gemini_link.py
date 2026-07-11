@@ -47,7 +47,7 @@ except ImportError:
 
 
 NAME          = "Gemini Link Auto"
-VERSION       = "3.2.8"
+VERSION       = "3.2.9"
 DESCRIPTION   = "ChatGPT автозакупка + выдача Gemini-ссылок из архива"
 CREDITS       = "Cursor AI"
 UUID          = "f7a2e8c1-4b3d-4e9f-a8c2-1d5e9b0f6a3c"
@@ -64,10 +64,9 @@ DEFAULT_AUTO_INTERVAL: Final[int] = 300
 DEFAULT_GEMINI_LOT_MATCH: Final[str] = "gemini link"
 DEFAULT_DELIVERY_PARTS: Final[int] = 3
 DEFAULT_REDELIVERY_PARTS: Final[int] = 4
-FUNPAY_MAX_WORD_LEN: Final[int] = 28
+DEFAULT_FALLBACK_CHUNK_LEN: Final[int] = 120
 LINK_JOIN_INSTRUCTION: Final[str] = (
-    "Склейте все части в одну ссылку (уберите пробелы, если они есть) "
-    "и вставьте её в браузер."
+    "Склейте все части в одну ссылку и вставьте её в браузер."
 )
 LINK_PART_DELAY: Final[float] = 3.0
 WELCOME_PARTS_DELAY: Final[float] = 2.5
@@ -541,7 +540,7 @@ def extract_activation_urls(text: str) -> list[str]:
 
 
 def split_link_parts(url: str, parts: int) -> list[str]:
-    """Ровно N частей ссылки (без пробелов); для FunPay пробелы добавляются при отправке."""
+    """Ровно N частей ссылки без пробелов."""
     url = (url or "").strip()
     parts = max(1, int(parts))
     if parts == 1:
@@ -565,18 +564,13 @@ def split_link_parts(url: str, parts: int) -> list[str]:
     return chunks
 
 
-def break_fp_long_word(text: str, max_len: int = FUNPAY_MAX_WORD_LEN) -> str:
-    """Вставляет пробелы в длинное «слово», чтобы FunPay принял сообщение."""
-    text = (text or "").strip()
-    max_len = max(8, int(max_len))
-    if len(text) <= max_len or " " in text:
-        return text
-    return " ".join(text[i:i + max_len] for i in range(0, len(text), max_len))
-
-
-def is_long_word_fp_error(msg: str) -> bool:
-    low = (msg or "").casefold()
-    return "длинн" in low and "слов" in low
+def split_link_by_chunk_size(url: str, chunk_size: int) -> list[str]:
+    """Делит ссылку на части фиксированной длины (без пробелов)."""
+    url = (url or "").strip()
+    chunk_size = max(1, int(chunk_size))
+    if not url:
+        raise ValueError("пустая ссылка")
+    return [url[i:i + chunk_size] for i in range(0, len(url), chunk_size)]
 
 
 def parse_shop_purchase_history(text: str) -> list[dict[str, str]]:
@@ -752,13 +746,17 @@ class Plugin:
                 sm = str(loaded.get("stock_mode", "auto_buy"))
                 if sm in _LEGACY_STOCK_MODES:
                     loaded["stock_mode"] = "gemini_links" if sm in ("stocked", "warehouse", "import_lot") else "auto_buy"
+                if str(loaded.get("_cfg_version", "0")) < "3.2.9":
+                    loaded.setdefault("gemini_fallback_chunk_len", DEFAULT_FALLBACK_CHUNK_LEN)
+                    loaded.pop("gemini_max_word_len", None)
+                    loaded["_cfg_version"] = "3.2.9"
                 if str(loaded.get("_cfg_version", "0")) < "3.2.8":
                     loaded["gemini_delivery_parts"] = DEFAULT_DELIVERY_PARTS
                     loaded["gemini_redelivery_parts"] = DEFAULT_REDELIVERY_PARTS
-                    loaded.setdefault("gemini_max_word_len", FUNPAY_MAX_WORD_LEN)
+                    loaded.setdefault("gemini_max_word_len", 28)
                     loaded["_cfg_version"] = "3.2.8"
                 if str(loaded.get("_cfg_version", "0")) < "3.2.7":
-                    loaded.setdefault("gemini_max_word_len", FUNPAY_MAX_WORD_LEN)
+                    loaded.setdefault("gemini_max_word_len", 28)
                     loaded["_cfg_version"] = "3.2.7"
                 if str(loaded.get("_cfg_version", "0")) < "3.2.5":
                     loaded["gemini_delivery_parts"] = DEFAULT_DELIVERY_PARTS
@@ -865,13 +863,13 @@ class Plugin:
             "gemini_lot_id": "",
             "gemini_delivery_parts": DEFAULT_DELIVERY_PARTS,
             "gemini_redelivery_parts": DEFAULT_REDELIVERY_PARTS,
-            "gemini_max_word_len": FUNPAY_MAX_WORD_LEN,
+            "gemini_fallback_chunk_len": DEFAULT_FALLBACK_CHUNK_LEN,
             "gemini_auto_enabled": True,
             "confirm_reminder_enabled": True,
             "confirm_reminder_delay_sec": CONFIRM_REMINDER_DELAY,
             "confirm_reminder_text": "",
             "last_delivery_error": "",
-            "_cfg_version": "3.2.8",
+            "_cfg_version": "3.2.9",
         }
 
     # ── UI: компактные страницы вместо длинного списка кнопок ───────────────
@@ -895,7 +893,7 @@ class Plugin:
             {"key": "gemini_lot_id", "label": "ID лота Gemini (необяз.)", "type": "text"},
             {"key": "gemini_delivery_parts", "label": "Частей при выдаче", "type": "int", "min": 2, "max": 6},
             {"key": "gemini_redelivery_parts", "label": "Частей при перевыдаче", "type": "int", "min": 2, "max": 8},
-            {"key": "gemini_max_word_len", "label": "Макс. длина фрагмента", "type": "int", "min": 12, "max": 40},
+            {"key": "gemini_fallback_chunk_len", "label": "Символов в части (запас)", "type": "int", "min": 40, "max": 200},
             {"key": "warehouse_release_qty", "label": "Выложить со склада (шт.)", "type": "int", "min": 0, "max": 100},
         ]
 
@@ -2458,36 +2456,22 @@ class Plugin:
                 self._refresh_fp_account()
                 time.sleep(1.2 * attempt)
             for cid in candidates:
-                payloads = [text]
-                if " " not in text and len(text) > 16:
-                    payloads.append(break_fp_long_word(text, FUNPAY_MAX_WORD_LEN))
-                last_variant_err: Exception | None = None
-                for payload in payloads:
-                    try:
-                        msg = self._account_send_message(cid, payload, buyer_name)
-                        mid = getattr(msg, "id", None)
-                        spaced = " spaced" if payload != text else ""
-                        _boot_log(
-                            f"FP send OK chat={cid} try={attempt}/{FP_SEND_MAX_ATTEMPTS} "
-                            f"len={len(payload)}{spaced} msg_id={mid}"
-                        )
-                        return cid
-                    except Exception as exc:
-                        last_variant_err = exc
-                        err_text = self._format_fp_error(exc)
-                        if payload == text and is_long_word_fp_error(err_text):
-                            _boot_log(f"FP long-word reject chat={cid}, retry with spaces")
-                            continue
-                        last_err = exc
-                        _boot_log(
-                            f"FP send FAIL chat={cid} try={attempt}/{FP_SEND_MAX_ATTEMPTS}: {err_text}"
-                        )
-                        logger.debug("%s send chat=%s: %s", _P, cid, err_text)
-                        break
-                else:
-                    if last_variant_err is not None:
-                        last_err = last_variant_err
-                time.sleep(0.8)
+                try:
+                    msg = self._account_send_message(cid, text, buyer_name)
+                    mid = getattr(msg, "id", None)
+                    _boot_log(
+                        f"FP send OK chat={cid} try={attempt}/{FP_SEND_MAX_ATTEMPTS} "
+                        f"len={len(text)} msg_id={mid}"
+                    )
+                    return cid
+                except Exception as exc:
+                    last_err = exc
+                    err_text = self._format_fp_error(exc)
+                    _boot_log(
+                        f"FP send FAIL chat={cid} try={attempt}/{FP_SEND_MAX_ATTEMPTS}: {err_text}"
+                    )
+                    logger.debug("%s send chat=%s: %s", _P, cid, err_text)
+                    time.sleep(0.8)
 
         raise RuntimeError(self._format_fp_error(last_err) if last_err else "FunPay send failed")
 
@@ -2524,6 +2508,41 @@ class Plugin:
                     time.sleep(1.5 * n)
         raise RuntimeError(self._format_fp_error(last_exc) if last_exc else "send failed")
 
+    def _deliver_link_chunks(
+        self,
+        chat_id: Any,
+        buyer: str,
+        chunks: list[str],
+        *,
+        chat_candidates: list[int | str] | None = None,
+        full_order: Any = None,
+        event: Any = None,
+        order_id: str = "",
+    ) -> int | str:
+        """Отправляет фрагменты ссылки как есть (без пробелов внутри)."""
+        active_chat = chat_id
+        send_kw = {
+            "chat_candidates": chat_candidates,
+            "full_order": full_order,
+            "event": event,
+            "order_id": order_id,
+        }
+        for idx, chunk in enumerate(chunks):
+            if idx > 0:
+                time.sleep(LINK_PART_DELAY + 0.5 * idx)
+            active_chat = self._fp_send_retry(
+                active_chat, chunk, buyer, watermark=False, **send_kw,
+            )
+        time.sleep(LINK_PART_DELAY)
+        active_chat = self._fp_send_retry(
+            active_chat,
+            LINK_JOIN_INSTRUCTION,
+            buyer,
+            watermark=False,
+            **send_kw,
+        )
+        return active_chat
+
     def _deliver_link_in_parts(
         self,
         chat_id: Any,
@@ -2535,41 +2554,44 @@ class Plugin:
         full_order: Any = None,
         event: Any = None,
         order_id: str = "",
-        max_word_len: int = FUNPAY_MAX_WORD_LEN,
     ) -> int | str:
-        """Ровно N сообщений с фрагментами ссылки + финальная инструкция."""
-        max_word_len = max(
-            12,
-            int(self.get_cfg("gemini_max_word_len", max_word_len)),
-        )
         chunks = split_link_parts(url, parts)
         _boot_log(
-            f"split link len={len(url)} parts={parts} "
-            f"chunks={[len(c) for c in chunks]} fp_word<={max_word_len}"
+            f"split link len={len(url)} parts={parts} chunks={[len(c) for c in chunks]}"
         )
-        active_chat = chat_id
-        send_kw = {
-            "chat_candidates": chat_candidates,
-            "full_order": full_order,
-            "event": event,
-            "order_id": order_id,
-        }
-        for idx, chunk in enumerate(chunks):
-            if idx > 0:
-                time.sleep(LINK_PART_DELAY + 0.5 * idx)
-            fp_text = break_fp_long_word(chunk, max_word_len)
-            active_chat = self._fp_send_retry(
-                active_chat, fp_text, buyer, watermark=False, **send_kw,
-            )
-        time.sleep(LINK_PART_DELAY)
-        active_chat = self._fp_send_retry(
-            active_chat,
-            LINK_JOIN_INSTRUCTION,
-            buyer,
-            watermark=False,
-            **send_kw,
+        return self._deliver_link_chunks(
+            chat_id, buyer, chunks,
+            chat_candidates=chat_candidates,
+            full_order=full_order,
+            event=event,
+            order_id=order_id,
         )
-        return active_chat
+
+    def _deliver_link_by_chunk_size(
+        self,
+        chat_id: Any,
+        buyer: str,
+        url: str,
+        chunk_size: int,
+        *,
+        chat_candidates: list[int | str] | None = None,
+        full_order: Any = None,
+        event: Any = None,
+        order_id: str = "",
+    ) -> int | str:
+        chunk_size = max(1, int(chunk_size))
+        chunks = split_link_by_chunk_size(url, chunk_size)
+        _boot_log(
+            f"split link len={len(url)} chunk_size={chunk_size} "
+            f"parts={len(chunks)} chunks={[len(c) for c in chunks]}"
+        )
+        return self._deliver_link_chunks(
+            chat_id, buyer, chunks,
+            chat_candidates=chat_candidates,
+            full_order=full_order,
+            event=event,
+            order_id=order_id,
+        )
 
     def _deliver_single_gemini_link(
         self,
@@ -2586,7 +2608,15 @@ class Plugin:
         fallback = max(2, min(8, int(self.get_cfg("gemini_redelivery_parts", DEFAULT_REDELIVERY_PARTS))))
         if fallback <= primary:
             fallback = primary + 1
-        plans = [primary] if fallback == primary else [primary, fallback]
+        chunk_size = max(
+            40,
+            int(self.get_cfg("gemini_fallback_chunk_len", DEFAULT_FALLBACK_CHUNK_LEN)),
+        )
+        plans: list[tuple[str, int]] = [
+            ("parts", primary),
+            ("parts", fallback),
+            ("size", chunk_size),
+        ]
         last_err = ""
         send_kw = {
             "chat_candidates": chat_candidates,
@@ -2595,28 +2625,35 @@ class Plugin:
             "order_id": order_id,
         }
         active_chat = chat_id
-        for attempt, n_parts in enumerate(plans):
+        for attempt, (mode, value) in enumerate(plans):
             try:
                 if attempt > 0:
+                    notice = (
+                        f"Повторная отправка ссылки в {value} части…"
+                        if mode == "parts"
+                        else f"Повторная отправка ссылки частями по {value} символов…"
+                    )
                     try:
                         active_chat = self._fp_send(
-                            active_chat,
-                            f"Повторная отправка ссылки в {n_parts} части…",
-                            buyer,
-                            watermark=False,
-                            **send_kw,
+                            active_chat, notice, buyer, watermark=False, **send_kw,
                         )
                     except Exception:
                         pass
                     time.sleep(WELCOME_PARTS_DELAY)
-                active_chat = self._deliver_link_in_parts(
-                    active_chat, buyer, url, n_parts, **send_kw,
-                )
+                if mode == "parts":
+                    active_chat = self._deliver_link_in_parts(
+                        active_chat, buyer, url, value, **send_kw,
+                    )
+                else:
+                    active_chat = self._deliver_link_by_chunk_size(
+                        active_chat, buyer, url, value, **send_kw,
+                    )
                 return True, "", active_chat
             except Exception as exc:
                 last_err = self._format_fp_error(exc)
-                self.log("выдача %s частями не удалась: %s", n_parts, last_err)
-                _boot_log(f"deliver parts={n_parts} fail: {last_err}")
+                label = f"{value} parts" if mode == "parts" else f"{value} chars"
+                self.log("выдача (%s) не удалась: %s", label, last_err)
+                _boot_log(f"deliver {label} fail: {last_err}")
         return False, last_err or "send failed", active_chat
 
     def deliver_gemini_order(
