@@ -12,6 +12,7 @@ import re
 import threading
 import time
 import traceback
+import unicodedata
 from datetime import datetime
 from types import SimpleNamespace
 from typing import Any, Final
@@ -47,7 +48,7 @@ except ImportError:
 
 
 NAME          = "Gemini Link Auto"
-VERSION       = "3.2.9"
+VERSION       = "3.3.0"
 DESCRIPTION   = "ChatGPT автозакупка + выдача Gemini-ссылок из архива"
 CREDITS       = "Cursor AI"
 UUID          = "f7a2e8c1-4b3d-4e9f-a8c2-1d5e9b0f6a3c"
@@ -66,7 +67,8 @@ DEFAULT_DELIVERY_PARTS: Final[int] = 3
 DEFAULT_REDELIVERY_PARTS: Final[int] = 4
 DEFAULT_FALLBACK_CHUNK_LEN: Final[int] = 120
 LINK_JOIN_INSTRUCTION: Final[str] = (
-    "Склейте все части в одну ссылку и вставьте её в браузер."
+    "Скопируйте все части ссылки по порядку, склейте их в одну строку "
+    "(без пробелов и переносов) и вставьте в адресную строку браузера."
 )
 LINK_PART_DELAY: Final[float] = 3.0
 WELCOME_PARTS_DELAY: Final[float] = 2.5
@@ -512,13 +514,46 @@ def _order_looks_like_gemini_activation(order_text: str) -> bool:
     return any(m in blob for m in markers)
 
 
-def _normalize_activation_url(url: str) -> str:
-    u = (url or "").strip()
+_LINK_HIDDEN_RE = re.compile(
+    r"[\s\u00ad\u180e\u200b-\u200f\u202a-\u202e\u2060-\u2064\u206a-\u206f"
+    r"\ufeff\ufff9-\ufffb]+",
+)
+_LINK_TRAIL_JUNK_RE = re.compile(r"[.,;)\]>\"'«»}\]]+$")
+_LINK_ALLOWED_RE = re.compile(r"^[A-Za-z0-9:/?#\[\]@!$&'()*+,;=%._~-]+$")
+
+
+def sanitize_activation_url(url: str, *, tag: str = "") -> str:
+    """Очищает ссылку: без пробелов, переносов и невидимых Unicode-символов."""
+    raw = str(url or "")
+    u = unicodedata.normalize("NFKC", raw)
+    u = _LINK_HIDDEN_RE.sub("", u)
+    u = _LINK_TRAIL_JUNK_RE.sub("", u)
     if u.lower().startswith("https://"):
         u = "https://" + u[8:]
     elif u.lower().startswith("http://"):
         u = "http://" + u[7:]
+    if tag and u != raw.strip():
+        _boot_log(f"{tag} url sanitized len={len(raw)}->{len(u)}")
     return u
+
+
+def ensure_clean_link_chunk(chunk: str) -> str:
+    """Проверяет фрагмент ссылки перед отправкой в чат FunPay."""
+    c = sanitize_activation_url(chunk)
+    if not c:
+        raise ValueError("пустой фрагмент ссылки")
+    if _LINK_HIDDEN_RE.search(c):
+        raise ValueError("фрагмент содержит скрытые символы")
+    if any(ord(ch) < 32 for ch in c):
+        raise ValueError("фрагмент содержит управляющие символы")
+    if not _LINK_ALLOWED_RE.match(c):
+        bad = sorted({ch for ch in c if not _LINK_ALLOWED_RE.match(ch)})
+        raise ValueError(f"фрагмент содержит недопустимые символы: {bad!r}")
+    return c
+
+
+def _normalize_activation_url(url: str) -> str:
+    return sanitize_activation_url(url)
 
 
 def _import_target_from_state(state: str) -> str:
@@ -540,8 +575,8 @@ def extract_activation_urls(text: str) -> list[str]:
 
 
 def split_link_parts(url: str, parts: int) -> list[str]:
-    """Ровно N частей ссылки без пробелов."""
-    url = (url or "").strip()
+    """Ровно N частей очищенной ссылки без пробелов."""
+    url = sanitize_activation_url(url)
     parts = max(1, int(parts))
     if parts == 1:
         return [url]
@@ -561,16 +596,16 @@ def split_link_parts(url: str, parts: int) -> list[str]:
         pos += size
     if len(chunks) != parts or pos != n:
         raise ValueError(f"не удалось разбить ссылку на {parts} частей (len={n})")
-    return chunks
+    return [ensure_clean_link_chunk(c) for c in chunks]
 
 
 def split_link_by_chunk_size(url: str, chunk_size: int) -> list[str]:
-    """Делит ссылку на части фиксированной длины (без пробелов)."""
-    url = (url or "").strip()
+    """Делит очищенную ссылку на части фиксированной длины (без пробелов)."""
+    url = sanitize_activation_url(url)
     chunk_size = max(1, int(chunk_size))
     if not url:
         raise ValueError("пустая ссылка")
-    return [url[i:i + chunk_size] for i in range(0, len(url), chunk_size)]
+    return [ensure_clean_link_chunk(url[i:i + chunk_size]) for i in range(0, len(url), chunk_size)]
 
 
 def parse_shop_purchase_history(text: str) -> list[dict[str, str]]:
@@ -746,6 +781,8 @@ class Plugin:
                 sm = str(loaded.get("stock_mode", "auto_buy"))
                 if sm in _LEGACY_STOCK_MODES:
                     loaded["stock_mode"] = "gemini_links" if sm in ("stocked", "warehouse", "import_lot") else "auto_buy"
+                if str(loaded.get("_cfg_version", "0")) < "3.3.0":
+                    loaded["_cfg_version"] = "3.3.0"
                 if str(loaded.get("_cfg_version", "0")) < "3.2.9":
                     loaded.setdefault("gemini_fallback_chunk_len", DEFAULT_FALLBACK_CHUNK_LEN)
                     loaded.pop("gemini_max_word_len", None)
@@ -808,6 +845,10 @@ class Plugin:
         except Exception as exc:
             logger.error("%s settings load: %s", _P, exc)
             self._cfg = defaults
+        try:
+            self._sanitize_gemini_archive()
+        except Exception as exc:
+            logger.debug("%s archive sanitize: %s", _P, exc)
 
     def _save_settings_dict(self, cfg: dict[str, Any]) -> None:
         with self._lock:
@@ -869,7 +910,7 @@ class Plugin:
             "confirm_reminder_delay_sec": CONFIRM_REMINDER_DELAY,
             "confirm_reminder_text": "",
             "last_delivery_error": "",
-            "_cfg_version": "3.2.9",
+            "_cfg_version": "3.3.0",
         }
 
     # ── UI: компактные страницы вместо длинного списка кнопок ───────────────
@@ -1874,6 +1915,23 @@ class Plugin:
     def gemini_archive_count(self) -> int:
         return len(self._load_gemini_archive())
 
+    def _sanitize_gemini_archive(self) -> int:
+        with self._lock:
+            archive = self._load_gemini_archive()
+            if not archive:
+                return 0
+            changed = 0
+            for item in archive:
+                old = str(item.get("url", ""))
+                new = sanitize_activation_url(old)
+                if new != old:
+                    item["url"] = new
+                    changed += 1
+            if changed:
+                self._save_gemini_archive(archive)
+                _boot_log(f"archive sanitized {changed} url(s)")
+            return changed
+
     def add_urls_to_gemini_archive(self, urls: list[str]) -> tuple[int, int]:
         archive = self._load_gemini_archive()
         known = {str(x.get("url", "")) for x in archive}
@@ -1907,7 +1965,7 @@ class Plugin:
             rest = archive[count:]
             if taken:
                 self._save_gemini_archive(rest)
-            return [str(x.get("url", "")) for x in taken if x.get("url")]
+            return [sanitize_activation_url(str(x.get("url", "")), tag="archive") for x in taken if x.get("url")]
 
     def return_urls_to_gemini_archive(self, urls: list[str]) -> None:
         urls = [_normalize_activation_url(u) for u in urls if u]
@@ -2530,8 +2588,9 @@ class Plugin:
         for idx, chunk in enumerate(chunks):
             if idx > 0:
                 time.sleep(LINK_PART_DELAY + 0.5 * idx)
+            clean = ensure_clean_link_chunk(chunk)
             active_chat = self._fp_send_retry(
-                active_chat, chunk, buyer, watermark=False, **send_kw,
+                active_chat, clean, buyer, watermark=False, **send_kw,
             )
         time.sleep(LINK_PART_DELAY)
         active_chat = self._fp_send_retry(
@@ -2604,6 +2663,9 @@ class Plugin:
         event: Any = None,
         order_id: str = "",
     ) -> tuple[bool, str, int | str | None]:
+        url = sanitize_activation_url(url, tag="DELIVER")
+        if not url:
+            return False, "пустая ссылка", chat_id
         primary = max(2, min(6, int(self.get_cfg("gemini_delivery_parts", DEFAULT_DELIVERY_PARTS))))
         fallback = max(2, min(8, int(self.get_cfg("gemini_redelivery_parts", DEFAULT_REDELIVERY_PARTS))))
         if fallback <= primary:
