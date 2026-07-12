@@ -48,7 +48,7 @@ except ImportError:
 
 
 NAME          = "Gemini Link Auto"
-VERSION       = "3.3.0"
+VERSION       = "3.3.1"
 DESCRIPTION   = "ChatGPT автозакупка + выдача Gemini-ссылок из архива"
 CREDITS       = "Cursor AI"
 UUID          = "f7a2e8c1-4b3d-4e9f-a8c2-1d5e9b0f6a3c"
@@ -67,8 +67,10 @@ DEFAULT_DELIVERY_PARTS: Final[int] = 3
 DEFAULT_REDELIVERY_PARTS: Final[int] = 4
 DEFAULT_FALLBACK_CHUNK_LEN: Final[int] = 120
 LINK_JOIN_INSTRUCTION: Final[str] = (
-    "Скопируйте все части ссылки по порядку, склейте их в одну строку "
-    "(без пробелов и переносов) и вставьте в адресную строку браузера."
+    "Склейте все части ссылки в одну строку и вставьте её в адресную строку браузера.\n\n"
+    "Если возникнут проблемы — отправьте все части любой нейросети с просьбой "
+    "убрать пробелы и скрытые символы, затем перейдите по готовой ссылке "
+    "для активации тарифа."
 )
 LINK_PART_DELAY: Final[float] = 3.0
 WELCOME_PARTS_DELAY: Final[float] = 2.5
