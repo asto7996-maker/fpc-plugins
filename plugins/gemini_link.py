@@ -48,7 +48,7 @@ except ImportError:
 
 
 NAME          = "Gemini Link Auto"
-VERSION       = "3.3.1"
+VERSION       = "4.0.0"
 DESCRIPTION   = "ChatGPT автозакупка + выдача Gemini-ссылок из архива"
 CREDITS       = "Cursor AI"
 UUID          = "f7a2e8c1-4b3d-4e9f-a8c2-1d5e9b0f6a3c"
@@ -63,17 +63,13 @@ DEFAULT_LOT_MATCH: Final[str] = "GPT plus 1M (NW)"
 DEFAULT_MIN_LOT_STOCK: Final[int] = 3
 DEFAULT_AUTO_INTERVAL: Final[int] = 300
 DEFAULT_GEMINI_LOT_MATCH: Final[str] = "gemini link"
-DEFAULT_DELIVERY_PARTS: Final[int] = 3
-DEFAULT_REDELIVERY_PARTS: Final[int] = 4
-DEFAULT_FALLBACK_CHUNK_LEN: Final[int] = 120
-LINK_JOIN_INSTRUCTION: Final[str] = (
-    "Склейте все части ссылки в одну строку и вставьте её в адресную строку браузера.\n\n"
-    "Если возникнут проблемы — отправьте все части любой нейросети с просьбой "
-    "убрать пробелы и скрытые символы, затем перейдите по готовой ссылке "
-    "для активации тарифа."
+DEFAULT_GOLINK_BASE_URL: Final[str] = "https://go-link.ru"
+GOLINK_TIMEOUT: Final[float] = 20.0
+GEMINI_DELIVERY_TEXT: Final[str] = (
+    "Перейдите по ссылке и активируйте тариф Gemini:\n{short_url}"
 )
-LINK_PART_DELAY: Final[float] = 3.0
-WELCOME_PARTS_DELAY: Final[float] = 2.5
+LINK_PART_DELAY: Final[float] = 2.0
+WELCOME_PARTS_DELAY: Final[float] = 1.5
 FP_SEND_MAX_ATTEMPTS: Final[int] = 3
 FP_SEND_RETRY_COUNT: Final[int] = 2
 CONFIRM_REMINDER_DELAY: Final[int] = 300
@@ -516,12 +512,16 @@ def _order_looks_like_gemini_activation(order_text: str) -> bool:
     return any(m in blob for m in markers)
 
 
+_GOLINK_TOKEN_RE = re.compile(r'name="_token"\s+value="([^"]+)"')
+_GOLINK_SHORT_RE = re.compile(
+    r'<span class="history__link"\s+href="(https://golnk\.ru/[A-Za-z0-9]+)"',
+    re.IGNORECASE,
+)
 _LINK_HIDDEN_RE = re.compile(
     r"[\s\u00ad\u180e\u200b-\u200f\u202a-\u202e\u2060-\u2064\u206a-\u206f"
     r"\ufeff\ufff9-\ufffb]+",
 )
 _LINK_TRAIL_JUNK_RE = re.compile(r"[.,;)\]>\"'«»}\]]+$")
-_LINK_ALLOWED_RE = re.compile(r"^[A-Za-z0-9:/?#\[\]@!$&'()*+,;=%._~-]+$")
 
 
 def sanitize_activation_url(url: str, *, tag: str = "") -> str:
@@ -537,21 +537,6 @@ def sanitize_activation_url(url: str, *, tag: str = "") -> str:
     if tag and u != raw.strip():
         _boot_log(f"{tag} url sanitized len={len(raw)}->{len(u)}")
     return u
-
-
-def ensure_clean_link_chunk(chunk: str) -> str:
-    """Проверяет фрагмент ссылки перед отправкой в чат FunPay."""
-    c = sanitize_activation_url(chunk)
-    if not c:
-        raise ValueError("пустой фрагмент ссылки")
-    if _LINK_HIDDEN_RE.search(c):
-        raise ValueError("фрагмент содержит скрытые символы")
-    if any(ord(ch) < 32 for ch in c):
-        raise ValueError("фрагмент содержит управляющие символы")
-    if not _LINK_ALLOWED_RE.match(c):
-        bad = sorted({ch for ch in c if not _LINK_ALLOWED_RE.match(ch)})
-        raise ValueError(f"фрагмент содержит недопустимые символы: {bad!r}")
-    return c
 
 
 def _normalize_activation_url(url: str) -> str:
@@ -576,38 +561,41 @@ def extract_activation_urls(text: str) -> list[str]:
     return found
 
 
-def split_link_parts(url: str, parts: int) -> list[str]:
-    """Ровно N частей очищенной ссылки без пробелов."""
-    url = sanitize_activation_url(url)
-    parts = max(1, int(parts))
-    if parts == 1:
-        return [url]
-    n = len(url)
-    if n == 0:
-        raise ValueError("пустая ссылка")
-    if n < parts:
-        parts = n
-    base, rem = divmod(n, parts)
-    chunks: list[str] = []
-    pos = 0
-    for i in range(parts):
-        size = base + (1 if i < rem else 0)
-        if size <= 0:
-            break
-        chunks.append(url[pos:pos + size])
-        pos += size
-    if len(chunks) != parts or pos != n:
-        raise ValueError(f"не удалось разбить ссылку на {parts} частей (len={n})")
-    return [ensure_clean_link_chunk(c) for c in chunks]
+def shorten_url_golink(
+    long_url: str,
+    *,
+    base_url: str = DEFAULT_GOLINK_BASE_URL,
+    timeout: float = GOLINK_TIMEOUT,
+) -> str:
+    """Сокращает ссылку через GoLink (go-link.ru → golnk.ru)."""
+    import requests
 
-
-def split_link_by_chunk_size(url: str, chunk_size: int) -> list[str]:
-    """Делит очищенную ссылку на части фиксированной длины (без пробелов)."""
-    url = sanitize_activation_url(url)
-    chunk_size = max(1, int(chunk_size))
-    if not url:
+    long_url = sanitize_activation_url(long_url)
+    if not long_url:
         raise ValueError("пустая ссылка")
-    return [ensure_clean_link_chunk(url[i:i + chunk_size]) for i in range(0, len(url), chunk_size)]
+    base = (base_url or DEFAULT_GOLINK_BASE_URL).rstrip("/")
+    session = requests.Session()
+    session.headers["User-Agent"] = (
+        "Mozilla/5.0 (compatible; FPC-GeminiLink/4.0; +https://go-link.ru)"
+    )
+    page = session.get(f"{base}/", timeout=timeout)
+    page.raise_for_status()
+    token_m = _GOLINK_TOKEN_RE.search(page.text)
+    if not token_m:
+        raise RuntimeError("GoLink: CSRF-токен не найден")
+    resp = session.post(
+        f"{base}/link/create",
+        data={"_token": token_m.group(1), "url": long_url},
+        timeout=timeout,
+    )
+    resp.raise_for_status()
+    short_m = _GOLINK_SHORT_RE.search(resp.text)
+    if short_m:
+        return short_m.group(1)
+    for link in re.findall(r"https://golnk\.ru/[A-Za-z0-9]+", resp.text):
+        if not link.endswith("/PlGM4"):
+            return link
+    raise RuntimeError("GoLink: короткая ссылка не найдена в ответе")
 
 
 def parse_shop_purchase_history(text: str) -> list[dict[str, str]]:
@@ -783,29 +771,35 @@ class Plugin:
                 sm = str(loaded.get("stock_mode", "auto_buy"))
                 if sm in _LEGACY_STOCK_MODES:
                     loaded["stock_mode"] = "gemini_links" if sm in ("stocked", "warehouse", "import_lot") else "auto_buy"
+                if str(loaded.get("_cfg_version", "0")) < "4.0.0":
+                    loaded.setdefault("golink_enabled", True)
+                    loaded.setdefault("golink_api_url", DEFAULT_GOLINK_BASE_URL)
+                    loaded.setdefault("golink_timeout_sec", GOLINK_TIMEOUT)
+                    loaded.setdefault("gemini_delivery_text", "")
+                    loaded["_cfg_version"] = "4.0.0"
                 if str(loaded.get("_cfg_version", "0")) < "3.3.0":
                     loaded["_cfg_version"] = "3.3.0"
                 if str(loaded.get("_cfg_version", "0")) < "3.2.9":
-                    loaded.setdefault("gemini_fallback_chunk_len", DEFAULT_FALLBACK_CHUNK_LEN)
+                    loaded.setdefault("gemini_fallback_chunk_len", 120)
                     loaded.pop("gemini_max_word_len", None)
                     loaded["_cfg_version"] = "3.2.9"
                 if str(loaded.get("_cfg_version", "0")) < "3.2.8":
-                    loaded["gemini_delivery_parts"] = DEFAULT_DELIVERY_PARTS
-                    loaded["gemini_redelivery_parts"] = DEFAULT_REDELIVERY_PARTS
+                    loaded["gemini_delivery_parts"] = 3
+                    loaded["gemini_redelivery_parts"] = 4
                     loaded.setdefault("gemini_max_word_len", 28)
                     loaded["_cfg_version"] = "3.2.8"
                 if str(loaded.get("_cfg_version", "0")) < "3.2.7":
                     loaded.setdefault("gemini_max_word_len", 28)
                     loaded["_cfg_version"] = "3.2.7"
                 if str(loaded.get("_cfg_version", "0")) < "3.2.5":
-                    loaded["gemini_delivery_parts"] = DEFAULT_DELIVERY_PARTS
-                    loaded["gemini_redelivery_parts"] = DEFAULT_REDELIVERY_PARTS
+                    loaded["gemini_delivery_parts"] = 3
+                    loaded["gemini_redelivery_parts"] = 4
                     loaded["_cfg_version"] = "3.2.5"
                 if str(loaded.get("_cfg_version", "0")) < "3.2.3":
-                    if int(loaded.get("gemini_delivery_parts", DEFAULT_DELIVERY_PARTS)) == 3:
-                        loaded["gemini_delivery_parts"] = DEFAULT_DELIVERY_PARTS
-                    if int(loaded.get("gemini_redelivery_parts", DEFAULT_REDELIVERY_PARTS)) == 4:
-                        loaded["gemini_redelivery_parts"] = DEFAULT_REDELIVERY_PARTS
+                    if int(loaded.get("gemini_delivery_parts", 3)) == 3:
+                        loaded["gemini_delivery_parts"] = 3
+                    if int(loaded.get("gemini_redelivery_parts", 4)) == 4:
+                        loaded["gemini_redelivery_parts"] = 4
                     loaded["_cfg_version"] = "3.2.3"
                 if str(loaded.get("_cfg_version", "0")) < "3.2.2":
                     loaded.setdefault("confirm_reminder_enabled", True)
@@ -818,8 +812,8 @@ class Plugin:
                     loaded["_cfg_version"] = "3.2.0"
                 if str(loaded.get("_cfg_version", "0")) < "3.0.0":
                     loaded.setdefault("gemini_lot_match", DEFAULT_GEMINI_LOT_MATCH)
-                    loaded.setdefault("gemini_delivery_parts", DEFAULT_DELIVERY_PARTS)
-                    loaded.setdefault("gemini_redelivery_parts", DEFAULT_REDELIVERY_PARTS)
+                    loaded.setdefault("gemini_delivery_parts", 3)
+                    loaded.setdefault("gemini_redelivery_parts", 4)
                     if loaded.get("stock_mode") == "stocked":
                         loaded["stock_mode"] = "gemini_links"
                     loaded["_cfg_version"] = "3.0.0"
@@ -904,15 +898,16 @@ class Plugin:
             "warehouse_release_qty": 5,
             "gemini_lot_match": DEFAULT_GEMINI_LOT_MATCH,
             "gemini_lot_id": "",
-            "gemini_delivery_parts": DEFAULT_DELIVERY_PARTS,
-            "gemini_redelivery_parts": DEFAULT_REDELIVERY_PARTS,
-            "gemini_fallback_chunk_len": DEFAULT_FALLBACK_CHUNK_LEN,
+            "golink_enabled": True,
+            "golink_api_url": DEFAULT_GOLINK_BASE_URL,
+            "golink_timeout_sec": GOLINK_TIMEOUT,
+            "gemini_delivery_text": "",
             "gemini_auto_enabled": True,
             "confirm_reminder_enabled": True,
             "confirm_reminder_delay_sec": CONFIRM_REMINDER_DELAY,
             "confirm_reminder_text": "",
             "last_delivery_error": "",
-            "_cfg_version": "3.3.0",
+            "_cfg_version": "4.0.0",
         }
 
     # ── UI: компактные страницы вместо длинного списка кнопок ───────────────
@@ -934,9 +929,9 @@ class Plugin:
             {"key": "autobuy_lot_id", "label": "ID лота (необяз.)", "type": "text"},
             {"key": "gemini_lot_match", "label": "Метка лота Gemini", "type": "text"},
             {"key": "gemini_lot_id", "label": "ID лота Gemini (необяз.)", "type": "text"},
-            {"key": "gemini_delivery_parts", "label": "Частей при выдаче", "type": "int", "min": 2, "max": 6},
-            {"key": "gemini_redelivery_parts", "label": "Частей при перевыдаче", "type": "int", "min": 2, "max": 8},
-            {"key": "gemini_fallback_chunk_len", "label": "Символов в части (запас)", "type": "int", "min": 40, "max": 200},
+            {"key": "golink_api_url", "label": "GoLink URL", "type": "text"},
+            {"key": "golink_timeout_sec", "label": "GoLink таймаут (сек)", "type": "int", "min": 5, "max": 60},
+            {"key": "gemini_delivery_text", "label": "Текст выдачи ({short_url})", "type": "text"},
             {"key": "warehouse_release_qty", "label": "Выложить со склада (шт.)", "type": "int", "min": 0, "max": 100},
         ]
 
@@ -2568,91 +2563,19 @@ class Plugin:
                     time.sleep(1.5 * n)
         raise RuntimeError(self._format_fp_error(last_exc) if last_exc else "send failed")
 
-    def _deliver_link_chunks(
-        self,
-        chat_id: Any,
-        buyer: str,
-        chunks: list[str],
-        *,
-        chat_candidates: list[int | str] | None = None,
-        full_order: Any = None,
-        event: Any = None,
-        order_id: str = "",
-    ) -> int | str:
-        """Отправляет фрагменты ссылки как есть (без пробелов внутри)."""
-        active_chat = chat_id
-        send_kw = {
-            "chat_candidates": chat_candidates,
-            "full_order": full_order,
-            "event": event,
-            "order_id": order_id,
-        }
-        for idx, chunk in enumerate(chunks):
-            if idx > 0:
-                time.sleep(LINK_PART_DELAY + 0.5 * idx)
-            clean = ensure_clean_link_chunk(chunk)
-            active_chat = self._fp_send_retry(
-                active_chat, clean, buyer, watermark=False, **send_kw,
-            )
-        time.sleep(LINK_PART_DELAY)
-        active_chat = self._fp_send_retry(
-            active_chat,
-            LINK_JOIN_INSTRUCTION,
-            buyer,
-            watermark=False,
-            **send_kw,
-        )
-        return active_chat
+    def _golink_shorten(self, url: str) -> str:
+        if not bool(self.get_cfg("golink_enabled", True)):
+            raise RuntimeError("GoLink отключён в настройках")
+        base = str(self.get_cfg("golink_api_url", DEFAULT_GOLINK_BASE_URL)).strip()
+        if not base:
+            base = DEFAULT_GOLINK_BASE_URL
+        timeout = float(self.get_cfg("golink_timeout_sec", GOLINK_TIMEOUT))
+        return shorten_url_golink(url, base_url=base, timeout=timeout)
 
-    def _deliver_link_in_parts(
-        self,
-        chat_id: Any,
-        buyer: str,
-        url: str,
-        parts: int,
-        *,
-        chat_candidates: list[int | str] | None = None,
-        full_order: Any = None,
-        event: Any = None,
-        order_id: str = "",
-    ) -> int | str:
-        chunks = split_link_parts(url, parts)
-        _boot_log(
-            f"split link len={len(url)} parts={parts} chunks={[len(c) for c in chunks]}"
-        )
-        return self._deliver_link_chunks(
-            chat_id, buyer, chunks,
-            chat_candidates=chat_candidates,
-            full_order=full_order,
-            event=event,
-            order_id=order_id,
-        )
-
-    def _deliver_link_by_chunk_size(
-        self,
-        chat_id: Any,
-        buyer: str,
-        url: str,
-        chunk_size: int,
-        *,
-        chat_candidates: list[int | str] | None = None,
-        full_order: Any = None,
-        event: Any = None,
-        order_id: str = "",
-    ) -> int | str:
-        chunk_size = max(1, int(chunk_size))
-        chunks = split_link_by_chunk_size(url, chunk_size)
-        _boot_log(
-            f"split link len={len(url)} chunk_size={chunk_size} "
-            f"parts={len(chunks)} chunks={[len(c) for c in chunks]}"
-        )
-        return self._deliver_link_chunks(
-            chat_id, buyer, chunks,
-            chat_candidates=chat_candidates,
-            full_order=full_order,
-            event=event,
-            order_id=order_id,
-        )
+    def _gemini_delivery_text(self, short_url: str) -> str:
+        custom = str(self.get_cfg("gemini_delivery_text", "") or "").strip()
+        template = custom or GEMINI_DELIVERY_TEXT
+        return template.format(short_url=short_url)
 
     def _deliver_single_gemini_link(
         self,
@@ -2668,20 +2591,6 @@ class Plugin:
         url = sanitize_activation_url(url, tag="DELIVER")
         if not url:
             return False, "пустая ссылка", chat_id
-        primary = max(2, min(6, int(self.get_cfg("gemini_delivery_parts", DEFAULT_DELIVERY_PARTS))))
-        fallback = max(2, min(8, int(self.get_cfg("gemini_redelivery_parts", DEFAULT_REDELIVERY_PARTS))))
-        if fallback <= primary:
-            fallback = primary + 1
-        chunk_size = max(
-            40,
-            int(self.get_cfg("gemini_fallback_chunk_len", DEFAULT_FALLBACK_CHUNK_LEN)),
-        )
-        plans: list[tuple[str, int]] = [
-            ("parts", primary),
-            ("parts", fallback),
-            ("size", chunk_size),
-        ]
-        last_err = ""
         send_kw = {
             "chat_candidates": chat_candidates,
             "full_order": full_order,
@@ -2689,36 +2598,28 @@ class Plugin:
             "order_id": order_id,
         }
         active_chat = chat_id
-        for attempt, (mode, value) in enumerate(plans):
-            try:
-                if attempt > 0:
-                    notice = (
-                        f"Повторная отправка ссылки в {value} части…"
-                        if mode == "parts"
-                        else f"Повторная отправка ссылки частями по {value} символов…"
-                    )
-                    try:
-                        active_chat = self._fp_send(
-                            active_chat, notice, buyer, watermark=False, **send_kw,
-                        )
-                    except Exception:
-                        pass
-                    time.sleep(WELCOME_PARTS_DELAY)
-                if mode == "parts":
-                    active_chat = self._deliver_link_in_parts(
-                        active_chat, buyer, url, value, **send_kw,
-                    )
-                else:
-                    active_chat = self._deliver_link_by_chunk_size(
-                        active_chat, buyer, url, value, **send_kw,
-                    )
-                return True, "", active_chat
-            except Exception as exc:
-                last_err = self._format_fp_error(exc)
-                label = f"{value} parts" if mode == "parts" else f"{value} chars"
-                self.log("выдача (%s) не удалась: %s", label, last_err)
-                _boot_log(f"deliver {label} fail: {last_err}")
-        return False, last_err or "send failed", active_chat
+        try:
+            short_url = self._golink_shorten(url)
+            _boot_log(f"golink OK len={len(url)} -> {short_url}")
+        except Exception as exc:
+            err = str(exc)
+            self.log("GoLink shorten fail: %s", err)
+            _boot_log(f"golink FAIL: {err}")
+            return False, f"GoLink: {err}", active_chat
+        try:
+            active_chat = self._fp_send_retry(
+                active_chat,
+                self._gemini_delivery_text(short_url),
+                buyer,
+                watermark=False,
+                **send_kw,
+            )
+            return True, "", active_chat
+        except Exception as exc:
+            err = self._format_fp_error(exc)
+            self.log("выдача короткой ссылки не удалась: %s", err)
+            _boot_log(f"deliver short url fail: {err}")
+            return False, err, active_chat
 
     def deliver_gemini_order(
         self,
@@ -3137,8 +3038,7 @@ class Plugin:
                         f"{'🟢' if auto_on else '🔴'} <b>Автовыдача:</b> {'ВКЛ' if auto_on else 'ВЫКЛ'}",
                         f"📋 <b>Лотов с</b> <code>{_escape(match)}</code>: {lot_hint}",
                         f"🗄 <b>Архив ссылок:</b> {self.gemini_archive_count()} шт.",
-                        f"📨 <b>Формат:</b> приветствие + "
-                        f"{int(self.get_cfg('gemini_delivery_parts', DEFAULT_DELIVERY_PARTS))} части ссылки + инструкция",
+                        f"📨 <b>Формат:</b> приветствие + короткая ссылка GoLink",
                         "<i>⏳ Обновление списка лотов…</i>",
                     ]
                 return "\n".join(lines)
@@ -3156,7 +3056,7 @@ class Plugin:
                     f"{'🟢' if auto_on else '🔴'} <b>Автовыдача:</b> {'ВКЛ' if auto_on else 'ВЫКЛ'}",
                     f"📋 <b>Лотов с</b> <code>{_escape(match)}</code>: <b>{len(lot_ids)}</b>{cache_age}",
                     f"🗄 <b>Архив ссылок:</b> {self.gemini_archive_count()} шт.",
-                    f"📨 <b>Выдача:</b> приветствие + <b>{int(self.get_cfg('gemini_delivery_parts', DEFAULT_DELIVERY_PARTS))} части</b> ссылки + инструкция",
+                    f"📨 <b>Выдача:</b> приветствие + <b>короткая ссылка GoLink</b>",
                 ]
                 last_err = str(self.get_cfg("last_delivery_error", "") or "").strip()
                 if last_err:
@@ -3247,9 +3147,7 @@ class Plugin:
                 lines.append(f"\n📋 <b>Лотов с</b> <code>{_escape(match)}</code>: <b>{len(lot_ids)}</b>")
                 lines.append(f"🗄 <b>Архив ссылок:</b> {self.gemini_archive_count()} шт.")
                 lines.append(
-                    f"📤 <b>Выдача:</b> {int(self.get_cfg('gemini_delivery_parts', DEFAULT_DELIVERY_PARTS))} части "
-                    f"(перевыдача: {int(self.get_cfg('gemini_redelivery_parts', DEFAULT_REDELIVERY_PARTS))}, "
-                    f"запас: по {int(self.get_cfg('gemini_fallback_chunk_len', DEFAULT_FALLBACK_CHUNK_LEN))} симв.)"
+                    f"📤 <b>Выдача:</b> GoLink → golnk.ru"
                 )
             else:
                 lines.append(f"\n📦 <b>На лоте:</b> {self._lot_stock_info(fast=True)}")
