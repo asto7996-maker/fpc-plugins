@@ -48,7 +48,7 @@ except ImportError:
 
 
 NAME          = "Gemini Link Auto"
-VERSION       = "4.0.1"
+VERSION       = "4.0.2"
 DESCRIPTION   = "ChatGPT автозакупка + выдача Gemini-ссылок через GoLink"
 CREDITS       = "Cursor AI"
 UUID          = "f7a2e8c1-4b3d-4e9f-a8c2-1d5e9b0f6a3c"
@@ -69,7 +69,6 @@ GEMINI_DELIVERY_TEXT: Final[str] = (
     "Перейдите по ссылке и активируйте тариф Gemini:\n{short_url}"
 )
 LINK_PART_DELAY: Final[float] = 2.0
-WELCOME_PARTS_DELAY: Final[float] = 1.5
 FP_SEND_MAX_ATTEMPTS: Final[int] = 3
 FP_SEND_RETRY_COUNT: Final[int] = 2
 CONFIRM_REMINDER_DELAY: Final[int] = 300
@@ -676,6 +675,7 @@ class Plugin:
         self._gemini_lots_cache_ts: float = 0.0
         self._gemini_lots_scan_lock = threading.Lock()
         self._gemini_lots_scan_running = False
+        self._archive_lot_sync_lock = threading.Lock()
         self._delivery_in_progress: set[str] = set()
         self.reload_settings()
 
@@ -788,6 +788,9 @@ class Plugin:
                 sm = str(loaded.get("stock_mode", "auto_buy"))
                 if sm in _LEGACY_STOCK_MODES:
                     loaded["stock_mode"] = "gemini_links" if sm in ("stocked", "warehouse", "import_lot") else "auto_buy"
+                if str(loaded.get("_cfg_version", "0")) < "4.0.2":
+                    loaded.setdefault("gemini_disable_empty_lots", True)
+                    loaded["_cfg_version"] = "4.0.2"
                 if str(loaded.get("_cfg_version", "0")) < "4.0.0":
                     loaded.setdefault("golink_enabled", True)
                     loaded.setdefault("golink_api_url", DEFAULT_GOLINK_BASE_URL)
@@ -920,11 +923,12 @@ class Plugin:
             "golink_timeout_sec": GOLINK_TIMEOUT,
             "gemini_delivery_text": "",
             "gemini_auto_enabled": True,
+            "gemini_disable_empty_lots": True,
             "confirm_reminder_enabled": True,
             "confirm_reminder_delay_sec": CONFIRM_REMINDER_DELAY,
             "confirm_reminder_text": "",
             "last_delivery_error": "",
-            "_cfg_version": "4.0.0",
+            "_cfg_version": "4.0.2",
         }
 
     # ── UI: компактные страницы вместо длинного списка кнопок ───────────────
@@ -1955,6 +1959,66 @@ class Plugin:
         os.makedirs(os.path.dirname(GEMINI_ARCHIVE_FILE), exist_ok=True)
         with open(GEMINI_ARCHIVE_FILE, "w", encoding="utf-8") as f:
             json.dump(items, f, ensure_ascii=False, indent=2)
+        self._schedule_gemini_lots_archive_sync(len(items))
+
+    def _gemini_lot_ids_for_manage(self) -> list[int]:
+        lot_ids = list(self._gemini_lots_cache)
+        if not lot_ids:
+            lot_ids = self.find_gemini_link_lot_ids(fast=False)
+        cfg = str(self.get_cfg("gemini_lot_id", "")).strip()
+        if cfg.isdigit():
+            lid = int(cfg)
+            if lid not in lot_ids:
+                lot_ids.append(lid)
+        return lot_ids
+
+    def _set_gemini_lot_active(self, lot_id: int, active: bool) -> tuple[bool, str]:
+        acc = self.cardinal.account
+        lot_id = int(lot_id)
+        try:
+            lf = acc.get_lot_fields(lot_id)
+            if bool(lf.active) == active:
+                state = "активен" if active else "выключен"
+                return True, f"лот #{lot_id} уже {state}"
+            lf.active = active
+            lf.renew_fields()
+            acc.save_lot(lf)
+            state = "🟢 включён" if active else "🔴 выключен"
+            return True, f"лот #{lot_id}: {state}"
+        except Exception as exc:
+            return False, str(exc)
+
+    def _schedule_gemini_lots_archive_sync(self, archive_count: int | None = None) -> None:
+        if self.stock_mode() != "gemini_links":
+            return
+        if not bool(self.get_cfg("gemini_disable_empty_lots", True)):
+            return
+        threading.Thread(
+            target=lambda: self._sync_gemini_lots_by_archive(archive_count),
+            daemon=True,
+            name="GeminiLotArchiveSync",
+        ).start()
+
+    def _sync_gemini_lots_by_archive(self, archive_count: int | None = None) -> None:
+        if self.stock_mode() != "gemini_links":
+            return
+        if not bool(self.get_cfg("gemini_disable_empty_lots", True)):
+            return
+        if not self._archive_lot_sync_lock.acquire(blocking=False):
+            return
+        try:
+            count = archive_count if archive_count is not None else self.gemini_archive_count()
+            want_active = count > 0
+            lot_ids = self._gemini_lot_ids_for_manage()
+            if not lot_ids:
+                _boot_log(f"LOT_SYNC skip: нет лотов archive={count}")
+                return
+            for lot_id in lot_ids:
+                ok, info = self._set_gemini_lot_active(lot_id, want_active)
+                self.log("archive→лот #%s (остаток %s): %s", lot_id, count, info)
+                _boot_log(f"LOT_SYNC #{lot_id} active={want_active} archive={count} ok={ok}")
+        finally:
+            self._archive_lot_sync_lock.release()
 
     def gemini_archive_count(self) -> int:
         return len(self._load_gemini_archive())
@@ -2168,6 +2232,7 @@ class Plugin:
                 "скан gemini: %s лот(ов) с %r из %s (api=%s)",
                 len(matched), needle, len(lot_ids), api_calls,
             )
+            self._schedule_gemini_lots_archive_sync()
             return list(matched)
         finally:
             self._gemini_lots_scan_running = False
@@ -2746,21 +2811,10 @@ class Plugin:
             f"DELIVER #{order_id} chat_id={chat_id} candidates={chat_candidates} "
             f"buyer={buyer} qty={qty}"
         )
-        try:
-            chat_id = self._fp_send(
-                chat_id,
-                "Выдаю ссылку активации Gemini…",
-                buyer,
-                watermark=False,
-                **send_kw,
-            )
-            time.sleep(WELCOME_PARTS_DELAY)
-        except Exception as exc:
-            self.log("заказ #%s: приветствие: %s", order_id, self._format_fp_error(exc))
-            _boot_log(f"DELIVER #{order_id} welcome fail: {self._format_fp_error(exc)}")
         urls = self.take_urls_from_gemini_archive(qty)
         if len(urls) < qty:
             self.return_urls_to_gemini_archive(urls)
+            self._schedule_gemini_lots_archive_sync()
             try:
                 self._fp_send(
                     chat_id,
@@ -3952,6 +4006,7 @@ def post_init_plugin(cardinal: Cardinal) -> None:
         _plugin.ensure_telegram_handlers()
         if _plugin.stock_mode() == "gemini_links":
             _plugin.refresh_gemini_lots_async()
+            _plugin._schedule_gemini_lots_archive_sync()
         elif _plugin.stock_mode() == "auto_buy":
             _plugin.start_auto_worker()
         _boot_log(f"POST_INIT OK mode={_plugin.stock_mode()}")
