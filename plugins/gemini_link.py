@@ -48,7 +48,7 @@ except ImportError:
 
 
 NAME          = "Gemini Link Auto"
-VERSION       = "4.0.0"
+VERSION       = "4.0.1"
 DESCRIPTION   = "ChatGPT автозакупка + выдача Gemini-ссылок через GoLink"
 CREDITS       = "Cursor AI"
 UUID          = "f7a2e8c1-4b3d-4e9f-a8c2-1d5e9b0f6a3c"
@@ -120,7 +120,6 @@ logger = logging.getLogger("FPC.GeminiLink")
 _P = "[GeminiLink]"
 
 _plugin: "Plugin | None" = None
-_tg_ui_registered_for: int | None = None
 
 
 def _boot_log(msg: str) -> None:
@@ -245,6 +244,27 @@ def _register_priority_cbq(tg, handler, predicate) -> None:
     if handlers:
         handlers.insert(0, handlers.pop())
     _normalize_cbq_handler_order(tg.bot)
+
+
+def _tag_gemini_msg_filter(func):
+    func.__gemini_link_msg__ = True  # type: ignore[attr-defined]
+    return func
+
+
+def _remove_gemini_msg_handlers(bot) -> None:
+    bot.message_handlers[:] = [
+        h for h in bot.message_handlers
+        if not getattr(h.get("filters", {}).get("func"), "__gemini_link_msg__", False)
+    ]
+
+
+def _register_priority_msg(tg, handler, predicate, **kwargs) -> None:
+    """Регистрирует text/document-хэндлер в начало очереди (до Cardinal file handlers)."""
+    tagged = _tag_gemini_msg_filter(predicate)
+    tg.msg_handler(handler, func=tagged, **kwargs)
+    handlers = tg.bot.message_handlers
+    if handlers:
+        handlers.insert(0, handlers.pop())
 
 
 def _escape(val: Any) -> str:
@@ -745,16 +765,13 @@ class Plugin:
 
     def ensure_telegram_handlers(self) -> None:
         """Регистрирует UI и гарантирует приоритет кнопки «Настройки» в карточке."""
-        global _tg_ui_registered_for
         if not self.cardinal.telegram:
             self.log("Telegram недоступен — UI не зарегистрирован")
             return
-        bot = self.cardinal.telegram.bot
-        bot_id = id(bot)
-        if _tg_ui_registered_for != bot_id:
-            self.setup_telegram()
-            _tg_ui_registered_for = bot_id
-        _ensure_gemini_settings_handler(bot, _gemini_link_open_settings)
+        self._setup_telegram_handlers()
+        _ensure_gemini_settings_handler(
+            self.cardinal.telegram.bot, _gemini_link_open_settings,
+        )
 
     def log(self, msg: str, *args) -> None:
         logger.info("%s " + msg, _P, *args)
@@ -1640,7 +1657,7 @@ class Plugin:
             dest = (
                 "Ссылки попадут в <b>архив Gemini</b>.\n"
                 "При оплате лота с меткой <code>gemini link</code> в подробном описании "
-                "плагин выдаст ссылку покупателю частями."
+                "плагин выдаст покупателю короткую ссылку GoLink."
             )
         elif target == "warehouse":
             dest = (
@@ -1655,7 +1672,8 @@ class Plugin:
             "Вставьте ссылки <code>one.google.com/activate-plan/…</code> "
             "(по одной на строку) или <b>Purchase History</b>.\n"
             "Можно файлом <code>.txt</code>.\n\n"
-            "<code>/done</code> — разобрать | <code>/cancel</code> — отмена"
+            "Ссылки распознаются автоматически. Также: <code>/done</code> — разобрать, "
+            "<code>/cancel</code> — отмена"
         )
 
     def _accumulate_import_text(self, chat_id: int, user_id: int, chunk: str) -> int:
@@ -1663,6 +1681,35 @@ class Plugin:
         buf = self._import_buffers.get(key, "") + (chunk or "")
         self._import_buffers[key] = buf
         return len(buf)
+
+    def _import_buffer_has_urls(self, chat_id: int, user_id: int) -> bool:
+        raw = self._import_buffers.get((chat_id, user_id), "")
+        if not raw.strip():
+            return False
+        if extract_activation_urls(raw):
+            return True
+        return bool(parse_shop_purchase_history(raw))
+
+    def _user_in_import_mode(self, chat_id: int, user_id: int) -> bool:
+        if (chat_id, user_id) in self._import_buffers:
+            return True
+        tg = self.cardinal.telegram
+        if not tg:
+            return False
+        state_data = tg.get_state(chat_id, user_id)
+        if not state_data:
+            return False
+        return str(state_data.get("state", "")).startswith(f"{CB_PREFIX}:import:wait")
+
+    def _set_import_state(
+        self, chat_id: int, user_id: int, target: str, message_id: int,
+    ) -> None:
+        tg = self.cardinal.telegram
+        if tg:
+            tg.set_state(
+                chat_id, message_id, user_id,
+                state=f"{CB_PREFIX}:import:wait:{target}",
+            )
 
     def process_import_buffer(self, chat_id: int, user_id: int, skipped_dup: int = 0) -> None:
         bot = self.cardinal.telegram.bot if self.cardinal.telegram else None
@@ -3325,13 +3372,13 @@ class Plugin:
                 "📤 <b>Выдача заказа вручную</b>\n\n"
                 "Введите номер заказа FunPay, например:\n"
                 "<code>Z8U62P1Z</code>\n\n"
-                "Плагин отправит покупателю ссылку частями (3 сообщения + инструкция).\n"
+                "Плагин сократит ссылку через GoLink и отправит покупателю.\n"
                 "<code>/cancel</code> — отмена"
             )
             result = bot.send_message(chat_id, prompt, parse_mode="HTML")
             if self.cardinal.telegram:
                 self.cardinal.telegram.set_state(
-                    chat_id, 0, call.from_user.id,
+                    chat_id, result.message_id, call.from_user.id,
                     state=f"{CB_PREFIX}:deliver:wait",
                 )
             return True
@@ -3347,12 +3394,9 @@ class Plugin:
                 target = "lot"
             bot.answer_callback_query(call.id)
             prompt = self.start_import_mode(chat_id, call.from_user.id, target)
-            bot.send_message(chat_id, prompt, parse_mode="HTML")
-            if self.cardinal.telegram:
-                self.cardinal.telegram.set_state(
-                    chat_id, 0, call.from_user.id,
-                    state=f"{CB_PREFIX}:import:wait:{target}",
-                )
+            result = bot.send_message(chat_id, prompt, parse_mode="HTML")
+            self._set_import_state(chat_id, call.from_user.id, target, result.message_id)
+            _boot_log(f"IMPORT start chat={chat_id} user={call.from_user.id} target={target}")
             return True
 
         if action == "release_warehouse":
@@ -3382,13 +3426,14 @@ class Plugin:
 
     # ── Telegram UI (schema-driven, как Starvell) ────────────────────────────
 
-    def setup_telegram(self) -> None:
+    def _setup_telegram_handlers(self) -> None:
         if not self.cardinal.telegram:
             self.log("Telegram недоступен — UI не зарегистрирован")
             return
         tg = self.cardinal.telegram
         bot = tg.bot
         plugin = self
+        _remove_gemini_msg_handlers(bot)
 
         def show_settings(
             chat_id: int, msg_id: int, page: str = "hub",
@@ -3577,44 +3622,56 @@ class Plugin:
                 bot.answer_callback_query(call.id)
 
         def on_import_text(message: Message) -> None:
-            state_data = tg.get_state(message.chat.id, message.from_user.id)
-            state = str((state_data or {}).get("state", ""))
-            if not state.startswith(f"{CB_PREFIX}:import:wait"):
+            pl = _plugin
+            if pl is None:
                 return
-            target = _import_target_from_state(state)
             chat_id = message.chat.id
             uid = message.from_user.id
-            plugin._import_target[chat_id] = target
+            if not pl._user_in_import_mode(chat_id, uid):
+                return
+            state_data = tg.get_state(chat_id, uid) or {}
+            state = str(state_data.get("state", ""))
+            target = _import_target_from_state(state) if state else pl._import_target.get(chat_id, "gemini_archive")
+            pl._import_target[chat_id] = target
             text = message.text or ""
             low = text.strip().lower()
             if low in ("/cancel", "отмена"):
-                plugin.cancel_import(chat_id, uid)
+                pl.cancel_import(chat_id, uid)
                 tg.clear_state(chat_id, uid)
                 bot.reply_to(message, "❌ Импорт отменён")
                 return
             if low in ("/done", "готово", "done"):
                 tg.clear_state(chat_id, uid)
-                plugin.process_import_buffer(chat_id, uid)
+                pl.process_import_buffer(chat_id, uid)
                 return
-            added = plugin._accumulate_import_text(chat_id, uid, text)
+            pl._accumulate_import_text(chat_id, uid, text)
+            if pl._import_buffer_has_urls(chat_id, uid):
+                _boot_log(f"IMPORT auto-parse chat={chat_id} user={uid} len={len(text)}")
+                tg.clear_state(chat_id, uid)
+                pl.process_import_buffer(chat_id, uid)
+                return
+            added = len(pl._import_buffers.get((chat_id, uid), ""))
             bot.reply_to(
                 message,
-                f"✅ +{len(text)} симв. (всего <b>{added}</b>)\n"
-                f"Ещё части или <code>/done</code>",
+                f"✅ Принято (+{len(text)} симв., всего <b>{added}</b>)\n"
+                f"Отправьте ещё ссылки или <code>/done</code>",
                 parse_mode="HTML",
             )
 
         def on_import_document(message: Message) -> None:
-            state_data = tg.get_state(message.chat.id, message.from_user.id)
-            state = str((state_data or {}).get("state", ""))
-            if not state.startswith(f"{CB_PREFIX}:import:wait"):
-                return
-            target = _import_target_from_state(state)
-            doc = message.document
-            if not doc:
+            pl = _plugin
+            if pl is None:
                 return
             chat_id = message.chat.id
             uid = message.from_user.id
+            if not pl._user_in_import_mode(chat_id, uid):
+                return
+            state_data = tg.get_state(chat_id, uid) or {}
+            state = str(state_data.get("state", ""))
+            target = _import_target_from_state(state) if state else pl._import_target.get(chat_id, "gemini_archive")
+            doc = message.document
+            if not doc:
+                return
             try:
                 file_info = bot.get_file(doc.file_id)
                 raw = bot.download_file(file_info.file_path)
@@ -3622,16 +3679,17 @@ class Plugin:
             except Exception as exc:
                 bot.reply_to(message, f"❌ Не удалось прочитать файл: {_escape(exc)}", parse_mode="HTML")
                 return
-            plugin._import_buffers[(chat_id, uid)] = text
-            plugin._import_target[chat_id] = target
+            pl._import_buffers[(chat_id, uid)] = text
+            pl._import_target[chat_id] = target
             tg.clear_state(chat_id, uid)
             bot.reply_to(message, f"📄 Файл принят ({len(text)} симв.), разбираю…")
-            plugin.process_import_buffer(chat_id, uid)
+            pl.process_import_buffer(chat_id, uid)
 
         def _is_importing(m: Message) -> bool:
-            state_data = tg.get_state(m.chat.id, m.from_user.id)
-            state = str((state_data or {}).get("state", ""))
-            return state.startswith(f"{CB_PREFIX}:import:wait")
+            pl = _plugin
+            if pl is None:
+                return False
+            return pl._user_in_import_mode(m.chat.id, m.from_user.id)
 
         def on_text(message: Message) -> None:
             state_data = tg.get_state(message.chat.id, message.from_user.id)
@@ -3738,16 +3796,16 @@ class Plugin:
 
             threading.Thread(target=_run, daemon=True, name=f"GlDeliverUI-{order_id}").start()
 
-        tg.msg_handler(on_deliver_text, func=_is_deliver_waiting)
+        _register_priority_msg(tg, on_deliver_text, _is_deliver_waiting)
 
         _register_priority_cbq(
             tg,
             on_callback,
             lambda c: (c.data or "").startswith(f"{CB_PREFIX}:"),
         )
-        tg.msg_handler(on_import_text, func=_is_importing)
-        tg.msg_handler(on_import_document, content_types=["document"], func=_is_importing)
-        tg.msg_handler(on_text, func=_is_editing)
+        _register_priority_msg(tg, on_import_text, _is_importing)
+        _register_priority_msg(tg, on_import_document, _is_importing, content_types=["document"])
+        _register_priority_msg(tg, on_text, _is_editing)
 
         def send_panel(message: Message) -> None:
             chat_id = message.chat.id
