@@ -49,7 +49,7 @@ except ImportError:
 
 NAME          = "Gemini Link Auto"
 VERSION       = "4.0.0"
-DESCRIPTION   = "ChatGPT автозакупка + выдача Gemini-ссылок из архива"
+DESCRIPTION   = "ChatGPT автозакупка + выдача Gemini-ссылок через GoLink"
 CREDITS       = "Cursor AI"
 UUID          = "f7a2e8c1-4b3d-4e9f-a8c2-1d5e9b0f6a3c"
 SETTINGS_PAGE = True
