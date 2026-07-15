@@ -48,7 +48,7 @@ except ImportError:
 
 
 NAME          = "Gemini Link Auto"
-VERSION       = "4.0.5"
+VERSION       = "4.0.6"
 DESCRIPTION   = "ChatGPT автозакупка + выдача Gemini-ссылок через GoLink"
 CREDITS       = "Cursor AI"
 UUID          = "f7a2e8c1-4b3d-4e9f-a8c2-1d5e9b0f6a3c"
@@ -74,6 +74,7 @@ GEMINI_MULTI_LINK_BATCH_EVERY: Final[int] = 3
 GEMINI_MULTI_LINK_BATCH_PAUSE: Final[float] = 15.0
 GEMINI_DELIVER_LINK_RETRIES: Final[int] = 3
 GOLINK_RETRY_COUNT: Final[int] = 3
+GEMINI_DELIVER_MAX_CONSECUTIVE_FAILS: Final[int] = 2
 IMPORT_FINALIZE_SEC: Final[float] = 2.0
 FP_SEND_MAX_ATTEMPTS: Final[int] = 3
 FP_SEND_RETRY_COUNT: Final[int] = 2
@@ -654,6 +655,29 @@ def parse_shop_purchase_history(text: str) -> list[dict[str, str]]:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+#  Активная выдача (отмена)
+# ═════════════════════════════════════════════════════════════════════════════
+
+class _DeliveryJob:
+    __slots__ = ("order_id", "cancel", "notify_chat_id", "user_id", "total", "delivered")
+
+    def __init__(
+        self,
+        order_id: str,
+        total: int,
+        *,
+        notify_chat_id: int | None = None,
+        user_id: int | None = None,
+    ) -> None:
+        self.order_id = order_id
+        self.cancel = threading.Event()
+        self.notify_chat_id = notify_chat_id
+        self.user_id = user_id
+        self.total = total
+        self.delivered = 0
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 #  Plugin
 # ═════════════════════════════════════════════════════════════════════════════
 
@@ -685,6 +709,8 @@ class Plugin:
         self._gemini_lots_scan_running = False
         self._archive_lot_sync_lock = threading.Lock()
         self._delivery_in_progress: set[str] = set()
+        self._delivery_jobs: dict[str, _DeliveryJob] = {}
+        self._delivery_jobs_lock = threading.Lock()
         self.reload_settings()
 
     def open_settings_card(self, call: CallbackQuery) -> None:
@@ -796,6 +822,8 @@ class Plugin:
                 sm = str(loaded.get("stock_mode", "auto_buy"))
                 if sm in _LEGACY_STOCK_MODES:
                     loaded["stock_mode"] = "gemini_links" if sm in ("stocked", "warehouse", "import_lot") else "auto_buy"
+                if str(loaded.get("_cfg_version", "0")) < "4.0.6":
+                    loaded["_cfg_version"] = "4.0.6"
                 if str(loaded.get("_cfg_version", "0")) < "4.0.5":
                     loaded.setdefault("gemini_multi_link_delay_sec", GEMINI_MULTI_LINK_DELAY)
                     loaded.setdefault("gemini_multi_link_batch_every", GEMINI_MULTI_LINK_BATCH_EVERY)
@@ -948,7 +976,7 @@ class Plugin:
             "gemini_multi_link_delay_sec": GEMINI_MULTI_LINK_DELAY,
             "gemini_multi_link_batch_every": GEMINI_MULTI_LINK_BATCH_EVERY,
             "gemini_multi_link_batch_pause_sec": GEMINI_MULTI_LINK_BATCH_PAUSE,
-            "_cfg_version": "4.0.5",
+            "_cfg_version": "4.0.6",
         }
 
     # ── UI: компактные страницы вместо длинного списка кнопок ───────────────
@@ -2738,7 +2766,85 @@ class Plugin:
                     time.sleep(1.5 * n)
         raise RuntimeError(self._format_fp_error(last_exc) if last_exc else "send failed")
 
-    def _golink_shorten(self, url: str) -> str:
+    def _interruptible_sleep(self, seconds: float, cancel: threading.Event | None) -> bool:
+        """Спит до seconds сек. Возвращает True, если выдачу отменили."""
+        if seconds <= 0:
+            return bool(cancel and cancel.is_set())
+        if not cancel:
+            time.sleep(seconds)
+            return False
+        end = time.time() + seconds
+        while time.time() < end:
+            if cancel.is_set():
+                return True
+            time.sleep(min(0.4, end - time.time()))
+        return cancel.is_set()
+
+    def _register_delivery_job(
+        self,
+        order_id: str,
+        total: int,
+        *,
+        notify_chat_id: int | None = None,
+        user_id: int | None = None,
+    ) -> _DeliveryJob:
+        job = _DeliveryJob(
+            order_id, total, notify_chat_id=notify_chat_id, user_id=user_id,
+        )
+        with self._delivery_jobs_lock:
+            self._delivery_jobs[order_id] = job
+        return job
+
+    def _unregister_delivery_job(self, order_id: str) -> None:
+        with self._delivery_jobs_lock:
+            self._delivery_jobs.pop(order_id, None)
+
+    def _find_delivery_job(self, order_id: str | None = None, user_id: int | None = None) -> _DeliveryJob | None:
+        with self._delivery_jobs_lock:
+            if order_id:
+                return self._delivery_jobs.get(str(order_id))
+            if user_id is not None:
+                for job in self._delivery_jobs.values():
+                    if job.user_id == user_id:
+                        return job
+            return None
+
+    def request_cancel_delivery(self, order_id: str | None = None, user_id: int | None = None) -> tuple[bool, str]:
+        with self._delivery_jobs_lock:
+            jobs = list(self._delivery_jobs.values())
+        if order_id:
+            job = self._find_delivery_job(order_id=order_id)
+            if not job:
+                return False, f"❌ Нет активной выдачи для #{order_id.lstrip('#')}"
+            job.cancel.set()
+            return True, f"⛔ Отменяю выдачу #{job.order_id} ({job.delivered}/{job.total})…"
+        if user_id is not None:
+            job = self._find_delivery_job(user_id=user_id)
+            if job:
+                job.cancel.set()
+                return True, f"⛔ Отменяю выдачу #{job.order_id} ({job.delivered}/{job.total})…"
+        if jobs:
+            for job in jobs:
+                job.cancel.set()
+            if len(jobs) == 1:
+                j = jobs[0]
+                return True, f"⛔ Отменяю выдачу #{j.order_id} ({j.delivered}/{j.total})…"
+            return True, f"⛔ Отменяю {len(jobs)} активных выдач…"
+        return False, "❌ Нет активной выдачи"
+
+    def _notify_delivery_progress(self, job: _DeliveryJob | None, text: str) -> None:
+        if not job or not job.notify_chat_id or not self.cardinal.telegram:
+            return
+        bot = self.cardinal.telegram.bot
+        try:
+            bot.send_message(job.notify_chat_id, text, parse_mode="HTML")
+        except Exception:
+            try:
+                bot.send_message(job.notify_chat_id, text)
+            except Exception:
+                pass
+
+    def _golink_shorten(self, url: str, cancel: threading.Event | None = None) -> str:
         if not bool(self.get_cfg("golink_enabled", True)):
             raise RuntimeError("GoLink отключён в настройках")
         base = str(self.get_cfg("golink_api_url", DEFAULT_GOLINK_BASE_URL)).strip()
@@ -2747,24 +2853,29 @@ class Plugin:
         timeout = float(self.get_cfg("golink_timeout_sec", GOLINK_TIMEOUT))
         last_err = "unknown"
         for attempt in range(1, GOLINK_RETRY_COUNT + 1):
+            if cancel and cancel.is_set():
+                raise RuntimeError("выдача отменена")
             try:
                 return shorten_url_golink(url, base_url=base, timeout=timeout)
             except Exception as exc:
                 last_err = str(exc)
                 if attempt < GOLINK_RETRY_COUNT:
-                    time.sleep(1.5 * attempt)
+                    if self._interruptible_sleep(1.5 * attempt, cancel):
+                        raise RuntimeError("выдача отменена")
         raise RuntimeError(last_err)
 
-    def _pause_between_gemini_links(self, index: int, total: int) -> None:
+    def _pause_between_gemini_links(
+        self, index: int, total: int, cancel: threading.Event | None = None,
+    ) -> bool:
         if index >= total:
-            return
+            return False
         delay = float(self.get_cfg("gemini_multi_link_delay_sec", GEMINI_MULTI_LINK_DELAY))
         batch_every = max(1, int(self.get_cfg("gemini_multi_link_batch_every", GEMINI_MULTI_LINK_BATCH_EVERY)))
         if index % batch_every == 0:
             delay += float(self.get_cfg("gemini_multi_link_batch_pause_sec", GEMINI_MULTI_LINK_BATCH_PAUSE))
         delay = max(1.0, delay)
         _boot_log(f"multi-link pause {delay:.1f}s after {index}/{total}")
-        time.sleep(delay)
+        return self._interruptible_sleep(delay, cancel)
 
     def _gemini_delivery_text(self, short_url: str) -> str:
         custom = str(self.get_cfg("gemini_delivery_text", "") or "").strip()
@@ -2781,6 +2892,7 @@ class Plugin:
         full_order: Any = None,
         event: Any = None,
         order_id: str = "",
+        cancel: threading.Event | None = None,
     ) -> tuple[bool, str, int | str | None]:
         url = sanitize_activation_url(url, tag="DELIVER")
         if not url:
@@ -2793,10 +2905,12 @@ class Plugin:
         }
         active_chat = chat_id
         try:
-            short_url = self._golink_shorten(url)
+            short_url = self._golink_shorten(url, cancel)
             _boot_log(f"golink OK len={len(url)} -> {short_url}")
         except Exception as exc:
             err = str(exc)
+            if "отменена" in err.lower():
+                return False, err, active_chat
             self.log("GoLink shorten fail: %s", err)
             _boot_log(f"golink FAIL: {err}")
             return False, f"GoLink: {err}", active_chat
@@ -2824,6 +2938,8 @@ class Plugin:
         force: bool = False,
         manual: bool = False,
         quantity: int | None = None,
+        notify_chat_id: int | None = None,
+        notify_user_id: int | None = None,
     ) -> tuple[bool, str]:
         order_id = str(order_id).strip().lstrip("#")
         if not order_id:
@@ -2844,6 +2960,8 @@ class Plugin:
                 force=force,
                 manual=manual,
                 quantity=quantity,
+                notify_chat_id=notify_chat_id,
+                notify_user_id=notify_user_id,
             )
         finally:
             self._delivery_in_progress.discard(order_id)
@@ -2857,6 +2975,8 @@ class Plugin:
         force: bool = False,
         manual: bool = False,
         quantity: int | None = None,
+        notify_chat_id: int | None = None,
+        notify_user_id: int | None = None,
     ) -> tuple[bool, str]:
         if full_order is None:
             try:
@@ -2914,35 +3034,100 @@ class Plugin:
             err = f"Архив пуст ({len(urls)}/{qty} ссылок)"
             self.set_cfg("last_delivery_error", err)
             return False, err
+
+        job = self._register_delivery_job(
+            order_id, len(urls),
+            notify_chat_id=notify_chat_id if manual else None,
+            user_id=notify_user_id if manual else None,
+        )
+        cancel = job.cancel
+        cancelled = False
+        self._notify_delivery_progress(
+            job,
+            f"📤 <b>Выдача #{_escape(order_id)}</b>: 0/{len(urls)} ссыл.\n"
+            f"Отмена: <code>/gl_cancel_deliver</code> или <code>/gl_cancel_deliver {order_id}</code>",
+        )
         delivered: list[str] = []
         failed: list[str] = []
         last_err = ""
+        consecutive_fails = 0
         try:
-            for i, url in enumerate(urls, 1):
+            for i, url in enumerate(urls):
+                if cancel.is_set():
+                    cancelled = True
+                    last_err = "отменено пользователем"
+                    for u in urls[i:]:
+                        if u not in delivered and u not in failed:
+                            failed.append(u)
+                    _boot_log(f"DELIVER #{order_id} CANCEL at {i}/{len(urls)}")
+                    break
+
                 ok_link = False
                 err_link = ""
                 for attempt in range(1, GEMINI_DELIVER_LINK_RETRIES + 1):
+                    if cancel.is_set():
+                        cancelled = True
+                        last_err = "отменено пользователем"
+                        break
                     ok_link, err_link, new_chat = self._deliver_single_gemini_link(
-                        chat_id, buyer, url, **send_kw,
+                        chat_id, buyer, url, cancel=cancel, **send_kw,
                     )
                     if new_chat is not None:
                         chat_id = new_chat
                     if ok_link:
                         break
+                    if "отменена" in (err_link or "").lower():
+                        cancelled = True
+                        last_err = err_link
+                        break
                     if attempt < GEMINI_DELIVER_LINK_RETRIES:
                         retry_pause = 2.0 * attempt + (8.0 if attempt >= 2 else 0.0)
                         _boot_log(
-                            f"DELIVER #{order_id} link {i}/{len(urls)} "
+                            f"DELIVER #{order_id} link {i + 1}/{len(urls)} "
                             f"retry {attempt}/{GEMINI_DELIVER_LINK_RETRIES} in {retry_pause:.1f}s: {err_link}"
                         )
-                        time.sleep(retry_pause)
+                        if self._interruptible_sleep(retry_pause, cancel):
+                            cancelled = True
+                            last_err = "отменено пользователем"
+                            break
+
+                if cancelled:
+                    for u in urls[i:]:
+                        if u not in delivered and u not in failed:
+                            failed.append(u)
+                    break
+
                 if ok_link:
                     delivered.append(url)
-                    self._pause_between_gemini_links(i, len(urls))
+                    job.delivered = len(delivered)
+                    consecutive_fails = 0
+                    self._notify_delivery_progress(
+                        job,
+                        f"✅ #{_escape(order_id)}: <b>{len(delivered)}/{len(urls)}</b> ссыл.",
+                    )
+                    if i + 1 < len(urls):
+                        if self._pause_between_gemini_links(i + 1, len(urls), cancel):
+                            cancelled = True
+                            last_err = "отменено пользователем"
+                            for u in urls[i + 1:]:
+                                if u not in delivered and u not in failed:
+                                    failed.append(u)
+                            break
                 else:
                     failed.append(url)
+                    consecutive_fails += 1
                     last_err = err_link or "send failed"
-                    _boot_log(f"DELIVER #{order_id} link {i}/{len(urls)} FAIL: {last_err}")
+                    _boot_log(f"DELIVER #{order_id} link {i + 1}/{len(urls)} FAIL: {last_err}")
+                    if consecutive_fails >= GEMINI_DELIVER_MAX_CONSECUTIVE_FAILS:
+                        last_err = (
+                            f"Слишком много ошибок подряд ({consecutive_fails}). "
+                            f"Возможен лимит FunPay — остальное возвращено в архив."
+                        )
+                        for u in urls[i + 1:]:
+                            if u not in delivered and u not in failed:
+                                failed.append(u)
+                        _boot_log(f"DELIVER #{order_id} abort after {consecutive_fails} fails")
+                        break
         except Exception as exc:
             last_err = self._format_fp_error(exc)
             _boot_log(f"DELIVER #{order_id} loop EXC: {last_err}")
@@ -2950,9 +3135,22 @@ class Plugin:
                 if url not in delivered and url not in failed:
                     failed.append(url)
         finally:
+            self._unregister_delivery_job(order_id)
             if failed:
                 self.return_urls_to_gemini_archive(failed)
                 _boot_log(f"DELIVER #{order_id} archive restored {len(failed)} url(s)")
+        if cancelled:
+            self.set_cfg("last_delivery_error", last_err)
+            if delivered:
+                err_msg = (
+                    f"⛔ <b>Выдача #{_escape(order_id)} отменена</b>\n"
+                    f"Выдано: <b>{len(delivered)}/{len(urls)}</b>\n"
+                    f"Остальное возвращено в архив"
+                )
+            else:
+                err_msg = f"⛔ Выдача #{_escape(order_id)} отменена. Ссылки в архиве."
+            self._notify_delivery_progress(job, err_msg)
+            return False, err_msg
         if delivered and len(delivered) == len(urls):
             self._mark_gemini_order_delivered(order_id, buyer, delivered, manual=manual)
             self._schedule_confirm_reminder(
@@ -3019,12 +3217,18 @@ class Plugin:
         *,
         force: bool = False,
         quantity: int | None = None,
+        user_id: int | None = None,
         reply_fn: Any = None,
     ) -> None:
         def _run() -> None:
             try:
                 ok, msg = self.deliver_gemini_order(
-                    order_id, force=force, manual=True, quantity=quantity,
+                    order_id,
+                    force=force,
+                    manual=True,
+                    quantity=quantity,
+                    notify_chat_id=chat_id,
+                    notify_user_id=user_id,
                 )
             except Exception as exc:
                 _boot_log(f"DELIVER #{order_id} EXC: {exc}")
@@ -3465,6 +3669,12 @@ class Plugin:
                     IKB("📤 Выдать заказ", callback_data=f"{CB_PREFIX}:act:deliver_order"),
                     IKB("📥 В архив", callback_data=f"{CB_PREFIX}:act:start_import:gemini_archive"),
                 )
+                with self._delivery_jobs_lock:
+                    if self._delivery_jobs:
+                        kb.row(IKB(
+                            "⛔ Отменить выдачу",
+                            callback_data=f"{CB_PREFIX}:act:cancel_deliver",
+                        ))
                 kb.row(IKB("🔄 Обновить", callback_data=f"{CB_PREFIX}:nav:hub"))
                 kb.row(IKB("⚙️ Настройки", callback_data=f"{CB_PREFIX}:nav:settings"))
             kb.row(IKB("📊 Статус", callback_data=f"{CB_PREFIX}:act:stock_status"))
@@ -3576,11 +3786,10 @@ class Plugin:
             prompt = (
                 "📤 <b>Выдача заказа вручную</b>\n\n"
                 "Введите номер заказа FunPay, например:\n"
-                "<code>Z8U62P1Z</code> или <code>Z8U62P1Z 3</code>\n\n"
-                "Если количество не указано — спросим отдельно "
-                "(по умолчанию — сколько в заказе на FunPay).\n"
-                "Плагин сократит ссылку через GoLink и отправит покупателю.\n"
-                "<code>/cancel</code> — отмена"
+                "<code>Z8U62P1Z</code> или <code>Z8U62P1Z 15</code>\n\n"
+                "Если количество не указано — спросим отдельно.\n"
+                "Во время выдачи: <code>/gl_cancel_deliver</code> — отмена\n"
+                "<code>/cancel</code> — отмена ввода"
             )
             result = bot.send_message(chat_id, prompt, parse_mode="HTML")
             if self.cardinal.telegram:
@@ -3588,6 +3797,20 @@ class Plugin:
                     chat_id, result.message_id, call.from_user.id,
                     state=f"{CB_PREFIX}:deliver:wait",
                 )
+            return True
+        if action == "cancel_deliver":
+            oid = (arg or "").strip().lstrip("#") or None
+            ok, msg = self.request_cancel_delivery(oid, user_id=call.from_user.id)
+            try:
+                bot.answer_callback_query(
+                    call.id,
+                    "Отмена…" if ok else msg[:180],
+                    show_alert=not ok,
+                )
+            except Exception:
+                pass
+            if ok:
+                bot.send_message(chat_id, msg, parse_mode="HTML")
             return True
         if action == "start_import":
             mode = self.stock_mode()
@@ -3989,6 +4212,12 @@ class Plugin:
             state_data = tg.get_state(chat_id, uid) or {}
             state = str(state_data.get("state", ""))
             if text.lower() in ("/cancel", "отмена"):
+                ok, cmsg = plugin.request_cancel_delivery(user_id=uid)
+                if ok:
+                    plugin.cancel_deliver(chat_id, uid)
+                    tg.clear_state(chat_id, uid)
+                    bot.reply_to(message, cmsg)
+                    return
                 plugin.cancel_deliver(chat_id, uid)
                 tg.clear_state(chat_id, uid)
                 bot.reply_to(message, "❌ Отменено")
@@ -4018,7 +4247,7 @@ class Plugin:
                     parse_mode="HTML",
                 )
                 plugin._run_manual_deliver(
-                    chat_id, order_id, force=force, quantity=quantity,
+                    chat_id, order_id, force=force, quantity=quantity, user_id=uid,
                     reply_fn=lambda msg: bot.send_message(chat_id, msg, parse_mode="HTML"),
                 )
                 return
@@ -4036,7 +4265,7 @@ class Plugin:
                     parse_mode="HTML",
                 )
                 plugin._run_manual_deliver(
-                    chat_id, order_id, force=force, quantity=quantity,
+                    chat_id, order_id, force=force, quantity=quantity, user_id=uid,
                     reply_fn=lambda msg: bot.send_message(chat_id, msg, parse_mode="HTML"),
                 )
                 return
@@ -4052,7 +4281,7 @@ class Plugin:
                 message,
                 f"📦 Заказ <b>#{_escape(order_id)}</b>\n"
                 f"По заказу на FunPay: <b>{default_qty}</b> шт.\n\n"
-                f"Введите <b>количество</b> для выдачи (1–99), например <code>{default_qty}</code>",
+                f"Введите <b>количество</b> для выдачи, например <code>{default_qty}</code> или <code>15</code>",
                 parse_mode="HTML",
             )
 
@@ -4100,9 +4329,10 @@ class Plugin:
                     message,
                     "Использование:\n"
                     "<code>/gl_deliver NRWWY843</code>\n"
-                    "<code>/gl_deliver NRWWY843 3</code> — выдать 3 шт.\n"
+                    "<code>/gl_deliver NRWWY843 15</code> — выдать 15 шт.\n"
+                    "<code>/gl_cancel_deliver</code> — отменить активную выдачу\n"
                     "<code>/gl_deliver NRWWY843 force</code> — повтор\n"
-                    "<code>/gl_deliver NRWWY843 3 force</code>",
+                    "<code>/gl_deliver NRWWY843 15 force</code>",
                     parse_mode="HTML",
                 )
                 return
@@ -4130,10 +4360,26 @@ class Plugin:
                         pass
 
             plugin._run_manual_deliver(
-                message.chat.id, order_id, force=force, quantity=quantity, reply_fn=_reply,
+                message.chat.id,
+                order_id,
+                force=force,
+                quantity=quantity,
+                user_id=message.from_user.id,
+                reply_fn=_reply,
             )
 
         tg.msg_handler(send_deliver_cmd, func=lambda m: _tg_matches(m, "gl_deliver"))
+
+        def send_cancel_deliver_cmd(message: Message) -> None:
+            parts = (message.text or "").split()
+            order_id = parts[1].strip().lstrip("#") if len(parts) > 1 else None
+            ok, msg = plugin.request_cancel_delivery(order_id, user_id=message.from_user.id)
+            try:
+                bot.reply_to(message, msg, parse_mode="HTML")
+            except Exception:
+                bot.reply_to(message, msg)
+
+        tg.msg_handler(send_cancel_deliver_cmd, func=lambda m: _tg_matches(m, "gl_cancel_deliver"))
 
         def send_debug(message: Message) -> None:
             bot = tg.bot
@@ -4160,12 +4406,13 @@ class Plugin:
                 ("gemini_link", "панель Gemini Link Auto", True),
                 ("gl_stock", "склад Gemini Link", True),
                 ("gl_deliver", "выдать ссылку по номеру заказа", True),
+                ("gl_cancel_deliver", "отменить выдачу ссылок", True),
                 ("gl_debug", "диагностика Gemini Link", True),
             ])
         except Exception as exc:
             plugin.log("add_telegram_commands: %s", exc)
 
-        self.log("Telegram UI зарегистрирован (/gemini_link, /gl_stock, /gl_deliver, /gl_debug)")
+        self.log("Telegram UI зарегистрирован (/gemini_link, /gl_stock, /gl_deliver, /gl_cancel_deliver, /gl_debug)")
 
 
 # ═════════════════════════════════════════════════════════════════════════════
