@@ -48,7 +48,7 @@ except ImportError:
 
 
 NAME          = "Gemini Link Auto"
-VERSION       = "4.0.4"
+VERSION       = "4.0.5"
 DESCRIPTION   = "ChatGPT автозакупка + выдача Gemini-ссылок через GoLink"
 CREDITS       = "Cursor AI"
 UUID          = "f7a2e8c1-4b3d-4e9f-a8c2-1d5e9b0f6a3c"
@@ -69,6 +69,11 @@ GEMINI_DELIVERY_TEXT: Final[str] = (
     "Перейдите по ссылке и активируйте тариф Gemini:\n{short_url}"
 )
 LINK_PART_DELAY: Final[float] = 2.0
+GEMINI_MULTI_LINK_DELAY: Final[float] = 5.0
+GEMINI_MULTI_LINK_BATCH_EVERY: Final[int] = 3
+GEMINI_MULTI_LINK_BATCH_PAUSE: Final[float] = 15.0
+GEMINI_DELIVER_LINK_RETRIES: Final[int] = 3
+GOLINK_RETRY_COUNT: Final[int] = 3
 IMPORT_FINALIZE_SEC: Final[float] = 2.0
 FP_SEND_MAX_ATTEMPTS: Final[int] = 3
 FP_SEND_RETRY_COUNT: Final[int] = 2
@@ -791,6 +796,11 @@ class Plugin:
                 sm = str(loaded.get("stock_mode", "auto_buy"))
                 if sm in _LEGACY_STOCK_MODES:
                     loaded["stock_mode"] = "gemini_links" if sm in ("stocked", "warehouse", "import_lot") else "auto_buy"
+                if str(loaded.get("_cfg_version", "0")) < "4.0.5":
+                    loaded.setdefault("gemini_multi_link_delay_sec", GEMINI_MULTI_LINK_DELAY)
+                    loaded.setdefault("gemini_multi_link_batch_every", GEMINI_MULTI_LINK_BATCH_EVERY)
+                    loaded.setdefault("gemini_multi_link_batch_pause_sec", GEMINI_MULTI_LINK_BATCH_PAUSE)
+                    loaded["_cfg_version"] = "4.0.5"
                 if str(loaded.get("_cfg_version", "0")) < "4.0.4":
                     loaded["_cfg_version"] = "4.0.4"
                 if str(loaded.get("_cfg_version", "0")) < "4.0.3":
@@ -935,7 +945,10 @@ class Plugin:
             "confirm_reminder_delay_sec": CONFIRM_REMINDER_DELAY,
             "confirm_reminder_text": "",
             "last_delivery_error": "",
-            "_cfg_version": "4.0.2",
+            "gemini_multi_link_delay_sec": GEMINI_MULTI_LINK_DELAY,
+            "gemini_multi_link_batch_every": GEMINI_MULTI_LINK_BATCH_EVERY,
+            "gemini_multi_link_batch_pause_sec": GEMINI_MULTI_LINK_BATCH_PAUSE,
+            "_cfg_version": "4.0.5",
         }
 
     # ── UI: компактные страницы вместо длинного списка кнопок ───────────────
@@ -959,6 +972,9 @@ class Plugin:
             {"key": "gemini_lot_id", "label": "ID лота Gemini (необяз.)", "type": "text"},
             {"key": "golink_api_url", "label": "GoLink URL", "type": "text"},
             {"key": "golink_timeout_sec", "label": "GoLink таймаут (сек)", "type": "int", "min": 5, "max": 60},
+            {"key": "gemini_multi_link_delay_sec", "label": "Пауза между ссылками (сек)", "type": "float", "min": 1, "max": 120},
+            {"key": "gemini_multi_link_batch_every", "label": "Длинная пауза каждые N ссылок", "type": "int", "min": 1, "max": 20},
+            {"key": "gemini_multi_link_batch_pause_sec", "label": "Доп. пауза после N ссылок (сек)", "type": "float", "min": 0, "max": 300},
             {"key": "gemini_delivery_text", "label": "Текст выдачи ({short_url})", "type": "text"},
             {"key": "warehouse_release_qty", "label": "Выложить со склада (шт.)", "type": "int", "min": 0, "max": 100},
         ]
@@ -2729,7 +2745,26 @@ class Plugin:
         if not base:
             base = DEFAULT_GOLINK_BASE_URL
         timeout = float(self.get_cfg("golink_timeout_sec", GOLINK_TIMEOUT))
-        return shorten_url_golink(url, base_url=base, timeout=timeout)
+        last_err = "unknown"
+        for attempt in range(1, GOLINK_RETRY_COUNT + 1):
+            try:
+                return shorten_url_golink(url, base_url=base, timeout=timeout)
+            except Exception as exc:
+                last_err = str(exc)
+                if attempt < GOLINK_RETRY_COUNT:
+                    time.sleep(1.5 * attempt)
+        raise RuntimeError(last_err)
+
+    def _pause_between_gemini_links(self, index: int, total: int) -> None:
+        if index >= total:
+            return
+        delay = float(self.get_cfg("gemini_multi_link_delay_sec", GEMINI_MULTI_LINK_DELAY))
+        batch_every = max(1, int(self.get_cfg("gemini_multi_link_batch_every", GEMINI_MULTI_LINK_BATCH_EVERY)))
+        if index % batch_every == 0:
+            delay += float(self.get_cfg("gemini_multi_link_batch_pause_sec", GEMINI_MULTI_LINK_BATCH_PAUSE))
+        delay = max(1.0, delay)
+        _boot_log(f"multi-link pause {delay:.1f}s after {index}/{total}")
+        time.sleep(delay)
 
     def _gemini_delivery_text(self, short_url: str) -> str:
         custom = str(self.get_cfg("gemini_delivery_text", "") or "").strip()
@@ -2884,18 +2919,30 @@ class Plugin:
         last_err = ""
         try:
             for i, url in enumerate(urls, 1):
-                ok_link, err_link, new_chat = self._deliver_single_gemini_link(
-                    chat_id, buyer, url, **send_kw,
-                )
-                if new_chat is not None:
-                    chat_id = new_chat
+                ok_link = False
+                err_link = ""
+                for attempt in range(1, GEMINI_DELIVER_LINK_RETRIES + 1):
+                    ok_link, err_link, new_chat = self._deliver_single_gemini_link(
+                        chat_id, buyer, url, **send_kw,
+                    )
+                    if new_chat is not None:
+                        chat_id = new_chat
+                    if ok_link:
+                        break
+                    if attempt < GEMINI_DELIVER_LINK_RETRIES:
+                        retry_pause = 2.0 * attempt + (8.0 if attempt >= 2 else 0.0)
+                        _boot_log(
+                            f"DELIVER #{order_id} link {i}/{len(urls)} "
+                            f"retry {attempt}/{GEMINI_DELIVER_LINK_RETRIES} in {retry_pause:.1f}s: {err_link}"
+                        )
+                        time.sleep(retry_pause)
                 if ok_link:
                     delivered.append(url)
-                    if qty > 1 and i < len(urls):
-                        time.sleep(LINK_PART_DELAY)
+                    self._pause_between_gemini_links(i, len(urls))
                 else:
                     failed.append(url)
                     last_err = err_link or "send failed"
+                    _boot_log(f"DELIVER #{order_id} link {i}/{len(urls)} FAIL: {last_err}")
         except Exception as exc:
             last_err = self._format_fp_error(exc)
             _boot_log(f"DELIVER #{order_id} loop EXC: {last_err}")
@@ -2937,7 +2984,7 @@ class Plugin:
             )
         except Exception:
             pass
-            return False, err_msg
+        return False, err_msg
 
     def _parse_manual_deliver_args(self, text: str) -> tuple[str, int | None, bool]:
         parts = (text or "").strip().split()
