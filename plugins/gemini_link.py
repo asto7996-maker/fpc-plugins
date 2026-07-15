@@ -48,7 +48,7 @@ except ImportError:
 
 
 NAME          = "Gemini Link Auto"
-VERSION       = "4.0.3"
+VERSION       = "4.0.4"
 DESCRIPTION   = "ChatGPT автозакупка + выдача Gemini-ссылок через GoLink"
 CREDITS       = "Cursor AI"
 UUID          = "f7a2e8c1-4b3d-4e9f-a8c2-1d5e9b0f6a3c"
@@ -663,6 +663,7 @@ class Plugin:
         self._import_pending: dict[int, list[dict[str, str]]] = {}
         self._import_target: dict[int, str] = {}
         self._import_finalize_timers: dict[tuple[int, int], threading.Timer] = {}
+        self._deliver_pending: dict[tuple[int, int], dict[str, Any]] = {}
         self._cached_lot_id: int | None = None
         self._cached_lot_ts: float = 0.0
         self._product_cache: dict[str, Any] | None = None
@@ -790,6 +791,8 @@ class Plugin:
                 sm = str(loaded.get("stock_mode", "auto_buy"))
                 if sm in _LEGACY_STOCK_MODES:
                     loaded["stock_mode"] = "gemini_links" if sm in ("stocked", "warehouse", "import_lot") else "auto_buy"
+                if str(loaded.get("_cfg_version", "0")) < "4.0.4":
+                    loaded["_cfg_version"] = "4.0.4"
                 if str(loaded.get("_cfg_version", "0")) < "4.0.3":
                     loaded["_cfg_version"] = "4.0.3"
                 if str(loaded.get("_cfg_version", "0")) < "4.0.2":
@@ -2785,6 +2788,7 @@ class Plugin:
         full_order: Any = None,
         force: bool = False,
         manual: bool = False,
+        quantity: int | None = None,
     ) -> tuple[bool, str]:
         order_id = str(order_id).strip().lstrip("#")
         if not order_id:
@@ -2804,6 +2808,7 @@ class Plugin:
                 full_order=full_order,
                 force=force,
                 manual=manual,
+                quantity=quantity,
             )
         finally:
             self._delivery_in_progress.discard(order_id)
@@ -2816,6 +2821,7 @@ class Plugin:
         full_order: Any = None,
         force: bool = False,
         manual: bool = False,
+        quantity: int | None = None,
     ) -> tuple[bool, str]:
         if full_order is None:
             try:
@@ -2838,7 +2844,8 @@ class Plugin:
         if not self._order_matches_gemini_link(event, full_order, relaxed=relaxed):
             return False, f"Заказ #{order_id} не Gemini-link лот (lot_id={lot_id})"
         buyer = str(getattr(full_order, "buyer_username", "") or getattr(event.order, "buyer_username", "") or "")
-        qty = max(1, int(getattr(full_order, "amount", None) or getattr(event.order, "amount", 1) or 1))
+        order_qty = max(1, int(getattr(full_order, "amount", None) or getattr(event.order, "amount", 1) or 1))
+        qty = max(1, int(quantity)) if quantity is not None else order_qty
         chat_candidates = self._resolve_order_chat_id_candidates(
             full_order, event, buyer, order_id,
         )
@@ -2853,7 +2860,7 @@ class Plugin:
         }
         _boot_log(
             f"DELIVER #{order_id} chat_id={chat_id} candidates={chat_candidates} "
-            f"buyer={buyer} qty={qty}"
+            f"buyer={buyer} qty={qty} order_qty={order_qty}"
         )
         urls = self.take_urls_from_gemini_archive(qty)
         if len(urls) < qty:
@@ -2930,7 +2937,60 @@ class Plugin:
             )
         except Exception:
             pass
-        return False, err_msg
+            return False, err_msg
+
+    def _parse_manual_deliver_args(self, text: str) -> tuple[str, int | None, bool]:
+        parts = (text or "").strip().split()
+        if not parts:
+            return "", None, False
+        order_id = parts[0].strip().lstrip("#")
+        quantity: int | None = None
+        force = False
+        for part in parts[1:]:
+            low = part.casefold()
+            if low in ("force", "f", "повтор"):
+                force = True
+            elif part.isdigit():
+                quantity = max(1, int(part))
+        return order_id, quantity, force
+
+    def _fetch_order_quantity(self, order_id: str) -> int:
+        try:
+            full_order = self.cardinal.account.get_order(order_id)
+            return max(1, int(getattr(full_order, "amount", 1) or 1))
+        except Exception as exc:
+            _boot_log(f"DELIVER #{order_id} qty lookup fail: {exc}")
+            return 1
+
+    def cancel_deliver(self, chat_id: int, user_id: int) -> None:
+        self._deliver_pending.pop((chat_id, user_id), None)
+
+    def _run_manual_deliver(
+        self,
+        chat_id: int,
+        order_id: str,
+        *,
+        force: bool = False,
+        quantity: int | None = None,
+        reply_fn: Any = None,
+    ) -> None:
+        def _run() -> None:
+            try:
+                ok, msg = self.deliver_gemini_order(
+                    order_id, force=force, manual=True, quantity=quantity,
+                )
+            except Exception as exc:
+                _boot_log(f"DELIVER #{order_id} EXC: {exc}")
+                ok, msg = False, f"❌ Ошибка: {exc}"
+            if reply_fn:
+                try:
+                    reply_fn(msg)
+                except Exception:
+                    pass
+
+        threading.Thread(
+            target=_run, daemon=True, name=f"GlDeliverUI-{order_id}",
+        ).start()
 
     def handle_new_order(self, event: NewOrderEvent) -> None:
         order_id = str(event.order.id)
@@ -3469,7 +3529,9 @@ class Plugin:
             prompt = (
                 "📤 <b>Выдача заказа вручную</b>\n\n"
                 "Введите номер заказа FunPay, например:\n"
-                "<code>Z8U62P1Z</code>\n\n"
+                "<code>Z8U62P1Z</code> или <code>Z8U62P1Z 3</code>\n\n"
+                "Если количество не указано — спросим отдельно "
+                "(по умолчанию — сколько в заказе на FunPay).\n"
                 "Плагин сократит ссылку через GoLink и отправит покупателю.\n"
                 "<code>/cancel</code> — отмена"
             )
@@ -3871,35 +3933,81 @@ class Plugin:
             state_data = tg.get_state(m.chat.id, m.from_user.id)
             if not state_data or "state" not in state_data:
                 return False
-            return str(state_data["state"]) == f"{CB_PREFIX}:deliver:wait"
+            return str(state_data["state"]).startswith(f"{CB_PREFIX}:deliver:")
 
         def on_deliver_text(message: Message) -> None:
             chat_id = message.chat.id
             uid = message.from_user.id
             text = (message.text or "").strip()
+            state_data = tg.get_state(chat_id, uid) or {}
+            state = str(state_data.get("state", ""))
             if text.lower() in ("/cancel", "отмена"):
+                plugin.cancel_deliver(chat_id, uid)
                 tg.clear_state(chat_id, uid)
                 bot.reply_to(message, "❌ Отменено")
                 return
-            order_id = text.split()[0].strip().lstrip("#")
+
+            if state == f"{CB_PREFIX}:deliver:qty":
+                pending = plugin._deliver_pending.get((chat_id, uid))
+                if not pending:
+                    tg.clear_state(chat_id, uid)
+                    bot.reply_to(message, "⚠️ Сессия выдачи истекла. Нажмите «📤 Выдать заказ» снова.")
+                    return
+                if not text.isdigit() or int(text) < 1:
+                    bot.reply_to(
+                        message,
+                        "⚠️ Введите целое число ≥ 1, например <code>3</code>",
+                        parse_mode="HTML",
+                    )
+                    return
+                order_id = str(pending.get("order_id", ""))
+                force = bool(pending.get("force", False))
+                quantity = int(text)
+                plugin.cancel_deliver(chat_id, uid)
+                tg.clear_state(chat_id, uid)
+                bot.reply_to(
+                    message,
+                    f"⏳ Выдаю заказ <b>#{_escape(order_id)}</b> — <b>{quantity}</b> шт…",
+                    parse_mode="HTML",
+                )
+                plugin._run_manual_deliver(
+                    chat_id, order_id, force=force, quantity=quantity,
+                    reply_fn=lambda msg: bot.send_message(chat_id, msg, parse_mode="HTML"),
+                )
+                return
+
+            order_id, quantity, force = plugin._parse_manual_deliver_args(text)
             if not order_id:
                 bot.reply_to(message, "⚠️ Введите номер заказа, например <code>Z8U62P1Z</code>", parse_mode="HTML")
                 return
-            tg.clear_state(chat_id, uid)
-            bot.reply_to(message, f"⏳ Выдаю заказ <b>#{_escape(order_id)}</b>…", parse_mode="HTML")
+            if quantity is not None:
+                tg.clear_state(chat_id, uid)
+                plugin.cancel_deliver(chat_id, uid)
+                bot.reply_to(
+                    message,
+                    f"⏳ Выдаю заказ <b>#{_escape(order_id)}</b> — <b>{quantity}</b> шт…",
+                    parse_mode="HTML",
+                )
+                plugin._run_manual_deliver(
+                    chat_id, order_id, force=force, quantity=quantity,
+                    reply_fn=lambda msg: bot.send_message(chat_id, msg, parse_mode="HTML"),
+                )
+                return
 
-            def _run() -> None:
-                try:
-                    ok, msg = plugin.deliver_gemini_order(order_id, force=False, manual=True)
-                except Exception as exc:
-                    _boot_log(f"DELIVER #{order_id} EXC: {exc}")
-                    ok, msg = False, f"❌ Ошибка: {exc}"
-                try:
-                    bot.send_message(chat_id, msg, parse_mode="HTML")
-                except Exception:
-                    bot.send_message(chat_id, msg)
-
-            threading.Thread(target=_run, daemon=True, name=f"GlDeliverUI-{order_id}").start()
+            default_qty = plugin._fetch_order_quantity(order_id)
+            plugin._deliver_pending[(chat_id, uid)] = {
+                "order_id": order_id,
+                "force": force,
+                "default_qty": default_qty,
+            }
+            tg.set_state(chat_id, message.message_id, uid, state=f"{CB_PREFIX}:deliver:qty")
+            bot.reply_to(
+                message,
+                f"📦 Заказ <b>#{_escape(order_id)}</b>\n"
+                f"По заказу на FunPay: <b>{default_qty}</b> шт.\n\n"
+                f"Введите <b>количество</b> для выдачи (1–99), например <code>{default_qty}</code>",
+                parse_mode="HTML",
+            )
 
         _register_priority_msg(tg, on_deliver_text, _is_deliver_waiting)
 
@@ -3943,24 +4051,29 @@ class Plugin:
             if len(parts) < 2:
                 bot.reply_to(
                     message,
-                    "Использование: <code>/gl_deliver NRWWY843</code>\n"
-                    "Повтор: <code>/gl_deliver NRWWY843 force</code>",
+                    "Использование:\n"
+                    "<code>/gl_deliver NRWWY843</code>\n"
+                    "<code>/gl_deliver NRWWY843 3</code> — выдать 3 шт.\n"
+                    "<code>/gl_deliver NRWWY843 force</code> — повтор\n"
+                    "<code>/gl_deliver NRWWY843 3 force</code>",
                     parse_mode="HTML",
                 )
                 return
-            order_id = parts[1].strip().lstrip("#")
-            force = len(parts) > 2 and parts[2].casefold() in ("force", "f", "повтор")
+            order_id, quantity, force = plugin._parse_manual_deliver_args(" ".join(parts[1:]))
+            if not order_id:
+                bot.reply_to(message, "⚠️ Укажите номер заказа", parse_mode="HTML")
+                return
+            qty_note = f" — <b>{quantity}</b> шт." if quantity is not None else ""
             try:
-                bot.reply_to(message, f"⏳ Выдаю заказ <b>#{_escape(order_id)}</b>…", parse_mode="HTML")
+                bot.reply_to(
+                    message,
+                    f"⏳ Выдаю заказ <b>#{_escape(order_id)}</b>{qty_note}…",
+                    parse_mode="HTML",
+                )
             except Exception:
                 pass
 
-            def _run() -> None:
-                try:
-                    ok, msg = plugin.deliver_gemini_order(order_id, force=force, manual=True)
-                except Exception as exc:
-                    _boot_log(f"DELIVER #{order_id} EXC: {exc}")
-                    ok, msg = False, f"❌ Ошибка: {exc}"
+            def _reply(msg: str) -> None:
                 try:
                     bot.reply_to(message, msg, parse_mode="HTML")
                 except Exception:
@@ -3969,7 +4082,9 @@ class Plugin:
                     except Exception:
                         pass
 
-            threading.Thread(target=_run, daemon=True, name=f"GlDeliver-{order_id}").start()
+            plugin._run_manual_deliver(
+                message.chat.id, order_id, force=force, quantity=quantity, reply_fn=_reply,
+            )
 
         tg.msg_handler(send_deliver_cmd, func=lambda m: _tg_matches(m, "gl_deliver"))
 
