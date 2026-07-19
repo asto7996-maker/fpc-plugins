@@ -2,7 +2,7 @@ from __future__ import annotations
 
 # === ОБЯЗАТЕЛЬНЫЕ ПОЛЯ FunPay Cardinal (НЕ УДАЛЯТЬ) ===
 NAME = "VexBoost AutoSMM"
-VERSION = "2.4.9"
+VERSION = "2.4.10"
 DESCRIPTION = "Автонакрутка SMM-услуг для FunPay Cardinal"
 CREDITS = "@xei1y"
 UUID = "a3f8c2e1-7b4d-4a9f-9e2c-1d5b8f6a0c3e"
@@ -601,14 +601,40 @@ def find_order_by_buyer(orders: List[Dict[str, Any]], buyer: str) -> Optional[Di
 def find_order_in_chat(
     orders: List[Dict[str, Any]], buyer: str, chat_id: Any,
 ) -> Optional[Dict[str, Any]]:
-    """Заказ VexBoost, привязанный к конкретному чату FunPay."""
+    """Заказ VexBoost, привязанный к конкретному чату FunPay.
+
+    Сначала ищем заказ с точным совпадением chat_id, иначе — по нику
+    покупателя (chat_id заказа мог быть сохранён иным, чем приходит в
+    входящих сообщениях). Ник покупателя однозначно определяет его чат,
+    поэтому такой запасной вариант безопасен и не затрагивает чужие чаты.
+    """
     cid = _normalize_chat_id(chat_id)
+    fallback: Optional[Dict[str, Any]] = None
     for order in orders:
         if order.get("buyer") != buyer:
             continue
         if _normalize_chat_id(order.get("chat_id", -1)) == cid:
             return order
-    return None
+        if fallback is None:
+            fallback = order
+    return fallback
+
+
+def _rebind_pay_order_chat(order: Dict[str, Any], chat_id: Any) -> None:
+    """Привязать заказ к актуальному чату и сохранить, если он изменился."""
+    cid = _normalize_chat_id(chat_id)
+    if _normalize_chat_id(order.get("chat_id", -1)) == cid:
+        order["chat_id"] = cid
+        return
+    order["chat_id"] = cid
+    orders = load_payorders()
+    changed = False
+    for stored in orders:
+        if str(stored.get("OrderID")) == str(order.get("OrderID")):
+            stored["chat_id"] = cid
+            changed = True
+    if changed:
+        save_payorders(orders)
 
 
 def _chat_has_vexboost_order(chat_id: Any, buyer: str) -> bool:
@@ -1937,7 +1963,7 @@ def _process_buyer_message(
         pay_orders = load_payorders()
         order = find_order_in_chat(pay_orders, msgname, cid)
         if order and order.get("url"):
-            order["chat_id"] = cid
+            _rebind_pay_order_chat(order, cid)
             set_pending(order)
             confirm_order(c, cid, confirm_action, msgname)
         return
@@ -1959,7 +1985,7 @@ def _process_buyer_message(
     if order:
         links = extract_links(message_text)
         if links:
-            order["chat_id"] = cid
+            _rebind_pay_order_chat(order, cid)
             request_confirmation(c, order, links[0])
 
 
