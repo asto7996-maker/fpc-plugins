@@ -35,7 +35,7 @@ if TYPE_CHECKING:
     from cardinal import Cardinal
 
 NAME = "KOSell Rent"
-VERSION = "1.1.29b"
+VERSION = "1.1.30b"
 DESCRIPTION = "Официальный плагин KOSell.store"
 CREDITS = "@KOSell1"
 UUID = "0d8a4c2f-6e71-4b3a-9c4d-2f1e8a7b6c50"
@@ -118,7 +118,7 @@ DEFAULT_SETTINGS = {
     "balance_threshold": 0,
     "notify_rental_end": True,
     "tz_offset_hours": 3,
-    "poll_sec": 60,
+    "poll_sec": 30,
     "extend_cooldown": 30,
     "texts": {},
     "map_url": "https://www.kosell.store/downloads/kosell_funpay_map.json",
@@ -233,6 +233,16 @@ def load_all():
     global SETTINGS, MAPPINGS, RENTALS, HIDDEN, HANDLED
     SETTINGS = {**DEFAULT_SETTINGS, **_load_json(SETTINGS_FILE, {})}
     SETTINGS["texts"] = {**DEFAULT_TEXTS, **(SETTINGS.get("texts") or {})}
+    # Разовая миграция: ускоряем проверку наличия аккаунтов (старый дефолт был 60с).
+    # Делается один раз; если пользователь позже сам выставит другое значение — не трогаем.
+    if not SETTINGS.get("_poll_interval_migrated"):
+        try:
+            if int(SETTINGS.get("poll_sec", 30) or 30) >= 60:
+                SETTINGS["poll_sec"] = 30
+        except Exception:
+            SETTINGS["poll_sec"] = 30
+        SETTINGS["_poll_interval_migrated"] = True
+        save_settings()
     mp = _load_json(MAPPINGS_FILE, [])
     MAPPINGS = mp if isinstance(mp, list) else []
     RENTALS = _load_json(RENTALS_FILE, {})
@@ -1162,6 +1172,7 @@ def _poll_cycle():
     if SETTINGS.get("auto_hide_no_stock"):
         products = api.products()
         if products is None:
+            # Транзиентная ошибка API — не трогаем лоты, чтобы не скрыть всё зря.
             return
         avail = {}
         for p in products:
@@ -1174,10 +1185,14 @@ def _poll_cycle():
             try:
                 pid_int = int(pid)
             except Exception:
+                # Ручная привязка без product_id — не управляем наличием.
                 continue
-            if pid_int not in avail:
+            count = avail.get(pid_int)
+            if count is None:
+                # Товара больше нет в каталоге KOSell → в наличии его точно нет → скрываем.
+                _hide_lot(m["lot_id"], "stock")
                 continue
-            if avail[pid_int] <= 0:
+            if count <= 0:
                 _hide_lot(m["lot_id"], "stock")
             else:
                 if HIDDEN.get(str(m["lot_id"])) == "stock":
@@ -1390,7 +1405,7 @@ def _poller_loop():
     except Exception as e:
         logger.error(f"{LP} startup update check error: {e}")
     while not _poll_stop.is_set():
-        _poll_stop.wait(max(15, SETTINGS.get("poll_sec", 60)))
+        _poll_stop.wait(max(10, SETTINGS.get("poll_sec", 30)))
         if _poll_stop.is_set():
             break
         try:
@@ -2396,6 +2411,7 @@ def _autocreate_run(user_id: int, chat_id=None, mid=None):
                         "lot_id": str(lot_id),
                         "subcategory_id": sub_id,
                         "title_keyword": it["game_name"][:40],
+                        "game_name": it["game_name"],
                         "product_id": it["product_id"],
                         "product_name": it["product_name"],
                         "hours": it["hours"],
@@ -2536,6 +2552,127 @@ def _reprice_run(user_id: int, chat_id=None, mid=None):
                 f"➖ Без изменений: <b>{unchanged}</b>\n"
                 f"❌ Ошибок: <b>{failed}</b>\n\n"
                 f"Наценка: <b>{_pct(tpl.get('markup_percent', 0))}%</b>, мин. цена: <b>{floor}₽</b>")
+    if chat_id and mid:
+        try:
+            kb = K()
+            kb.row(B("◀️ В меню создания", callback_data=f"{P}_ac"))
+            bot.edit_message_text(done, chat_id, mid, parse_mode="HTML", reply_markup=kb)
+        except Exception:
+            pass
+    else:
+        notify_admins_info(done)
+
+
+def _mapping_game_name(m: dict, sellable_by_pid: "dict | None" = None) -> str:
+    gn = (m.get("game_name") or "").strip()
+    if gn:
+        return gn
+    if sellable_by_pid:
+        try:
+            gn = (sellable_by_pid.get(int(m.get("product_id"))) or "").strip()
+        except Exception:
+            gn = ""
+        if gn:
+            return gn
+    return (m.get("title_keyword") or m.get("product_name") or "аккаунт").strip() or "аккаунт"
+
+
+def _desc_update_run(user_id: int, chat_id=None, mid=None, mode: str = "both"):
+    """Обновляет краткое (summary) и/или подробное (desc) описание всех авто-созданных
+    лотов KOSell по текущему шаблону. mode: 'summary' | 'desc' | 'both'."""
+    account = cardinal_instance.account
+    api = _get_api()
+    tpl = _ac_tpl()
+    sellable_by_pid: dict = {}
+    try:
+        if api is not None:
+            for sg in (_all_sellable_games(api) or []):
+                sellable_by_pid[sg["product_id"]] = sg.get("game_name")
+    except Exception as e:
+        _dbg(f"desc-update: sellable lookup fail: {e}")
+    targets = [m for m in MAPPINGS if m.get("lot_id") and m.get("hours") is not None]
+    total = len(targets)
+    updated = unchanged = failed = 0
+    rate_limited = False
+    started = time.time()
+    labels = {"summary": "краткие описания", "desc": "подробные описания", "both": "описания"}
+    label = labels.get(mode, "описания")
+
+    def _is_rate_limit(msg: str) -> bool:
+        low = (msg or "").lower()
+        return ("много предложений" in low or "подождите" in low
+                or "too many" in low or "слишком часто" in low)
+
+    try:
+        _ac_progress_edit(chat_id, mid, 0, total, 0, 0, 0,
+                          f"Обновление: {label}…", "Обновлено", started=started)
+        for i, m in enumerate(targets, 1):
+            did_write = False
+            try:
+                game_name = _mapping_game_name(m, sellable_by_pid)
+                hours = int(m["hours"])
+                sru, sen, fru, fen = _build_lot_texts(game_name, hours, tpl)
+                lf = account.get_lot_fields(int(m["lot_id"]))
+                changed = False
+                if mode in ("summary", "both"):
+                    if sru and (lf.fields.get("fields[summary][ru]") or "") != sru:
+                        lf.fields["fields[summary][ru]"] = sru
+                        changed = True
+                    if sen and (lf.fields.get("fields[summary][en]") or "") != sen:
+                        lf.fields["fields[summary][en]"] = sen
+                        changed = True
+                if mode in ("desc", "both"):
+                    if fru and (lf.fields.get("fields[desc][ru]") or "") != fru:
+                        lf.fields["fields[desc][ru]"] = fru
+                        changed = True
+                    if fen and (lf.fields.get("fields[desc][en]") or "") != fen:
+                        lf.fields["fields[desc][en]"] = fen
+                        changed = True
+                if not changed:
+                    unchanged += 1
+                    _dbg(f"desc-update SKIP lot={m['lot_id']} {hours}ч ({game_name}) — без изменений")
+                else:
+                    lf.fields["csrf_token"] = account.csrf_token
+                    account.save_lot(lf)
+                    did_write = True
+                    updated += 1
+                    _dbg(f"desc-update lot={m['lot_id']} {hours}ч ({game_name}) режим={mode}")
+            except Exception as e:
+                msg = str(e)
+                if _is_rate_limit(msg):
+                    _dbg(f"desc-update rate-limit FunPay на lot={m.get('lot_id')}: остановка прогона")
+                    rate_limited = True
+                    break
+                failed += 1
+                _dbg(f"desc-update FAIL lot={m.get('lot_id')}: {msg[-200:]}")
+            finally:
+                if i % 3 == 0 or i == total:
+                    _ac_progress_edit(chat_id, mid, i, total, updated, unchanged, failed,
+                                      f"Обновление: {label}…", "Обновлено", started=started)
+            if did_write:
+                time.sleep(AC_CREATE_DELAY + random.uniform(0.0, 1.0))
+            else:
+                time.sleep(0.4 + random.uniform(0.0, 0.4))
+    except Exception as e:
+        logger.error(f"{LP} [AC] desc-update error: {e}", exc_info=True)
+    finally:
+        _ac_running["on"] = False
+
+    if rate_limited:
+        done = (f"⛔️ <b>FunPay лимит на изменение лотов.</b>\n\n"
+                f"✅ Обновлено: <b>{updated}</b>\n"
+                f"➖ Без изменений: <b>{unchanged}</b>\n"
+                f"❌ Ошибок: <b>{failed}</b>\n\n"
+                f"⏳ Это кулдаун FunPay — вернитесь позже и снова запустите «Обновить описания»: "
+                f"уже обновлённые лоты пропустятся, плагин до-обновит только оставшиеся.")
+    else:
+        done = (f"✍️ <b>Обновление описаний завершено.</b>\n\n"
+                f"Режим: <b>{label}</b>\n"
+                f"✅ Обновлено: <b>{updated}</b>\n"
+                f"➖ Без изменений: <b>{unchanged}</b>\n"
+                f"❌ Ошибок: <b>{failed}</b>\n\n"
+                f"<i>Тексты взяты из текущего шаблона (плейсхолдеры {PH_TIME}/{PH_GAME} подставлены "
+                f"под каждый лот).</i>")
     if chat_id and mid:
         try:
             kb = K()
@@ -3339,6 +3476,8 @@ def tg_msg_dispatch(message):
                     raise ValueError("only_int")
                 if key == "tz_offset_hours":
                     val = max(-12, min(14, val))
+                if key == "poll_sec":
+                    val = max(10, val)
             SETTINGS[key] = val
             save_settings()
             if key == "ac_min_price":
@@ -3639,6 +3778,7 @@ def tg_ac_menu(call):
                B("⚙️ Заново", callback_data=f"{P}_ac_w_start"))
         kb.row(B("👁 Предпросмотр цен", callback_data=f"{P}_ac_prev:0"),
                B("♻️ Пересчитать цены", callback_data=f"{P}_ac_reprice"))
+        kb.row(B("✍️ Обновить описания лотов", callback_data=f"{P}_ac_descupd"))
         text = (
             f"<b>📦 Создание лотов KOSell</b>\n\n"
             + (api_err + "\n\n" if api_err else "")
@@ -4047,6 +4187,94 @@ def tg_ac_reprice(call):
         pass
 
 
+_DESC_MODE_LABELS = {
+    "summary": "краткое описание (название)",
+    "desc": "подробное описание",
+    "both": "краткое и подробное описание",
+}
+
+
+def tg_ac_descupd(call):
+    if not _ac_has_template():
+        bot.answer_callback_query(call.id, "Сначала настройте шаблон", show_alert=True)
+        return
+    if _ac_running["on"]:
+        bot.answer_callback_query(call.id, "Уже выполняется", show_alert=True)
+        return
+    n = len([m for m in MAPPINGS if m.get("lot_id")])
+    t = _ac_tpl()
+    kb = K()
+    kb.row(B("📝 Краткое (название)", callback_data=f"{P}_ac_du:summary"))
+    kb.row(B("📄 Подробное описание", callback_data=f"{P}_ac_du:desc"))
+    kb.row(B("📝📄 Оба сразу", callback_data=f"{P}_ac_du:both"))
+    kb.row(_back_btn(f"{P}_ac"))
+    txt = (
+        f"<b>✍️ Обновить описания лотов</b>\n\n"
+        f"Привязанных лотов KOSell: <b>{n}</b>\n\n"
+        f"Возьму текущий шаблон и перезапишу выбранные тексты на <b>всех</b> лотах KOSell "
+        f"(только привязанные/созданные плагином — чужие лоты не трогаю).\n\n"
+        f"📝 Название RU:\n<code>{_html.escape(t.get('summary_ru', '') or '—')}</code>\n"
+        f"📄 Описание RU:\n<code>{_html.escape((t.get('desc_ru', '') or '—')[:120])}</code>\n\n"
+        f"<i>Плейсхолдеры {PH_TIME}/{PH_GAME} подставятся под каждый лот. "
+        f"Чтобы сначала изменить сам шаблон — «✏️ Изменить шаблон».</i>\n\n"
+        f"Что обновить?"
+    )
+    _edit(call, txt, kb)
+
+
+def tg_ac_descupd_pick(call):
+    mode = call.data.split(":", 1)[1]
+    if mode not in _DESC_MODE_LABELS:
+        bot.answer_callback_query(call.id, "Неизвестный режим", show_alert=True)
+        return
+    if not _ac_has_template():
+        bot.answer_callback_query(call.id, "Сначала настройте шаблон", show_alert=True)
+        return
+    if _ac_running["on"]:
+        bot.answer_callback_query(call.id, "Уже выполняется", show_alert=True)
+        return
+    n = len([m for m in MAPPINGS if m.get("lot_id")])
+    if n == 0:
+        bot.answer_callback_query(call.id, "Нет привязанных лотов KOSell", show_alert=True)
+        return
+    kb = K()
+    kb.row(B("✅ Да, обновить", callback_data=f"{P}_ac_du_go:{mode}"))
+    kb.row(_back_btn(f"{P}_ac_descupd"))
+    _edit(call,
+          f"<b>Подтверждение</b>\n\n"
+          f"Обновить <b>{_DESC_MODE_LABELS[mode]}</b> у <b>{n}</b> лотов KOSell?\n\n"
+          f"Уже совпадающие тексты будут пропущены. Операция может занять время из-за "
+          f"лимитов FunPay.", kb)
+
+
+def tg_ac_descupd_go(call):
+    mode = call.data.split(":", 1)[1]
+    if mode not in _DESC_MODE_LABELS:
+        bot.answer_callback_query(call.id, "Неизвестный режим", show_alert=True)
+        return
+    if not _ac_has_template():
+        bot.answer_callback_query(call.id, "Сначала настройте шаблон", show_alert=True)
+        return
+    if _ac_running["on"]:
+        bot.answer_callback_query(call.id, "Уже выполняется", show_alert=True)
+        return
+    n = len([m for m in MAPPINGS if m.get("lot_id")])
+    if n == 0:
+        bot.answer_callback_query(call.id, "Нет привязанных лотов KOSell", show_alert=True)
+        return
+    if not _ac_begin("Обновление описаний…"):
+        bot.answer_callback_query(call.id, "Уже идёт другой процесс", show_alert=True)
+        return
+    eta = max(1, n * 3 // 60)
+    _edit(call, f"✍️ <b>Запускаю обновление описаний ({n} лотов)</b>\n\n"
+                f"<code>{_bar(0, n)}</code>\n\n"
+                f"Примерно ~{eta} мин. Прогресс обновляется здесь.", None)
+    uid = call.from_user.id
+    chat_id = call.message.chat.id
+    mid = call.message.id
+    threading.Thread(target=_desc_update_run, args=(uid, chat_id, mid, mode), daemon=True).start()
+
+
 def tg_ac_edit(call):
     if not _ac_has_template():
         bot.answer_callback_query(call.id, "Сначала настройте шаблон", show_alert=True)
@@ -4065,7 +4293,7 @@ def tg_ac_edit(call):
         f"📄 Описание RU:\n<code>{_html.escape((t.get('desc_ru', '') or '—')[:120])}</code>\n"
         f"📄 Описание EN:\n<code>{_html.escape((t.get('desc_en', '') or '—')[:120])}</code>\n\n"
         f"<i>{PH_TIME} → время, {PH_GAME} → игра. Изменения вступят в силу для новых лотов; "
-        f"для уже созданных — нажмите «Пересчитать цены» (для наценки).</i>"
+        f"для уже созданных — «✍️ Обновить описания лотов» или «♻️ Пересчитать цены» (для наценки).</i>"
     )
     _edit(call, txt, kb)
 
@@ -4165,6 +4393,9 @@ def init(cardinal: "Cardinal"):
             (tg_ac_confirm, lambda c: c.data == f"{P}_ac_confirm"),
             (tg_ac_go, lambda c: c.data == f"{P}_ac_go"),
             (tg_ac_reprice, lambda c: c.data == f"{P}_ac_reprice"),
+            (tg_ac_descupd, lambda c: c.data == f"{P}_ac_descupd"),
+            (tg_ac_descupd_go, lambda c: c.data.startswith(f"{P}_ac_du_go:")),
+            (tg_ac_descupd_pick, lambda c: c.data.startswith(f"{P}_ac_du:")),
             (tg_ac_delall, lambda c: c.data == f"{P}_ac_delall"),
             (tg_ac_del_lots, lambda c: c.data == f"{P}_ac_del_lots"),
             (tg_ac_del_lots_yes, lambda c: c.data == f"{P}_ac_del_lots_yes"),
