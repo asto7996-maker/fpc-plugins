@@ -35,7 +35,7 @@ if TYPE_CHECKING:
     from cardinal import Cardinal
 
 NAME = "KOSell Rent"
-VERSION = "1.1.30b"
+VERSION = "1.1.31b"
 DESCRIPTION = "Официальный плагин KOSell.store"
 CREDITS = "@KOSell1"
 UUID = "0d8a4c2f-6e71-4b3a-9c4d-2f1e8a7b6c50"
@@ -2502,17 +2502,17 @@ def _reprice_run(user_id: int, chat_id=None, mid=None):
                 public = _public_price_rub(api, prod, int(m["hours"]), tpl)
                 inp = _lot_input_price(public, int(m["subcategory_id"]))
                 lf = account.get_lot_fields(int(m["lot_id"]))
-                old = lf.fields.get("price")
+                old_val = lf.price
                 try:
-                    old_val = float(str(old).replace(",", ".")) if old not in (None, "") else None
+                    old_val = float(str(old_val).replace(",", ".")) if old_val not in (None, "") else None
                 except Exception:
                     old_val = None
                 if old_val is not None and abs(round(old_val, 2) - round(inp, 2)) < 0.005:
                     unchanged += 1
                     _dbg(f"reprice SKIP lot={m['lot_id']} {m['hours']}ч цена не изменилась ({old_val})")
                 else:
-                    lf.fields["price"] = str(inp)
-                    lf.fields["csrf_token"] = account.csrf_token
+                    lf.price = inp
+                    lf.csrf_token = account.csrf_token
                     account.save_lot(lf)
                     did_write = True
                     updated += 1
@@ -2615,28 +2615,28 @@ def _desc_update_run(user_id: int, chat_id=None, mid=None, mode: str = "both"):
                 lf = account.get_lot_fields(int(m["lot_id"]))
                 changed = False
                 if mode in ("summary", "both"):
-                    if sru and (lf.fields.get("fields[summary][ru]") or "") != sru:
-                        lf.fields["fields[summary][ru]"] = sru
+                    if sru and (lf.title_ru or "") != sru:
+                        lf.title_ru = sru
                         changed = True
-                    if sen and (lf.fields.get("fields[summary][en]") or "") != sen:
-                        lf.fields["fields[summary][en]"] = sen
+                    if sen and (lf.title_en or "") != sen:
+                        lf.title_en = sen
                         changed = True
                 if mode in ("desc", "both"):
-                    if fru and (lf.fields.get("fields[desc][ru]") or "") != fru:
-                        lf.fields["fields[desc][ru]"] = fru
+                    if fru and (lf.description_ru or "") != fru:
+                        lf.description_ru = fru
                         changed = True
-                    if fen and (lf.fields.get("fields[desc][en]") or "") != fen:
-                        lf.fields["fields[desc][en]"] = fen
+                    if fen and (lf.description_en or "") != fen:
+                        lf.description_en = fen
                         changed = True
                 if not changed:
                     unchanged += 1
                     _dbg(f"desc-update SKIP lot={m['lot_id']} {hours}ч ({game_name}) — без изменений")
                 else:
-                    lf.fields["csrf_token"] = account.csrf_token
+                    lf.csrf_token = account.csrf_token
                     account.save_lot(lf)
                     did_write = True
                     updated += 1
-                    _dbg(f"desc-update lot={m['lot_id']} {hours}ч ({game_name}) режим={mode}")
+                    logger.info(f"{LP} desc-update lot={m['lot_id']} {hours}ч ({game_name}) режим={mode}")
             except Exception as e:
                 msg = str(e)
                 if _is_rate_limit(msg):
@@ -4395,7 +4395,7 @@ def init(cardinal: "Cardinal"):
             (tg_ac_reprice, lambda c: c.data == f"{P}_ac_reprice"),
             (tg_ac_descupd, lambda c: c.data == f"{P}_ac_descupd"),
             (tg_ac_descupd_go, lambda c: c.data.startswith(f"{P}_ac_du_go:")),
-            (tg_ac_descupd_pick, lambda c: c.data.startswith(f"{P}_ac_du:")),
+            (tg_ac_descupd_pick, lambda c: c.data.startswith(f"{P}_ac_du:") and not c.data.startswith(f"{P}_ac_du_go:")),
             (tg_ac_delall, lambda c: c.data == f"{P}_ac_delall"),
             (tg_ac_del_lots, lambda c: c.data == f"{P}_ac_del_lots"),
             (tg_ac_del_lots_yes, lambda c: c.data == f"{P}_ac_del_lots_yes"),
