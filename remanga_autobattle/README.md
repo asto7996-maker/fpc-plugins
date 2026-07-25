@@ -24,37 +24,35 @@ remanga_autobattle/
 └── user_data/            # профиль браузера (создаётся автоматически)
 ```
 
-## Установка
+## Установка на сервер (одна команда)
 
-Требуется **Python 3.10+** (рекомендуется 3.11/3.12) и графическое окружение **только для первого setup**.
+```bash
+curl -fsSL https://raw.githubusercontent.com/asto7996-maker/fpc-plugins/cursor/remanga-autobattle-ba83/remanga_autobattle/install.sh | bash
+```
+
+Скрипт спросит только **BOT_TOKEN** (@BotFather), поставит зависимости, Playwright и systemd-сервис `remanga-autobattle`.
+
+Дальше в Telegram:
+1. `/start` — вы станете админом, мастер спросит URL / интервал / таймаут
+2. Кнопка **⚙️ Настройки** — изменить параметры в любой момент
+3. Один раз на сервере (GUI/VNC):  
+   `cd ~/remanga_autobattle && source .venv/bin/activate && python bot.py --setup`
+
+### Ручная установка
 
 ```bash
 cd remanga_autobattle
-
-python -m venv .venv
-# Windows:
-.venv\Scripts\activate
-# Linux / macOS:
-source .venv/bin/activate
-
-pip install -r requirements.txt
-playwright install chromium
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt && playwright install chromium
+cp .env.example .env   # достаточно BOT_TOKEN
+python bot.py
 ```
 
-Скопируйте окружение:
-
-```bash
-cp .env.example .env
-# отредактируйте .env: BOT_TOKEN, TELEGRAM_ADMIN_ID, при необходимости BATTLE_URL
-```
-
-| Переменная | Описание |
+| Что | Где задаётся |
 |---|---|
-| `BOT_TOKEN` | токен от [@BotFather](https://t.me/BotFather) |
-| `TELEGRAM_ADMIN_ID` | ваш user id ([@userinfobot](https://t.me/userinfobot)) |
-| `BATTLE_URL` | URL страницы боёв (по умолчанию `https://remanga.org/cards`) |
-| `AUTO_BATTLE_INTERVAL_SEC` | интервал автобоя в секундах (по умолчанию 30, бесконечно до стопа) |
-| `SELECTOR_TIMEOUT_MS` | таймаут ожидания кнопки/результата (по умолчанию 30000) |
+| `BOT_TOKEN` | `.env` / install.sh |
+| Admin ID | автоматически при первом `/start` |
+| URL боёв, интервал, таймаут | Telegram → ⚙️ Настройки |
 
 ## Первый запуск (setup)
 
