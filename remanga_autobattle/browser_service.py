@@ -370,8 +370,15 @@ class BrowserService:
 
             try:
                 await button.scroll_into_view_if_needed()
-                # force=True: поверх могут быть декоративные слои анимации
-                await button.click(timeout=self.config.selector_timeout_ms, force=True)
+                # Реальный клик по центру кнопки (Playwright force/locator иногда не заводит бой)
+                box = await button.bounding_box()
+                if box and box["width"] > 0 and box["height"] > 0:
+                    await page.mouse.click(
+                        box["x"] + box["width"] / 2,
+                        box["y"] + box["height"] / 2,
+                    )
+                else:
+                    await button.click(timeout=self.config.selector_timeout_ms, force=True)
                 logger.info("Клик по «В БОЙ» выполнен. Текст до клика: %r", text_before)
             except Exception as exc:  # noqa: BLE001
                 logger.error("Не удалось нажать «В БОЙ»: %s", exc)
@@ -380,26 +387,7 @@ class BrowserService:
                     message=f"Клик по «В БОЙ» не удался: {exc}",
                 )
 
-            # Premium/реклама может перекрыть результат — закрываем
-            await asyncio.sleep(1.0)
-            await self._dismiss_overlays(page)
-
-            # Отчёт берём из текста кнопки / экрана результата после боя
-            result = await self._wait_and_parse_result_from_button(
-                page,
-                button,
-                text_before=text_before,
-            )
-            # Если вместо результата поймали Premium — закрыть и перечитать
-            raw_low = (result.raw_text or "").lower()
-            if "premium" in raw_low or "подписк" in raw_low:
-                await self._dismiss_overlays(page)
-                await asyncio.sleep(1.0)
-                result = await self._wait_and_parse_result_from_button(
-                    page,
-                    button,
-                    text_before=text_before,
-                )
+            result = await self._wait_battle_finish(page, text_before=text_before)
             logger.info("Итог боя: %s — %s", result.outcome.value, result.message)
             return result
 
@@ -480,19 +468,13 @@ class BrowserService:
         Найти кнопку «戰 В БОЙ» на экране дуэли murim-cards.
         Всегда возвращает Locator (не ElementHandle).
         """
-        # Сначала ищем в блоке подготовки к дуэли — меньше шанс кликнуть мимо
-        scoped = page.locator("body").filter(has_text=re.compile(r"подготовка к дуэли|готов ли ты", re.I))
+        # На murim-cards это <button> с текстом «戰\nВ БОЙ»
         candidates = [
-            scoped.get_by_role("button", name=re.compile(r"в\s*бой|戰", re.I)),
-            scoped.locator("button", has_text=re.compile(r"в\s*бой", re.I)),
-            scoped.locator("[role='button']", has_text=re.compile(r"в\s*бой|戰", re.I)),
-            scoped.get_by_text(re.compile(r"戰\s*В\s*БОЙ|^\s*В\s*БОЙ\s*$", re.I)),
-            page.get_by_role("button", name=re.compile(r"в\s*бой|戰", re.I)),
             page.locator("button", has_text=re.compile(r"в\s*бой", re.I)),
-            page.locator("[role='button']", has_text=re.compile(r"в\s*бой|戰", re.I)),
+            page.get_by_role("button", name=re.compile(r"в\s*бой|戰", re.I)),
             page.get_by_text(re.compile(r"戰\s*В\s*БОЙ", re.I)),
-            page.get_by_text(re.compile(r"^\s*В\s*БОЙ\s*$", re.I)),
             page.locator("button:has-text('В БОЙ')"),
+            page.locator("[role='button']", has_text=re.compile(r"в\s*бой", re.I)),
         ]
         for loc in candidates:
             try:
@@ -510,6 +492,114 @@ class BrowserService:
             except Exception:  # noqa: BLE001
                 continue
         return None
+
+    async def _wait_battle_finish(self, page: Page, text_before: str = "") -> BattleResult:
+        """
+        Дождаться конца боя на murim-cards.
+
+        После клика появляется экран «БОЙ ИДЁТ» и кнопка «К РЕЗУЛЬТАТАМ».
+        """
+        # Ждём старт боя
+        try:
+            await page.wait_for_selector(
+                "text=/бой идёт|к\\s*результатам|победа|поражение/i",
+                timeout=15_000,
+                state="visible",
+            )
+        except Exception:  # noqa: BLE001
+            logger.warning("Экран боя не появился за 15с — пробую читать как есть")
+
+        await self._dismiss_overlays(page)
+
+        # Ускоряем / пропускаем анимацию
+        for sel in (
+            "text=/к\\s*результатам/i",
+            "button:has-text('РЕЗУЛЬТАТ')",
+            "text=/×4/",
+            "text=/x4/i",
+        ):
+            try:
+                loc = page.locator(sel).first
+                if await loc.count() > 0 and await loc.is_visible():
+                    box = await loc.bounding_box()
+                    if box:
+                        await page.mouse.click(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+                    else:
+                        await loc.click(force=True)
+                    await asyncio.sleep(1.2)
+                    if "результат" in sel.lower() or "результатам" in sel:
+                        break
+            except Exception:  # noqa: BLE001
+                continue
+
+        # Ещё раз «К РЕЗУЛЬТАТАМ», если бой ещё идёт
+        try:
+            skip = page.get_by_text(re.compile(r"к\s*результатам", re.I)).first
+            if await skip.count() > 0 and await skip.is_visible():
+                box = await skip.bounding_box()
+                if box:
+                    await page.mouse.click(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+                await asyncio.sleep(2.0)
+        except Exception:  # noqa: BLE001
+            pass
+
+        await self._dismiss_overlays(page)
+        await asyncio.sleep(1.5)
+
+        # Читаем результат с экрана
+        raw = await self._safe_body_text(page) or ""
+        # Если снова Premium — закрыть и перечитать
+        if "premium" in raw.lower():
+            await self._dismiss_overlays(page)
+            await asyncio.sleep(1.0)
+            raw = await self._safe_body_text(page) or ""
+
+        outcome = BattleOutcome.UNKNOWN
+        message = "Бой завершён."
+        if self.WIN_MARKERS.search(raw):
+            outcome = BattleOutcome.WIN
+            message = "Бой выигран."
+        elif self.LOSE_MARKERS.search(raw):
+            outcome = BattleOutcome.LOSE
+            message = "Бой проигран."
+        elif self.DRAW_MARKERS.search(raw):
+            outcome = BattleOutcome.DRAW
+            message = "Ничья."
+        elif re.search(r"бой\s*идёт", raw, re.I):
+            message = "Бой ещё идёт / не дождались результата."
+        elif text_before and text_before in raw and "результат" not in raw.lower():
+            message = "Клик выполнен, но экран результата не распознан."
+
+        rating_change = None
+        # Слава / рейтинг вида +3 / −2
+        glory = re.search(r"(слава|рейтинг|mmr)[^\n]{0,30}([+\-−–]\s*\d+)", raw, re.I)
+        if glory:
+            rating_change = glory.group(0).strip()
+        else:
+            pm = re.search(r"([+\-−–]\s*\d+)\s*(?:славы|слава|рейтинг)?", raw, re.I)
+            if pm:
+                rating_change = pm.group(1).replace(" ", "")
+
+        rewards = None
+        reward_match = self.REWARD_MARKERS.search(raw)
+        if reward_match:
+            rewards = reward_match.group(0).strip()
+
+        # Короткий сниппет для отчёта — зона результата, не весь body
+        snippet = raw
+        for marker in ("ПОБЕДА", "Победа", "ПОРАЖЕНИЕ", "Поражение", "РЕЗУЛЬТАТ", "Слава"):
+            idx = raw.find(marker)
+            if idx >= 0:
+                snippet = raw[max(0, idx - 40) : idx + 240]
+                break
+
+        return BattleResult(
+            outcome=outcome,
+            message=message,
+            rating_change=rating_change,
+            rewards=rewards,
+            raw_text=snippet[:500],
+        )
 
     async def _wait_and_parse_result_from_button(
         self,
