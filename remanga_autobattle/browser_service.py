@@ -275,9 +275,7 @@ class BrowserService:
 
             try:
                 logger.info("Переход на страницу боёв: %s", self.config.battle_url)
-                await page.goto(self.config.battle_url, wait_until="domcontentloaded")
-                # Даём SPA дорисовать динамический UI
-                await page.wait_for_load_state("networkidle", timeout=self.config.selector_timeout_ms)
+                await self._navigate_battle_page(page)
             except Exception as exc:  # noqa: BLE001
                 logger.error("Не удалось открыть страницу боёв: %s", exc)
                 return BattleResult(
@@ -285,12 +283,21 @@ class BrowserService:
                     message=f"Не удалось открыть страницу боёв: {exc}",
                 )
 
-            # Случайная «человеческая» пауза перед поиском/кликом
-            await self._human_delay("перед поиском кнопки «В БОЙ»")
+            # Проверка Cloudflare / DDoS-Guard / неавторизован
+            body_text = await self._safe_body_text(page)
+            challenge = self._detect_challenge(body_text or "", page.url)
+            if challenge:
+                return BattleResult(
+                    outcome=BattleOutcome.ERROR,
+                    message=challenge,
+                    raw_text=(body_text or "")[:500],
+                )
+
+            # Короткая пауза: SPA (#/duel) дорисует кнопку
+            await asyncio.sleep(random.uniform(1.5, 3.0))
 
             button = await self._find_battle_button(page)
             if button is None:
-                # Возможно, на странице сообщение о кулдауне / нехватке энергии
                 body_text = await self._safe_body_text(page)
                 if body_text and self.COOLDOWN_MARKERS.search(body_text):
                     return BattleResult(
@@ -298,9 +305,22 @@ class BrowserService:
                         message="Кнопка «В БОЙ» недоступна (энергия/кулдаун).",
                         raw_text=body_text[:500],
                     )
+                # Сохраняем скриншот для диагностики на сервере
+                try:
+                    shot = self.config.user_data_dir.parent / "last_battle_error.png"
+                    await page.screenshot(path=str(shot), full_page=True)
+                    logger.warning("Скриншот ошибки: %s", shot)
+                except Exception:  # noqa: BLE001
+                    pass
                 return BattleResult(
                     outcome=BattleOutcome.ERROR,
-                    message="Кнопка «В БОЙ» не найдена на странице.",
+                    message=(
+                        "Кнопка «В БОЙ» не найдена. "
+                        "Сделайте setup (вход в аккаунт): "
+                        "systemctl stop remanga-autobattle && "
+                        "cd /root/remanga_autobattle && "
+                        "source .venv/bin/activate && python bot.py --setup"
+                    ),
                     raw_text=(body_text or "")[:500],
                 )
 
@@ -336,7 +356,11 @@ class BrowserService:
             except Exception:  # noqa: BLE001
                 text_before = ""
 
-            await self._human_delay("перед кликом «В БОЙ»")
+            # Короткая пауза перед кликом (антибан, но не блокируем интервал 30с)
+            await asyncio.sleep(random.uniform(
+                min(1.5, self.config.human_delay_min_sec),
+                min(4.0, self.config.human_delay_max_sec),
+            ))
 
             try:
                 await button.scroll_into_view_if_needed()
@@ -538,8 +562,67 @@ class BrowserService:
     # Вспомогательные методы
     # ------------------------------------------------------------------
 
+    async def _navigate_battle_page(self, page: Page) -> None:
+        """
+        Открыть страницу боёв.
+
+        Важно:
+        - НЕ ждём networkidle — у Remanga SPA/сокеты часто не затихают никогда.
+        - URL с hash (#/duel) открываем как base + hash (иначе SPA-роутер может не сработать).
+        """
+        url = self.config.battle_url.strip()
+        if "#" in url:
+            base, _, fragment = url.partition("#")
+            await page.goto(base or url, wait_until="domcontentloaded", timeout=self.config.selector_timeout_ms)
+            # Даём каркасу SPA загрузиться, затем переходим по hash-маршруту
+            await asyncio.sleep(1.5)
+            await page.evaluate(
+                """(frag) => { window.location.hash = frag; }""",
+                fragment if fragment.startswith("/") else f"/{fragment}",
+            )
+            await asyncio.sleep(2.0)
+        else:
+            await page.goto(url, wait_until="domcontentloaded", timeout=self.config.selector_timeout_ms)
+            await asyncio.sleep(2.0)
+
+        # Мягко ждём load (не критично, если таймаут)
+        try:
+            await page.wait_for_load_state("load", timeout=10_000)
+        except Exception:  # noqa: BLE001
+            pass
+
+    @staticmethod
+    def _detect_challenge(body_text: str, current_url: str) -> Optional[str]:
+        """Вернуть текст ошибки, если страница — капча / блок / не логин."""
+        low = (body_text or "").lower()
+        markers = (
+            "checking your browser",
+            "just a moment",
+            "ddos-guard",
+            "cloudflare",
+            "cf-browser-verification",
+            "внимание: доступ ограничен",
+            "подтвердите, что вы не робот",
+            "are you a robot",
+            "captcha",
+        )
+        if any(m in low for m in markers):
+            return (
+                "Сайт показал защиту (Cloudflare/DDoS-Guard). "
+                "Нужен ручной setup с входом в аккаунт:\n"
+                "systemctl stop remanga-autobattle && "
+                "cd /root/remanga_autobattle && source .venv/bin/activate && "
+                "python bot.py --setup"
+            )
+        if "вход" in low and "регистрац" in low and "в бой" not in low:
+            return (
+                "Похоже, вы не авторизованы на Remanga. "
+                "Выполните setup и войдите в аккаунт."
+            )
+        return None
+
     async def _human_delay(self, reason: str = "") -> None:
-        """Случайная пауза 3–8 секунд для снижения риска бана."""
+        """Случайная пауза для снижения риска бана."""
         delay = random.uniform(
             self.config.human_delay_min_sec,
             self.config.human_delay_max_sec,
