@@ -64,6 +64,12 @@ NIGHT_BREAK_END = time(5, 0)
 # Комментарии каждые 5–15 глав на случайной главе текущего тайтла
 COMMENT_EVERY_MIN = 5
 COMMENT_EVERY_MAX = 15
+# Читать тайтл почти до конца: оставить хвост 1–8 глав (или ~1–4%)
+TITLE_LEAVE_MIN = 1
+TITLE_LEAVE_MAX = 8
+TITLE_LEAVE_PCT = (0.01, 0.04)
+# Запасной потолок, если число глав неизвестно (идём пока есть «след. глава»)
+TITLE_READ_HARD_CAP = 5000
 COMMENT_WORDS_MIN = 5
 COMMENT_WORDS_MAX = 20
 # 65% — благодарности, 35% — похожие на чужие
@@ -1137,6 +1143,79 @@ class MangaBuffService:
         # чуть чаще оставляем топовые в начале
         return titles[:limit]
 
+    async def _estimate_title_chapters(self, slug: str) -> int:
+        """
+        Оценить число глав тайтла по странице /manga/{slug}.
+        0 = неизвестно (тогда читаем до конца по next-chapter).
+        """
+        if not slug or not self._page:
+            return 0
+        page = self._page
+        title_url = f"https://mangabuff.ru/manga/{slug}"
+        try:
+            if not await self._safe_goto(page, title_url):
+                return 0
+            await self._dismiss_overlays(page)
+            await self._human_pause(0.8, 1.6)
+            data = await page.evaluate(
+                """() => {
+                  const text = document.body ? (document.body.innerText || '') : '';
+                  const hrefs = [...document.querySelectorAll('a[href*="/manga/"]')]
+                    .map(el => el.getAttribute('href') || '');
+                  const nums = [];
+                  for (const h of hrefs) {
+                    const m = h.match(/\\/manga\\/[^/]+\\/(\\d+)\\/(\\d+)/);
+                    if (m) nums.push(parseInt(m[2], 10));
+                  }
+                  let fromText = 0;
+                  const m1 = text.match(/(\\d+)\\s*глав/i);
+                  if (m1) fromText = parseInt(m1[1], 10) || 0;
+                  if (!fromText) {
+                    const m2 = text.match(/глав[аыи]?\\s*[:\\-]?\\s*(\\d+)/i);
+                    if (m2) fromText = parseInt(m2[1], 10) || 0;
+                  }
+                  const fromLinks = nums.length ? Math.max.apply(null, nums) : 0;
+                  return { fromText, fromLinks, n: nums.length };
+                }"""
+            )
+            from_text = int((data or {}).get("fromText") or 0)
+            from_links = int((data or {}).get("fromLinks") or 0)
+            # если в тексте явно «12 глав», а в ссылках только превью — верим тексту,
+            # но не меньше max по ссылкам
+            total = max(from_text, from_links)
+            if total <= 0:
+                return 0
+            # отсечь мусорные выбросы
+            if total > 20000:
+                total = from_links or from_text
+            logger.info(
+                "MangaBuff title %s chapters≈%s (text=%s links=%s)",
+                slug,
+                total,
+                from_text,
+                from_links,
+            )
+            return total
+        except Exception as exc:  # noqa: BLE001
+            logger.info("MangaBuff chapter estimate failed for %s: %s", slug, exc)
+            return 0
+
+    def _chapters_target_for_title(self, total_chapters: int) -> int:
+        """Сколько глав читать: почти до конца, с небольшим хвостом."""
+        if total_chapters <= 0:
+            return TITLE_READ_HARD_CAP
+        if total_chapters <= 3:
+            return total_chapters
+        leave_pct = int(total_chapters * random.uniform(*TITLE_LEAVE_PCT))
+        leave = max(TITLE_LEAVE_MIN, min(TITLE_LEAVE_MAX, leave_pct or TITLE_LEAVE_MIN))
+        # на коротких тайтлах хвост меньше
+        if total_chapters < 20:
+            leave = min(leave, max(1, total_chapters // 10))
+        target = max(1, total_chapters - leave)
+        # никогда не меньше ~90% тайтла
+        target = max(target, int(total_chapters * 0.90))
+        return min(target, total_chapters)
+
     async def _open_first_chapter(self, title_href: str) -> Optional[str]:
         assert self._page is not None
         page = self._page
@@ -1991,24 +2070,35 @@ class MangaBuffService:
                     if self._stop_flag.is_set():
                         break
 
-                    logger.info("MangaBuff open title %s", title.get("slug"))
+                    slug = str(title.get("slug") or "")
+                    logger.info("MangaBuff open title %s", slug)
+                    # Сначала узнать длину тайтла — читать почти до конца
+                    total_chapters = await self._estimate_title_chapters(slug)
+                    max_per_title = self._chapters_target_for_title(total_chapters)
+                    logger.info(
+                        "MangaBuff will read ~%s/%s chapters of %s",
+                        max_per_title,
+                        total_chapters or "?",
+                        slug,
+                    )
+
                     start_url = await self._open_first_chapter(title["href"])
                     if not start_url or not re.search(
                         r"/manga/[^/]+/\d+/\d+", start_url
                     ):
-                        logger.warning("MangaBuff cannot open %s", title.get("slug"))
+                        logger.warning("MangaBuff cannot open %s", slug)
                         continue
                     self.stats.titles_visited += 1
                     self.stats.touch(f"тайтл: {title.get('title','')[:40]}", start_url)
                     logger.info(
-                        "MangaBuff reading %s from %s",
-                        title.get("slug"),
+                        "MangaBuff reading %s from %s (target=%s)",
+                        slug,
                         start_url,
+                        max_per_title,
                     )
                     self._persist_stats()
 
                     chapters_this_title = 0
-                    max_per_title = random.randint(40, 120)
                     self._skip_title.clear()
                     while (
                         not self._stop_flag.is_set()
@@ -2069,9 +2159,23 @@ class MangaBuffService:
                                 pass
 
                         await self._human_pause(2.0, 6.0)
+                        if chapters_this_title >= max_per_title:
+                            break
                         if not await self._go_next_chapter(page):
+                            logger.info(
+                                "MangaBuff title %s ended naturally after %s chapters",
+                                slug,
+                                chapters_this_title,
+                            )
                             break
 
+                    logger.info(
+                        "MangaBuff finished title %s: read %s (target %s, total≈%s)",
+                        slug,
+                        chapters_this_title,
+                        max_per_title,
+                        total_chapters or "?",
+                    )
                     await self._human_pause(8.0, 20.0)
 
             except Exception as exc:  # noqa: BLE001
