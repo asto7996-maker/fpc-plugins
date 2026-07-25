@@ -326,24 +326,31 @@ class BrowserService:
                     raw_text=(body_text or "")[:500],
                 )
 
-            # Проверяем, что кнопка видима и активна
+            # Проверяем видимость (Locator или ElementHandle)
             try:
-                await expect(button).to_be_visible(timeout=self.config.selector_timeout_ms)
-            except Exception as exc:  # noqa: BLE001
-                return BattleResult(
-                    outcome=BattleOutcome.SKIPPED,
-                    message=f"Кнопка «В БОЙ» не видима: {exc}",
-                )
+                visible = await button.is_visible()
+            except Exception:  # noqa: BLE001
+                visible = False
+            if not visible:
+                try:
+                    await expect(button).to_be_visible(timeout=5_000)
+                    visible = True
+                except Exception as exc:  # noqa: BLE001
+                    return BattleResult(
+                        outcome=BattleOutcome.SKIPPED,
+                        message=f"Кнопка «В БОЙ» не видима: {exc}",
+                    )
 
-            # На murim-cards кнопка часто div/span: is_disabled() и class*disabled
-            # дают ложные срабатывания. Считаем неактивной только явную блокировку.
+            # На murim-cards кнопка — стилизованный div: is_disabled часто врёт.
             try:
                 disabled = await button.is_disabled()
             except Exception:  # noqa: BLE001
                 disabled = False
-            aria_disabled = (await button.get_attribute("aria-disabled") or "").lower()
-            looks_disabled = disabled or aria_disabled in {"true", "1"}
-            if looks_disabled:
+            try:
+                aria_disabled = (await button.get_attribute("aria-disabled") or "").lower()
+            except Exception:  # noqa: BLE001
+                aria_disabled = ""
+            if disabled or aria_disabled in {"true", "1"}:
                 body_text = await self._safe_body_text(page)
                 return BattleResult(
                     outcome=BattleOutcome.SKIPPED,
@@ -351,21 +358,17 @@ class BrowserService:
                     raw_text=(body_text or "")[:500],
                 )
 
-            # Текст кнопки до клика — чтобы понять, когда он обновится
             try:
                 text_before = ((await button.inner_text(timeout=3_000)) or "").strip()
             except Exception:  # noqa: BLE001
                 text_before = ""
 
-            # Короткая пауза перед кликом (антибан, но не блокируем интервал 30с)
-            await asyncio.sleep(random.uniform(
-                min(1.5, self.config.human_delay_min_sec),
-                min(4.0, self.config.human_delay_max_sec),
-            ))
+            await asyncio.sleep(random.uniform(1.0, 2.5))
 
             try:
                 await button.scroll_into_view_if_needed()
-                await button.click(timeout=self.config.selector_timeout_ms)
+                # force=True: поверх могут быть декоративные слои анимации
+                await button.click(timeout=self.config.selector_timeout_ms, force=True)
                 logger.info("Клик по «В БОЙ» выполнен. Текст до клика: %r", text_before)
             except Exception as exc:  # noqa: BLE001
                 logger.error("Не удалось нажать «В БОЙ»: %s", exc)
@@ -386,72 +389,33 @@ class BrowserService:
     async def _find_battle_button(self, page: Page):
         """
         Найти кнопку «戰 В БОЙ» на экране дуэли murim-cards.
-
-        На UI текст часто разбит на строки: «戰» + «В БОЙ».
+        Всегда возвращает Locator (не ElementHandle).
         """
-        # 0. Самый надёжный вариант для текущего UI: regex по тексту
-        try:
-            loc = page.get_by_text(re.compile(r"戰\s*В\s*БОЙ|В\s*БОЙ", re.I))
-            count = await loc.count()
-            for i in range(min(count, 12)):
-                el = loc.nth(i)
-                if not await el.is_visible():
-                    continue
-                # Поднимаемся к кликабельному родителю (button / role=button / кликабельный div)
-                handle = await el.evaluate_handle(
-                    """(node) => {
-                        let n = node;
-                        for (let i = 0; i < 6 && n; i++) {
-                            const tag = (n.tagName || '').toLowerCase();
-                            const role = n.getAttribute && n.getAttribute('role');
-                            const style = window.getComputedStyle(n);
-                            const clickable = tag === 'button' || tag === 'a' || role === 'button'
-                                || style.cursor === 'pointer';
-                            const txt = (n.innerText || '').replace(/\\s+/g, ' ');
-                            if (clickable && /в\\s*бой/i.test(txt)) return n;
-                            n = n.parentElement;
-                        }
-                        return node;
-                    }"""
-                )
-                element = handle.as_element()
-                if element is not None:
-                    return element
-        except Exception:  # noqa: BLE001
-            pass
-
-        # 1. Семантический поиск по роли
-        for pattern in self.BATTLE_BUTTON_PATTERNS:
-            locator = page.get_by_role("button", name=pattern)
-            try:
-                if await locator.count() > 0:
-                    candidate = locator.first
-                    await candidate.wait_for(state="visible", timeout=3_000)
-                    return candidate
-            except Exception:  # noqa: BLE001
-                pass
-
-        # 2. CSS-fallback
-        css_candidates = [
-            "button:has-text('В БОЙ')",
-            "button:has-text('В бой')",
-            "[role='button']:has-text('В БОЙ')",
-            "[role='button']:has-text('戰')",
-            "a:has-text('В БОЙ')",
-            "[class*='duel'] button",
-            "[class*='battle'] button",
-            "[class*='fight'] button",
+        candidates = [
+            # Кликабельный предок текста «В БОЙ»
+            page.locator(
+                "xpath=//*[contains(translate(normalize-space(.),"
+                "'вбойВБОЙ','вбойвбой'),'в бой')]"
+                "[self::button or @role='button' or contains(@class,'button') "
+                "or contains(@class,'btn') or contains(@class,'duel')]"
+            ),
+            page.get_by_role("button", name=re.compile(r"в\s*бой|戰", re.I)),
+            page.locator("button", has_text=re.compile(r"в\s*бой", re.I)),
+            page.locator("[role='button']", has_text=re.compile(r"в\s*бой|戰", re.I)),
+            page.get_by_text(re.compile(r"戰\s*В\s*БОЙ", re.I)),
+            page.get_by_text(re.compile(r"^\s*В\s*БОЙ\s*$", re.I)),
+            page.locator("button:has-text('В БОЙ')"),
+            page.locator("[class*='duel'] >> text=/в\\s*бой/i"),
         ]
-        for css in css_candidates:
-            locator = page.locator(css)
+        for loc in candidates:
             try:
-                if await locator.count() > 0:
-                    candidate = locator.first
-                    await candidate.wait_for(state="visible", timeout=2_000)
-                    return candidate
+                count = await loc.count()
+                for i in range(min(count, 8)):
+                    item = loc.nth(i)
+                    if await item.is_visible():
+                        return item
             except Exception:  # noqa: BLE001
                 continue
-
         return None
 
     async def _wait_and_parse_result_from_button(
