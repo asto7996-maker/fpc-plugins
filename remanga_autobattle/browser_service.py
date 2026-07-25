@@ -263,6 +263,95 @@ class BrowserService:
     # Боевая логика
     # ------------------------------------------------------------------
 
+    async def fetch_rating(self):
+        """
+        Считать текущий рейтинг / славу / силу с murim-cards (экран карты).
+        Возвращает stats_store.RatingInfo.
+        """
+        from stats_store import RatingInfo
+
+        async with self._lock:
+            if not self.is_started:
+                await self.start(headless=True)
+            assert self._page is not None
+            page = self._page
+
+            try:
+                base = self.config.battle_url.strip().split("#", 1)[0]
+                await page.goto(base or "https://remanga.org/murim-cards", wait_until="domcontentloaded")
+                await self._inject_saved_token(page)
+                await asyncio.sleep(1.0)
+                await page.goto(
+                    f"{base}#/map" if base else "https://remanga.org/murim-cards#/map",
+                    wait_until="domcontentloaded",
+                )
+                await asyncio.sleep(2.5)
+                body = await self._safe_body_text(page) or ""
+            except Exception as exc:  # noqa: BLE001
+                logger.error("fetch_rating failed: %s", exc)
+                info = RatingInfo()
+                info.updated_at = datetime.now().strftime("%d.%m.%Y %H:%M:%S")
+                return info
+
+            info = self._parse_rating_from_text(body)
+            info.updated_at = datetime.now().strftime("%d.%m.%Y %H:%M:%S")
+            return info
+
+    @staticmethod
+    def _parse_rating_from_text(body: str):
+        from stats_store import RatingInfo
+
+        info = RatingInfo()
+        if not body:
+            return info
+
+        # Ник рядом с «УЧЕНИК» / в шапке
+        m_user = re.search(
+            r"(?:УЧЕНИК|Ученик)\s*\n\s*([A-Za-zА-Яа-яёЁ0-9_\.]{2,32})",
+            body,
+        )
+        if m_user:
+            info.username = m_user.group(1).strip()
+        else:
+            m_user2 = re.search(r"\n([A-Za-z][A-Za-z0-9_\.]{2,24})\n(?:БРОНЗА|СЕРЕБРО|ЗОЛОТО|ПЛАТИНА|АЛМАЗ|МАСТЕР)", body)
+            if m_user2:
+                info.username = m_user2.group(1).strip()
+
+        m_rank = re.search(
+            r"((?:БРОНЗА|СЕРЕБРО|ЗОЛОТО|ПЛАТИНА|АЛМАЗ|МАСТЕР|ЛЕГЕНДА)\s*[IVX0-9]*)",
+            body,
+            re.I,
+        )
+        if m_rank:
+            info.rank = m_rank.group(1).strip().upper()
+
+        # СЛАВА 48 / 50  или просто СЛАВА\n48
+        m_glory = re.search(
+            r"СЛАВА\s*[:\n]?\s*(\d+)\s*(?:/\s*(\d+))?",
+            body,
+            re.I,
+        )
+        if m_glory:
+            info.glory = int(m_glory.group(1))
+            if m_glory.group(2):
+                info.glory_to_next = int(m_glory.group(2))
+
+        m_power = re.search(
+            r"(?:боевая сила|сила отряда)[^\d]{0,20}(\d[\d\s\u00a0]*)",
+            body,
+            re.I,
+        )
+        if m_power:
+            digits = re.sub(r"\D", "", m_power.group(1))
+            if digits:
+                info.power = int(digits)
+
+        m_streak = re.search(r"сери[яю]\s*побед[^\d]{0,10}(\d+)", body, re.I)
+        if m_streak:
+            info.win_streak = int(m_streak.group(1))
+
+        return info
+
     async def do_battle(self) -> BattleResult:
         """
         Выполнить один бой: открыть страницу → дождаться кнопки → клик → результат.

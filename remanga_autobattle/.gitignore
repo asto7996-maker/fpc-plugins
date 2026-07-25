@@ -5,6 +5,10 @@
 settings.json
 settings.json.tmp
 
+# Статистика боёв
+stats.json
+stats.json.tmp
+
 # Токен Remanga (секреты — никогда не коммитить)
 .remanga_token.json
 login_check.png

@@ -30,7 +30,18 @@ from apscheduler.triggers.interval import IntervalTrigger
 
 from browser_service import BattleOutcome, BattleResult, BrowserService
 from config import Config, load_config
-from settings_store import load_settings, save_settings, update_settings
+from settings_store import (
+    load_settings,
+    toggle_notify,
+    update_notify,
+    update_settings,
+)
+from stats_store import (
+    get_cached_rating,
+    load_stats,
+    save_stats,
+    update_stats_from_result,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +57,7 @@ class SettingsStates(StatesGroup):
     waiting_battle_url = State()
     waiting_interval = State()
     waiting_timeout = State()
+    waiting_summary_every = State()
 
 
 # ======================================================================
@@ -167,6 +179,11 @@ def main_reply_keyboard() -> ReplyKeyboardMarkup:
                 KeyboardButton(text="📊 Статус"),
             ],
             [
+                KeyboardButton(text="📈 Статистика"),
+                KeyboardButton(text="🏅 Рейтинг"),
+            ],
+            [
+                KeyboardButton(text="🔔 Уведомления"),
                 KeyboardButton(text="⚙️ Настройки"),
             ],
         ],
@@ -181,6 +198,66 @@ def settings_keyboard() -> ReplyKeyboardMarkup:
         keyboard=[
             [KeyboardButton(text="🌐 URL боёв"), KeyboardButton(text="⏱ Интервал")],
             [KeyboardButton(text="⌛ Таймаут"), KeyboardButton(text="📋 Показать настройки")],
+            [KeyboardButton(text="◀️ Назад")],
+        ],
+        resize_keyboard=True,
+    )
+
+
+def notify_keyboard() -> ReplyKeyboardMarkup:
+    """Переключатели уведомлений."""
+    ns = load_settings().notify_settings()
+
+    def lab(title: str, on: bool) -> str:
+        return f"{'✅' if on else '❌'} {title}"
+
+    summary = (
+        f"📋 Сводка: {ns.notify_summary_every}"
+        if ns.notify_summary_every > 0
+        else "📋 Сводка: выкл"
+    )
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [
+                KeyboardButton(text=lab("Победы", ns.notify_wins)),
+                KeyboardButton(text=lab("Поражения", ns.notify_losses)),
+            ],
+            [
+                KeyboardButton(text=lab("Ничьи", ns.notify_draws)),
+                KeyboardButton(text=lab("Пропуски", ns.notify_skipped)),
+            ],
+            [
+                KeyboardButton(text=lab("Ошибки", ns.notify_errors)),
+                KeyboardButton(text=lab("Старт/стоп", ns.notify_autobattle_start_stop)),
+            ],
+            [
+                KeyboardButton(text=lab("Тихий режим", ns.quiet_mode)),
+                KeyboardButton(text=summary),
+            ],
+            [
+                KeyboardButton(text="🔔 Все вкл"),
+                KeyboardButton(text="🔕 Все выкл"),
+            ],
+            [KeyboardButton(text="◀️ Назад")],
+        ],
+        resize_keyboard=True,
+    )
+
+
+def rating_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="🔄 Обновить рейтинг")],
+            [KeyboardButton(text="◀️ Назад")],
+        ],
+        resize_keyboard=True,
+    )
+
+
+def stats_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="♻️ Сбросить статистику")],
             [KeyboardButton(text="◀️ Назад")],
         ],
         resize_keyboard=True,
@@ -273,10 +350,12 @@ class AutobattleApp:
         async def cmd_help(message: Message) -> None:
             await message.answer(
                 "<b>Кнопки:</b>\n"
-                "▶️ Запустить автобой\n"
-                "⏹ Остановить автобой\n"
+                "▶️ / ⏹ — автобой\n"
                 "⚔️ Сделать 1 бой\n"
-                "📊 Статус\n"
+                "📊 Статус сессии\n"
+                "📈 Статистика — накопленная\n"
+                "🏅 Рейтинг — слава / ранг сейчас\n"
+                "🔔 Уведомления — что слать в чат\n"
                 "⚙️ Настройки — URL, интервал, таймаут\n",
                 reply_markup=main_reply_keyboard(),
             )
@@ -309,6 +388,151 @@ class AutobattleApp:
                 self.state.status_text(self.config.auto_battle_interval_sec),
                 reply_markup=main_reply_keyboard(),
             )
+
+        # --- Статистика ---
+        @self.dp.message(StateFilter(None), F.text.in_({"📈 Статистика", "Статистика"}))
+        @self.dp.message(StateFilter(None), Command("stats"))
+        async def stats_msg(message: Message) -> None:
+            session = (
+                f"<b>Сессия сейчас:</b> "
+                f"{'🟢 автобой' if self.state.running else '🔴 стоп'} · "
+                f"боёв {self.state.total_battles} "
+                f"(W{self.state.wins}/L{self.state.losses})"
+            )
+            await message.answer(
+                load_stats().to_telegram(session_extra=session),
+                reply_markup=stats_keyboard(),
+            )
+
+        @self.dp.message(StateFilter(None), F.text == "♻️ Сбросить статистику")
+        async def stats_reset(message: Message) -> None:
+            from stats_store import BattleStats
+
+            save_stats(BattleStats())
+            await message.answer("Статистика обнулена.", reply_markup=stats_keyboard())
+
+        # --- Рейтинг ---
+        @self.dp.message(StateFilter(None), F.text.in_({"🏅 Рейтинг", "Рейтинг"}))
+        @self.dp.message(StateFilter(None), Command("rating"))
+        async def rating_msg(message: Message) -> None:
+            cached = get_cached_rating()
+            text = cached.to_telegram()
+            if not cached.rank and cached.glory is None:
+                text += "\n\nНажмите «🔄 Обновить рейтинг», чтобы считать с сайта."
+            await message.answer(text, reply_markup=rating_keyboard())
+
+        @self.dp.message(StateFilter(None), F.text == "🔄 Обновить рейтинг")
+        @self.dp.message(StateFilter(None), Command("rating_refresh"))
+        async def rating_refresh(message: Message) -> None:
+            await message.answer("⏳ Читаю рейтинг с Remanga...")
+            try:
+                info = await self.browser.fetch_rating()
+                stats = load_stats()
+                from dataclasses import asdict
+
+                stats.rating = asdict(info)
+                save_stats(stats)
+                await message.answer(info.to_telegram(), reply_markup=rating_keyboard())
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("rating refresh")
+                await message.answer(
+                    f"⚠️ Не удалось обновить рейтинг: <code>{exc}</code>",
+                    reply_markup=rating_keyboard(),
+                )
+
+        # --- Уведомления ---
+        @self.dp.message(StateFilter(None), F.text.in_({"🔔 Уведомления", "Уведомления"}))
+        @self.dp.message(StateFilter(None), Command("notify"))
+        async def notify_menu(message: Message) -> None:
+            ns = load_settings().notify_settings()
+            await message.answer(
+                ns.to_telegram() + "\n\nНажмите кнопку, чтобы переключить:",
+                reply_markup=notify_keyboard(),
+            )
+
+        @self.dp.message(StateFilter(None), F.text == "🔔 Все вкл")
+        async def notify_all_on(message: Message) -> None:
+            update_notify(
+                notify_wins=True,
+                notify_losses=True,
+                notify_draws=True,
+                notify_skipped=True,
+                notify_errors=True,
+                notify_autobattle_start_stop=True,
+                quiet_mode=False,
+            )
+            await message.answer(
+                load_settings().notify_settings().to_telegram(),
+                reply_markup=notify_keyboard(),
+            )
+
+        @self.dp.message(StateFilter(None), F.text == "🔕 Все выкл")
+        async def notify_all_off(message: Message) -> None:
+            update_notify(
+                notify_wins=False,
+                notify_losses=False,
+                notify_draws=False,
+                notify_skipped=False,
+                notify_errors=False,
+                notify_autobattle_start_stop=False,
+                quiet_mode=True,
+                notify_summary_every=0,
+            )
+            await message.answer(
+                load_settings().notify_settings().to_telegram(),
+                reply_markup=notify_keyboard(),
+            )
+
+        @self.dp.message(
+            StateFilter(None),
+            F.text.regexp(
+                r"^(✅|❌)\s*(Победы|Поражения|Ничьи|Пропуски|Ошибки|Старт/стоп|Тихий режим)$"
+            ),
+        )
+        async def notify_toggle(message: Message) -> None:
+            label = (message.text or "").split(maxsplit=1)[-1].strip()
+            key_map = {
+                "Победы": "notify_wins",
+                "Поражения": "notify_losses",
+                "Ничьи": "notify_draws",
+                "Пропуски": "notify_skipped",
+                "Ошибки": "notify_errors",
+                "Старт/стоп": "notify_autobattle_start_stop",
+                "Тихий режим": "quiet_mode",
+            }
+            key = key_map.get(label)
+            if not key:
+                return
+            ns = toggle_notify(key)
+            await message.answer(
+                f"Переключено: <b>{label}</b>\n\n{ns.to_telegram()}",
+                reply_markup=notify_keyboard(),
+            )
+
+        @self.dp.message(StateFilter(None), F.text.regexp(r"^📋 Сводка:"))
+        async def notify_summary_ask(message: Message, state: FSMContext) -> None:
+            await state.set_state(SettingsStates.waiting_summary_every)
+            await message.answer(
+                "Как часто слать сводку статистики?\n"
+                "Введите число боёв (например <b>10</b>).\n"
+                "<b>0</b> — отключить сводку.",
+                reply_markup=cancel_keyboard(),
+            )
+
+        @self.dp.message(SettingsStates.waiting_summary_every)
+        async def notify_summary_set(message: Message, state: FSMContext) -> None:
+            text = (message.text or "").strip()
+            try:
+                n = int(text)
+            except ValueError:
+                await message.answer("Введите целое число, например 10 или 0")
+                return
+            if n < 0:
+                await message.answer("Число не может быть отрицательным.")
+                return
+            ns = update_notify(notify_summary_every=n)
+            await state.clear()
+            await message.answer(ns.to_telegram(), reply_markup=notify_keyboard())
 
         # --- Меню настроек ---
         @self.dp.message(StateFilter(None), F.text.in_({"⚙️ Настройки", "Настройки"}))
@@ -516,12 +740,14 @@ class AutobattleApp:
         logger.info("Автобой запущен, интервал=%s", self.config.auto_battle_interval_sec)
         asyncio.create_task(self.run_single_battle(notify=True))
 
-        return (
+        text = (
             f"✅ Автобой <b>запущен</b> (бесконечно).\n"
             f"⏱ Интервал: {self.config.auto_battle_interval_sec} сек.\n"
             "Остановка — «Остановить автобой».\n"
-            "Отчёт — текст с кнопки на сайте."
+            "Уведомления настраиваются в «🔔 Уведомления»."
         )
+        # Ответ хэндлеру; доп. пуш только если включён флаг (и это не дубль ответа)
+        return text
 
     async def stop_autobattle(self) -> str:
         if not self.state.running and not self.scheduler.get_job(self.state.job_id):
@@ -538,6 +764,27 @@ class AutobattleApp:
             return
         await self.run_single_battle(notify=True)
 
+    def _should_notify_outcome(self, outcome: BattleOutcome) -> bool:
+        ns = load_settings().notify_settings()
+        return ns.allows_outcome(outcome.value)
+
+    async def _maybe_send_summary(self) -> None:
+        """Сводка каждые N завершённых боёв (не считая skip/error)."""
+        ns = load_settings().notify_settings()
+        every = ns.notify_summary_every
+        if every <= 0 or self._notify_chat_id is None:
+            return
+        stats = load_stats()
+        if stats.total_battles <= 0 or stats.total_battles % every != 0:
+            return
+        try:
+            await self.bot.send_message(
+                self._notify_chat_id,
+                f"📋 <b>Сводка</b> (каждые {every} боёв)\n\n" + stats.to_telegram(),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Не удалось отправить сводку: %s", exc)
+
     async def run_single_battle(self, notify: bool = True) -> BattleResult:
         async with self._battle_lock:
             try:
@@ -553,7 +800,36 @@ class AutobattleApp:
 
             self.state.register(result)
 
-            if notify and self._notify_chat_id is not None:
+            # Постоянная статистика + обновление рейтинга из текста результата
+            summary = f"{result.outcome.value}: {result.message}"
+            if result.rating_change:
+                summary += f" ({result.rating_change})"
+            rating_info = None
+            if result.raw_text:
+                try:
+                    parsed = BrowserService._parse_rating_from_text(result.raw_text)
+                    if parsed.rank or parsed.glory is not None or parsed.username:
+                        from datetime import datetime as _dt
+
+                        parsed.updated_at = _dt.now().strftime("%d.%m.%Y %H:%M:%S")
+                        # Серия побед из итога
+                        import re as _re
+
+                        m = _re.search(r"сери[яю]\s*побед[^\d]{0,10}(\d+)", result.raw_text, _re.I)
+                        if m:
+                            parsed.win_streak = int(m.group(1))
+                        rating_info = parsed
+                except Exception:  # noqa: BLE001
+                    rating_info = None
+
+            update_stats_from_result(
+                outcome=result.outcome.value,
+                rating_change=result.rating_change,
+                summary=summary,
+                rating=rating_info,
+            )
+
+            if notify and self._notify_chat_id is not None and self._should_notify_outcome(result.outcome):
                 try:
                     await self.bot.send_message(
                         self._notify_chat_id,
@@ -566,6 +842,7 @@ class AutobattleApp:
                 except Exception as exc:  # noqa: BLE001
                     logger.error("Не удалось отправить отчёт в Telegram: %s", exc)
 
+            await self._maybe_send_summary()
             return result
 
     async def run(self) -> None:
