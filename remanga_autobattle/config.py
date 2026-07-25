@@ -50,6 +50,8 @@ class Config:
     mangabuff_start_url: str
     mangabuff_delay_min_sec: float
     mangabuff_delay_max_sec: float
+    mangabuff_email: str
+    mangabuff_password: str
     selector_timeout_ms: int
 
     # Эмуляция «реального» браузера
@@ -128,6 +130,8 @@ def load_config() -> Config:
         mangabuff_start_url=runtime.mangabuff_start_url or "https://mangabuff.ru/",
         mangabuff_delay_min_sec=float(runtime.mangabuff_delay_min_sec or 5.0),
         mangabuff_delay_max_sec=float(runtime.mangabuff_delay_max_sec or 15.0),
+        mangabuff_email=_get_str("MANGABUFF_EMAIL"),
+        mangabuff_password=_get_str("MANGABUFF_PASSWORD"),
         selector_timeout_ms=timeout_ms,
         user_agent=(
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "

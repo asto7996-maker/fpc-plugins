@@ -189,16 +189,20 @@ def mangabuff_menu_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
             [
-                KeyboardButton(text="▶️ Запустить авточтение"),
-                KeyboardButton(text="⏹ Остановить авточтение"),
+                KeyboardButton(text="▶️ Запустить фарм"),
+                KeyboardButton(text="⏹ Остановить фарм"),
             ],
             [
                 KeyboardButton(text="🎁 Собрать награды"),
-                KeyboardButton(text="📊 Статус MangaBuff"),
+                KeyboardButton(text="🗺 Изучить макеты"),
             ],
             [
+                KeyboardButton(text="📊 Статус MangaBuff"),
                 KeyboardButton(text="⏱ Настройки задержки"),
+            ],
+            [
                 KeyboardButton(text="🔗 URL чтения"),
+                KeyboardButton(text="🔐 Логин MangaBuff"),
             ],
             [KeyboardButton(text="🏠 Главное меню")],
         ],
@@ -306,6 +310,8 @@ class App:
             start_url=config.mangabuff_start_url,
             delay_min_sec=config.mangabuff_delay_min_sec,
             delay_max_sec=config.mangabuff_delay_max_sec,
+            email=config.mangabuff_email,
+            password=config.mangabuff_password,
         )
         self._mb_task: Optional[asyncio.Task] = None
 
@@ -609,13 +615,19 @@ class App:
             await message.answer(f"✅ Таймаут: {sec} сек", reply_markup=settings_keyboard())
 
         # ===== MangaBuff =====
-        @self.dp.message(StateFilter(None), F.text == "▶️ Запустить авточтение")
+        @self.dp.message(
+            StateFilter(None),
+            F.text.in_({"▶️ Запустить фарм", "▶️ Запустить авточтение", "Запустить фарм"}),
+        )
         async def mb_start(message: Message) -> None:
             self._notify_chat_id = message.chat.id
             text = await self.start_mangabuff_read()
             await message.answer(text, reply_markup=mangabuff_menu_keyboard())
 
-        @self.dp.message(StateFilter(None), F.text == "⏹ Остановить авточтение")
+        @self.dp.message(
+            StateFilter(None),
+            F.text.in_({"⏹ Остановить фарм", "⏹ Остановить авточтение", "Остановить фарм"}),
+        )
         async def mb_stop(message: Message) -> None:
             text = await self.stop_mangabuff_read()
             await message.answer(text, reply_markup=mangabuff_menu_keyboard())
@@ -623,7 +635,10 @@ class App:
         @self.dp.message(StateFilter(None), F.text == "🎁 Собрать награды")
         async def mb_claim(message: Message) -> None:
             self._notify_chat_id = message.chat.id
-            await message.answer("⏳ Собираю награды MangaBuff...", reply_markup=mangabuff_menu_keyboard())
+            await message.answer(
+                "⏳ Собираю награды / карты / дейлики...",
+                reply_markup=mangabuff_menu_keyboard(),
+            )
             try:
                 if not self.mangabuff.is_started:
                     await self.mangabuff.start(headless=True)
@@ -632,10 +647,40 @@ class App:
             except Exception as exc:  # noqa: BLE001
                 logger.exception("mangabuff claim")
                 await message.answer(
-                    f"⚠️ Ошибка сбора: <code>{exc}</code>\n"
-                    "Сделайте setup: <code>python -m services.mangabuff_service</code>",
+                    f"⚠️ Ошибка сбора: <code>{exc}</code>",
                     reply_markup=mangabuff_menu_keyboard(),
                 )
+
+        @self.dp.message(StateFilter(None), F.text == "🗺 Изучить макеты")
+        async def mb_layouts(message: Message) -> None:
+            await message.answer("⏳ Обхожу разделы MangaBuff...", reply_markup=mangabuff_menu_keyboard())
+            try:
+                if not self.mangabuff.is_started:
+                    await self.mangabuff.start(headless=True)
+                n = await self.mangabuff.explore_layouts()
+                await message.answer(
+                    f"✅ Пройдено разделов: <b>{n}</b>",
+                    reply_markup=mangabuff_menu_keyboard(),
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("mangabuff layouts")
+                await message.answer(f"⚠️ {exc}", reply_markup=mangabuff_menu_keyboard())
+
+        @self.dp.message(StateFilter(None), F.text == "🔐 Логин MangaBuff")
+        async def mb_login(message: Message) -> None:
+            await message.answer("⏳ Логин MangaBuff...", reply_markup=mangabuff_menu_keyboard())
+            try:
+                if not self.mangabuff.is_started:
+                    await self.mangabuff.start(headless=True)
+                ok = await self.mangabuff.ensure_login()
+                if ok:
+                    update_settings(mangabuff_setup_done=True)
+                await message.answer(
+                    "✅ Сессия MangaBuff активна" if ok else "⚠️ Логин не удался — проверьте .env",
+                    reply_markup=mangabuff_menu_keyboard(),
+                )
+            except Exception as exc:  # noqa: BLE001
+                await message.answer(f"⚠️ {exc}", reply_markup=mangabuff_menu_keyboard())
 
         @self.dp.message(StateFilter(None), F.text == "📊 Статус MangaBuff")
         async def mb_status(message: Message) -> None:
@@ -806,26 +851,28 @@ class App:
 
     async def start_mangabuff_read(self) -> str:
         if self.mangabuff.stats.running or (self._mb_task and not self._mb_task.done()):
-            return "ℹ️ Авточтение MangaBuff уже запущено."
+            return "ℹ️ Фарм MangaBuff уже запущен."
 
         async def _runner() -> None:
             try:
                 if not self.mangabuff.is_started:
                     await self.mangabuff.start(headless=True)
+                # Полный фарм каталога; если задан URL конкретной главы — читать с него
+                url = (self.config.mangabuff_start_url or "").strip()
                 await self.mangabuff.read_loop(
-                    start_url=self.config.mangabuff_start_url,
+                    start_url=url if url and url.rstrip("/") != "https://mangabuff.ru" else None,
                     max_chapters=0,
                     on_progress=self._mb_progress,
                 )
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001
-                logger.exception("mangabuff read")
+                logger.exception("mangabuff farm")
                 if self._notify_chat_id:
                     try:
                         await self.bot.send_message(
                             self._notify_chat_id,
-                            f"⚠️ MangaBuff авточтение упало: <code>{exc}</code>",
+                            f"⚠️ MangaBuff фарм упал: <code>{exc}</code>",
                         )
                     except Exception:  # noqa: BLE001
                         pass
@@ -835,12 +882,16 @@ class App:
 
         self.scheduler.start()
         self._mb_task = asyncio.create_task(_runner(), name=JOB_MANGABUFF_READ)
+        update_settings(mangabuff_setup_done=True)
         return (
-            "✅ Авточтение MangaBuff <b>запущено</b>.\n"
-            f"URL: <code>{self.config.mangabuff_start_url}</code>\n"
-            f"Задержка: {self.config.mangabuff_delay_min_sec:.0f}–"
+            "✅ Фарм MangaBuff <b>запущен</b>.\n"
+            "• популярные тайтлы из каталога\n"
+            "• чтение глав + сбор наград/карт\n"
+            "• обход макетов и ивентов\n"
+            "• ночной перерыв 01:00–05:00 МСК (4ч)\n"
+            f"⏱ Задержка: {self.config.mangabuff_delay_min_sec:.0f}–"
             f"{self.config.mangabuff_delay_max_sec:.0f} сек\n"
-            "Остановка — «Остановить авточтение»."
+            "Остановка — «Остановить фарм»."
         )
 
     async def stop_mangabuff_read(self) -> str:
@@ -854,7 +905,7 @@ class App:
                 pass
         self._mb_task = None
         self.mangabuff.stats.running = False
-        return "⏹ Авточтение MangaBuff <b>остановлено</b>."
+        return "⏹ Фарм MangaBuff <b>остановлен</b>."
 
     async def _mb_progress(self, stats) -> None:
         # Тихие промежуточные апдейты — только в лог; статус по кнопке
@@ -871,13 +922,25 @@ class App:
 
     async def run(self) -> None:
         logger.info("Старт бота (admin=%s)", self.config.telegram_admin_id or "pending")
+        # Soft-start браузеров — падение одного не валит polling
         try:
             await self.remanga.start(headless=True)
         except Exception as exc:  # noqa: BLE001
             logger.warning("Remanga browser: %s", exc)
+        try:
+            if self.config.mangabuff_email:
+                await self.mangabuff.start(headless=True)
+                ok = await self.mangabuff.ensure_login()
+                logger.info("MangaBuff login on boot: %s", ok)
+                # автозапуск фарма после успешного логина
+                if ok:
+                    asyncio.create_task(self.start_mangabuff_read())
+                    logger.info("MangaBuff farm auto-started")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("MangaBuff browser: %s", exc)
         self.scheduler.start()
         try:
-            await self.dp.start_polling(self.bot)
+            await self.dp.start_polling(self.bot, handle_signals=True)
         finally:
             await self.shutdown()
 
