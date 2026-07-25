@@ -526,6 +526,8 @@ class MangaBuffStats:
     last_at: str = ""
     started_at: str = ""
     night_break_until: str = ""
+    # Ключи глав, куда уже писали комментарий: "slug/vol/ch" — строго 1 на главу
+    commented_chapters: List[str] = field(default_factory=list)
 
     def touch(self, action: str, url: str = "") -> None:
         self.last_action = action
@@ -542,6 +544,11 @@ class MangaBuffStats:
         cleaned = {k: v for k, v in (data or {}).items() if k in known}
         # running всегда сбрасываем при загрузке с диска
         cleaned["running"] = False
+        ch = cleaned.get("commented_chapters")
+        if not isinstance(ch, list):
+            cleaned["commented_chapters"] = []
+        else:
+            cleaned["commented_chapters"] = [str(x) for x in ch if x][-5000:]
         return cls(**cleaned)
 
     def to_telegram(self, delay_range: Tuple[float, float] = (5.0, 15.0)) -> str:
@@ -639,6 +646,8 @@ class MangaBuffService:
         self._title_voices: Dict[str, Dict[str, Any]] = {}
         self._last_comment_bits: Dict[str, Tuple[str, str]] = {}
         self._current_comment_slug: str = ""
+        # Главы, куда уже писали (строго 1 комментарий на главу)
+        self._commented_chapters: set[str] = set(self.stats.commented_chapters or [])
 
     def _load_stats(self) -> MangaBuffStats:
         if not STATS_PATH.exists():
@@ -1313,8 +1322,38 @@ class MangaBuffService:
             return None
         return m.group(1), int(m.group(2)), int(m.group(3))
 
+    @staticmethod
+    def _chapter_comment_key(slug: str, vol: int, ch: int) -> str:
+        return f"{slug}/{int(vol)}/{int(ch)}"
+
+    def _mark_chapter_commented(self, slug: str, vol: int, ch: int) -> None:
+        key = self._chapter_comment_key(slug, vol, ch)
+        if key in self._commented_chapters:
+            return
+        self._commented_chapters.add(key)
+        lst = list(self.stats.commented_chapters or [])
+        lst.append(key)
+        # не раздувать файл бесконечно
+        self.stats.commented_chapters = lst[-5000:]
+
+    def _pick_uncommented_chapter(
+        self, slug: str, vol: int, cur_ch: int
+    ) -> Optional[int]:
+        """Случайная глава тайтла, куда ещё не писали. Строго 1 коммент на главу."""
+        hi = max(cur_ch, 3)
+        # сначала в уже «доступном» диапазоне, включая текущую
+        for span in (hi, hi + 20, hi + 60, max(hi, 120)):
+            candidates = [
+                c
+                for c in range(1, span + 1)
+                if self._chapter_comment_key(slug, vol, c) not in self._commented_chapters
+            ]
+            if candidates:
+                return random.choice(candidates)
+        return None
+
     async def _maybe_comment(self, page: Page) -> bool:
-        """Каждые 5–15 глав: уйти на случайную главу тайтла и оставить комментарий."""
+        """Каждые 5–15 глав: 1 комментарий на ещё не комментированную главу тайтла."""
         self._chapters_since_comment += 1
         if self._chapters_since_comment < self._next_comment_after:
             return False
@@ -1327,14 +1366,29 @@ class MangaBuffService:
             return False
 
         slug, vol, cur_ch = parsed
-        # Случайная глава этого тайтла (из уже «доступного» диапазона 1..max(cur, 3))
-        hi = max(cur_ch, 3)
-        candidates = [c for c in range(1, hi + 1) if c != cur_ch] or [cur_ch]
-        target_ch = random.choice(candidates)
+        target_ch = self._pick_uncommented_chapter(slug, vol, cur_ch)
+        if target_ch is None:
+            logger.info(
+                "MangaBuff comment skip: no uncommented chapters for %s/%s (known=%s)",
+                slug,
+                vol,
+                sum(1 for k in self._commented_chapters if k.startswith(f"{slug}/{vol}/")),
+            )
+            self._next_comment_after = self._chapters_since_comment + random.randint(
+                COMMENT_EVERY_MIN, COMMENT_EVERY_MAX
+            )
+            return False
+
+        target_key = self._chapter_comment_key(slug, vol, target_ch)
+        # двойная защита от гонки / повтора
+        if target_key in self._commented_chapters:
+            self._next_comment_after = self._chapters_since_comment + random.randint(1, 2)
+            return False
+
         target_url = f"https://mangabuff.ru/manga/{slug}/{vol}/{target_ch}"
 
         logger.info(
-            "MangaBuff comment due after %s chapters → random chapter %s (resume %s)",
+            "MangaBuff comment due after %s chapters → chapter %s (resume %s)",
             self._chapters_since_comment,
             target_url,
             resume_url,
@@ -1347,13 +1401,29 @@ class MangaBuffService:
             await self._dismiss_overlays(page)
             await self._human_pause(1.0, 2.0)
 
-            ok = await self._post_human_comment(page, slug=slug)
+            # ещё раз проверить ключ по фактическому URL
+            landed = self._parse_chapter_url(page.url)
+            if not landed:
+                self._next_comment_after = self._chapters_since_comment + random.randint(1, 2)
+                return False
+            land_slug, land_vol, land_ch = landed
+            land_key = self._chapter_comment_key(land_slug, land_vol, land_ch)
+            if land_key in self._commented_chapters:
+                logger.info("MangaBuff comment skip: already commented %s", land_key)
+                self._next_comment_after = self._chapters_since_comment + random.randint(1, 3)
+                if page.url.split("?")[0] != resume_url:
+                    await self._safe_goto(page, resume_url)
+                return False
+
+            ok = await self._post_human_comment(page, slug=land_slug)
             if ok:
+                self._mark_chapter_commented(land_slug, land_vol, land_ch)
                 self._chapters_since_comment = 0
                 self._next_comment_after = random.randint(
                     COMMENT_EVERY_MIN, COMMENT_EVERY_MAX
                 )
                 self._persist_stats()
+                logger.info("MangaBuff comment locked to chapter %s", land_key)
             else:
                 self._next_comment_after = self._chapters_since_comment + random.randint(
                     1, 3
