@@ -60,9 +60,9 @@ LAYOUT_URLS = (
 NIGHT_BREAK_START = time(1, 0)
 NIGHT_BREAK_END = time(5, 0)
 
-# Комментарии каждые 10–30 глав (случайный интервал)
-COMMENT_EVERY_MIN = 10
-COMMENT_EVERY_MAX = 30
+# Комментарии каждые 5–15 глав на случайной главе текущего тайтла
+COMMENT_EVERY_MIN = 5
+COMMENT_EVERY_MAX = 15
 
 
 @dataclass
@@ -856,110 +856,289 @@ class MangaBuffService:
         return False
 
     # ------------------------------------------------------------------
-    # Comments (rare, human-like, low report risk)
+    # Comments — каждые 5–15 глав, на рандомной главе тайтла
     # ------------------------------------------------------------------
 
+    def _parse_chapter_url(self, url: str) -> Optional[Tuple[str, int, int]]:
+        m = re.search(r"mangabuff\.ru/manga/([^/]+)/(\d+)/(\d+)", url)
+        if not m:
+            return None
+        return m.group(1), int(m.group(2)), int(m.group(3))
+
     async def _maybe_comment(self, page: Page) -> bool:
-        """Писать комментарий каждые 10–30 глав (случайный интервал)."""
+        """Каждые 5–15 глав: уйти на случайную главу тайтла и оставить комментарий."""
         self._chapters_since_comment += 1
         if self._chapters_since_comment < self._next_comment_after:
             return False
 
+        resume_url = page.url.split("?")[0]
+        parsed = self._parse_chapter_url(resume_url)
+        if not parsed:
+            logger.info("MangaBuff comment skip: not on chapter url %s", resume_url)
+            self._next_comment_after = self._chapters_since_comment + random.randint(1, 3)
+            return False
+
+        slug, vol, cur_ch = parsed
+        # Случайная глава этого тайтла (из уже «доступного» диапазона 1..max(cur, 3))
+        hi = max(cur_ch, 3)
+        candidates = [c for c in range(1, hi + 1) if c != cur_ch] or [cur_ch]
+        target_ch = random.choice(candidates)
+        target_url = f"https://mangabuff.ru/manga/{slug}/{vol}/{target_ch}"
+
+        logger.info(
+            "MangaBuff comment due after %s chapters → random chapter %s (resume %s)",
+            self._chapters_since_comment,
+            target_url,
+            resume_url,
+        )
+
         try:
-            btn = page.locator("button.reader__show-comments-btn").first
-            if await btn.count() and await btn.is_visible(timeout=700):
-                await btn.click(force=True)
-                await self._human_pause(1.0, 2.0)
+            if not await self._safe_goto(page, target_url):
+                self._next_comment_after = self._chapters_since_comment + random.randint(1, 2)
+                return False
+            await self._dismiss_overlays(page)
+            await self._human_pause(1.0, 2.0)
 
+            ok = await self._post_human_comment(page)
+            if ok:
+                self._chapters_since_comment = 0
+                self._next_comment_after = random.randint(
+                    COMMENT_EVERY_MIN, COMMENT_EVERY_MAX
+                )
+                self._persist_stats()
+            else:
+                self._next_comment_after = self._chapters_since_comment + random.randint(
+                    1, 3
+                )
+
+            # вернуться к чтению
+            if page.url.split("?")[0] != resume_url:
+                await self._safe_goto(page, resume_url)
+                await self._dismiss_overlays(page)
+            return ok
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("MangaBuff comment flow failed: %s", exc)
+            self._next_comment_after = self._chapters_since_comment + random.randint(1, 3)
+            try:
+                await self._safe_goto(page, resume_url)
+            except Exception:  # noqa: BLE001
+                pass
+            return False
+
+    async def _open_comments_panel(self, page: Page) -> bool:
+        await self._dismiss_overlays(page)
+        # уже открыто?
+        try:
+            if await page.locator(".comments__send-form textarea").count():
+                if await page.locator(".comments__send-form textarea").first.is_visible(
+                    timeout=500
+                ):
+                    return True
+        except Exception:  # noqa: BLE001
+            pass
+
+        for sel in (
+            "button.reader__show-comments-btn",
+            "button.reader-menu__item--comment",
+            "button:has-text('Комментарии')",
+        ):
+            try:
+                loc = page.locator(sel).first
+                if await loc.count() and await loc.is_visible(timeout=800):
+                    await loc.click(force=True)
+                    await self._human_pause(1.2, 2.2)
+                    break
+            except Exception:  # noqa: BLE001
+                continue
+
+        # вкладка «Популярные» — там живее примеры
+        try:
+            pop = page.locator("button.comments__change-sort", has_text="Популярные")
+            if await pop.count() and await pop.first.is_visible(timeout=600):
+                await pop.first.click(force=True)
+                await self._human_pause(0.8, 1.5)
+        except Exception:  # noqa: BLE001
+            pass
+
+        try:
+            return await page.locator(".comments__send-form textarea").first.is_visible(
+                timeout=2000
+            )
+        except Exception:  # noqa: BLE001
+            return False
+
+    async def _collect_comment_samples(self, page: Page) -> List[str]:
+        samples: List[str] = []
+        try:
             samples = await page.locator(".comments__body").all_inner_texts()
-            samples = [s.strip() for s in samples if s and 8 <= len(s.strip()) <= 120]
-            text = self._craft_comment(samples)
-            if not text or not self._is_safe_comment(text):
-                # не сбрасываем счётчик полностью — попробуем через 2–4 главы
-                self._next_comment_after = self._chapters_since_comment + random.randint(2, 4)
-                return False
+        except Exception:  # noqa: BLE001
+            samples = []
+        cleaned: List[str] = []
+        for s in samples:
+            s = (s or "").strip()
+            s = re.sub(r"https?://\S+", "", s)
+            # убрать эмодзи / символы
+            s = re.sub(
+                r"[\U0001F300-\U0010ffff\u2600-\u27BF]",
+                "",
+                s,
+            )
+            s = re.sub(r"\s+", " ", s).strip()
+            if 5 <= len(s) <= 140 and self._is_safe_comment(s.lower().rstrip(".,!?")):
+                cleaned.append(s)
+        return cleaned[:40]
 
-            area = page.locator(".comments__send-form textarea").first
-            if await area.count() == 0:
-                self._next_comment_after = self._chapters_since_comment + random.randint(2, 4)
-                return False
-            await area.click()
-            await self._human_pause(0.4, 1.0)
+    async def _post_human_comment(self, page: Page) -> bool:
+        if not await self._open_comments_panel(page):
+            logger.info("MangaBuff comment: panel not opened")
+            return False
+
+        samples = await self._collect_comment_samples(page)
+        # если мало — переключить на «Новые»
+        if len(samples) < 3:
+            try:
+                neu = page.locator("button.comments__change-sort", has_text="Новые")
+                if await neu.count():
+                    await neu.first.click(force=True)
+                    await self._human_pause(0.8, 1.4)
+                    samples = await self._collect_comment_samples(page)
+            except Exception:  # noqa: BLE001
+                pass
+
+        text = self._craft_comment(samples)
+        if not text or not self._is_safe_comment(text):
+            logger.info("MangaBuff comment: craft failed (samples=%s)", len(samples))
+            return False
+
+        area = page.locator(".comments__send-form textarea").first
+        if await area.count() == 0:
+            area = page.locator("textarea").first
+        if await area.count() == 0:
+            logger.info("MangaBuff comment: no textarea")
+            return False
+
+        try:
+            await area.click(force=True)
+            await self._human_pause(0.3, 0.8)
+            await area.fill("")
+            # «печатает» с паузами
             for ch in text:
-                await area.type(ch, delay=random.randint(40, 140))
-            await self._human_pause(0.8, 2.0)
+                await area.type(ch, delay=random.randint(35, 120))
+                if random.random() < 0.04:
+                    await asyncio.sleep(random.uniform(0.15, 0.45))
+            await self._human_pause(0.7, 1.8)
+
             send = page.locator("button.comments__send-btn").first
-            await send.click(force=True)
+            if await send.count() == 0:
+                send = page.get_by_role("button", name=re.compile(r"отправ", re.I)).first
+            await send.click(force=True, timeout=4000)
             await self._human_pause(1.5, 3.0)
+
             self.stats.comments_posted += 1
-            self._chapters_since_comment = 0
-            self._next_comment_after = random.randint(COMMENT_EVERY_MIN, COMMENT_EVERY_MAX)
-            self.stats.touch(f"коммент: {text[:40]}")
-            self._persist_stats()
+            self.stats.touch(f"коммент: {text[:50]}", page.url)
             logger.info(
-                "MangaBuff comment posted (next in %s chapters): %s",
-                self._next_comment_after,
+                "MangaBuff comment posted on %s (next in %s–%s): %s",
+                page.url,
+                COMMENT_EVERY_MIN,
+                COMMENT_EVERY_MAX,
                 text,
             )
             return True
         except Exception as exc:  # noqa: BLE001
-            logger.debug("comment skip: %s", exc)
-            self._next_comment_after = self._chapters_since_comment + random.randint(2, 4)
+            logger.warning("MangaBuff comment send failed: %s", exc)
             return False
 
     def _craft_comment(self, samples: Sequence[str]) -> str:
-        # Базовые нейтральные шаблоны + вариации из чужих комментов
-        templates = [
-            "ну интересно пошло",
-            "глава норм зашла",
-            "пока держит внимание",
-            "рисуют приятно",
-            "хочу дальше уже",
-            "атмосфера огонь",
-            "персонажи живые",
-            "неплохо закрутили",
-            "жду продолжение",
-            "мне зашло",
-        ]
-        cleaned = []
+        """
+        Сделать комментарий похожим на чужие:
+        взять 1–2 реальных, укоротить/переставить, строчными, без точки в конце.
+        """
+        cleaned: List[str] = []
         for s in samples:
             s = s.strip()
             s = re.sub(r"https?://\S+", "", s)
-            s = re.sub(r"[\U00010000-\U0010ffff]", "", s)  # эмодзи-плоско
-            s = re.sub(r"[^\w\sа-яА-ЯёЁ.,!?\-]", "", s, flags=re.UNICODE)
-            s = s.strip(" .!?,;:-")
-            if 6 <= len(s) <= 90 and not re.search(
-                r"дур|идиот|убей|суицид|ненавиж|репорт|жалоб|спам|реклам|подпиш",
-                s,
-                re.I,
-            ):
+            s = re.sub(r"[\U0001F300-\U0010ffff\u2600-\u27BF]", "", s)
+            s = re.sub(r"[^\w\sа-яА-ЯёЁ.,!?\-']", "", s, flags=re.UNICODE)
+            s = re.sub(r"\s+", " ", s).strip(" .!?,;:-")
+            if 5 <= len(s) <= 100 and self._is_safe_comment(s.lower()):
                 cleaned.append(s.lower())
 
-        if cleaned and random.random() < 0.55:
+        fillers = (
+            "ну",
+            "блин",
+            "кста",
+            "имхо",
+            "честно",
+            "ладно",
+            "хз",
+            "короче",
+        )
+        endings = (
+            "норм",
+            "зашло",
+            "держится",
+            "интереснее стало",
+            "жду дальше",
+            "неплохо",
+            "огонь",
+            "странно конечно",
+            "пока ок",
+        )
+
+        if cleaned:
             base = random.choice(cleaned)
-            # укоротить / слегка перефразировать
-            words = base.split()
-            if len(words) > 8:
+            words = [w for w in base.split() if w]
+            # иногда взять кусок из второго коммента
+            if len(cleaned) > 1 and random.random() < 0.45:
+                other = random.choice(cleaned).split()
+                cut_a = words[: random.randint(2, min(6, len(words)))]
+                cut_b = other[: random.randint(1, min(4, len(other)))]
+                words = cut_a + cut_b
+            elif len(words) > 7:
                 words = words[: random.randint(4, 8)]
+            elif len(words) < 3 and random.random() < 0.5:
+                words = words + random.choice(endings).split()
+
+            # лёгкая «очеловечивающая» правка
+            if random.random() < 0.35:
+                words = [random.choice(fillers)] + words
+            if random.random() < 0.25 and words:
+                # убрать одно слово — как небрежный набор
+                drop = random.randrange(len(words))
+                words = words[:drop] + words[drop + 1 :]
             text = " ".join(words)
         else:
-            text = random.choice(templates)
+            text = random.choice(
+                [
+                    "ну глава норм",
+                    "мне зашло",
+                    "интереснее стало",
+                    "жду дальше уже",
+                    "пока держит",
+                    "неплохо закрутили",
+                    "рисуют приятно кста",
+                    "атмосфера огонь",
+                ]
+            )
 
-        text = text.strip().lower()
+        text = re.sub(r"\s+", " ", text).strip().lower()
         text = text.rstrip(".,!?;:…")
-        # без эмодзи и заглавной
+        # без эмодзи, с маленькой буквы, без финальной точки
         if text:
             text = text[0].lower() + text[1:]
-        return text[:90]
+        # отсечь слишком короткое/длинное
+        if len(text) < 5:
+            text = "ну норм вроде"
+        return text[:85]
 
     def _is_safe_comment(self, text: str) -> bool:
-        if not text or len(text) < 5:
+        if not text or len(text) < 4:
             return False
-        if re.search(r"[A-ZА-Я]{4,}", text):
+        if re.search(r"[A-ZА-Я]{5,}", text):
             return False
-        if re.search(r"[!?]{2,}|@{2,}|#\w+", text):
+        if re.search(r"[!?]{2,}|@{1,}|#\w+|https?://", text):
             return False
-        if any(ord(c) > 0x1F300 for c in text):
+        if any(ord(c) >= 0x1F300 for c in text):
             return False
         banned = (
             "убей",
@@ -975,6 +1154,8 @@ class MangaBuffService:
             "ссылк",
             "http",
             "t.me",
+            "телег",
+            "промокод",
         )
         low = text.lower()
         return not any(b in low for b in banned)
