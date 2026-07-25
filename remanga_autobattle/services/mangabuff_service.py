@@ -828,8 +828,13 @@ class MangaBuffService:
             "button.close-adult-modal-btn",
             "button:has-text('Подтвердить')",
             "button:has-text('Мне 18')",
+            "button:has-text('Мне есть 18')",
             "button:has-text('Понятно')",
             "button:has-text('Закрыть')",
+            "button:has-text('Продолжить')",
+            "button:has-text('Смотреть')",
+            "button:has-text('Да, мне есть')",
+            "a:has-text('Продолжить')",
         )
         for sel in selectors:
             try:
@@ -837,7 +842,7 @@ class MangaBuffService:
                 n = await loc.count()
                 for i in range(min(n, 3)):
                     btn = loc.nth(i)
-                    if await btn.is_visible(timeout=800):
+                    if await btn.is_visible(timeout=600):
                         await btn.click(force=True, timeout=1500)
                         await self._human_pause(0.2, 0.6)
             except Exception:  # noqa: BLE001
@@ -921,6 +926,11 @@ class MangaBuffService:
     # ------------------------------------------------------------------
 
     async def claim_rewards(self) -> ClaimResult:
+        # Во время фарма не уводим вкладку с главы — сбор уже есть в цикле
+        if self.stats.running:
+            return ClaimResult(
+                message="Сейчас идёт чтение глав. Награды собираются в цикле фарма."
+            )
         async with self._lock:
             return await self._claim_rewards_unlocked()
 
@@ -970,6 +980,9 @@ class MangaBuffService:
 
     async def explore_layouts(self) -> int:
         """Пройти основные разделы сайта (изучение макетов)."""
+        if self.stats.running:
+            logger.info("MangaBuff layouts skipped: farm running")
+            return 0
         async with self._lock:
             return await self._explore_layouts_unlocked()
 
@@ -1222,6 +1235,23 @@ class MangaBuffService:
         slug_m = re.search(r"/manga/([^/?#]+)/?$", title_href.rstrip("/"))
         slug = slug_m.group(1) if slug_m else ""
 
+        async def _ok_reader() -> Optional[str]:
+            await self._dismiss_overlays(page)
+            title = ""
+            try:
+                title = await page.title()
+            except Exception:  # noqa: BLE001
+                pass
+            if "404" in title.lower():
+                return None
+            if re.search(r"/manga/[^/]+/\d+/\d+", page.url):
+                if page.url.rstrip("/").endswith("/0") and slug:
+                    await self._safe_goto(page, f"https://mangabuff.ru/manga/{slug}/1/1")
+                    await self._dismiss_overlays(page)
+                if re.search(r"/manga/[^/]+/\d+/\d+", page.url):
+                    return page.url.split("?")[0]
+            return None
+
         # Прямой URL первой главы — самый надёжный путь
         if slug:
             for candidate in (
@@ -1229,30 +1259,28 @@ class MangaBuffService:
                 f"https://mangabuff.ru/manga/{slug}/1/0",
             ):
                 if await self._safe_goto(page, candidate):
-                    await self._dismiss_overlays(page)
-                    title = await page.title()
-                    if "404" not in title and re.search(
-                        r"/manga/[^/]+/\d+/\d+", page.url
-                    ):
-                        # /1/0 часто редиректит/ведёт в ридер — ок
-                        if page.url.rstrip("/").endswith("/0"):
-                            # попробуем перейти на реальную 1
-                            nxt = f"https://mangabuff.ru/manga/{slug}/1/1"
-                            await self._safe_goto(page, nxt)
-                            await self._dismiss_overlays(page)
-                        return page.url
+                    got = await _ok_reader()
+                    if got:
+                        return got
 
         if not await self._safe_goto(page, title_href):
             return None
         await self._dismiss_overlays(page)
         try:
-            read_btn = page.get_by_role("link", name=re.compile(r"^Читать$", re.I))
-            if await read_btn.count():
-                await read_btn.first.click()
-                await self._human_pause(2.0, 3.5)
-                await self._dismiss_overlays(page)
-                if re.search(r"/manga/[^/]+/\d+/\d+", page.url):
-                    return page.url
+            for name in (
+                r"^Читать$",
+                r"Продолжить с\s*1",
+                r"Продолжить",
+                r"Начать чтение",
+                r"Читать с начала",
+            ):
+                read_btn = page.get_by_role("link", name=re.compile(name, re.I))
+                if await read_btn.count():
+                    await read_btn.first.click()
+                    await self._human_pause(2.0, 3.5)
+                    got = await _ok_reader()
+                    if got:
+                        return got
         except Exception:  # noqa: BLE001
             pass
         try:
@@ -1278,14 +1306,24 @@ class MangaBuffService:
         return None
 
     async def _smooth_read_chapter(self, page: Page) -> int:
+        """Доскроллить главу почти до конца (не 7–12 шагов на огромной странице)."""
         steps = 0
+        chapter_url = page.url.split("?")[0]
         try:
-            total_height = await page.evaluate("() => document.body.scrollHeight || 4000")
+            total_height = await page.evaluate(
+                "() => document.body.scrollHeight || 4000"
+            )
             viewport = await page.evaluate("() => window.innerHeight || 900")
         except Exception:  # noqa: BLE001
             total_height, viewport = 4000, 900
 
-        max_steps = random.randint(self.steps_min, self.steps_max)
+        viewport = max(int(viewport), 600)
+        pages_approx = max(1, int(total_height / viewport))
+        # хватает шагов, чтобы реально дойти до низа (+ запас на lazy-load)
+        max_steps = min(
+            140,
+            max(self.steps_max, pages_approx + random.randint(2, 6)),
+        )
         position = 0
         logger.info(
             "MangaBuff scroll start height=%s viewport=%s max_steps=%s delay=%.1f-%.1f",
@@ -1295,17 +1333,28 @@ class MangaBuffService:
             self.delay_min_sec,
             self.delay_max_sec,
         )
-        while position + viewport < total_height - 40 and steps < max_steps:
+        while position + viewport < total_height - 60 and steps < max_steps:
             if self._stop_flag.is_set() or self._skip_title.is_set():
                 break
-            chunk = int(viewport * random.uniform(0.65, 0.95))
+            # если страницу утащили (награды/макеты) — вернуться
+            if page.url.split("?")[0] != chapter_url and not re.search(
+                r"/manga/[^/]+/\d+/\d+", page.url
+            ):
+                logger.warning(
+                    "MangaBuff left chapter during scroll (%s) → restore %s",
+                    page.url,
+                    chapter_url,
+                )
+                if not await self._safe_goto(page, chapter_url):
+                    break
+                await self._dismiss_overlays(page)
+            chunk = int(viewport * random.uniform(0.70, 0.95))
             target = min(position + chunk, int(total_height))
             await self._animate_scroll(page, position, target)
             position = target
             steps += 1
             self.stats.pages_scrolled += 1
 
-            # Пауза строго из настроек скорости (+ лёгкий jitter)
             lo = self.delay_min_sec
             hi = self.delay_max_sec
             delay = random.uniform(lo, hi) * random.uniform(0.92, 1.08)
@@ -1316,10 +1365,14 @@ class MangaBuffService:
                 pass
 
             try:
-                new_h = await page.evaluate("() => document.body.scrollHeight || 4000")
-                # не даём lazy-load бесконечно раздувать страницу
+                new_h = await page.evaluate(
+                    "() => document.body.scrollHeight || 4000"
+                )
                 if new_h > total_height:
-                    total_height = min(new_h, total_height + viewport * 2)
+                    # lazy-load: даём подрасти, но не бесконечно
+                    total_height = min(new_h, total_height + viewport * 3)
+                    if steps > max_steps - 3 and new_h > position + viewport * 2:
+                        max_steps = min(140, max_steps + 4)
             except Exception:  # noqa: BLE001
                 pass
 
@@ -1328,7 +1381,6 @@ class MangaBuffService:
                 "() => window.scrollTo({top: document.body.scrollHeight, behavior: 'smooth'})"
             )
             await self._human_pause(0.5, 1.0)
-            # карты/награды в конце главы — с таймаутом
             c, cards, _ = await asyncio.wait_for(
                 self._click_reward_buttons(page), timeout=10
             )
@@ -1351,6 +1403,7 @@ class MangaBuffService:
             await asyncio.sleep(random.uniform(0.04, 0.14))
 
     async def _go_next_chapter(self, page: Page) -> bool:
+        before = page.url.split("?")[0]
         # Текст вида «След. глава 1 - 3»
         candidates = (
             page.get_by_role("link", name=re.compile(r"След\.?\s*глава", re.I)),
@@ -1369,26 +1422,31 @@ class MangaBuffService:
                 try:
                     if not await el.is_visible(timeout=700):
                         continue
-                    href = await el.get_attribute("href")
                     await el.click(force=True)
                     await self._human_pause(1.8, 3.2)
                     await self._dismiss_overlays(page)
-                    if href or re.search(r"/manga/[^/]+/\d+/\d+", page.url):
+                    now = page.url.split("?")[0]
+                    if now != before and re.search(r"/manga/[^/]+/\d+/\d+", now):
+                        logger.info("MangaBuff next chapter via click %s", now)
                         return True
                 except Exception:  # noqa: BLE001
                     continue
 
-        # URL-инкремент — основной надёжный путь
-        m = re.search(r"(https://mangabuff\.ru/manga/[^/]+/)(\d+)/(\d+)", page.url)
-        if m:
-            base, vol, ch = m.group(1), int(m.group(2)), int(m.group(3))
-            nxt = f"{base}{vol}/{ch + 1}"
-            before = page.url
-            if await self._safe_goto(page, nxt):
-                title = await page.title()
-                if page.url != before and "404" not in title:
-                    logger.info("MangaBuff next chapter via URL %s", page.url)
-                    return True
+        # URL-инкремент: следующая глава или следующий том
+        m = re.search(r"(https://mangabuff\.ru/manga/[^/]+/)(\d+)/(\d+)", before)
+        if not m:
+            return False
+        base, vol, ch = m.group(1), int(m.group(2)), int(m.group(3))
+        for nxt in (f"{base}{vol}/{ch + 1}", f"{base}{vol + 1}/1"):
+            if not await self._safe_goto(page, nxt):
+                continue
+            title = await page.title()
+            now = page.url.split("?")[0]
+            if now == before or "404" in title.lower():
+                continue
+            if re.search(r"/manga/[^/]+/\d+/\d+", now):
+                logger.info("MangaBuff next chapter via URL %s", now)
+                return True
         return False
 
     # ------------------------------------------------------------------
@@ -2018,6 +2076,151 @@ class MangaBuffService:
     # Main farm loop
     # ------------------------------------------------------------------
 
+    async def _read_title_almost_end(
+        self,
+        page: Page,
+        title: Dict[str, Any],
+        on_progress=None,
+    ) -> int:
+        """Прочитать один тайтл почти до конца. Вызывать под self._lock."""
+        slug = str(title.get("slug") or "")
+        logger.info("MangaBuff open title %s", slug)
+        total_chapters = await self._estimate_title_chapters(slug)
+        max_per_title = self._chapters_target_for_title(total_chapters)
+        logger.info(
+            "MangaBuff will read ~%s/%s chapters of %s",
+            max_per_title,
+            total_chapters or "?",
+            slug,
+        )
+
+        start_url = await self._open_first_chapter(title.get("href") or "")
+        if not start_url or not re.search(r"/manga/[^/]+/\d+/\d+", start_url):
+            logger.warning("MangaBuff cannot open %s", slug)
+            return 0
+
+        self.stats.titles_visited += 1
+        self.stats.touch(f"тайтл: {str(title.get('title') or '')[:40]}", start_url)
+        logger.info(
+            "MangaBuff reading %s from %s (target=%s)",
+            slug,
+            start_url,
+            max_per_title,
+        )
+        self._persist_stats()
+
+        chapters_this_title = 0
+        last_chapter_url = start_url.split("?")[0]
+        self._skip_title.clear()
+
+        while (
+            not self._stop_flag.is_set()
+            and not self._skip_title.is_set()
+            and chapters_this_title < max_per_title
+        ):
+            # ночной стоп — выходим, farm_loop подождёт снаружи
+            if self._in_night_break_window():
+                logger.info("MangaBuff pause title for night break")
+                break
+
+            url = page.url.split("?")[0]
+            if not re.search(r"/manga/[^/]+/\d+/\d+", url):
+                recover = last_chapter_url or (
+                    f"https://mangabuff.ru/manga/{slug}/1/"
+                    f"{max(1, chapters_this_title + 1)}"
+                )
+                logger.warning(
+                    "MangaBuff not on chapter page: %s — recover %s",
+                    url,
+                    recover,
+                )
+                if not await self._safe_goto(page, recover):
+                    break
+                url = page.url.split("?")[0]
+                if not re.search(r"/manga/[^/]+/\d+/\d+", url):
+                    break
+
+            if url in self._read_urls:
+                if not await self._go_next_chapter(page):
+                    break
+                continue
+
+            self._read_urls.add(url)
+            last_chapter_url = url
+            logger.info("MangaBuff scroll chapter %s", url)
+
+            try:
+                await asyncio.wait_for(self._dismiss_overlays(page), timeout=8)
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                c, cards, _ = await asyncio.wait_for(
+                    self._click_reward_buttons(page), timeout=12
+                )
+                self.stats.rewards_claimed += c
+                self.stats.cards_claimed += cards
+            except Exception:  # noqa: BLE001
+                pass
+
+            steps = await self._smooth_read_chapter(page)
+            final_url = page.url.split("?")[0]
+            if not re.search(r"/manga/[^/]+/\d+/\d+", final_url):
+                logger.warning(
+                    "MangaBuff chapter aborted (left reader): %s", final_url
+                )
+                if not await self._safe_goto(page, url):
+                    break
+                continue
+
+            self.stats.chapters_read += 1
+            chapters_this_title += 1
+            last_chapter_url = final_url
+            self.stats.touch("глава прочитана", final_url)
+            self._persist_stats()
+            logger.info(
+                "MangaBuff chapter done steps=%s total_chapters=%s url=%s",
+                steps,
+                self.stats.chapters_read,
+                final_url,
+            )
+
+            await self._maybe_comment(page)
+            if not re.search(r"/manga/[^/]+/\d+/\d+", page.url.split("?")[0]):
+                await self._safe_goto(page, final_url)
+
+            if on_progress is not None:
+                try:
+                    await on_progress(self.stats)
+                except Exception:  # noqa: BLE001
+                    pass
+
+            await self._human_pause(1.5, 4.0)
+            if chapters_this_title >= max_per_title:
+                break
+            if not await self._go_next_chapter(page):
+                logger.info(
+                    "MangaBuff title %s ended naturally after %s chapters",
+                    slug,
+                    chapters_this_title,
+                )
+                break
+
+        logger.info(
+            "MangaBuff title %s progress: read %s (target %s, total≈%s)",
+            slug,
+            chapters_this_title,
+            max_per_title,
+            total_chapters or "?",
+        )
+        return chapters_this_title
+
+    def _in_night_break_window(self) -> bool:
+        now = datetime.now(MSK).time()
+        if NIGHT_BREAK_START <= NIGHT_BREAK_END:
+            return NIGHT_BREAK_START <= now < NIGHT_BREAK_END
+        # через полночь
+        return now >= NIGHT_BREAK_START or now < NIGHT_BREAK_END
+
     async def farm_loop(self, on_progress=None) -> MangaBuffStats:
         """
         Основной цикл: награды → макеты → популярные тайтлы → чтение глав.
@@ -2046,14 +2249,17 @@ class MangaBuffService:
 
             cycle += 1
             try:
-                logger.info("MangaBuff farm cycle %s: rewards", cycle)
-                await self._claim_rewards_unlocked(quick=True)
-                if cycle == 1 or cycle % 4 == 0:
-                    logger.info("MangaBuff farm cycle %s: layouts", cycle)
-                    await self._explore_layouts_unlocked()
+                # Лок на навигацию: параллельные «Награды/Макеты» больше
+                # не уводят вкладку во время чтения.
+                async with self._lock:
+                    logger.info("MangaBuff farm cycle %s: rewards", cycle)
+                    await self._claim_rewards_unlocked(quick=True)
+                    if cycle == 1 or cycle % 4 == 0:
+                        logger.info("MangaBuff farm cycle %s: layouts", cycle)
+                        await self._explore_layouts_unlocked()
+                    logger.info("MangaBuff farm cycle %s: fetch popular", cycle)
+                    titles = await self.fetch_popular_titles(limit=24)
 
-                logger.info("MangaBuff farm cycle %s: fetch popular", cycle)
-                titles = await self.fetch_popular_titles(limit=24)
                 if not titles:
                     self.stats.touch("каталог пуст — пауза")
                     await self._human_pause(20, 40)
@@ -2071,112 +2277,18 @@ class MangaBuffService:
                         break
 
                     slug = str(title.get("slug") or "")
-                    logger.info("MangaBuff open title %s", slug)
-                    # Сначала узнать длину тайтла — читать почти до конца
-                    total_chapters = await self._estimate_title_chapters(slug)
-                    max_per_title = self._chapters_target_for_title(total_chapters)
-                    logger.info(
-                        "MangaBuff will read ~%s/%s chapters of %s",
-                        max_per_title,
-                        total_chapters or "?",
-                        slug,
-                    )
-
-                    start_url = await self._open_first_chapter(title["href"])
-                    if not start_url or not re.search(
-                        r"/manga/[^/]+/\d+/\d+", start_url
-                    ):
-                        logger.warning("MangaBuff cannot open %s", slug)
-                        continue
-                    self.stats.titles_visited += 1
-                    self.stats.touch(f"тайтл: {title.get('title','')[:40]}", start_url)
-                    logger.info(
-                        "MangaBuff reading %s from %s (target=%s)",
-                        slug,
-                        start_url,
-                        max_per_title,
-                    )
-                    self._persist_stats()
-
-                    chapters_this_title = 0
-                    self._skip_title.clear()
-                    while (
-                        not self._stop_flag.is_set()
-                        and not self._skip_title.is_set()
-                        and chapters_this_title < max_per_title
-                    ):
-                        await self._await_night_break_if_needed()
-                        if self._stop_flag.is_set() or self._skip_title.is_set():
-                            break
-
-                        url = page.url.split("?")[0]
-                        if not re.search(r"/manga/[^/]+/\d+/\d+", url):
-                            logger.warning(
-                                "MangaBuff not on chapter page: %s — skip title",
-                                url,
-                            )
-                            break
-                        if url in self._read_urls:
-                            if not await self._go_next_chapter(page):
-                                break
-                            continue
-                        self._read_urls.add(url)
-                        logger.info("MangaBuff scroll chapter %s", url)
-
-                        try:
-                            await asyncio.wait_for(
-                                self._dismiss_overlays(page), timeout=8
-                            )
-                        except Exception:  # noqa: BLE001
-                            pass
-                        try:
-                            c, cards, _ = await asyncio.wait_for(
-                                self._click_reward_buttons(page), timeout=12
-                            )
-                            self.stats.rewards_claimed += c
-                            self.stats.cards_claimed += cards
-                        except Exception:  # noqa: BLE001
-                            pass
-
-                        steps = await self._smooth_read_chapter(page)
-                        self.stats.chapters_read += 1
-                        chapters_this_title += 1
-                        self.stats.touch("глава прочитана", page.url)
-                        self._persist_stats()
-                        logger.info(
-                            "MangaBuff chapter done steps=%s total_chapters=%s url=%s",
-                            steps,
-                            self.stats.chapters_read,
-                            page.url,
+                    async with self._lock:
+                        chapters_this_title = await self._read_title_almost_end(
+                            page,
+                            title,
+                            on_progress=on_progress,
                         )
-
-                        await self._maybe_comment(page)
-
-                        if on_progress is not None:
-                            try:
-                                await on_progress(self.stats)
-                            except Exception:  # noqa: BLE001
-                                pass
-
-                        await self._human_pause(2.0, 6.0)
-                        if chapters_this_title >= max_per_title:
-                            break
-                        if not await self._go_next_chapter(page):
-                            logger.info(
-                                "MangaBuff title %s ended naturally after %s chapters",
-                                slug,
-                                chapters_this_title,
-                            )
-                            break
-
                     logger.info(
-                        "MangaBuff finished title %s: read %s (target %s, total≈%s)",
+                        "MangaBuff finished title %s: read %s chapters",
                         slug,
                         chapters_this_title,
-                        max_per_title,
-                        total_chapters or "?",
                     )
-                    await self._human_pause(8.0, 20.0)
+                    await self._human_pause(5.0, 12.0)
 
             except Exception as exc:  # noqa: BLE001
                 logger.exception("MangaBuff farm_loop")
