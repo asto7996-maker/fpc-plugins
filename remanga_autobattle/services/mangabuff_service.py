@@ -16,6 +16,7 @@ mangabuff_service.py — Playwright-автоматизация mangabuff.ru.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import os
 import random
@@ -24,7 +25,7 @@ import json
 from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime, time, timedelta
 from pathlib import Path
-from typing import List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 from zoneinfo import ZoneInfo
 
 from playwright.async_api import BrowserContext, Page, Playwright, async_playwright
@@ -65,136 +66,387 @@ COMMENT_EVERY_MIN = 5
 COMMENT_EVERY_MAX = 15
 COMMENT_WORDS_MIN = 5
 COMMENT_WORDS_MAX = 20
-# 65% — благодарности («спасибо за главу» и т.п.), 35% — похожие на чужие
+# 65% — благодарности, 35% — похожие на чужие
 THANKS_COMMENT_CHANCE = 0.65
 
-# Конструктор благодарностей: комбинации дают >1000 уникальных фраз
-_THANKS_PREFIX = (
-    "",
-    "",
-    "",
-    "ну",
-    "блин",
-    "кста",
-    "реально",
-    "прям",
-    "честно",
-    "короче",
-    "вот",
-    "ладно",
-)
-_THANKS_CORE = (
-    "спасибо",
-    "спасибо большое",
-    "большое спасибо",
-    "огромное спасибо",
-    "спасибо огромное",
-    "спасибочки",
-    "благодарю",
-    "огромная благодарность",
-    "сердечно благодарю",
-    "спасибо вам",
-    "спасибо автору",
-    "спасибо команде",
-    "спасибо переводчику",
-    "искренне спасибо",
-    "от души спасибо",
-    "реально спасибо",
-    "прям спасибо",
-    "спасибо большое вам",
-    "благодарю вас",
-    "спасибо большое автору",
-    "благодарю автора",
-    "благодарю команду",
-    "благодарю переводчика",
-    "огромное вам спасибо",
-    "огромное спасибо вам",
-)
-_THANKS_FOR = (
-    "за главу",
-    "за эту главу",
-    "за новую главу",
-    "за свежую главу",
-    "за очередную главу",
-    "за главу сегодня",
-    "за главу реально",
-    "за тайтл",
-    "за этот тайтл",
-    "за такой тайтл",
-    "за крутой тайтл",
-    "за историю",
-    "за сюжет",
-    "за продолжение",
-    "за обновление",
-    "за выпуск",
-    "за серию",
-    "за часть",
-    "за труды",
-    "за работу",
-    "за старания",
-    "за усилия",
-    "за труд",
-    "за вайб",
-    "за атмосферу",
-    "за эмоции",
-    "за кайф",
-    "за контент",
-    "за рисовку",
-    "за арт",
-    "автору за труды",
-    "автору за работу",
-    "автору за старания",
-    "автору за главу",
-    "автору за тайтл",
-    "автору за историю",
-    "автору за труд",
-    "переводчику за работу",
-    "переводчику за главу",
-    "переводчику за труды",
-    "команде за работу",
-    "команде за главу",
-    "команде за труды",
-    "за то что выкладываете",
-    "за то что не бросаете",
-    "за то что радуете",
-)
-_THANKS_EXTRA = (
-    "",
-    "",
-    "",
-    "очень жду дальше",
-    "жду продолжение",
-    "жду следующую",
-    "жду новую главу",
-    "буду ждать дальше",
-    "продолжайте пожалуйста",
-    "продолжайте в том же духе",
-    "не останавливайтесь пожалуйста",
-    "держите уровень",
-    "вы лучшие",
-    "вы супер",
-    "это важно",
-    "мне приятно",
-    "реально приятно",
-    "глава зашла",
-    "тайтл зашёл",
-    "очень зашло",
-    "читаю с удовольствием",
-    "читаю и кайфую",
-    "поддерживаю вас",
-    "уважение вам",
-    "сил и вдохновения",
-    "удачи в работе",
-    "творческих успехов",
-    "так держать",
-    "надеюсь скоро будет ещё",
-    "уже жду следующую главу",
-    "спасибо что радуете",
-    "приятно читать",
-    "отличная работа",
-    "хорошая работа",
-    "классная глава",
-    "глава топ",
+# Интонации: внутри одного тайтла голос стабильный, между тайтлами — разный.
+# У каждой — свои начала/концы, чтобы не звучало однотипно.
+_COMMENT_VOICES: Tuple[Dict[str, Any], ...] = (
+    {
+        "key": "soft",
+        "starts": (
+            "",
+            "ну",
+            "вот",
+            "эх",
+            "ладно",
+            "кстати",
+            "если честно",
+            "мне кажется",
+            "тихий кайф но",
+            "просто хочу сказать",
+        ),
+        "thanks": (
+            "спасибо",
+            "спасибо большое",
+            "ну спасибо",
+            "спасибочки",
+            "благодарю",
+            "спасибо вам",
+            "искренне спасибо",
+        ),
+        "subjects": (
+            "за главу",
+            "за эту главу",
+            "за новую главу",
+            "за тайтл",
+            "за атмосферу",
+            "за историю",
+            "автору за труды",
+            "за спокойный вайб",
+            "за то что выкладываете",
+        ),
+        "ends": (
+            "",
+            "приятно читать",
+            "очень мягко зашло",
+            "буду ждать дальше",
+            "как-то тепло стало",
+            "читаю с удовольствием",
+            "надеюсь не пропадёте",
+            "мне правда нравится",
+            "тихо сижу и читаю дальше",
+        ),
+        "similar_openers": ("ну", "вот", "если честно", "мне кажется", "ладно"),
+        "similar_tails": ("приятно", "мягко зашло", "жду дальше", "пока нравится"),
+    },
+    {
+        "key": "hype",
+        "starts": (
+            "",
+            "ооо",
+            "блин",
+            "ну наконец",
+            "реально",
+            "прям",
+            "жесть но",
+            "я в шоке",
+            "короче",
+            "ребята",
+        ),
+        "thanks": (
+            "спасибо",
+            "огромное спасибо",
+            "от души спасибо",
+            "реально спасибо",
+            "прям спасибо",
+            "спасибо огромное",
+            "респект и спасибо",
+        ),
+        "subjects": (
+            "за главу",
+            "за эту главу",
+            "за свежую главу",
+            "за такой тайтл",
+            "за крутой тайтл",
+            "за вайб",
+            "за кайф",
+            "за эмоции",
+            "автору за главу",
+            "за продолжение",
+        ),
+        "ends": (
+            "",
+            "это пушка",
+            "глава топ",
+            "я в восторге",
+            "уже жду следующую",
+            "не отпускает вообще",
+            "огонь просто",
+            "так держать",
+            "читаю и ору от кайфа",
+            "выдаёт железно",
+        ),
+        "similar_openers": ("блин", "реально", "прям", "короче", "ооо"),
+        "similar_tails": ("огонь", "пушка", "топ", "не отпускает", "жду следующую"),
+    },
+    {
+        "key": "polite",
+        "starts": (
+            "",
+            "добрый вечер",
+            "хочу сказать",
+            "разрешите",
+            "отдельно",
+            "честно говоря",
+            "с уважением",
+            "просто",
+            "на всякий случай",
+        ),
+        "thanks": (
+            "благодарю",
+            "сердечно благодарю",
+            "огромная благодарность",
+            "благодарю вас",
+            "благодарю автора",
+            "благодарю команду",
+            "спасибо большое вам",
+        ),
+        "subjects": (
+            "за главу",
+            "за новую главу",
+            "за работу",
+            "за труды",
+            "за старания",
+            "автору за труд",
+            "команде за работу",
+            "переводчику за работу",
+            "за обновление",
+            "за выпуск",
+        ),
+        "ends": (
+            "",
+            "творческих успехов",
+            "сил и вдохновения",
+            "удачи в работе",
+            "продолжайте пожалуйста",
+            "уважение вам",
+            "это правда важно",
+            "буду следить дальше",
+            "хорошая работа",
+        ),
+        "similar_openers": ("честно говоря", "хочу сказать", "отдельно", "просто"),
+        "similar_tails": ("с уважением", "успехов", "хорошая работа", "буду следить"),
+    },
+    {
+        "key": "chill",
+        "starts": (
+            "",
+            "кста",
+            "ну",
+            "хз",
+            "короче",
+            "по-тихому",
+            "ладно",
+            "типа",
+            "а вообще",
+        ),
+        "thanks": (
+            "спс",
+            "спасибо",
+            "ну спс",
+            "спасибочки",
+            "от души",
+            "респект",
+            "спасибо бро",
+        ),
+        "subjects": (
+            "за главу",
+            "за тайтл",
+            "за серию",
+            "за часть",
+            "за вайб",
+            "за контент",
+            "за обновление",
+            "за то что не бросаете",
+        ),
+        "ends": (
+            "",
+            "норм",
+            "зашло",
+            "жду дальше",
+            "пока ок",
+            "без лишнего",
+            "держите уровень",
+            "неплохо вообще",
+            "пойдёт",
+        ),
+        "similar_openers": ("кста", "ну", "хз", "короче", "типа"),
+        "similar_tails": ("норм", "зашло", "пока ок", "пойдёт", "жду дальше"),
+    },
+    {
+        "key": "warm",
+        "starts": (
+            "",
+            "ой",
+            "боже",
+            "ну вот",
+            "как же",
+            "мне так",
+            "просто",
+            "слушайте",
+            "честно",
+        ),
+        "thanks": (
+            "спасибо",
+            "огромное спасибо",
+            "от души спасибо",
+            "спасибо автору",
+            "спасибо большое",
+            "благодарю от сердца",
+            "спасибо что есть",
+        ),
+        "subjects": (
+            "за главу",
+            "за этот тайтл",
+            "за историю",
+            "за эмоции",
+            "за атмосферу",
+            "автору за труды",
+            "за то что радуете",
+            "за тепло в главе",
+            "за такую историю",
+        ),
+        "ends": (
+            "",
+            "мне очень приятно",
+            "аж до слёз почти",
+            "обнимаю автора мысленно",
+            "уже жду новую главу",
+            "спасибо что радуете",
+            "читаю и улыбаюсь",
+            "вы реально свет",
+            "сердцу хорошо",
+        ),
+        "similar_openers": ("ой", "ну вот", "честно", "просто", "как же"),
+        "similar_tails": ("приятно", "тепло", "жду новую", "улыбнуло", "зашло в душу"),
+    },
+    {
+        "key": "slang",
+        "starts": (
+            "",
+            "йо",
+            "ну кароч",
+            "слыш",
+            "имба но",
+            "бро",
+            "реально же",
+            "база",
+            "честно",
+        ),
+        "thanks": (
+            "респект",
+            "красава спасибо",
+            "от души",
+            "спасибо жирно",
+            "ну респект",
+            "апвоут и спасибо",
+            "спс огромное",
+        ),
+        "subjects": (
+            "за главу",
+            "за тайтл",
+            "за вайб",
+            "за кайф",
+            "за арт",
+            "за рисовку",
+            "за сюжет",
+            "автору за главу",
+            "за такую раздачу",
+        ),
+        "ends": (
+            "",
+            "база",
+            "имба",
+            "жестко зашло",
+            "не слабо",
+            "жду дроп дальше",
+            "держи планку",
+            "чисто огонь",
+            "я в деле дальше",
+        ),
+        "similar_openers": ("йо", "ну кароч", "бро", "база", "реально же"),
+        "similar_tails": ("база", "имба", "жестко", "не слабо", "жду дроп"),
+    },
+    {
+        "key": "quiet",
+        "starts": (
+            "",
+            "тихо скажу",
+            "на заметку",
+            "просто",
+            "между прочим",
+            "мне",
+            "вроде как",
+            "ну да",
+        ),
+        "thanks": (
+            "спасибо",
+            "благодарю",
+            "спасибо автору",
+            "ну спасибо",
+            "тихое спасибо",
+            "спасибо небольшое но искреннее",
+        ),
+        "subjects": (
+            "за главу",
+            "за тайтл",
+            "за работу",
+            "за старания",
+            "за продолжение",
+            "за серию",
+            "за аккуратную работу",
+            "переводчику за главу",
+        ),
+        "ends": (
+            "",
+            "читаю дальше",
+            "без шума но ценю",
+            "мне достаточно",
+            "спокойно зашло",
+            "буду рядом",
+            "не кричу но спасибо",
+            "просто нравится",
+        ),
+        "similar_openers": ("просто", "ну да", "вроде как", "тихо скажу", "мне"),
+        "similar_tails": ("тихо зашло", "читаю дальше", "нравится", "спокойно"),
+    },
+    {
+        "key": "fan",
+        "starts": (
+            "",
+            "как фанат скажу",
+            "поддерживаю",
+            "сразу",
+            "не могу не написать",
+            "обязательно",
+            "в комментах просто",
+            "ну всё",
+        ),
+        "thanks": (
+            "спасибо",
+            "огромное спасибо",
+            "спасибо команде",
+            "спасибо автору",
+            "благодарю команду",
+            "спасибо переводчику",
+            "респект команде",
+        ),
+        "subjects": (
+            "за главу",
+            "за тайтл",
+            "за труды",
+            "за то что не бросаете",
+            "за стабильные главы",
+            "команде за труды",
+            "автору за историю",
+            "за то что радуете",
+            "за долгую работу",
+        ),
+        "ends": (
+            "",
+            "поддерживаю вас",
+            "вы лучшие",
+            "не останавливайтесь пожалуйста",
+            "я с вами",
+            "фанатею дальше",
+            "ждите донаты моральные",
+            "держась за тайтл",
+            "вы супер",
+        ),
+        "similar_openers": ("поддерживаю", "как фанат", "сразу", "ну всё"),
+        "similar_tails": ("поддерживаю", "вы лучшие", "я с вами", "фанатею"),
+    },
 )
 
 # Синонимы / близкие слова для «человеческого» перефраза чужих комментов
@@ -383,6 +635,10 @@ class MangaBuffService:
         self._skip_title = asyncio.Event()
         self.steps_min = 8
         self.steps_max = 12
+        # slug → голос интонации; last start/end чтобы не повторять подряд
+        self._title_voices: Dict[str, Dict[str, Any]] = {}
+        self._last_comment_bits: Dict[str, Tuple[str, str]] = {}
+        self._current_comment_slug: str = ""
 
     def _load_stats(self) -> MangaBuffStats:
         if not STATS_PATH.exists():
@@ -1091,7 +1347,7 @@ class MangaBuffService:
             await self._dismiss_overlays(page)
             await self._human_pause(1.0, 2.0)
 
-            ok = await self._post_human_comment(page)
+            ok = await self._post_human_comment(page, slug=slug)
             if ok:
                 self._chapters_since_comment = 0
                 self._next_comment_after = random.randint(
@@ -1180,7 +1436,7 @@ class MangaBuffService:
                 cleaned.append(s)
         return cleaned[:40]
 
-    async def _post_human_comment(self, page: Page) -> bool:
+    async def _post_human_comment(self, page: Page, slug: str = "") -> bool:
         if not await self._open_comments_panel(page):
             logger.info("MangaBuff comment: panel not opened")
             return False
@@ -1197,7 +1453,10 @@ class MangaBuffService:
             except Exception:  # noqa: BLE001
                 pass
 
-        text = self._craft_comment(samples)
+        if not slug:
+            parsed = self._parse_chapter_url(page.url)
+            slug = parsed[0] if parsed else ""
+        text = self._craft_comment(samples, slug=slug)
         if not text or not self._is_safe_comment(text):
             logger.info("MangaBuff comment: craft failed (samples=%s)", len(samples))
             return False
@@ -1228,9 +1487,11 @@ class MangaBuffService:
 
             self.stats.comments_posted += 1
             self.stats.touch(f"коммент: {text[:50]}", page.url)
+            voice = self._voice_for_slug(slug).get("key", "?")
             logger.info(
-                "MangaBuff comment posted on %s (next in %s–%s): %s",
+                "MangaBuff comment posted on %s voice=%s (next in %s–%s): %s",
                 page.url,
+                voice,
                 COMMENT_EVERY_MIN,
                 COMMENT_EVERY_MAX,
                 text,
@@ -1356,107 +1617,130 @@ class MangaBuffService:
                 out.append(self._synonymize_token(w))
         return " ".join(out)
 
+    def _voice_for_slug(self, slug: str) -> Dict[str, Any]:
+        """Одинаковая интонация внутри тайтла, разная между тайтлами."""
+        key = (slug or "default").strip().lower() or "default"
+        if key in self._title_voices:
+            return self._title_voices[key]
+        digest = hashlib.md5(key.encode("utf-8")).hexdigest()
+        idx = int(digest[:8], 16) % len(_COMMENT_VOICES)
+        voice = _COMMENT_VOICES[idx]
+        self._title_voices[key] = voice
+        logger.debug("MangaBuff comment voice for %s → %s", key, voice.get("key"))
+        return voice
+
+    def _pick_varied(self, options: Sequence[str], avoid: str = "") -> str:
+        pool = [x for x in options if x != avoid]
+        if not pool:
+            pool = list(options)
+        return random.choice(pool)
+
     @staticmethod
     def thanks_variants_count() -> int:
-        """Число уникальных благодарностей из комбинаций частей."""
+        """Число уникальных благодарностей по всем голосам."""
         uniq = set()
-        for pref in _THANKS_PREFIX:
-            for core in _THANKS_CORE:
-                for for_what in _THANKS_FOR:
-                    for extra in _THANKS_EXTRA:
-                        parts = [p for p in (pref, core, for_what, extra) if p]
-                        text = re.sub(r"\s+", " ", " ".join(parts)).strip().lower()
-                        if text.count(" за ") >= 2:
-                            continue
-                        mentions = sum(
-                            len(re.findall(stem, text))
-                            for stem in ("автор", "переводчик", "команд")
-                        )
-                        if mentions >= 2:
-                            continue
-                        n = len(text.split())
-                        if COMMENT_WORDS_MIN <= n <= COMMENT_WORDS_MAX:
-                            uniq.add(text)
+        for voice in _COMMENT_VOICES:
+            for start in voice["starts"]:
+                for thanks in voice["thanks"]:
+                    for subject in voice["subjects"]:
+                        for end in voice["ends"]:
+                            parts = [p for p in (start, thanks, subject, end) if p]
+                            text = re.sub(r"\s+", " ", " ".join(parts)).strip().lower()
+                            if text.count(" за ") >= 2:
+                                continue
+                            mentions = sum(
+                                len(re.findall(stem, text))
+                                for stem in ("автор", "переводчик", "команд")
+                            )
+                            if mentions >= 2:
+                                continue
+                            n = len(text.split())
+                            if COMMENT_WORDS_MIN <= n <= COMMENT_WORDS_MAX:
+                                uniq.add(text)
         return len(uniq)
 
-    def _craft_thanks_comment(self) -> str:
-        """Случайная благодарность из >1000 вариантов, 5–20 слов."""
-        for _ in range(40):
-            parts = [
-                random.choice(_THANKS_PREFIX),
-                random.choice(_THANKS_CORE),
-                random.choice(_THANKS_FOR),
-                random.choice(_THANKS_EXTRA),
-            ]
-            # иногда короче: без префикса и/или без хвоста
-            if random.random() < 0.45:
-                parts[0] = ""
-            if random.random() < 0.35:
-                parts[3] = ""
-            # избегаем тавтологий вроде «спасибо автору автору за…»
-            joined = " ".join(p for p in parts if p)
-            low = joined.lower()
-            if sum(low.count(x) for x in ("автор", "переводчик", "команд")) >= 2:
-                # больше одного упоминания автора/команды/переводчика
-                mentions = 0
-                for stem in ("автор", "переводчик", "команд"):
-                    mentions += len(re.findall(stem, low))
-                if mentions >= 2:
-                    continue
-            # «за» не должно повторяться дважды подряд смыслово
-            if low.count(" за ") >= 2:
+    def _finalize_comment_text(self, text: str) -> str:
+        text = re.sub(r"\s+", " ", (text or "")).strip().lower().rstrip(".,!?;:…")
+        words = []
+        for w in text.split():
+            if words and words[-1] == w:
                 continue
-            text = re.sub(r"\s+", " ", joined).strip().lower().rstrip(".,!?;:…")
-            words = text.split()
-            if COMMENT_WORDS_MIN <= len(words) <= COMMENT_WORDS_MAX and self._is_safe_comment(
-                text
-            ):
-                return text
-        return "спасибо большое за главу жду дальше"
+            words.append(w)
+        if len(words) < COMMENT_WORDS_MIN:
+            return ""
+        words = words[:COMMENT_WORDS_MAX]
+        text = " ".join(words)
+        if text:
+            text = text[0].lower() + text[1:]
+        return text if self._is_safe_comment(text) else ""
 
-    def _craft_comment(self, samples: Sequence[str]) -> str:
+    def _craft_thanks_comment(self, slug: str = "") -> str:
+        """Благодарность в интонации тайтла: разное начало/конец, 5–20 слов."""
+        voice = self._voice_for_slug(slug)
+        last_start, last_end = self._last_comment_bits.get(slug or "default", ("", ""))
+        for _ in range(50):
+            start = self._pick_varied(voice["starts"], avoid=last_start)
+            thanks = random.choice(voice["thanks"])
+            subject = random.choice(voice["subjects"])
+            end = self._pick_varied(voice["ends"], avoid=last_end)
+            # иногда без начала или без хвоста — но не оба сразу слишком часто
+            roll = random.random()
+            if roll < 0.22:
+                start = ""
+            elif roll > 0.78:
+                end = ""
+            # не начинать thanks-фразой которая уже в start
+            if start and thanks.startswith(start):
+                start = ""
+            joined = " ".join(p for p in (start, thanks, subject, end) if p)
+            low = joined.lower()
+            mentions = sum(
+                len(re.findall(stem, low)) for stem in ("автор", "переводчик", "команд")
+            )
+            if mentions >= 2 or low.count(" за ") >= 2:
+                continue
+            # thanks уже содержит «за …» — subject не должен дублировать
+            if " за " in thanks and subject.startswith("за "):
+                continue
+            text = self._finalize_comment_text(joined)
+            if not text:
+                continue
+            self._last_comment_bits[slug or "default"] = (start, end)
+            return text
+        return "спасибо за главу жду дальше"
+
+    def _craft_comment(self, samples: Sequence[str], slug: str = "") -> str:
         """
-        65% — благодарности («спасибо за главу/тайтл/автору…»),
-        35% — похожие на чужие комменты (синонимы + микс), 5–20 слов.
+        65% — благодарности в голосе тайтла,
+        35% — похожие на чужие, тоже с интонацией тайтла.
         """
+        self._current_comment_slug = slug or ""
         if random.random() < THANKS_COMMENT_CHANCE:
-            return self._craft_thanks_comment()
-        return self._craft_similar_comment(samples)
+            return self._craft_thanks_comment(slug=slug)
+        return self._craft_similar_comment(samples, slug=slug)
 
-    def _craft_similar_comment(self, samples: Sequence[str]) -> str:
-        """Похожий на чужие: синонимы + куски из разных сообщений."""
+    def _craft_similar_comment(self, samples: Sequence[str], slug: str = "") -> str:
+        """Похожий на чужие: синонимы + куски, интонация тайтла."""
         cleaned: List[str] = []
         for s in samples:
             norm = self._normalize_comment_sample(s)
             if 8 <= len(norm) <= 160 and self._is_safe_comment(norm):
                 cleaned.append(norm)
 
-        openers = (
-            "ну",
-            "блин",
-            "кста",
-            "имхо",
-            "честно",
-            "ладно",
-            "хз",
-            "короче",
-            "по-моему",
-            "мне кажется",
-            "если честно",
-        )
+        voice = self._voice_for_slug(slug)
+        last_start, last_end = self._last_comment_bits.get(slug or "default", ("", ""))
+        openers = tuple(voice.get("similar_openers") or ("ну", "кста", "честно"))
         bridges = ("и", "но", "хотя", "кста", "ещё", "плюс")
-        tails = (
-            "норм",
-            "зашло",
-            "держит",
-            "жду дальше",
-            "интереснее стало",
-            "неплохо",
-            "вайб зашёл",
-            "пока ок",
-            "странно конечно",
-            "тянет читать",
-            "атмосфера кайф",
+        tails = tuple(
+            voice.get("similar_tails")
+            or (
+                "норм",
+                "зашло",
+                "держит",
+                "жду дальше",
+                "интереснее стало",
+                "неплохо",
+            )
         )
         fallbacks = (
             "ну глава в целом норм зашло",
@@ -1491,22 +1775,24 @@ class MangaBuffService:
                 used_sources.append(src)
                 picked.append(self._paraphrase_idea(random.choice(src_ideas)))
 
+            used_start, used_end = "", ""
             if not picked:
                 text = random.choice(fallbacks)
             else:
                 chunks: List[str] = []
-                if random.random() < 0.6:
-                    chunks.append(random.choice(openers))
+                if random.random() < 0.7:
+                    used_start = self._pick_varied(openers, avoid=last_start)
+                    chunks.append(used_start)
                 chunks.append(picked[0])
                 for idea in picked[1:]:
                     if random.random() < 0.75:
                         chunks.append(random.choice(bridges))
                     chunks.append(idea)
-                if random.random() < 0.65:
-                    chunks.append(random.choice(tails))
+                if random.random() < 0.7:
+                    used_end = self._pick_varied(tails, avoid=last_end)
+                    chunks.append(used_end)
 
                 words = " ".join(chunks).split()
-                # убрать обрывки в конце: одиночные союзы/частицы
                 dangling = {
                     "и",
                     "а",
@@ -1524,17 +1810,17 @@ class MangaBuffService:
                 while words and words[-1] in dangling:
                     words.pop()
                 if len(words) < COMMENT_WORDS_MIN:
-                    words.extend(random.choice(tails).split())
+                    used_end = used_end or self._pick_varied(tails, avoid=last_end)
+                    words.extend(used_end.split())
                 if len(words) > target_words:
                     words = words[:target_words]
                     while words and words[-1] in dangling:
                         words.pop()
                 if len(words) < COMMENT_WORDS_MIN:
-                    words.extend(random.choice(tails).split())
+                    words.extend(self._pick_varied(tails, avoid=last_end).split())
                 words = words[:COMMENT_WORDS_MAX]
                 text = " ".join(words)
 
-            # если слишком похоже на исходник — ещё синонимизация по словам из словаря
             for _ in range(3):
                 if not used_sources:
                     break
@@ -1543,23 +1829,11 @@ class MangaBuffService:
                 ):
                     break
                 text = self._paraphrase_idea(text)
+            self._last_comment_bits[slug or "default"] = (used_start, used_end)
         else:
             text = random.choice(fallbacks)
 
-        text = re.sub(r"\s+", " ", text).strip().lower().rstrip(".,!?;:…")
-        words = []
-        for w in text.split():
-            if words and words[-1] == w:
-                continue
-            words.append(w)
-        if len(words) < COMMENT_WORDS_MIN:
-            words.extend(random.choice(tails).split())
-        words = words[:COMMENT_WORDS_MAX]
-        text = " ".join(words).strip()
-        if text:
-            text = text[0].lower() + text[1:]
-        if not self._is_safe_comment(text) or len(text.split()) < COMMENT_WORDS_MIN:
-            text = random.choice(fallbacks)
+        text = self._finalize_comment_text(text) or random.choice(fallbacks)
         return text
 
     def _is_safe_comment(self, text: str) -> bool:
