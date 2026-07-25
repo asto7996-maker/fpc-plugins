@@ -11,6 +11,7 @@ browser_service.py — управление Playwright Persistent Context для
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import random
 import re
@@ -94,8 +95,9 @@ class BrowserService:
         await service.stop()
     """
 
-    # Текстовые маркеры кнопки «В БОЙ» (регистр не важен)
+    # Текстовые маркеры кнопки «В БОЙ» / «戰 В БОЙ» (как на murim-cards)
     BATTLE_BUTTON_PATTERNS = (
+        re.compile(r"戰\s*в\s*бой", re.IGNORECASE),
         re.compile(r"^\s*в\s*бой\s*$", re.IGNORECASE),
         re.compile(r"в\s*бой", re.IGNORECASE),
         re.compile(r"fight|battle|атаковать", re.IGNORECASE),
@@ -403,7 +405,7 @@ class BrowserService:
                 pass
 
         # 2. Любой элемент с точным/похожим текстом
-        for text in ("В БОЙ", "В бой", "в бой", "Fight", "Battle"):
+        for text in ("戰 В БОЙ", "В БОЙ", "В бой", "в бой", "Fight", "Battle"):
             locator = page.get_by_text(text, exact=False)
             try:
                 count = await locator.count()
@@ -420,14 +422,18 @@ class BrowserService:
 
         # 3. CSS-fallback: кнопки / элементы с data-атрибутами
         css_candidates = [
+            "button:has-text('戰 В БОЙ')",
             "button:has-text('В БОЙ')",
             "button:has-text('В бой')",
             "[role='button']:has-text('В БОЙ')",
+            "[role='button']:has-text('戰')",
             "a:has-text('В БОЙ')",
+            "div:has-text('戰 В БОЙ')",
             "[data-testid*='battle']",
             "[class*='battle'] button",
             "[class*='fight'] button",
-        ]
+            "[class*='duel'] button",
+        )
         for css in css_candidates:
             locator = page.locator(css)
             try:
@@ -562,6 +568,53 @@ class BrowserService:
     # Вспомогательные методы
     # ------------------------------------------------------------------
 
+    async def _inject_saved_token(self, page: Page) -> None:
+        """Если есть .remanga_token.json — записать access_token в localStorage/cookie."""
+        token_path = Path(__file__).resolve().parent / ".remanga_token.json"
+        if not token_path.exists():
+            return
+        try:
+            data = json.loads(token_path.read_text(encoding="utf-8"))
+            token = (data.get("access_token") or "").strip()
+            user_id = int(data.get("id") or 0)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Не удалось прочитать .remanga_token.json: %s", exc)
+            return
+        if not token:
+            return
+
+        await page.evaluate(
+            """([token, userId]) => {
+                const keys = ['token', 'access_token', 'accessToken', 'auth_token', 'user_token'];
+                for (const k of keys) {
+                    try { localStorage.setItem(k, token); } catch (e) {}
+                }
+                try {
+                    localStorage.setItem('user', JSON.stringify({ id: userId, access_token: token }));
+                    localStorage.setItem('auth', JSON.stringify({ access_token: token, token }));
+                } catch (e) {}
+            }""",
+            [token, user_id],
+        )
+        try:
+            assert self._context is not None
+            await self._context.add_cookies(
+                [
+                    {
+                        "name": "token",
+                        "value": token,
+                        "domain": ".remanga.org",
+                        "path": "/",
+                        "httpOnly": False,
+                        "secure": True,
+                        "sameSite": "Lax",
+                    }
+                ]
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("cookie inject: %s", exc)
+        logger.info("Токен Remanga инжектирован в профиль (user_id=%s)", user_id)
+
     async def _navigate_battle_page(self, page: Page) -> None:
         """
         Открыть страницу боёв.
@@ -570,19 +623,25 @@ class BrowserService:
         - НЕ ждём networkidle — у Remanga SPA/сокеты часто не затихают никогда.
         - URL с hash (#/duel) открываем как base + hash (иначе SPA-роутер может не сработать).
         """
+        # Сначала домен + токен, потом боевая страница
+        await page.goto("https://remanga.org/", wait_until="domcontentloaded", timeout=self.config.selector_timeout_ms)
+        await self._inject_saved_token(page)
+
         url = self.config.battle_url.strip()
         if "#" in url:
             base, _, fragment = url.partition("#")
             await page.goto(base or url, wait_until="domcontentloaded", timeout=self.config.selector_timeout_ms)
+            await self._inject_saved_token(page)
             # Даём каркасу SPA загрузиться, затем переходим по hash-маршруту
             await asyncio.sleep(1.5)
             await page.evaluate(
                 """(frag) => { window.location.hash = frag; }""",
                 fragment if fragment.startswith("/") else f"/{fragment}",
             )
-            await asyncio.sleep(2.0)
+            await asyncio.sleep(2.5)
         else:
             await page.goto(url, wait_until="domcontentloaded", timeout=self.config.selector_timeout_ms)
+            await self._inject_saved_token(page)
             await asyncio.sleep(2.0)
 
         # Мягко ждём load (не критично, если таймаут)

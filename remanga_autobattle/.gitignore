@@ -5,6 +5,11 @@
 settings.json
 settings.json.tmp
 
+# Токен Remanga (секреты — никогда не коммитить)
+.remanga_token.json
+login_check.png
+last_battle_error.png
+
 # Профиль браузера Playwright (сессия, cookies, localStorage)
 user_data/*
 !user_data/.gitkeep
