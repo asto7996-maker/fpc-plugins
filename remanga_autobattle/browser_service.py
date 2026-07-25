@@ -444,13 +444,19 @@ class BrowserService:
         return False
 
     async def _dismiss_overlays(self, page: Page) -> None:
-        """Закрыть Premium/модалки, мешающие клику и чтению результата."""
-        # Escape
+        """
+        Закрыть Premium-модалки.
+
+        Важно: НЕ жмём Escape и НЕ кликаем backdrop — на murim-cards
+        Escape часто возвращает с #/duel на #/map.
+        """
+        # Только если на экране явно Premium
         try:
-            await page.keyboard.press("Escape")
-            await asyncio.sleep(0.3)
+            body = (await page.locator("body").inner_text(timeout=2_000) or "").lower()
         except Exception:  # noqa: BLE001
-            pass
+            body = ""
+        if "premium" not in body and "подписк" not in body:
+            return
 
         close_selectors = [
             "button:has-text('Закрыть')",
@@ -458,9 +464,6 @@ class BrowserService:
             "button:has-text('Нет, спасибо')",
             "[aria-label='Close']",
             "[aria-label='Закрыть']",
-            "button:has-text('×')",
-            "[class*='modal'] button:has-text('×')",
-            "[class*='close']",
         ]
         for sel in close_selectors:
             try:
@@ -468,19 +471,9 @@ class BrowserService:
                 if await loc.count() > 0 and await loc.is_visible():
                     await loc.click(timeout=1500, force=True)
                     await asyncio.sleep(0.4)
+                    return
             except Exception:  # noqa: BLE001
                 continue
-
-        # Клик по тёмному фону модалки (backdrop), если есть
-        try:
-            backdrop = page.locator("[class*='overlay'], [class*='backdrop'], [class*='modal-bg']").first
-            if await backdrop.count() > 0 and await backdrop.is_visible():
-                box = await backdrop.bounding_box()
-                if box:
-                    await page.mouse.click(box["x"] + 5, box["y"] + 5)
-                    await asyncio.sleep(0.3)
-        except Exception:  # noqa: BLE001
-            pass
 
     async def _find_battle_button(self, page: Page):
         """
