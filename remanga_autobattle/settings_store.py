@@ -94,8 +94,14 @@ class RuntimeSettings:
     selector_timeout_ms: int = 30_000
     # False = ещё не проходили мастер настройки в Telegram
     setup_completed: bool = False
-    # Управление уведомлениями
+    # Управление уведомлениями Remanga
     notify: Optional[Dict[str, Any]] = field(default=None)
+
+    # ---- MangaBuff ----
+    mangabuff_start_url: str = "https://mangabuff.ru/"
+    mangabuff_delay_min_sec: float = 5.0
+    mangabuff_delay_max_sec: float = 15.0
+    mangabuff_setup_done: bool = False
 
     def __post_init__(self) -> None:
         if self.notify is None:

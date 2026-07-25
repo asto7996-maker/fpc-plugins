@@ -45,6 +45,11 @@ class Config:
     battle_url: str
     auto_battle_interval_sec: int
     user_data_dir: Path
+    # Отдельный профиль браузера для MangaBuff
+    mangabuff_user_data_dir: Path
+    mangabuff_start_url: str
+    mangabuff_delay_min_sec: float
+    mangabuff_delay_max_sec: float
     selector_timeout_ms: int
 
     # Эмуляция «реального» браузера
@@ -52,7 +57,7 @@ class Config:
     viewport_width: int
     viewport_height: int
 
-    # Случайная пауза перед кликами (секунды)
+    # Случайная пауза перед кликами (секунды) — Remanga
     human_delay_min_sec: float
     human_delay_max_sec: float
 
@@ -66,6 +71,12 @@ class Config:
             self.auto_battle_interval_sec = settings.auto_battle_interval_sec
         if settings.selector_timeout_ms >= 1000:
             self.selector_timeout_ms = settings.selector_timeout_ms
+        if getattr(settings, "mangabuff_start_url", None):
+            self.mangabuff_start_url = settings.mangabuff_start_url.strip()
+        if getattr(settings, "mangabuff_delay_min_sec", 0) >= 1:
+            self.mangabuff_delay_min_sec = float(settings.mangabuff_delay_min_sec)
+        if getattr(settings, "mangabuff_delay_max_sec", 0) >= 1:
+            self.mangabuff_delay_max_sec = float(settings.mangabuff_delay_max_sec)
 
 
 def load_config() -> Config:
@@ -75,7 +86,6 @@ def load_config() -> Config:
     Raises:
         ValueError: если не задан BOT_TOKEN.
     """
-    # Импорт здесь, чтобы избежать циклов при первом импорте BASE_DIR
     from settings_store import load_settings
 
     bot_token = _get_str("BOT_TOKEN")
@@ -87,10 +97,11 @@ def load_config() -> Config:
 
     runtime = load_settings()
 
-    # Admin: приоритет settings.json, затем .env (0 = ещё не задан, возьмём из Telegram)
     admin_id = runtime.telegram_admin_id or _get_int("TELEGRAM_ADMIN_ID", 0)
 
-    battle_url = runtime.battle_url or _get_str("BATTLE_URL", "https://remanga.org/cards")
+    battle_url = runtime.battle_url or _get_str(
+        "BATTLE_URL", "https://remanga.org/murim-cards#/duel"
+    )
     interval = runtime.auto_battle_interval_sec or _get_int("AUTO_BATTLE_INTERVAL_SEC", 30)
     if interval < 5:
         interval = 30
@@ -100,6 +111,11 @@ def load_config() -> Config:
     if not user_data_dir.is_absolute():
         user_data_dir = BASE_DIR / user_data_dir
 
+    mb_raw = _get_str("MANGABUFF_USER_DATA_DIR", "user_data_mangabuff") or "user_data_mangabuff"
+    mb_dir = Path(mb_raw)
+    if not mb_dir.is_absolute():
+        mb_dir = BASE_DIR / mb_dir
+
     timeout_ms = runtime.selector_timeout_ms or _get_int("SELECTOR_TIMEOUT_MS", 30_000)
 
     return Config(
@@ -108,6 +124,10 @@ def load_config() -> Config:
         battle_url=battle_url,
         auto_battle_interval_sec=interval,
         user_data_dir=user_data_dir,
+        mangabuff_user_data_dir=mb_dir,
+        mangabuff_start_url=runtime.mangabuff_start_url or "https://mangabuff.ru/",
+        mangabuff_delay_min_sec=float(runtime.mangabuff_delay_min_sec or 5.0),
+        mangabuff_delay_max_sec=float(runtime.mangabuff_delay_max_sec or 15.0),
         selector_timeout_ms=timeout_ms,
         user_agent=(
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "

@@ -14,9 +14,11 @@ stats.json.tmp
 login_check.png
 last_battle_error.png
 
-# Профиль браузера Playwright (сессия, cookies, localStorage)
+# Профили браузера Playwright (сессии)
 user_data/*
 !user_data/.gitkeep
+user_data_mangabuff/
+user_data_mangabuff/*
 
 # Python
 __pycache__/

@@ -1,8 +1,10 @@
 """
-bot.py — точка входа Telegram-бота управления автобоями Remanga.
+bot.py — Telegram-бот: Remanga.org (автобои) + MangaBuff.ru (авточтение / награды).
 
-Настройки (URL боёв, интервал, таймаут, admin) вводятся прямо в Telegram.
-Для старта нужен только BOT_TOKEN в .env (install.sh спросит его сам).
+Двухуровневое меню:
+  Главное → Remanga / MangaBuff
+  Remanga → автобой, 1 бой, статус, уведомления, рейтинг...
+  MangaBuff → авточтение, награды, задержки, статус
 """
 
 from __future__ import annotations
@@ -10,7 +12,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import sys
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
+from datetime import datetime
 from typing import Any, Awaitable, Callable, Dict, Optional
 
 from aiogram import BaseMiddleware, Bot, Dispatcher, F
@@ -19,17 +22,16 @@ from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import (
-    KeyboardButton,
-    Message,
-    ReplyKeyboardMarkup,
-    TelegramObject,
-)
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from apscheduler.triggers.interval import IntervalTrigger
+from aiogram.types import KeyboardButton, Message, ReplyKeyboardMarkup, TelegramObject
 
-from browser_service import BattleOutcome, BattleResult, BrowserService
 from config import Config, load_config
+from scheduler import (
+    JOB_MANGABUFF_READ,
+    JOB_REMANGA_AUTOBATTLE,
+    AppScheduler,
+)
+from services.mangabuff_service import MangaBuffService
+from services.remanga_service import BattleOutcome, BattleResult, BrowserService
 from settings_store import (
     load_settings,
     toggle_notify,
@@ -47,28 +49,25 @@ logger = logging.getLogger(__name__)
 
 
 # ======================================================================
-# FSM настроек (ввод в Telegram)
+# FSM
 # ======================================================================
 
 
 class SettingsStates(StatesGroup):
-    """Мастер настройки / изменение параметров в чате."""
-
     waiting_battle_url = State()
     waiting_interval = State()
     waiting_timeout = State()
     waiting_summary_every = State()
+    waiting_mangabuff_url = State()
 
 
 # ======================================================================
-# Состояние автобоя
+# Remanga session stats
 # ======================================================================
 
 
 @dataclass
 class AutobattleState:
-    """Сводная статистика и флаги текущего сеанса."""
-
     running: bool = False
     total_battles: int = 0
     wins: int = 0
@@ -77,7 +76,6 @@ class AutobattleState:
     skipped: int = 0
     errors: int = 0
     last_result: Optional[BattleResult] = field(default=None)
-    job_id: str = "autobattle_job"
 
     def register(self, result: BattleResult) -> None:
         self.last_result = result
@@ -98,40 +96,31 @@ class AutobattleState:
     def status_text(self, interval_sec: int) -> str:
         flag = "🟢 Активен" if self.running else "🔴 Остановлен"
         lines = [
-            f"<b>Статус автобоя:</b> {flag}",
+            f"<b>Remanga — статус</b>",
+            f"Автобой: {flag}",
             f"⏱ Интервал: {interval_sec} сек",
-            f"⚔️ Проведено боёв: {self.total_battles}",
-            f"🏆 Победы: {self.wins}",
-            f"💀 Поражения: {self.losses}",
-            f"🤝 Ничьи: {self.draws}",
-            f"⏸ Пропуски: {self.skipped}",
-            f"⚠️ Ошибки: {self.errors}",
+            f"⚔️ Боёв: {self.total_battles}",
+            f"🏆 {self.wins} · 💀 {self.losses} · 🤝 {self.draws}",
+            f"⏸ Пропуски: {self.skipped} · ⚠️ Ошибки: {self.errors}",
         ]
         if self.last_result:
-            lines.append("")
-            lines.append("<b>Последний бой:</b>")
             last = (
                 self.last_result.to_telegram()
                 .replace("&", "&amp;")
                 .replace("<", "&lt;")
                 .replace(">", "&gt;")
             )
-            lines.append(f"<code>{last}</code>")
+            lines += ["", "<b>Последний бой:</b>", f"<code>{last}</code>"]
         return "\n".join(lines)
 
 
 # ======================================================================
-# Middleware: только админ (первый /start закрепляет админа)
+# Middleware
 # ======================================================================
 
 
 class AdminOnlyMiddleware(BaseMiddleware):
-    """
-    Если admin ещё не задан (0) — первый написавший становится админом.
-    Дальше пускаем только его.
-    """
-
-    def __init__(self, app: "AutobattleApp") -> None:
+    def __init__(self, app: "App") -> None:
         self.app = app
 
     async def __call__(
@@ -143,31 +132,35 @@ class AdminOnlyMiddleware(BaseMiddleware):
         user = data.get("event_from_user")
         if user is None:
             return None
-
         admin_id = self.app.config.telegram_admin_id
-
-        # Первый пользователь закрепляется как админ
         if admin_id <= 0:
             self.app.bind_admin(user.id)
             admin_id = user.id
-            logger.info("Админ закреплён по первому сообщению: %s", user.id)
-
+            logger.info("Админ закреплён: %s", user.id)
         if user.id != admin_id:
             if isinstance(event, Message):
-                await event.answer("⛔ Доступ запрещён. Этот бот приватный.")
-            logger.warning("Отклонён запрос от user_id=%s", user.id)
+                await event.answer("⛔ Доступ запрещён.")
             return None
-
         return await handler(event, data)
 
 
 # ======================================================================
-# Клавиатуры
+# Клавиатуры (двухуровневое меню)
 # ======================================================================
 
 
-def main_reply_keyboard() -> ReplyKeyboardMarkup:
-    """Кнопки управления прямо в боте."""
+def main_menu_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="⚔️ Remanga.org"), KeyboardButton(text="📚 MangaBuff.ru")],
+            [KeyboardButton(text="ℹ️ Помощь")],
+        ],
+        resize_keyboard=True,
+        is_persistent=True,
+    )
+
+
+def remanga_menu_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
             [
@@ -176,7 +169,7 @@ def main_reply_keyboard() -> ReplyKeyboardMarkup:
             ],
             [
                 KeyboardButton(text="⚔️ Сделать 1 бой"),
-                KeyboardButton(text="📊 Статус"),
+                KeyboardButton(text="📊 Статус Remanga"),
             ],
             [
                 KeyboardButton(text="📈 Статистика"),
@@ -184,28 +177,58 @@ def main_reply_keyboard() -> ReplyKeyboardMarkup:
             ],
             [
                 KeyboardButton(text="🔔 Уведомления"),
-                KeyboardButton(text="⚙️ Настройки"),
+                KeyboardButton(text="⚙️ Настройки Remanga"),
             ],
+            [KeyboardButton(text="🏠 Главное меню")],
         ],
         resize_keyboard=True,
-        is_persistent=True,
+    )
+
+
+def mangabuff_menu_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [
+                KeyboardButton(text="▶️ Запустить авточтение"),
+                KeyboardButton(text="⏹ Остановить авточтение"),
+            ],
+            [
+                KeyboardButton(text="🎁 Собрать награды"),
+                KeyboardButton(text="📊 Статус MangaBuff"),
+            ],
+            [
+                KeyboardButton(text="⏱ Настройки задержки"),
+                KeyboardButton(text="🔗 URL чтения"),
+            ],
+            [KeyboardButton(text="🏠 Главное меню")],
+        ],
+        resize_keyboard=True,
+    )
+
+
+def delay_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="⚡ Быстро 5–8с"), KeyboardButton(text="📖 Норма 5–15с")],
+            [KeyboardButton(text="🐢 Медленно 10–20с"), KeyboardButton(text="🧘 Очень медленно 15–30с")],
+            [KeyboardButton(text="◀️ В меню MangaBuff")],
+        ],
+        resize_keyboard=True,
     )
 
 
 def settings_keyboard() -> ReplyKeyboardMarkup:
-    """Подменю настроек."""
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="🌐 URL боёв"), KeyboardButton(text="⏱ Интервал")],
             [KeyboardButton(text="⌛ Таймаут"), KeyboardButton(text="📋 Показать настройки")],
-            [KeyboardButton(text="◀️ Назад")],
+            [KeyboardButton(text="◀️ В меню Remanga")],
         ],
         resize_keyboard=True,
     )
 
 
 def notify_keyboard() -> ReplyKeyboardMarkup:
-    """Переключатели уведомлений."""
     ns = load_settings().notify_settings()
 
     def lab(title: str, on: bool) -> str:
@@ -218,27 +241,12 @@ def notify_keyboard() -> ReplyKeyboardMarkup:
     )
     return ReplyKeyboardMarkup(
         keyboard=[
-            [
-                KeyboardButton(text=lab("Победы", ns.notify_wins)),
-                KeyboardButton(text=lab("Поражения", ns.notify_losses)),
-            ],
-            [
-                KeyboardButton(text=lab("Ничьи", ns.notify_draws)),
-                KeyboardButton(text=lab("Пропуски", ns.notify_skipped)),
-            ],
-            [
-                KeyboardButton(text=lab("Ошибки", ns.notify_errors)),
-                KeyboardButton(text=lab("Старт/стоп", ns.notify_autobattle_start_stop)),
-            ],
-            [
-                KeyboardButton(text=lab("Тихий режим", ns.quiet_mode)),
-                KeyboardButton(text=summary),
-            ],
-            [
-                KeyboardButton(text="🔔 Все вкл"),
-                KeyboardButton(text="🔕 Все выкл"),
-            ],
-            [KeyboardButton(text="◀️ Назад")],
+            [KeyboardButton(text=lab("Победы", ns.notify_wins)), KeyboardButton(text=lab("Поражения", ns.notify_losses))],
+            [KeyboardButton(text=lab("Ничьи", ns.notify_draws)), KeyboardButton(text=lab("Пропуски", ns.notify_skipped))],
+            [KeyboardButton(text=lab("Ошибки", ns.notify_errors)), KeyboardButton(text=lab("Старт/стоп", ns.notify_autobattle_start_stop))],
+            [KeyboardButton(text=lab("Тихий режим", ns.quiet_mode)), KeyboardButton(text=summary)],
+            [KeyboardButton(text="🔔 Все вкл"), KeyboardButton(text="🔕 Все выкл")],
+            [KeyboardButton(text="◀️ В меню Remanga")],
         ],
         resize_keyboard=True,
     )
@@ -248,7 +256,7 @@ def rating_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="🔄 Обновить рейтинг")],
-            [KeyboardButton(text="◀️ Назад")],
+            [KeyboardButton(text="◀️ В меню Remanga")],
         ],
         resize_keyboard=True,
     )
@@ -258,7 +266,7 @@ def stats_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="♻️ Сбросить статистику")],
-            [KeyboardButton(text="◀️ Назад")],
+            [KeyboardButton(text="◀️ В меню Remanga")],
         ],
         resize_keyboard=True,
     )
@@ -272,13 +280,11 @@ def cancel_keyboard() -> ReplyKeyboardMarkup:
 
 
 # ======================================================================
-# Оркестратор
+# App
 # ======================================================================
 
 
-class AutobattleApp:
-    """Склеивает Telegram, BrowserService и APScheduler."""
-
+class App:
     def __init__(self, config: Config) -> None:
         self.config = config
         self.bot = Bot(
@@ -286,123 +292,160 @@ class AutobattleApp:
             default=DefaultBotProperties(parse_mode=ParseMode.HTML),
         )
         self.dp = Dispatcher()
-        self.browser = BrowserService(config)
-        self.scheduler = AsyncIOScheduler(timezone="Europe/Moscow")
-        self.state = AutobattleState()
-        self._battle_lock = asyncio.Lock()
-        self._notify_chat_id: Optional[int] = None
-        self._setup_done_hint = (config.user_data_dir / "Default").exists()
+        self.scheduler = AppScheduler()
 
+        # Remanga
+        self.remanga = BrowserService(config)
+        self.remanga_state = AutobattleState()
+        self._battle_lock = asyncio.Lock()
+
+        # MangaBuff — отдельный профиль
+        self.mangabuff = MangaBuffService(
+            config,
+            user_data_dir=config.mangabuff_user_data_dir,
+            start_url=config.mangabuff_start_url,
+            delay_min_sec=config.mangabuff_delay_min_sec,
+            delay_max_sec=config.mangabuff_delay_max_sec,
+        )
+        self._mb_task: Optional[asyncio.Task] = None
+
+        self._notify_chat_id: Optional[int] = None
         self.dp.message.middleware(AdminOnlyMiddleware(self))
         self._register_handlers()
 
     def bind_admin(self, user_id: int) -> None:
-        """Сохранить админа в память + settings.json."""
         self.config.telegram_admin_id = user_id
         update_settings(telegram_admin_id=user_id)
 
-    def _settings_text(self) -> str:
+    def _remanga_settings_text(self) -> str:
         return (
-            "<b>Текущие настройки</b>\n\n"
-            f"👤 Admin ID: <code>{self.config.telegram_admin_id}</code>\n"
-            f"🌐 URL боёв: <code>{self.config.battle_url}</code>\n"
+            "<b>Настройки Remanga</b>\n\n"
+            f"🌐 URL: <code>{self.config.battle_url}</code>\n"
             f"⏱ Интервал: <b>{self.config.auto_battle_interval_sec}</b> сек\n"
-            f"⌛ Таймаут: <b>{self.config.selector_timeout_ms // 1000}</b> сек\n"
-            f"📁 Профиль: <code>{self.config.user_data_dir}</code>"
+            f"⌛ Таймаут: <b>{self.config.selector_timeout_ms // 1000}</b> сек"
         )
 
+    # ------------------------------------------------------------------
+    # Handlers
+    # ------------------------------------------------------------------
+
     def _register_handlers(self) -> None:
-        # --- /start ---
+        # ===== Главное меню =====
         @self.dp.message(CommandStart())
         async def cmd_start(message: Message, state: FSMContext) -> None:
             await state.clear()
             self._notify_chat_id = message.chat.id
-            text = (
-                "⚔️ <b>Remanga Autobattle</b>\n\n"
-                "Управление автобоями на remanga.org.\n"
-                f"Интервал: <b>{self.config.auto_battle_interval_sec} сек</b> "
-                "(бесконечно до остановки).\n\n"
-                f"{self._settings_text()}\n\n"
-                "Параметры — кнопка <b>⚙️ Настройки</b>.\n"
-                "Перед боями один раз сохраните сессию Remanga:\n"
-                "<code>cd ~/remanga_autobattle && source .venv/bin/activate && python bot.py --setup</code>"
+            await message.answer(
+                "🤖 <b>Мультибот автоматизации</b>\n\n"
+                "Выберите модуль:",
+                reply_markup=main_menu_keyboard(),
             )
-            await message.answer(text, reply_markup=main_reply_keyboard())
 
-            # Первый запуск — мастер настроек прямо в Telegram
-            if not load_settings().setup_completed:
-                await state.update_data(wizard=True)
-                await message.answer(
-                    "🔧 Первый запуск — настроим бота в чате.\n"
-                    "Отправьте URL страницы боёв или «Пропустить»:\n"
-                    f"<code>{self.config.battle_url}</code>",
-                    reply_markup=ReplyKeyboardMarkup(
-                        keyboard=[
-                            [KeyboardButton(text="Пропустить")],
-                            [KeyboardButton(text="❌ Отмена")],
-                        ],
-                        resize_keyboard=True,
-                    ),
-                )
-                await state.set_state(SettingsStates.waiting_battle_url)
+        @self.dp.message(F.text.in_({"🏠 Главное меню", "Главное меню"}))
+        @self.dp.message(Command("menu"))
+        async def go_main(message: Message, state: FSMContext) -> None:
+            await state.clear()
+            await message.answer("Главное меню — выберите модуль:", reply_markup=main_menu_keyboard())
 
+        @self.dp.message(F.text.in_({"ℹ️ Помощь", "Помощь"}))
         @self.dp.message(Command("help"))
         async def cmd_help(message: Message) -> None:
             await message.answer(
-                "<b>Кнопки:</b>\n"
-                "▶️ / ⏹ — автобой\n"
-                "⚔️ Сделать 1 бой\n"
-                "📊 Статус сессии\n"
-                "📈 Статистика — накопленная\n"
-                "🏅 Рейтинг — слава / ранг сейчас\n"
-                "🔔 Уведомления — что слать в чат\n"
-                "⚙️ Настройки — URL, интервал, таймаут\n",
-                reply_markup=main_reply_keyboard(),
+                "<b>Модули</b>\n"
+                "⚔️ <b>Remanga.org</b> — автобои murim-cards\n"
+                "📚 <b>MangaBuff.ru</b> — авточтение и сбор наград\n\n"
+                "Сессии браузера раздельные:\n"
+                f"• Remanga: <code>{self.config.user_data_dir.name}</code>\n"
+                f"• MangaBuff: <code>{self.config.mangabuff_user_data_dir.name}</code>\n\n"
+                "Setup MangaBuff на сервере:\n"
+                "<code>cd /root/remanga_autobattle && source .venv/bin/activate && "
+                "python -m services.mangabuff_service</code>",
+                reply_markup=main_menu_keyboard(),
             )
 
-        # --- Основные кнопки ---
+        @self.dp.message(F.text.in_({"⚔️ Remanga.org", "Remanga.org", "Remanga"}))
+        async def open_remanga(message: Message) -> None:
+            self._notify_chat_id = message.chat.id
+            await message.answer(
+                "⚔️ <b>Модуль Remanga.org</b>\nАвтобои карточных дуэлей.",
+                reply_markup=remanga_menu_keyboard(),
+            )
+
+        @self.dp.message(F.text.in_({"📚 MangaBuff.ru", "MangaBuff.ru", "MangaBuff"}))
+        async def open_mangabuff(message: Message) -> None:
+            self._notify_chat_id = message.chat.id
+            s = load_settings()
+            delay = f"{self.config.mangabuff_delay_min_sec:.0f}–{self.config.mangabuff_delay_max_sec:.0f}с"
+            tip = ""
+            if not s.mangabuff_setup_done:
+                tip = (
+                    "\n\n⚠️ Сначала сохраните сессию на сервере:\n"
+                    "<code>systemctl stop remanga-autobattle && "
+                    "cd /root/remanga_autobattle && source .venv/bin/activate && "
+                    "python -m services.mangabuff_service && "
+                    "systemctl start remanga-autobattle</code>"
+                )
+            await message.answer(
+                f"📚 <b>Модуль MangaBuff.ru</b>\n"
+                f"Авточтение и фарм наград.\n"
+                f"⏱ Задержка: {delay}\n"
+                f"🔗 URL: <code>{self.config.mangabuff_start_url}</code>"
+                f"{tip}",
+                reply_markup=mangabuff_menu_keyboard(),
+            )
+
+        @self.dp.message(F.text == "◀️ В меню Remanga")
+        async def back_remanga(message: Message, state: FSMContext) -> None:
+            await state.clear()
+            await message.answer("Меню Remanga:", reply_markup=remanga_menu_keyboard())
+
+        @self.dp.message(F.text.in_({"◀️ В меню MangaBuff", "В меню MangaBuff"}))
+        async def back_mb(message: Message, state: FSMContext) -> None:
+            await state.clear()
+            await message.answer("Меню MangaBuff:", reply_markup=mangabuff_menu_keyboard())
+
+        @self.dp.message(F.text.in_({"❌ Отмена", "Отмена"}))
+        async def cancel_any(message: Message, state: FSMContext) -> None:
+            await state.clear()
+            await message.answer("Отменено.", reply_markup=main_menu_keyboard())
+
+        # ===== Remanga =====
         @self.dp.message(StateFilter(None), F.text.in_({"▶️ Запустить автобой", "Запустить автобой"}))
         @self.dp.message(StateFilter(None), Command("auto"))
-        async def start_auto_msg(message: Message) -> None:
+        async def remanga_start(message: Message) -> None:
             self._notify_chat_id = message.chat.id
-            text = await self.start_autobattle()
-            await message.answer(text, reply_markup=main_reply_keyboard())
+            text = await self.start_remanga_autobattle()
+            await message.answer(text, reply_markup=remanga_menu_keyboard())
 
         @self.dp.message(StateFilter(None), F.text.in_({"⏹ Остановить автобой", "Остановить автобой"}))
         @self.dp.message(StateFilter(None), Command("stop"))
-        async def stop_auto_msg(message: Message) -> None:
-            text = await self.stop_autobattle()
-            await message.answer(text, reply_markup=main_reply_keyboard())
+        async def remanga_stop(message: Message) -> None:
+            text = await self.stop_remanga_autobattle()
+            await message.answer(text, reply_markup=remanga_menu_keyboard())
 
         @self.dp.message(StateFilter(None), F.text.in_({"⚔️ Сделать 1 бой", "Сделать 1 бой"}))
         @self.dp.message(StateFilter(None), Command("battle"))
-        async def one_battle_msg(message: Message) -> None:
+        async def remanga_one(message: Message) -> None:
             self._notify_chat_id = message.chat.id
-            await message.answer("⏳ Запускаю один бой...", reply_markup=main_reply_keyboard())
-            await self.run_single_battle(notify=True)
+            await message.answer("⏳ Один бой Remanga...", reply_markup=remanga_menu_keyboard())
+            await self.run_remanga_battle(notify=True)
 
-        @self.dp.message(StateFilter(None), F.text.in_({"📊 Статус", "Статус"}))
-        @self.dp.message(StateFilter(None), Command("status"))
-        async def status_msg(message: Message) -> None:
+        @self.dp.message(StateFilter(None), F.text.in_({"📊 Статус Remanga", "Статус Remanga"}))
+        async def remanga_status(message: Message) -> None:
             await message.answer(
-                self.state.status_text(self.config.auto_battle_interval_sec),
-                reply_markup=main_reply_keyboard(),
+                self.remanga_state.status_text(self.config.auto_battle_interval_sec),
+                reply_markup=remanga_menu_keyboard(),
             )
 
-        # --- Статистика ---
         @self.dp.message(StateFilter(None), F.text.in_({"📈 Статистика", "Статистика"}))
         @self.dp.message(StateFilter(None), Command("stats"))
-        async def stats_msg(message: Message) -> None:
+        async def remanga_stats(message: Message) -> None:
             session = (
-                f"<b>Сессия сейчас:</b> "
-                f"{'🟢 автобой' if self.state.running else '🔴 стоп'} · "
-                f"боёв {self.state.total_battles} "
-                f"(W{self.state.wins}/L{self.state.losses})"
+                f"<b>Сессия:</b> "
+                f"{'🟢' if self.remanga_state.running else '🔴'} · "
+                f"W{self.remanga_state.wins}/L{self.remanga_state.losses}"
             )
-            await message.answer(
-                load_stats().to_telegram(session_extra=session),
-                reply_markup=stats_keyboard(),
-            )
+            await message.answer(load_stats().to_telegram(session_extra=session), reply_markup=stats_keyboard())
 
         @self.dp.message(StateFilter(None), F.text == "♻️ Сбросить статистику")
         async def stats_reset(message: Message) -> None:
@@ -411,396 +454,319 @@ class AutobattleApp:
             save_stats(BattleStats())
             await message.answer("Статистика обнулена.", reply_markup=stats_keyboard())
 
-        # --- Рейтинг ---
         @self.dp.message(StateFilter(None), F.text.in_({"🏅 Рейтинг", "Рейтинг"}))
         @self.dp.message(StateFilter(None), Command("rating"))
         async def rating_msg(message: Message) -> None:
             cached = get_cached_rating()
             text = cached.to_telegram()
             if not cached.rank and cached.glory is None:
-                text += "\n\nНажмите «🔄 Обновить рейтинг», чтобы считать с сайта."
+                text += "\n\nНажмите «🔄 Обновить рейтинг»."
             await message.answer(text, reply_markup=rating_keyboard())
 
         @self.dp.message(StateFilter(None), F.text == "🔄 Обновить рейтинг")
-        @self.dp.message(StateFilter(None), Command("rating_refresh"))
         async def rating_refresh(message: Message) -> None:
-            await message.answer("⏳ Читаю рейтинг с Remanga...")
+            await message.answer("⏳ Читаю рейтинг...")
             try:
-                info = await self.browser.fetch_rating()
+                info = await self.remanga.fetch_rating()
                 stats = load_stats()
-                from dataclasses import asdict
-
                 stats.rating = asdict(info)
                 save_stats(stats)
                 await message.answer(info.to_telegram(), reply_markup=rating_keyboard())
             except Exception as exc:  # noqa: BLE001
-                logger.exception("rating refresh")
-                await message.answer(
-                    f"⚠️ Не удалось обновить рейтинг: <code>{exc}</code>",
-                    reply_markup=rating_keyboard(),
-                )
+                await message.answer(f"⚠️ {exc}", reply_markup=rating_keyboard())
 
-        # --- Уведомления ---
+        # --- Remanga notify ---
         @self.dp.message(StateFilter(None), F.text.in_({"🔔 Уведомления", "Уведомления"}))
-        @self.dp.message(StateFilter(None), Command("notify"))
         async def notify_menu(message: Message) -> None:
-            ns = load_settings().notify_settings()
             await message.answer(
-                ns.to_telegram() + "\n\nНажмите кнопку, чтобы переключить:",
+                load_settings().notify_settings().to_telegram() + "\n\nПереключите кнопкой:",
                 reply_markup=notify_keyboard(),
             )
 
         @self.dp.message(StateFilter(None), F.text == "🔔 Все вкл")
         async def notify_all_on(message: Message) -> None:
             update_notify(
-                notify_wins=True,
-                notify_losses=True,
-                notify_draws=True,
-                notify_skipped=True,
-                notify_errors=True,
-                notify_autobattle_start_stop=True,
-                quiet_mode=False,
+                notify_wins=True, notify_losses=True, notify_draws=True,
+                notify_skipped=True, notify_errors=True,
+                notify_autobattle_start_stop=True, quiet_mode=False,
             )
-            await message.answer(
-                load_settings().notify_settings().to_telegram(),
-                reply_markup=notify_keyboard(),
-            )
+            await message.answer(load_settings().notify_settings().to_telegram(), reply_markup=notify_keyboard())
 
         @self.dp.message(StateFilter(None), F.text == "🔕 Все выкл")
         async def notify_all_off(message: Message) -> None:
             update_notify(
-                notify_wins=False,
-                notify_losses=False,
-                notify_draws=False,
-                notify_skipped=False,
-                notify_errors=False,
-                notify_autobattle_start_stop=False,
-                quiet_mode=True,
+                notify_wins=False, notify_losses=False, notify_draws=False,
+                notify_skipped=False, notify_errors=False,
+                notify_autobattle_start_stop=False, quiet_mode=True,
                 notify_summary_every=0,
             )
-            await message.answer(
-                load_settings().notify_settings().to_telegram(),
-                reply_markup=notify_keyboard(),
-            )
+            await message.answer(load_settings().notify_settings().to_telegram(), reply_markup=notify_keyboard())
 
         @self.dp.message(
             StateFilter(None),
-            F.text.regexp(
-                r"^(✅|❌)\s*(Победы|Поражения|Ничьи|Пропуски|Ошибки|Старт/стоп|Тихий режим)$"
-            ),
+            F.text.regexp(r"^(✅|❌)\s*(Победы|Поражения|Ничьи|Пропуски|Ошибки|Старт/стоп|Тихий режим)$"),
         )
         async def notify_toggle(message: Message) -> None:
             label = (message.text or "").split(maxsplit=1)[-1].strip()
             key_map = {
-                "Победы": "notify_wins",
-                "Поражения": "notify_losses",
-                "Ничьи": "notify_draws",
-                "Пропуски": "notify_skipped",
-                "Ошибки": "notify_errors",
-                "Старт/стоп": "notify_autobattle_start_stop",
+                "Победы": "notify_wins", "Поражения": "notify_losses",
+                "Ничьи": "notify_draws", "Пропуски": "notify_skipped",
+                "Ошибки": "notify_errors", "Старт/стоп": "notify_autobattle_start_stop",
                 "Тихий режим": "quiet_mode",
             }
             key = key_map.get(label)
             if not key:
                 return
             ns = toggle_notify(key)
-            await message.answer(
-                f"Переключено: <b>{label}</b>\n\n{ns.to_telegram()}",
-                reply_markup=notify_keyboard(),
-            )
+            await message.answer(f"Переключено: <b>{label}</b>\n\n{ns.to_telegram()}", reply_markup=notify_keyboard())
 
         @self.dp.message(StateFilter(None), F.text.regexp(r"^📋 Сводка:"))
         async def notify_summary_ask(message: Message, state: FSMContext) -> None:
             await state.set_state(SettingsStates.waiting_summary_every)
-            await message.answer(
-                "Как часто слать сводку статистики?\n"
-                "Введите число боёв (например <b>10</b>).\n"
-                "<b>0</b> — отключить сводку.",
-                reply_markup=cancel_keyboard(),
-            )
+            await message.answer("Число боёв для сводки (0 = выкл):", reply_markup=cancel_keyboard())
 
         @self.dp.message(SettingsStates.waiting_summary_every)
         async def notify_summary_set(message: Message, state: FSMContext) -> None:
-            text = (message.text or "").strip()
             try:
-                n = int(text)
+                n = int((message.text or "").strip())
             except ValueError:
-                await message.answer("Введите целое число, например 10 или 0")
+                await message.answer("Введите целое число")
                 return
             if n < 0:
-                await message.answer("Число не может быть отрицательным.")
+                await message.answer(">= 0")
                 return
             ns = update_notify(notify_summary_every=n)
             await state.clear()
             await message.answer(ns.to_telegram(), reply_markup=notify_keyboard())
 
-        # --- Меню настроек ---
-        @self.dp.message(StateFilter(None), F.text.in_({"⚙️ Настройки", "Настройки"}))
-        @self.dp.message(StateFilter(None), Command("settings"))
-        async def open_settings(message: Message) -> None:
-            await message.answer(
-                self._settings_text() + "\n\nЧто изменить?",
-                reply_markup=settings_keyboard(),
-            )
-
-        @self.dp.message(StateFilter(None), F.text == "◀️ Назад")
-        async def settings_back(message: Message, state: FSMContext) -> None:
-            await state.clear()
-            await message.answer("Главное меню:", reply_markup=main_reply_keyboard())
+        # --- Remanga settings ---
+        @self.dp.message(StateFilter(None), F.text.in_({"⚙️ Настройки Remanga", "Настройки Remanga"}))
+        async def remanga_settings(message: Message) -> None:
+            await message.answer(self._remanga_settings_text() + "\n\nЧто изменить?", reply_markup=settings_keyboard())
 
         @self.dp.message(StateFilter(None), F.text == "📋 Показать настройки")
         async def show_settings(message: Message) -> None:
-            await message.answer(self._settings_text(), reply_markup=settings_keyboard())
+            await message.answer(self._remanga_settings_text(), reply_markup=settings_keyboard())
 
         @self.dp.message(StateFilter(None), F.text == "🌐 URL боёв")
         async def ask_url(message: Message, state: FSMContext) -> None:
             await state.set_state(SettingsStates.waiting_battle_url)
-            await state.update_data(wizard=False)
-            await message.answer(
-                "Отправьте URL страницы боёв Remanga:\n"
-                f"Сейчас: <code>{self.config.battle_url}</code>",
-                reply_markup=cancel_keyboard(),
-            )
+            await message.answer(f"URL боёв:\nСейчас: <code>{self.config.battle_url}</code>", reply_markup=cancel_keyboard())
+
+        @self.dp.message(SettingsStates.waiting_battle_url)
+        async def set_url(message: Message, state: FSMContext) -> None:
+            text = (message.text or "").strip()
+            if not (text.startswith("http://") or text.startswith("https://")):
+                await message.answer("Нужен полный URL")
+                return
+            self.config.battle_url = text
+            update_settings(battle_url=text, setup_completed=True)
+            await state.clear()
+            await message.answer(f"✅ URL: <code>{text}</code>", reply_markup=settings_keyboard())
 
         @self.dp.message(StateFilter(None), F.text == "⏱ Интервал")
         async def ask_interval(message: Message, state: FSMContext) -> None:
             await state.set_state(SettingsStates.waiting_interval)
-            await state.update_data(wizard=False)
-            await message.answer(
-                "Отправьте интервал автобоя в <b>секундах</b> (например 30):\n"
-                f"Сейчас: <b>{self.config.auto_battle_interval_sec}</b>",
-                reply_markup=cancel_keyboard(),
-            )
+            await message.answer("Интервал автобоя в секундах:", reply_markup=cancel_keyboard())
+
+        @self.dp.message(SettingsStates.waiting_interval)
+        async def set_interval(message: Message, state: FSMContext) -> None:
+            try:
+                interval = int((message.text or "").strip())
+            except ValueError:
+                await message.answer("Целое число")
+                return
+            if interval < 5:
+                await message.answer("Минимум 5")
+                return
+            self.config.auto_battle_interval_sec = interval
+            update_settings(auto_battle_interval_sec=interval)
+            if self.remanga_state.running:
+                self.scheduler.set_interval_job(
+                    JOB_REMANGA_AUTOBATTLE, self._scheduled_remanga_battle, interval
+                )
+            await state.clear()
+            await message.answer(f"✅ Интервал: {interval} сек", reply_markup=settings_keyboard())
 
         @self.dp.message(StateFilter(None), F.text == "⌛ Таймаут")
         async def ask_timeout(message: Message, state: FSMContext) -> None:
             await state.set_state(SettingsStates.waiting_timeout)
-            await state.update_data(wizard=False)
-            await message.answer(
-                "Отправьте таймаут ожидания кнопки в <b>секундах</b> (например 30):\n"
-                f"Сейчас: <b>{self.config.selector_timeout_ms // 1000}</b>",
-                reply_markup=cancel_keyboard(),
-            )
-
-        @self.dp.message(F.text.in_({"❌ Отмена", "Отмена"}))
-        async def cancel_input(message: Message, state: FSMContext) -> None:
-            data = await state.get_data()
-            if data.get("wizard"):
-                update_settings(setup_completed=True)
-            await state.clear()
-            await message.answer("Отменено. Настройки можно изменить позже.", reply_markup=main_reply_keyboard())
-
-        # --- Ввод значений ---
-        @self.dp.message(SettingsStates.waiting_battle_url)
-        async def set_battle_url(message: Message, state: FSMContext) -> None:
-            text = (message.text or "").strip()
-            if text.lower() in {"пропустить", "skip", "-"}:
-                url = self.config.battle_url
-            else:
-                if not (text.startswith("http://") or text.startswith("https://")):
-                    await message.answer(
-                        "Нужен полный URL, например:\n<code>https://remanga.org/cards</code>"
-                    )
-                    return
-                url = text
-
-            self.config.battle_url = url
-            update_settings(battle_url=url)
-            data = await state.get_data()
-            if not data.get("wizard"):
-                await state.clear()
-                await message.answer(
-                    f"✅ URL сохранён: <code>{url}</code>",
-                    reply_markup=settings_keyboard(),
-                )
-                return
-
-            await state.set_state(SettingsStates.waiting_interval)
-            await message.answer(
-                f"✅ URL сохранён: <code>{url}</code>\n\n"
-                "Интервал автобоя в секундах (например <b>30</b>) или «Пропустить»:",
-                reply_markup=ReplyKeyboardMarkup(
-                    keyboard=[
-                        [KeyboardButton(text="30"), KeyboardButton(text="60")],
-                        [KeyboardButton(text="Пропустить"), KeyboardButton(text="❌ Отмена")],
-                    ],
-                    resize_keyboard=True,
-                ),
-            )
-
-        @self.dp.message(SettingsStates.waiting_interval)
-        async def set_interval(message: Message, state: FSMContext) -> None:
-            text = (message.text or "").strip().lower()
-            if text in {"пропустить", "skip", "-"}:
-                interval = self.config.auto_battle_interval_sec
-            else:
-                try:
-                    interval = int(text)
-                except ValueError:
-                    await message.answer("Введите целое число секунд, например 30")
-                    return
-                if interval < 5:
-                    await message.answer("Минимум 5 секунд.")
-                    return
-
-            self.config.auto_battle_interval_sec = interval
-            update_settings(auto_battle_interval_sec=interval)
-            if self.state.running:
-                await self._reschedule()
-
-            data = await state.get_data()
-            if not data.get("wizard"):
-                await state.clear()
-                await message.answer(
-                    f"✅ Интервал: <b>{interval}</b> сек",
-                    reply_markup=settings_keyboard(),
-                )
-                return
-
-            await state.set_state(SettingsStates.waiting_timeout)
-            await message.answer(
-                f"✅ Интервал: <b>{interval}</b> сек\n\n"
-                "Таймаут ожидания кнопки в секундах (например <b>30</b>) или «Пропустить»:",
-                reply_markup=ReplyKeyboardMarkup(
-                    keyboard=[
-                        [KeyboardButton(text="30"), KeyboardButton(text="60")],
-                        [KeyboardButton(text="Пропустить"), KeyboardButton(text="❌ Отмена")],
-                    ],
-                    resize_keyboard=True,
-                ),
-            )
+            await message.answer("Таймаут ожидания в секундах:", reply_markup=cancel_keyboard())
 
         @self.dp.message(SettingsStates.waiting_timeout)
         async def set_timeout(message: Message, state: FSMContext) -> None:
-            text = (message.text or "").strip().lower()
-            if text in {"пропустить", "skip", "-"}:
-                timeout_sec = self.config.selector_timeout_ms // 1000
-            else:
-                try:
-                    timeout_sec = int(text)
-                except ValueError:
-                    await message.answer("Введите целое число секунд, например 30")
-                    return
-                if timeout_sec < 5:
-                    await message.answer("Минимум 5 секунд.")
-                    return
-
-            self.config.selector_timeout_ms = timeout_sec * 1000
-            data = await state.get_data()
-            update_settings(
-                selector_timeout_ms=self.config.selector_timeout_ms,
-                setup_completed=True,
-            )
-            await state.clear()
-            kb = main_reply_keyboard() if data.get("wizard") else settings_keyboard()
-            await message.answer(
-                f"✅ Таймаут: <b>{timeout_sec}</b> сек\n\n"
-                f"{self._settings_text()}\n\n"
-                "Готово!",
-                reply_markup=kb,
-            )
-
-    async def _reschedule(self) -> None:
-        """Перезапустить job автобоя с актуальным интервалом."""
-        if self.scheduler.get_job(self.state.job_id):
-            self.scheduler.remove_job(self.state.job_id)
-        self.scheduler.add_job(
-            self._scheduled_battle,
-            trigger=IntervalTrigger(seconds=self.config.auto_battle_interval_sec),
-            id=self.state.job_id,
-            replace_existing=True,
-            max_instances=1,
-            coalesce=True,
-        )
-
-    # ------------------------------------------------------------------
-    # Планировщик
-    # ------------------------------------------------------------------
-
-    async def start_autobattle(self) -> str:
-        if self.state.running:
-            return "ℹ️ Автобой уже запущен."
-
-        if not self.browser.is_started:
             try:
-                await self.browser.start(headless=True)
+                sec = int((message.text or "").strip())
+            except ValueError:
+                await message.answer("Целое число")
+                return
+            if sec < 5:
+                await message.answer("Минимум 5")
+                return
+            self.config.selector_timeout_ms = sec * 1000
+            update_settings(selector_timeout_ms=sec * 1000)
+            await state.clear()
+            await message.answer(f"✅ Таймаут: {sec} сек", reply_markup=settings_keyboard())
+
+        # ===== MangaBuff =====
+        @self.dp.message(StateFilter(None), F.text == "▶️ Запустить авточтение")
+        async def mb_start(message: Message) -> None:
+            self._notify_chat_id = message.chat.id
+            text = await self.start_mangabuff_read()
+            await message.answer(text, reply_markup=mangabuff_menu_keyboard())
+
+        @self.dp.message(StateFilter(None), F.text == "⏹ Остановить авточтение")
+        async def mb_stop(message: Message) -> None:
+            text = await self.stop_mangabuff_read()
+            await message.answer(text, reply_markup=mangabuff_menu_keyboard())
+
+        @self.dp.message(StateFilter(None), F.text == "🎁 Собрать награды")
+        async def mb_claim(message: Message) -> None:
+            self._notify_chat_id = message.chat.id
+            await message.answer("⏳ Собираю награды MangaBuff...", reply_markup=mangabuff_menu_keyboard())
+            try:
+                if not self.mangabuff.is_started:
+                    await self.mangabuff.start(headless=True)
+                result = await self.mangabuff.claim_rewards()
+                await message.answer(result.to_telegram(), reply_markup=mangabuff_menu_keyboard())
             except Exception as exc:  # noqa: BLE001
-                logger.exception("Не удалось запустить браузер")
-                return (
-                    f"⚠️ Не удалось запустить браузер: <code>{exc}</code>\n"
-                    "Сначала setup:\n"
-                    "<code>cd ~/remanga_autobattle && source .venv/bin/activate && python bot.py --setup</code>"
+                logger.exception("mangabuff claim")
+                await message.answer(
+                    f"⚠️ Ошибка сбора: <code>{exc}</code>\n"
+                    "Сделайте setup: <code>python -m services.mangabuff_service</code>",
+                    reply_markup=mangabuff_menu_keyboard(),
                 )
 
-        await self._reschedule()
-        if not self.scheduler.running:
-            self.scheduler.start()
+        @self.dp.message(StateFilter(None), F.text == "📊 Статус MangaBuff")
+        async def mb_status(message: Message) -> None:
+            await message.answer(
+                self.mangabuff.stats.to_telegram(
+                    (self.config.mangabuff_delay_min_sec, self.config.mangabuff_delay_max_sec)
+                ),
+                reply_markup=mangabuff_menu_keyboard(),
+            )
 
-        self.state.running = True
-        logger.info("Автобой запущен, интервал=%s", self.config.auto_battle_interval_sec)
-        asyncio.create_task(self.run_single_battle(notify=True))
+        @self.dp.message(StateFilter(None), F.text == "⏱ Настройки задержки")
+        async def mb_delay_menu(message: Message) -> None:
+            await message.answer(
+                f"Текущая задержка чтения: "
+                f"<b>{self.config.mangabuff_delay_min_sec:.0f}–"
+                f"{self.config.mangabuff_delay_max_sec:.0f}</b> сек\n"
+                "Выберите пресет:",
+                reply_markup=delay_keyboard(),
+            )
 
-        text = (
-            f"✅ Автобой <b>запущен</b> (бесконечно).\n"
-            f"⏱ Интервал: {self.config.auto_battle_interval_sec} сек.\n"
-            "Остановка — «Остановить автобой».\n"
-            "Уведомления настраиваются в «🔔 Уведомления»."
+        @self.dp.message(StateFilter(None), F.text == "⚡ Быстро 5–8с")
+        async def delay_fast(message: Message) -> None:
+            await self._set_mb_delay(message, 5, 8)
+
+        @self.dp.message(StateFilter(None), F.text == "📖 Норма 5–15с")
+        async def delay_norm(message: Message) -> None:
+            await self._set_mb_delay(message, 5, 15)
+
+        @self.dp.message(StateFilter(None), F.text == "🐢 Медленно 10–20с")
+        async def delay_slow(message: Message) -> None:
+            await self._set_mb_delay(message, 10, 20)
+
+        @self.dp.message(StateFilter(None), F.text == "🧘 Очень медленно 15–30с")
+        async def delay_vslow(message: Message) -> None:
+            await self._set_mb_delay(message, 15, 30)
+
+        @self.dp.message(StateFilter(None), F.text == "🔗 URL чтения")
+        async def mb_url_ask(message: Message, state: FSMContext) -> None:
+            await state.set_state(SettingsStates.waiting_mangabuff_url)
+            await message.answer(
+                "Отправьте URL главы/тайтла MangaBuff для авточтения:\n"
+                f"Сейчас: <code>{self.config.mangabuff_start_url}</code>",
+                reply_markup=cancel_keyboard(),
+            )
+
+        @self.dp.message(SettingsStates.waiting_mangabuff_url)
+        async def mb_url_set(message: Message, state: FSMContext) -> None:
+            text = (message.text or "").strip()
+            if "mangabuff.ru" not in text and not text.startswith("http"):
+                await message.answer("Нужен URL вида https://mangabuff.ru/...")
+                return
+            self.config.mangabuff_start_url = text
+            self.mangabuff.start_url = text
+            update_settings(mangabuff_start_url=text)
+            await state.clear()
+            await message.answer(f"✅ URL чтения: <code>{text}</code>", reply_markup=mangabuff_menu_keyboard())
+
+    async def _set_mb_delay(self, message: Message, dmin: float, dmax: float) -> None:
+        self.config.mangabuff_delay_min_sec = dmin
+        self.config.mangabuff_delay_max_sec = dmax
+        self.mangabuff.set_delay(dmin, dmax)
+        update_settings(mangabuff_delay_min_sec=dmin, mangabuff_delay_max_sec=dmax)
+        await message.answer(
+            f"✅ Задержка чтения: <b>{dmin:.0f}–{dmax:.0f}</b> сек",
+            reply_markup=mangabuff_menu_keyboard(),
         )
-        # Ответ хэндлеру; доп. пуш только если включён флаг (и это не дубль ответа)
-        return text
 
-    async def stop_autobattle(self) -> str:
-        if not self.state.running and not self.scheduler.get_job(self.state.job_id):
-            self.state.running = False
-            return "ℹ️ Автобой уже остановлен."
+    # ------------------------------------------------------------------
+    # Remanga jobs
+    # ------------------------------------------------------------------
 
-        if self.scheduler.get_job(self.state.job_id):
-            self.scheduler.remove_job(self.state.job_id)
-        self.state.running = False
-        return "⏹ Автобой <b>остановлен</b>."
+    async def start_remanga_autobattle(self) -> str:
+        if self.remanga_state.running:
+            return "ℹ️ Автобой Remanga уже запущен."
+        if not self.remanga.is_started:
+            try:
+                await self.remanga.start(headless=True)
+            except Exception as exc:  # noqa: BLE001
+                return f"⚠️ Браузер Remanga: <code>{exc}</code>"
+        self.scheduler.set_interval_job(
+            JOB_REMANGA_AUTOBATTLE,
+            self._scheduled_remanga_battle,
+            self.config.auto_battle_interval_sec,
+        )
+        self.scheduler.start()
+        self.remanga_state.running = True
+        asyncio.create_task(self.run_remanga_battle(notify=True))
+        return (
+            f"✅ Автобой Remanga <b>запущен</b>.\n"
+            f"Интервал: {self.config.auto_battle_interval_sec} сек."
+        )
 
-    async def _scheduled_battle(self) -> None:
-        if not self.state.running:
-            return
-        await self.run_single_battle(notify=True)
+    async def stop_remanga_autobattle(self) -> str:
+        if not self.remanga_state.running:
+            return "ℹ️ Автобой Remanga уже остановлен."
+        self.scheduler.remove_job(JOB_REMANGA_AUTOBATTLE)
+        self.remanga_state.running = False
+        return "⏹ Автобой Remanga <b>остановлен</b>."
 
-    def _should_notify_outcome(self, outcome: BattleOutcome) -> bool:
-        ns = load_settings().notify_settings()
-        return ns.allows_outcome(outcome.value)
+    async def _scheduled_remanga_battle(self) -> None:
+        if self.remanga_state.running:
+            await self.run_remanga_battle(notify=True)
 
-    async def _maybe_send_summary(self) -> None:
-        """Сводка каждые N завершённых боёв (не считая skip/error)."""
+    def _should_notify(self, outcome: BattleOutcome) -> bool:
+        return load_settings().notify_settings().allows_outcome(outcome.value)
+
+    async def _maybe_summary(self) -> None:
         ns = load_settings().notify_settings()
         every = ns.notify_summary_every
         if every <= 0 or self._notify_chat_id is None:
             return
         stats = load_stats()
-        if stats.total_battles <= 0 or stats.total_battles % every != 0:
-            return
-        try:
-            await self.bot.send_message(
-                self._notify_chat_id,
-                f"📋 <b>Сводка</b> (каждые {every} боёв)\n\n" + stats.to_telegram(),
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.error("Не удалось отправить сводку: %s", exc)
+        if stats.total_battles > 0 and stats.total_battles % every == 0:
+            try:
+                await self.bot.send_message(
+                    self._notify_chat_id,
+                    f"📋 <b>Сводка</b>\n\n{stats.to_telegram()}",
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.error("summary: %s", exc)
 
-    async def run_single_battle(self, notify: bool = True) -> BattleResult:
+    async def run_remanga_battle(self, notify: bool = True) -> BattleResult:
         async with self._battle_lock:
             try:
-                if not self.browser.is_started:
-                    await self.browser.start(headless=True)
-                result = await self.browser.do_battle()
+                if not self.remanga.is_started:
+                    await self.remanga.start(headless=True)
+                result = await self.remanga.do_battle()
             except Exception as exc:  # noqa: BLE001
-                logger.exception("Критическая ошибка боя")
-                result = BattleResult(
-                    outcome=BattleOutcome.ERROR,
-                    message=f"Критическая ошибка: {exc}",
-                )
+                result = BattleResult(outcome=BattleOutcome.ERROR, message=str(exc))
 
-            self.state.register(result)
-
-            # Постоянная статистика + обновление рейтинга из текста результата
+            self.remanga_state.register(result)
             summary = f"{result.outcome.value}: {result.message}"
             if result.rating_change:
                 summary += f" ({result.rating_change})"
@@ -809,55 +775,107 @@ class AutobattleApp:
                 try:
                     parsed = BrowserService._parse_rating_from_text(result.raw_text)
                     if parsed.rank or parsed.glory is not None or parsed.username:
-                        from datetime import datetime as _dt
-
-                        parsed.updated_at = _dt.now().strftime("%d.%m.%Y %H:%M:%S")
-                        # Серия побед из итога
-                        import re as _re
-
-                        m = _re.search(r"сери[яю]\s*побед[^\d]{0,10}(\d+)", result.raw_text, _re.I)
-                        if m:
-                            parsed.win_streak = int(m.group(1))
+                        parsed.updated_at = datetime.now().strftime("%d.%m.%Y %H:%M:%S")
                         rating_info = parsed
                 except Exception:  # noqa: BLE001
-                    rating_info = None
-
+                    pass
             update_stats_from_result(
                 outcome=result.outcome.value,
                 rating_change=result.rating_change,
                 summary=summary,
                 rating=rating_info,
             )
-
-            if notify and self._notify_chat_id is not None and self._should_notify_outcome(result.outcome):
+            if notify and self._notify_chat_id and self._should_notify(result.outcome):
                 try:
                     await self.bot.send_message(
                         self._notify_chat_id,
-                        "📋 <b>Отчёт о бое</b>\n\n"
+                        "📋 <b>Отчёт Remanga</b>\n\n"
                         + result.to_telegram()
                         .replace("&", "&amp;")
                         .replace("<", "&lt;")
                         .replace(">", "&gt;"),
                     )
                 except Exception as exc:  # noqa: BLE001
-                    logger.error("Не удалось отправить отчёт в Telegram: %s", exc)
-
-            await self._maybe_send_summary()
+                    logger.error("notify: %s", exc)
+            await self._maybe_summary()
             return result
 
-    async def run(self) -> None:
-        logger.info(
-            "Запуск бота (admin_id=%s). Настройки — в Telegram.",
-            self.config.telegram_admin_id or "будет закреплён при первом /start",
+    # ------------------------------------------------------------------
+    # MangaBuff jobs
+    # ------------------------------------------------------------------
+
+    async def start_mangabuff_read(self) -> str:
+        if self.mangabuff.stats.running or (self._mb_task and not self._mb_task.done()):
+            return "ℹ️ Авточтение MangaBuff уже запущено."
+
+        async def _runner() -> None:
+            try:
+                if not self.mangabuff.is_started:
+                    await self.mangabuff.start(headless=True)
+                await self.mangabuff.read_loop(
+                    start_url=self.config.mangabuff_start_url,
+                    max_chapters=0,
+                    on_progress=self._mb_progress,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("mangabuff read")
+                if self._notify_chat_id:
+                    try:
+                        await self.bot.send_message(
+                            self._notify_chat_id,
+                            f"⚠️ MangaBuff авточтение упало: <code>{exc}</code>",
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass
+            finally:
+                self.mangabuff.stats.running = False
+                self.scheduler.remove_job(JOB_MANGABUFF_READ)
+
+        self.scheduler.start()
+        self._mb_task = asyncio.create_task(_runner(), name=JOB_MANGABUFF_READ)
+        return (
+            "✅ Авточтение MangaBuff <b>запущено</b>.\n"
+            f"URL: <code>{self.config.mangabuff_start_url}</code>\n"
+            f"Задержка: {self.config.mangabuff_delay_min_sec:.0f}–"
+            f"{self.config.mangabuff_delay_max_sec:.0f} сек\n"
+            "Остановка — «Остановить авточтение»."
         )
+
+    async def stop_mangabuff_read(self) -> str:
+        self.mangabuff.request_stop()
+        self.scheduler.remove_job(JOB_MANGABUFF_READ)
+        if self._mb_task and not self._mb_task.done():
+            self._mb_task.cancel()
+            try:
+                await self._mb_task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+        self._mb_task = None
+        self.mangabuff.stats.running = False
+        return "⏹ Авточтение MangaBuff <b>остановлено</b>."
+
+    async def _mb_progress(self, stats) -> None:
+        # Тихие промежуточные апдейты — только в лог; статус по кнопке
+        logger.info(
+            "MangaBuff progress: chapters=%s pages=%s rewards=%s",
+            stats.chapters_read,
+            stats.pages_scrolled,
+            stats.rewards_claimed,
+        )
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
+    async def run(self) -> None:
+        logger.info("Старт бота (admin=%s)", self.config.telegram_admin_id or "pending")
         try:
-            await self.browser.start(headless=True)
+            await self.remanga.start(headless=True)
         except Exception as exc:  # noqa: BLE001
-            logger.warning("Браузер не стартовал сразу: %s", exc)
-
-        if not self.scheduler.running:
-            self.scheduler.start()
-
+            logger.warning("Remanga browser: %s", exc)
+        self.scheduler.start()
         try:
             await self.dp.start_polling(self.bot)
         finally:
@@ -865,13 +883,11 @@ class AutobattleApp:
 
     async def shutdown(self) -> None:
         logger.info("Shutdown...")
-        self.state.running = False
-        try:
-            if self.scheduler.running:
-                self.scheduler.shutdown(wait=False)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Ошибка остановки scheduler: %s", exc)
-        await self.browser.stop()
+        self.remanga_state.running = False
+        self.mangabuff.request_stop()
+        self.scheduler.shutdown()
+        await self.remanga.stop()
+        await self.mangabuff.stop()
         await self.bot.session.close()
 
 
@@ -883,36 +899,32 @@ async def amain() -> None:
     )
     logging.getLogger("apscheduler").setLevel(logging.WARNING)
     logging.getLogger("aiogram.event").setLevel(logging.WARNING)
-
-    config = load_config()
-    app = AutobattleApp(config)
+    app = App(load_config())
     await app.run()
 
 
 def main() -> None:
     import argparse
 
-    parser = argparse.ArgumentParser(description="Remanga Autobattle Telegram Bot")
-    parser.add_argument(
-        "--setup",
-        action="store_true",
-        help="Режим ручного входа (headless=False), сохраняет сессию в user_data",
-    )
+    parser = argparse.ArgumentParser(description="Remanga + MangaBuff bot")
+    parser.add_argument("--setup", action="store_true", help="Setup Remanga (headed)")
+    parser.add_argument("--setup-mangabuff", action="store_true", help="Setup MangaBuff (headed)")
     args = parser.parse_args()
 
     if args.setup:
-        from browser_service import main_setup
+        from services.remanga_service import main_setup
 
-        try:
-            asyncio.run(main_setup())
-        except KeyboardInterrupt:
-            print("\nSetup прерван")
+        asyncio.run(main_setup())
         return
+    if args.setup_mangabuff:
+        from services.mangabuff_service import main_setup as mb_setup
 
+        asyncio.run(mb_setup())
+        return
     try:
         asyncio.run(amain())
     except KeyboardInterrupt:
-        print("\nВыход по Ctrl+C")
+        print("\nВыход")
 
 
 if __name__ == "__main__":
