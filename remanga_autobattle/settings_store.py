@@ -99,9 +99,13 @@ class RuntimeSettings:
 
     # ---- MangaBuff ----
     mangabuff_start_url: str = "https://mangabuff.ru/"
-    mangabuff_delay_min_sec: float = 5.0
-    mangabuff_delay_max_sec: float = 15.0
+    mangabuff_delay_min_sec: float = 2.8
+    mangabuff_delay_max_sec: float = 5.5
     mangabuff_setup_done: bool = False
+    mangabuff_speed_preset: str = "lively"
+    # Вехи в Telegram каждые N глав (0 = выкл)
+    mangabuff_milestone_every: int = 10
+    mangabuff_notify_milestones: bool = True
 
     def __post_init__(self) -> None:
         if self.notify is None:

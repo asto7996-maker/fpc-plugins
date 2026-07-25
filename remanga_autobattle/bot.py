@@ -22,7 +22,13 @@ from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import KeyboardButton, Message, ReplyKeyboardMarkup, TelegramObject
+from aiogram.types import (
+    BotCommand,
+    KeyboardButton,
+    Message,
+    ReplyKeyboardMarkup,
+    TelegramObject,
+)
 
 from config import Config, load_config
 from scheduler import (
@@ -44,6 +50,18 @@ from stats_store import (
     save_stats,
     update_stats_from_result,
 )
+from ui_theme import (
+    BRAND,
+    BRAND_LINE,
+    DEFAULT_SPEED_KEY,
+    SPEED_PRESETS,
+    help_text,
+    mangabuff_home,
+    pulse_text,
+    remanga_home,
+    speed_menu_text,
+    welcome_text,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +77,8 @@ class SettingsStates(StatesGroup):
     waiting_timeout = State()
     waiting_summary_every = State()
     waiting_mangabuff_url = State()
+    waiting_custom_speed = State()
+    waiting_milestone_every = State()
 
 
 # ======================================================================
@@ -152,8 +172,9 @@ class AdminOnlyMiddleware(BaseMiddleware):
 def main_menu_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="⚔️ Remanga.org"), KeyboardButton(text="📚 MangaBuff.ru")],
-            [KeyboardButton(text="ℹ️ Помощь")],
+            [KeyboardButton(text="⚔️ Remanga"), KeyboardButton(text="📚 MangaBuff")],
+            [KeyboardButton(text="✦ Пульс"), KeyboardButton(text="🎚 Темп чтения")],
+            [KeyboardButton(text="ℹ️ О боте")],
         ],
         resize_keyboard=True,
         is_persistent=True,
@@ -164,11 +185,11 @@ def remanga_menu_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
             [
-                KeyboardButton(text="▶️ Запустить автобой"),
-                KeyboardButton(text="⏹ Остановить автобой"),
+                KeyboardButton(text="▶️ Автобой"),
+                KeyboardButton(text="⏹ Стоп бой"),
             ],
             [
-                KeyboardButton(text="⚔️ Сделать 1 бой"),
+                KeyboardButton(text="⚔️ Один бой"),
                 KeyboardButton(text="📊 Статус Remanga"),
             ],
             [
@@ -179,7 +200,7 @@ def remanga_menu_keyboard() -> ReplyKeyboardMarkup:
                 KeyboardButton(text="🔔 Уведомления"),
                 KeyboardButton(text="⚙️ Настройки Remanga"),
             ],
-            [KeyboardButton(text="🏠 Главное меню")],
+            [KeyboardButton(text="⌂ Домой")],
         ],
         resize_keyboard=True,
     )
@@ -189,22 +210,26 @@ def mangabuff_menu_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
             [
-                KeyboardButton(text="▶️ Запустить фарм"),
-                KeyboardButton(text="⏹ Остановить фарм"),
+                KeyboardButton(text="▶️ Фарм"),
+                KeyboardButton(text="⏹ Стоп фарм"),
             ],
             [
-                KeyboardButton(text="🎁 Собрать награды"),
-                KeyboardButton(text="🗺 Изучить макеты"),
-            ],
-            [
+                KeyboardButton(text="⏭ След. тайтл"),
                 KeyboardButton(text="📊 Статус MangaBuff"),
-                KeyboardButton(text="⏱ Настройки задержки"),
             ],
             [
-                KeyboardButton(text="🔗 URL чтения"),
-                KeyboardButton(text="🔐 Логин MangaBuff"),
+                KeyboardButton(text="🎁 Награды"),
+                KeyboardButton(text="🗺 Макеты"),
             ],
-            [KeyboardButton(text="🏠 Главное меню")],
+            [
+                KeyboardButton(text="🎚 Темп чтения"),
+                KeyboardButton(text="📡 Вехи"),
+            ],
+            [
+                KeyboardButton(text="🔗 URL"),
+                KeyboardButton(text="🔐 Сессия"),
+            ],
+            [KeyboardButton(text="⌂ Домой")],
         ],
         resize_keyboard=True,
     )
@@ -213,9 +238,11 @@ def mangabuff_menu_keyboard() -> ReplyKeyboardMarkup:
 def delay_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="⚡ Быстро 5–8с"), KeyboardButton(text="📖 Норма 5–15с")],
-            [KeyboardButton(text="🐢 Медленно 10–20с"), KeyboardButton(text="🧘 Очень медленно 15–30с")],
-            [KeyboardButton(text="◀️ В меню MangaBuff")],
+            [KeyboardButton(text="⚡ Турбо"), KeyboardButton(text="🏃 Быстрый")],
+            [KeyboardButton(text="✨ Живой"), KeyboardButton(text="📖 Норма")],
+            [KeyboardButton(text="🐢 Неспешно"), KeyboardButton(text="🕯 Медленно")],
+            [KeyboardButton(text="🎛 Своя скорость")],
+            [KeyboardButton(text="◀️ MangaBuff")],
         ],
         resize_keyboard=True,
     )
@@ -226,7 +253,7 @@ def settings_keyboard() -> ReplyKeyboardMarkup:
         keyboard=[
             [KeyboardButton(text="🌐 URL боёв"), KeyboardButton(text="⏱ Интервал")],
             [KeyboardButton(text="⌛ Таймаут"), KeyboardButton(text="📋 Показать настройки")],
-            [KeyboardButton(text="◀️ В меню Remanga")],
+            [KeyboardButton(text="◀️ Remanga")],
         ],
         resize_keyboard=True,
     )
@@ -250,7 +277,7 @@ def notify_keyboard() -> ReplyKeyboardMarkup:
             [KeyboardButton(text=lab("Ошибки", ns.notify_errors)), KeyboardButton(text=lab("Старт/стоп", ns.notify_autobattle_start_stop))],
             [KeyboardButton(text=lab("Тихий режим", ns.quiet_mode)), KeyboardButton(text=summary)],
             [KeyboardButton(text="🔔 Все вкл"), KeyboardButton(text="🔕 Все выкл")],
-            [KeyboardButton(text="◀️ В меню Remanga")],
+            [KeyboardButton(text="◀️ Remanga")],
         ],
         resize_keyboard=True,
     )
@@ -260,7 +287,7 @@ def rating_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="🔄 Обновить рейтинг")],
-            [KeyboardButton(text="◀️ В меню Remanga")],
+            [KeyboardButton(text="◀️ Remanga")],
         ],
         resize_keyboard=True,
     )
@@ -270,7 +297,7 @@ def stats_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="♻️ Сбросить статистику")],
-            [KeyboardButton(text="◀️ В меню Remanga")],
+            [KeyboardButton(text="◀️ Remanga")],
         ],
         resize_keyboard=True,
     )
@@ -314,10 +341,59 @@ class App:
             password=config.mangabuff_password,
         )
         self._mb_task: Optional[asyncio.Task] = None
+        self._mb_session_started_at: Optional[datetime] = None
+        self._apply_speed_from_settings()
 
         self._notify_chat_id: Optional[int] = None
         self.dp.message.middleware(AdminOnlyMiddleware(self))
         self._register_handlers()
+
+    def _apply_speed_from_settings(self) -> None:
+        s = load_settings()
+        key = s.mangabuff_speed_preset or DEFAULT_SPEED_KEY
+        preset = SPEED_PRESETS.get(key)
+        if preset:
+            self.config.mangabuff_delay_min_sec = preset.delay_min
+            self.config.mangabuff_delay_max_sec = preset.delay_max
+            self.mangabuff.set_delay(
+                preset.delay_min,
+                preset.delay_max,
+                preset.steps_min,
+                preset.steps_max,
+            )
+        else:
+            self.mangabuff.set_delay(
+                s.mangabuff_delay_min_sec or 2.8,
+                s.mangabuff_delay_max_sec or 5.5,
+            )
+
+    def _speed_label(self) -> str:
+        s = load_settings()
+        preset = SPEED_PRESETS.get(s.mangabuff_speed_preset or "")
+        if preset:
+            return f"{preset.title} ({preset.delay_min:.1f}–{preset.delay_max:.1f}с)"
+        return (
+            f"Своя ({self.config.mangabuff_delay_min_sec:.1f}–"
+            f"{self.config.mangabuff_delay_max_sec:.1f}с)"
+        )
+
+    def _chapters_per_hour(self) -> float:
+        stats = self.mangabuff.stats
+        if not self._mb_session_started_at or stats.chapters_read <= 0:
+            return 0.0
+        elapsed = (datetime.now() - self._mb_session_started_at).total_seconds() / 3600.0
+        if elapsed <= 0.01:
+            return 0.0
+        return stats.chapters_read / elapsed
+
+    def _dashboard_text(self) -> str:
+        return welcome_text(
+            remanga_on=self.remanga_state.running,
+            mb_on=self.mangabuff.stats.running,
+            speed_label=self._speed_label(),
+            chapters=self.mangabuff.stats.chapters_read,
+            battles=self.remanga_state.total_battles,
+        )
 
     def bind_admin(self, user_id: int) -> None:
         self.config.telegram_admin_id = user_id
@@ -341,74 +417,74 @@ class App:
         async def cmd_start(message: Message, state: FSMContext) -> None:
             await state.clear()
             self._notify_chat_id = message.chat.id
-            await message.answer(
-                "🤖 <b>Мультибот автоматизации</b>\n\n"
-                "Выберите модуль:",
-                reply_markup=main_menu_keyboard(),
-            )
+            await message.answer(self._dashboard_text(), reply_markup=main_menu_keyboard())
 
-        @self.dp.message(F.text.in_({"🏠 Главное меню", "Главное меню"}))
+        @self.dp.message(F.text.in_({"⌂ Домой", "🏠 Главное меню", "Главное меню"}))
         @self.dp.message(Command("menu"))
         async def go_main(message: Message, state: FSMContext) -> None:
             await state.clear()
-            await message.answer("Главное меню — выберите модуль:", reply_markup=main_menu_keyboard())
+            await message.answer(self._dashboard_text(), reply_markup=main_menu_keyboard())
 
-        @self.dp.message(F.text.in_({"ℹ️ Помощь", "Помощь"}))
+        @self.dp.message(F.text.in_({"ℹ️ О боте", "ℹ️ Помощь", "Помощь"}))
         @self.dp.message(Command("help"))
         async def cmd_help(message: Message) -> None:
+            await message.answer(help_text(), reply_markup=main_menu_keyboard())
+
+        @self.dp.message(F.text.in_({"✦ Пульс", "Пульс"}))
+        @self.dp.message(Command("pulse"))
+        async def cmd_pulse(message: Message) -> None:
             await message.answer(
-                "<b>Модули</b>\n"
-                "⚔️ <b>Remanga.org</b> — автобои murim-cards\n"
-                "📚 <b>MangaBuff.ru</b> — авточтение и сбор наград\n\n"
-                "Сессии браузера раздельные:\n"
-                f"• Remanga: <code>{self.config.user_data_dir.name}</code>\n"
-                f"• MangaBuff: <code>{self.config.mangabuff_user_data_dir.name}</code>\n\n"
-                "Setup MangaBuff на сервере:\n"
-                "<code>cd /root/remanga_autobattle && source .venv/bin/activate && "
-                "python -m services.mangabuff_service</code>",
+                pulse_text(
+                    remanga_on=self.remanga_state.running,
+                    mb_on=self.mangabuff.stats.running,
+                    chapters=self.mangabuff.stats.chapters_read,
+                    cph=self._chapters_per_hour(),
+                    battles=self.remanga_state.total_battles,
+                    speed=self._speed_label(),
+                    last_mb=self.mangabuff.stats.last_action,
+                ),
                 reply_markup=main_menu_keyboard(),
             )
 
-        @self.dp.message(F.text.in_({"⚔️ Remanga.org", "Remanga.org", "Remanga"}))
+        @self.dp.message(F.text.in_({"⚔️ Remanga", "⚔️ Remanga.org", "Remanga.org", "Remanga"}))
         async def open_remanga(message: Message) -> None:
             self._notify_chat_id = message.chat.id
             await message.answer(
-                "⚔️ <b>Модуль Remanga.org</b>\nАвтобои карточных дуэлей.",
+                remanga_home(
+                    self.remanga_state.running,
+                    self.config.auto_battle_interval_sec,
+                    self.remanga_state.wins,
+                    self.remanga_state.losses,
+                    self.remanga_state.draws,
+                    self.remanga_state.total_battles,
+                ),
                 reply_markup=remanga_menu_keyboard(),
             )
 
-        @self.dp.message(F.text.in_({"📚 MangaBuff.ru", "MangaBuff.ru", "MangaBuff"}))
+        @self.dp.message(F.text.in_({"📚 MangaBuff", "📚 MangaBuff.ru", "MangaBuff.ru", "MangaBuff"}))
         async def open_mangabuff(message: Message) -> None:
             self._notify_chat_id = message.chat.id
-            s = load_settings()
-            delay = f"{self.config.mangabuff_delay_min_sec:.0f}–{self.config.mangabuff_delay_max_sec:.0f}с"
-            tip = ""
-            if not s.mangabuff_setup_done:
-                tip = (
-                    "\n\n⚠️ Сначала сохраните сессию на сервере:\n"
-                    "<code>systemctl stop remanga-autobattle && "
-                    "cd /root/remanga_autobattle && source .venv/bin/activate && "
-                    "python -m services.mangabuff_service && "
-                    "systemctl start remanga-autobattle</code>"
-                )
-            await message.answer(
-                f"📚 <b>Модуль MangaBuff.ru</b>\n"
-                f"Авточтение и фарм наград.\n"
-                f"⏱ Задержка: {delay}\n"
-                f"🔗 URL: <code>{self.config.mangabuff_start_url}</code>"
-                f"{tip}",
-                reply_markup=mangabuff_menu_keyboard(),
-            )
+            await message.answer(self._mb_status_card(), reply_markup=mangabuff_menu_keyboard())
 
-        @self.dp.message(F.text == "◀️ В меню Remanga")
+        @self.dp.message(F.text.in_({"◀️ Remanga", "◀️ В меню Remanga"}))
         async def back_remanga(message: Message, state: FSMContext) -> None:
             await state.clear()
-            await message.answer("Меню Remanga:", reply_markup=remanga_menu_keyboard())
+            await message.answer(
+                remanga_home(
+                    self.remanga_state.running,
+                    self.config.auto_battle_interval_sec,
+                    self.remanga_state.wins,
+                    self.remanga_state.losses,
+                    self.remanga_state.draws,
+                    self.remanga_state.total_battles,
+                ),
+                reply_markup=remanga_menu_keyboard(),
+            )
 
-        @self.dp.message(F.text.in_({"◀️ В меню MangaBuff", "В меню MangaBuff"}))
+        @self.dp.message(F.text.in_({"◀️ MangaBuff", "◀️ В меню MangaBuff", "В меню MangaBuff"}))
         async def back_mb(message: Message, state: FSMContext) -> None:
             await state.clear()
-            await message.answer("Меню MangaBuff:", reply_markup=mangabuff_menu_keyboard())
+            await message.answer(self._mb_status_card(), reply_markup=mangabuff_menu_keyboard())
 
         @self.dp.message(F.text.in_({"❌ Отмена", "Отмена"}))
         async def cancel_any(message: Message, state: FSMContext) -> None:
@@ -416,20 +492,20 @@ class App:
             await message.answer("Отменено.", reply_markup=main_menu_keyboard())
 
         # ===== Remanga =====
-        @self.dp.message(StateFilter(None), F.text.in_({"▶️ Запустить автобой", "Запустить автобой"}))
+        @self.dp.message(StateFilter(None), F.text.in_({"▶️ Автобой", "▶️ Запустить автобой", "Запустить автобой"}))
         @self.dp.message(StateFilter(None), Command("auto"))
         async def remanga_start(message: Message) -> None:
             self._notify_chat_id = message.chat.id
             text = await self.start_remanga_autobattle()
             await message.answer(text, reply_markup=remanga_menu_keyboard())
 
-        @self.dp.message(StateFilter(None), F.text.in_({"⏹ Остановить автобой", "Остановить автобой"}))
+        @self.dp.message(StateFilter(None), F.text.in_({"⏹ Стоп бой", "⏹ Остановить автобой", "Остановить автобой"}))
         @self.dp.message(StateFilter(None), Command("stop"))
         async def remanga_stop(message: Message) -> None:
             text = await self.stop_remanga_autobattle()
             await message.answer(text, reply_markup=remanga_menu_keyboard())
 
-        @self.dp.message(StateFilter(None), F.text.in_({"⚔️ Сделать 1 бой", "Сделать 1 бой"}))
+        @self.dp.message(StateFilter(None), F.text.in_({"⚔️ Один бой", "⚔️ Сделать 1 бой", "Сделать 1 бой"}))
         @self.dp.message(StateFilter(None), Command("battle"))
         async def remanga_one(message: Message) -> None:
             self._notify_chat_id = message.chat.id
@@ -617,7 +693,7 @@ class App:
         # ===== MangaBuff =====
         @self.dp.message(
             StateFilter(None),
-            F.text.in_({"▶️ Запустить фарм", "▶️ Запустить авточтение", "Запустить фарм"}),
+            F.text.in_({"▶️ Фарм", "▶️ Запустить фарм", "▶️ Запустить авточтение", "Запустить фарм"}),
         )
         async def mb_start(message: Message) -> None:
             self._notify_chat_id = message.chat.id
@@ -626,19 +702,27 @@ class App:
 
         @self.dp.message(
             StateFilter(None),
-            F.text.in_({"⏹ Остановить фарм", "⏹ Остановить авточтение", "Остановить фарм"}),
+            F.text.in_({"⏹ Стоп фарм", "⏹ Остановить фарм", "⏹ Остановить авточтение", "Остановить фарм"}),
         )
         async def mb_stop(message: Message) -> None:
             text = await self.stop_mangabuff_read()
             await message.answer(text, reply_markup=mangabuff_menu_keyboard())
 
-        @self.dp.message(StateFilter(None), F.text == "🎁 Собрать награды")
-        async def mb_claim(message: Message) -> None:
-            self._notify_chat_id = message.chat.id
+        @self.dp.message(StateFilter(None), F.text.in_({"⏭ След. тайтл", "След. тайтл"}))
+        async def mb_skip(message: Message) -> None:
+            if not self.mangabuff.stats.running:
+                await message.answer("Фарм не запущен.", reply_markup=mangabuff_menu_keyboard())
+                return
+            self.mangabuff.request_skip_title()
             await message.answer(
-                "⏳ Собираю награды / карты / дейлики...",
+                "⏭ Переключаю на следующий тайтл…",
                 reply_markup=mangabuff_menu_keyboard(),
             )
+
+        @self.dp.message(StateFilter(None), F.text.in_({"🎁 Награды", "🎁 Собрать награды"}))
+        async def mb_claim(message: Message) -> None:
+            self._notify_chat_id = message.chat.id
+            await message.answer("⏳ Собираю награды…", reply_markup=mangabuff_menu_keyboard())
             try:
                 if not self.mangabuff.is_started:
                     await self.mangabuff.start(headless=True)
@@ -651,9 +735,9 @@ class App:
                     reply_markup=mangabuff_menu_keyboard(),
                 )
 
-        @self.dp.message(StateFilter(None), F.text == "🗺 Изучить макеты")
+        @self.dp.message(StateFilter(None), F.text.in_({"🗺 Макеты", "🗺 Изучить макеты"}))
         async def mb_layouts(message: Message) -> None:
-            await message.answer("⏳ Обхожу разделы MangaBuff...", reply_markup=mangabuff_menu_keyboard())
+            await message.answer("⏳ Обхожу разделы…", reply_markup=mangabuff_menu_keyboard())
             try:
                 if not self.mangabuff.is_started:
                     await self.mangabuff.start(headless=True)
@@ -663,12 +747,11 @@ class App:
                     reply_markup=mangabuff_menu_keyboard(),
                 )
             except Exception as exc:  # noqa: BLE001
-                logger.exception("mangabuff layouts")
                 await message.answer(f"⚠️ {exc}", reply_markup=mangabuff_menu_keyboard())
 
-        @self.dp.message(StateFilter(None), F.text == "🔐 Логин MangaBuff")
+        @self.dp.message(StateFilter(None), F.text.in_({"🔐 Сессия", "🔐 Логин MangaBuff"}))
         async def mb_login(message: Message) -> None:
-            await message.answer("⏳ Логин MangaBuff...", reply_markup=mangabuff_menu_keyboard())
+            await message.answer("⏳ Проверяю сессию…", reply_markup=mangabuff_menu_keyboard())
             try:
                 if not self.mangabuff.is_started:
                     await self.mangabuff.start(headless=True)
@@ -676,7 +759,7 @@ class App:
                 if ok:
                     update_settings(mangabuff_setup_done=True)
                 await message.answer(
-                    "✅ Сессия MangaBuff активна" if ok else "⚠️ Логин не удался — проверьте .env",
+                    "✅ Сессия MangaBuff активна" if ok else "⚠️ Логин не удался",
                     reply_markup=mangabuff_menu_keyboard(),
                 )
             except Exception as exc:  # noqa: BLE001
@@ -684,65 +767,112 @@ class App:
 
         @self.dp.message(StateFilter(None), F.text == "📊 Статус MangaBuff")
         async def mb_status(message: Message) -> None:
-            # подтянуть с диска, если фарм ещё не писал в память этого процесса
-            try:
-                disk = self.mangabuff._load_stats()
-                live = self.mangabuff.stats
-                # показываем live, но если диск больше (после рестарта) — мержим максимумы
-                if disk.chapters_read > live.chapters_read:
-                    live.chapters_read = disk.chapters_read
-                    live.pages_scrolled = max(live.pages_scrolled, disk.pages_scrolled)
-                    live.rewards_claimed = max(live.rewards_claimed, disk.rewards_claimed)
-                    live.cards_claimed = max(live.cards_claimed, disk.cards_claimed)
-                    live.comments_posted = max(live.comments_posted, disk.comments_posted)
-                    live.titles_visited = max(live.titles_visited, disk.titles_visited)
-                    live.layouts_visited = max(live.layouts_visited, disk.layouts_visited)
-                    if disk.last_url:
-                        live.last_url = disk.last_url
-                    if disk.last_action:
-                        live.last_action = disk.last_action
-                    if disk.last_at:
-                        live.last_at = disk.last_at
-            except Exception:  # noqa: BLE001
-                pass
-            await message.answer(
-                self.mangabuff.stats.to_telegram(
-                    (self.config.mangabuff_delay_min_sec, self.config.mangabuff_delay_max_sec)
-                ),
-                reply_markup=mangabuff_menu_keyboard(),
-            )
+            await message.answer(self._mb_status_card(), reply_markup=mangabuff_menu_keyboard())
 
-        @self.dp.message(StateFilter(None), F.text == "⏱ Настройки задержки")
+        @self.dp.message(StateFilter(None), F.text.in_({"🎚 Темп чтения", "⏱ Настройки задержки"}))
         async def mb_delay_menu(message: Message) -> None:
+            s = load_settings()
             await message.answer(
-                f"Текущая задержка чтения: "
-                f"<b>{self.config.mangabuff_delay_min_sec:.0f}–"
-                f"{self.config.mangabuff_delay_max_sec:.0f}</b> сек\n"
-                "Выберите пресет:",
+                speed_menu_text(
+                    self.config.mangabuff_delay_min_sec,
+                    self.config.mangabuff_delay_max_sec,
+                    s.mangabuff_speed_preset or "",
+                ),
                 reply_markup=delay_keyboard(),
             )
 
-        @self.dp.message(StateFilter(None), F.text == "⚡ Быстро 5–8с")
+        @self.dp.message(StateFilter(None), F.text == "⚡ Турбо")
+        async def delay_turbo(message: Message) -> None:
+            await self._apply_speed_preset(message, "turbo")
+
+        @self.dp.message(StateFilter(None), F.text == "🏃 Быстрый")
         async def delay_fast(message: Message) -> None:
-            await self._set_mb_delay(message, 5, 8)
+            await self._apply_speed_preset(message, "fast")
 
-        @self.dp.message(StateFilter(None), F.text == "📖 Норма 5–15с")
+        @self.dp.message(StateFilter(None), F.text == "✨ Живой")
+        async def delay_lively(message: Message) -> None:
+            await self._apply_speed_preset(message, "lively")
+
+        @self.dp.message(StateFilter(None), F.text == "📖 Норма")
         async def delay_norm(message: Message) -> None:
-            await self._set_mb_delay(message, 5, 15)
+            await self._apply_speed_preset(message, "normal")
 
-        @self.dp.message(StateFilter(None), F.text == "🐢 Медленно 10–20с")
+        @self.dp.message(StateFilter(None), F.text == "🐢 Неспешно")
         async def delay_slow(message: Message) -> None:
-            await self._set_mb_delay(message, 10, 20)
+            await self._apply_speed_preset(message, "slow")
 
-        @self.dp.message(StateFilter(None), F.text == "🧘 Очень медленно 15–30с")
-        async def delay_vslow(message: Message) -> None:
-            await self._set_mb_delay(message, 15, 30)
+        @self.dp.message(StateFilter(None), F.text == "🕯 Медленно")
+        async def delay_crawl(message: Message) -> None:
+            await self._apply_speed_preset(message, "crawl")
 
-        @self.dp.message(StateFilter(None), F.text == "🔗 URL чтения")
+        @self.dp.message(StateFilter(None), F.text == "🎛 Своя скорость")
+        async def delay_custom_ask(message: Message, state: FSMContext) -> None:
+            await state.set_state(SettingsStates.waiting_custom_speed)
+            await message.answer(
+                "Введите две паузы в секундах через пробел или дефис.\n"
+                "Пример: <code>2.5 5</code> или <code>3-6</code>\n"
+                f"Сейчас: <code>{self.config.mangabuff_delay_min_sec:.1f}–"
+                f"{self.config.mangabuff_delay_max_sec:.1f}</code>",
+                reply_markup=cancel_keyboard(),
+            )
+
+        @self.dp.message(SettingsStates.waiting_custom_speed)
+        async def delay_custom_set(message: Message, state: FSMContext) -> None:
+            raw = (message.text or "").strip().replace(",", ".")
+            parts = raw.replace("–", "-").replace("—", "-").replace(" ", "-").split("-")
+            parts = [p for p in parts if p]
+            try:
+                if len(parts) == 1:
+                    dmin = dmax = float(parts[0])
+                else:
+                    dmin, dmax = float(parts[0]), float(parts[1])
+            except ValueError:
+                await message.answer("Формат: <code>2.8 5.5</code>")
+                return
+            if dmin < 0.8 or dmax < dmin or dmax > 60:
+                await message.answer("Диапазон: от 0.8 до 60 сек, min ≤ max")
+                return
+            await state.clear()
+            await self._set_mb_delay(message, dmin, dmax, preset_key="custom")
+
+        @self.dp.message(StateFilter(None), F.text == "📡 Вехи")
+        async def mb_milestones(message: Message, state: FSMContext) -> None:
+            s = load_settings()
+            flag = "вкл" if s.mangabuff_notify_milestones else "выкл"
+            await state.set_state(SettingsStates.waiting_milestone_every)
+            await message.answer(
+                f"<b>📡 Вехи чтения</b>\n"
+                f"Сейчас: <b>{flag}</b>, каждые <b>{s.mangabuff_milestone_every}</b> глав\n\n"
+                f"Введите число глав между отчётами\n"
+                f"<code>0</code> — выключить уведомления",
+                reply_markup=cancel_keyboard(),
+            )
+
+        @self.dp.message(SettingsStates.waiting_milestone_every)
+        async def mb_milestones_set(message: Message, state: FSMContext) -> None:
+            try:
+                n = int((message.text or "").strip())
+            except ValueError:
+                await message.answer("Целое число, например 10")
+                return
+            if n < 0:
+                await message.answer("≥ 0")
+                return
+            update_settings(
+                mangabuff_milestone_every=n,
+                mangabuff_notify_milestones=n > 0,
+            )
+            await state.clear()
+            await message.answer(
+                "📡 Вехи выключены" if n == 0 else f"📡 Буду писать каждые <b>{n}</b> глав",
+                reply_markup=mangabuff_menu_keyboard(),
+            )
+
+        @self.dp.message(StateFilter(None), F.text.in_({"🔗 URL", "🔗 URL чтения"}))
         async def mb_url_ask(message: Message, state: FSMContext) -> None:
             await state.set_state(SettingsStates.waiting_mangabuff_url)
             await message.answer(
-                "Отправьте URL главы/тайтла MangaBuff для авточтения:\n"
+                "URL главы или тайтла MangaBuff:\n"
                 f"Сейчас: <code>{self.config.mangabuff_start_url}</code>",
                 reply_markup=cancel_keyboard(),
             )
@@ -757,15 +887,87 @@ class App:
             self.mangabuff.start_url = text
             update_settings(mangabuff_start_url=text)
             await state.clear()
-            await message.answer(f"✅ URL чтения: <code>{text}</code>", reply_markup=mangabuff_menu_keyboard())
+            await message.answer(f"✅ URL: <code>{text}</code>", reply_markup=mangabuff_menu_keyboard())
 
-    async def _set_mb_delay(self, message: Message, dmin: float, dmax: float) -> None:
+    def _sync_mb_stats_from_disk(self) -> None:
+        try:
+            disk = self.mangabuff._load_stats()
+            live = self.mangabuff.stats
+            if disk.chapters_read > live.chapters_read:
+                live.chapters_read = disk.chapters_read
+                live.pages_scrolled = max(live.pages_scrolled, disk.pages_scrolled)
+                live.rewards_claimed = max(live.rewards_claimed, disk.rewards_claimed)
+                live.cards_claimed = max(live.cards_claimed, disk.cards_claimed)
+                live.comments_posted = max(live.comments_posted, disk.comments_posted)
+                live.titles_visited = max(live.titles_visited, disk.titles_visited)
+                live.layouts_visited = max(live.layouts_visited, disk.layouts_visited)
+                if disk.last_url:
+                    live.last_url = disk.last_url
+                if disk.last_action:
+                    live.last_action = disk.last_action
+                if disk.last_at:
+                    live.last_at = disk.last_at
+            # running берём из live-процесса
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _mb_status_card(self) -> str:
+        self._sync_mb_stats_from_disk()
+        s = load_settings()
+        preset = SPEED_PRESETS.get(s.mangabuff_speed_preset or "")
+        title = preset.title if preset else "Своя"
+        st = self.mangabuff.stats
+        return mangabuff_home(
+            running=st.running,
+            dmin=self.config.mangabuff_delay_min_sec,
+            dmax=self.config.mangabuff_delay_max_sec,
+            chapters=st.chapters_read,
+            pages=st.pages_scrolled,
+            titles=st.titles_visited,
+            rewards=st.rewards_claimed,
+            cards=st.cards_claimed,
+            comments=st.comments_posted,
+            cph=self._chapters_per_hour(),
+            last_action=st.last_action,
+            last_url=st.last_url,
+            night=st.night_break_until,
+            preset_title=title,
+        )
+
+    async def _apply_speed_preset(self, message: Message, key: str) -> None:
+        preset = SPEED_PRESETS[key]
+        await self._set_mb_delay(
+            message,
+            preset.delay_min,
+            preset.delay_max,
+            preset_key=key,
+            steps_min=preset.steps_min,
+            steps_max=preset.steps_max,
+        )
+
+    async def _set_mb_delay(
+        self,
+        message: Message,
+        dmin: float,
+        dmax: float,
+        preset_key: str = "custom",
+        steps_min: int = 8,
+        steps_max: int = 12,
+    ) -> None:
         self.config.mangabuff_delay_min_sec = dmin
         self.config.mangabuff_delay_max_sec = dmax
-        self.mangabuff.set_delay(dmin, dmax)
-        update_settings(mangabuff_delay_min_sec=dmin, mangabuff_delay_max_sec=dmax)
+        self.mangabuff.set_delay(dmin, dmax, steps_min, steps_max)
+        update_settings(
+            mangabuff_delay_min_sec=dmin,
+            mangabuff_delay_max_sec=dmax,
+            mangabuff_speed_preset=preset_key,
+        )
+        label = SPEED_PRESETS[preset_key].title if preset_key in SPEED_PRESETS else "Своя"
         await message.answer(
-            f"✅ Задержка чтения: <b>{dmin:.0f}–{dmax:.0f}</b> сек",
+            f"🎚 Темп: <b>{label}</b>\n"
+            f"Пауза на шаг: <code>{dmin:.1f}–{dmax:.1f}</code> сек\n"
+            f"Шагов на главу: <code>{steps_min}–{steps_max}</code>\n"
+            f"<i>Применяется сразу, без перезапуска фарма.</i>",
             reply_markup=mangabuff_menu_keyboard(),
         )
 
@@ -903,16 +1105,16 @@ class App:
 
         self.scheduler.start()
         self._mb_task = asyncio.create_task(_runner(), name=JOB_MANGABUFF_READ)
+        self._mb_session_started_at = datetime.now()
         update_settings(mangabuff_setup_done=True)
         return (
-            "✅ Фарм MangaBuff <b>запущен</b>.\n"
-            "• популярные тайтлы из каталога\n"
-            "• чтение глав + сбор наград/карт\n"
-            "• обход макетов и ивентов\n"
-            "• ночной перерыв 01:00–05:00 МСК (4ч)\n"
-            f"⏱ Задержка: {self.config.mangabuff_delay_min_sec:.0f}–"
-            f"{self.config.mangabuff_delay_max_sec:.0f} сек\n"
-            "Остановка — «Остановить фарм»."
+            f"<b>📚 Фарм запущен</b>\n"
+            f"────────────────────\n"
+            f"• топ тайтлы из каталога\n"
+            f"• чтение · награды · ивенты\n"
+            f"• ночь 01:00–05:00 МСК\n"
+            f"🎚 Темп: <b>{self._speed_label()}</b>\n"
+            f"Остановка — «Стоп фарм» · пропуск — «След. тайтл»."
         )
 
     async def stop_mangabuff_read(self) -> str:
@@ -926,16 +1128,83 @@ class App:
                 pass
         self._mb_task = None
         self.mangabuff.stats.running = False
-        return "⏹ Фарм MangaBuff <b>остановлен</b>."
+        st = self.mangabuff.stats
+        return (
+            f"<b>⏹ Фарм остановлен</b>\n"
+            f"────────────────────\n"
+            f"📖 Глав: <b>{st.chapters_read}</b>\n"
+            f"📈 Темп: <b>{self._chapters_per_hour():.1f}</b> гл/час"
+        )
 
     async def _mb_progress(self, stats) -> None:
-        # Тихие промежуточные апдейты — только в лог; статус по кнопке
         logger.info(
             "MangaBuff progress: chapters=%s pages=%s rewards=%s",
             stats.chapters_read,
             stats.pages_scrolled,
             stats.rewards_claimed,
         )
+        s = load_settings()
+        every = int(s.mangabuff_milestone_every or 0)
+        if (
+            not s.mangabuff_notify_milestones
+            or every <= 0
+            or self._notify_chat_id is None
+            or stats.chapters_read <= 0
+            or stats.chapters_read % every != 0
+        ):
+            return
+        try:
+            await self.bot.send_message(
+                self._notify_chat_id,
+                f"<b>📡 Веха · {stats.chapters_read} глав</b>\n"
+                f"────────────────────\n"
+                f"📈 {self._chapters_per_hour():.1f} гл/час\n"
+                f"🏷 Тайтлов: {stats.titles_visited}\n"
+                f"🎁 Наград: {stats.rewards_claimed} · 🃏 {stats.cards_claimed}\n"
+                f"🎚 {self._speed_label()}\n"
+                f"🔗 <code>{(stats.last_url or '—')[:100]}</code>",
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("milestone notify: %s", exc)
+
+    async def _setup_bot_profile(self) -> None:
+        """Название, описание и команды бота в Telegram."""
+        try:
+            await self.bot.set_my_name(name=BRAND)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("set_my_name: %s", exc)
+        try:
+            await self.bot.set_my_short_description(
+                short_description=f"{BRAND_LINE} · автобои и авточтение"
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("set_my_short_description: %s", exc)
+        try:
+            await self.bot.set_my_description(
+                description=(
+                    f"{BRAND} — личный автопилот для Remanga и MangaBuff.\n\n"
+                    "⚔️ Remanga: автобои murim-cards, статус, рейтинг, тонкие уведомления.\n"
+                    "📚 MangaBuff: фарм популярных тайтлов, награды, карты, макеты, "
+                    "редкие комментарии, ночной режим.\n\n"
+                    "Темп чтения настраивается пресетами. Сессии браузера раздельные. "
+                    "Интерфейс — чистый, статус — всегда под рукой."
+                )
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("set_my_description: %s", exc)
+        try:
+            await self.bot.set_my_commands(
+                [
+                    BotCommand(command="start", description="Домой · панель Orion"),
+                    BotCommand(command="pulse", description="Пульс обоих модулей"),
+                    BotCommand(command="menu", description="Главное меню"),
+                    BotCommand(command="auto", description="Remanga: автобой"),
+                    BotCommand(command="battle", description="Remanga: один бой"),
+                    BotCommand(command="help", description="О боте"),
+                ]
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("set_my_commands: %s", exc)
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -943,6 +1212,7 @@ class App:
 
     async def run(self) -> None:
         logger.info("Старт бота (admin=%s)", self.config.telegram_admin_id or "pending")
+        await self._setup_bot_profile()
         # Soft-start браузеров — падение одного не валит polling
         try:
             await self.remanga.start(headless=True)
@@ -953,12 +1223,25 @@ class App:
                 await self.mangabuff.start(headless=True)
                 ok = await self.mangabuff.ensure_login()
                 logger.info("MangaBuff login on boot: %s", ok)
-                # автозапуск фарма после успешного логина
                 if ok:
                     asyncio.create_task(self.start_mangabuff_read())
                     logger.info("MangaBuff farm auto-started")
         except Exception as exc:  # noqa: BLE001
             logger.warning("MangaBuff browser: %s", exc)
+        # Если в settings ещё старые медленные дефолты 5–15 — поднять до «Живой»
+        s = load_settings()
+        if (
+            abs(s.mangabuff_delay_min_sec - 5.0) < 0.01
+            and abs(s.mangabuff_delay_max_sec - 15.0) < 0.01
+        ) or not s.mangabuff_speed_preset:
+            preset = SPEED_PRESETS[DEFAULT_SPEED_KEY]
+            update_settings(
+                mangabuff_delay_min_sec=preset.delay_min,
+                mangabuff_delay_max_sec=preset.delay_max,
+                mangabuff_speed_preset=preset.key,
+            )
+            self._apply_speed_from_settings()
+            logger.info("MangaBuff speed defaulted to Живой 2.8–5.5с")
         self.scheduler.start()
         try:
             await self.dp.start_polling(self.bot, handle_signals=True)

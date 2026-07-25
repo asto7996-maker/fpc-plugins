@@ -187,6 +187,9 @@ class MangaBuffService:
         self.stats = self._load_stats()
         self._chapters_since_comment = 0
         self._read_urls: set[str] = set()
+        self._skip_title = asyncio.Event()
+        self.steps_min = 8
+        self.steps_max = 12
 
     def _load_stats(self) -> MangaBuffStats:
         if not STATS_PATH.exists():
@@ -283,9 +286,22 @@ class MangaBuffService:
         self.stats.running = False
         self.stats.touch("стоп запрошен")
 
-    def set_delay(self, delay_min: float, delay_max: float) -> None:
-        self.delay_min_sec = max(1.0, float(delay_min))
+    def request_skip_title(self) -> None:
+        """Пропустить текущий тайтл и взять следующий из каталога."""
+        self._skip_title.set()
+        self.stats.touch("пропуск тайтла запрошен")
+
+    def set_delay(
+        self,
+        delay_min: float,
+        delay_max: float,
+        steps_min: int = 8,
+        steps_max: int = 12,
+    ) -> None:
+        self.delay_min_sec = max(0.8, float(delay_min))
         self.delay_max_sec = max(self.delay_min_sec, float(delay_max))
+        self.steps_min = max(4, int(steps_min))
+        self.steps_max = max(self.steps_min, int(steps_max))
 
     async def run_setup(self) -> None:
         await self.start(headless=False)
@@ -732,17 +748,18 @@ class MangaBuffService:
         except Exception:  # noqa: BLE001
             total_height, viewport = 4000, 900
 
-        # 8–14 шагов на главу: достаточно для «прочтения», без зависаний
-        max_steps = random.randint(8, 14)
+        max_steps = random.randint(self.steps_min, self.steps_max)
         position = 0
         logger.info(
-            "MangaBuff scroll start height=%s viewport=%s max_steps=%s",
+            "MangaBuff scroll start height=%s viewport=%s max_steps=%s delay=%.1f-%.1f",
             total_height,
             viewport,
             max_steps,
+            self.delay_min_sec,
+            self.delay_max_sec,
         )
         while position + viewport < total_height - 40 and steps < max_steps:
-            if self._stop_flag.is_set():
+            if self._stop_flag.is_set() or self._skip_title.is_set():
                 break
             chunk = int(viewport * random.uniform(0.65, 0.95))
             target = min(position + chunk, int(total_height))
@@ -751,11 +768,10 @@ class MangaBuffService:
             steps += 1
             self.stats.pages_scrolled += 1
 
-            # 3–8 сек на шаг (быстрее прежних 5–15, но всё ещё «живо»)
-            delay = random.uniform(
-                max(2.5, self.delay_min_sec * 0.5),
-                max(5.0, min(8.0, self.delay_max_sec * 0.55)),
-            )
+            # Пауза строго из настроек скорости (+ лёгкий jitter)
+            lo = self.delay_min_sec
+            hi = self.delay_max_sec
+            delay = random.uniform(lo, hi) * random.uniform(0.92, 1.08)
             try:
                 await asyncio.wait_for(self._stop_flag.wait(), timeout=delay)
                 break
@@ -1033,12 +1049,14 @@ class MangaBuffService:
 
                     chapters_this_title = 0
                     max_per_title = random.randint(40, 120)
+                    self._skip_title.clear()
                     while (
                         not self._stop_flag.is_set()
+                        and not self._skip_title.is_set()
                         and chapters_this_title < max_per_title
                     ):
                         await self._await_night_break_if_needed()
-                        if self._stop_flag.is_set():
+                        if self._stop_flag.is_set() or self._skip_title.is_set():
                             break
 
                         url = page.url.split("?")[0]
