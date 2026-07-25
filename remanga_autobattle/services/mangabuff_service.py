@@ -732,26 +732,30 @@ class MangaBuffService:
         except Exception:  # noqa: BLE001
             total_height, viewport = 4000, 900
 
-        # лимит шагов — чтобы не зависнуть на бесконечном lazy-load
-        max_steps = 25
+        # 8–14 шагов на главу: достаточно для «прочтения», без зависаний
+        max_steps = random.randint(8, 14)
         position = 0
+        logger.info(
+            "MangaBuff scroll start height=%s viewport=%s max_steps=%s",
+            total_height,
+            viewport,
+            max_steps,
+        )
         while position + viewport < total_height - 40 and steps < max_steps:
             if self._stop_flag.is_set():
                 break
-            chunk = int(viewport * random.uniform(0.55, 0.9))
-            target = min(position + chunk, total_height)
+            chunk = int(viewport * random.uniform(0.65, 0.95))
+            target = min(position + chunk, int(total_height))
             await self._animate_scroll(page, position, target)
             position = target
             steps += 1
             self.stats.pages_scrolled += 1
 
-            # короче пауза на шаге, полная «человеческая» — раз в 2–3 шага
-            delay = random.uniform(self.delay_min_sec, self.delay_max_sec)
-            if steps % 2 == 0:
-                delay = random.uniform(
-                    max(2.0, self.delay_min_sec * 0.6),
-                    max(4.0, self.delay_max_sec * 0.7),
-                )
+            # 3–8 сек на шаг (быстрее прежних 5–15, но всё ещё «живо»)
+            delay = random.uniform(
+                max(2.5, self.delay_min_sec * 0.5),
+                max(5.0, min(8.0, self.delay_max_sec * 0.55)),
+            )
             try:
                 await asyncio.wait_for(self._stop_flag.wait(), timeout=delay)
                 break
@@ -759,22 +763,24 @@ class MangaBuffService:
                 pass
 
             try:
-                total_height = await page.evaluate(
-                    "() => document.body.scrollHeight || 4000"
-                )
+                new_h = await page.evaluate("() => document.body.scrollHeight || 4000")
+                # не даём lazy-load бесконечно раздувать страницу
+                if new_h > total_height:
+                    total_height = min(new_h, total_height + viewport * 2)
             except Exception:  # noqa: BLE001
                 pass
-
-            if steps % 3 == 0:
-                c, cards, _ = await self._click_reward_buttons(page)
-                self.stats.rewards_claimed += c
-                self.stats.cards_claimed += cards
 
         try:
             await page.evaluate(
                 "() => window.scrollTo({top: document.body.scrollHeight, behavior: 'smooth'})"
             )
-            await self._human_pause(0.6, 1.2)
+            await self._human_pause(0.5, 1.0)
+            # карты/награды в конце главы — с таймаутом
+            c, cards, _ = await asyncio.wait_for(
+                self._click_reward_buttons(page), timeout=10
+            )
+            self.stats.rewards_claimed += c
+            self.stats.cards_claimed += cards
         except Exception:  # noqa: BLE001
             pass
         return steps
@@ -1049,10 +1055,20 @@ class MangaBuffService:
                         self._read_urls.add(url)
                         logger.info("MangaBuff scroll chapter %s", url)
 
-                        await self._dismiss_overlays(page)
-                        c, cards, _ = await self._click_reward_buttons(page)
-                        self.stats.rewards_claimed += c
-                        self.stats.cards_claimed += cards
+                        try:
+                            await asyncio.wait_for(
+                                self._dismiss_overlays(page), timeout=8
+                            )
+                        except Exception:  # noqa: BLE001
+                            pass
+                        try:
+                            c, cards, _ = await asyncio.wait_for(
+                                self._click_reward_buttons(page), timeout=12
+                            )
+                            self.stats.rewards_claimed += c
+                            self.stats.cards_claimed += cards
+                        except Exception:  # noqa: BLE001
+                            pass
 
                         steps = await self._smooth_read_chapter(page)
                         self.stats.chapters_read += 1
