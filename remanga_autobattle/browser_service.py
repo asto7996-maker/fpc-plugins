@@ -121,8 +121,10 @@ class BrowserService:
         r"(награда|получено|опыт|монет|карт|фрагмент)[^\n]{0,60}",
         re.IGNORECASE,
     )
+    # Не используем голое «энергия» — оно всегда есть в шапке murim-cards
     COOLDOWN_MARKERS = re.compile(
-        r"энерги|кулдаун|перезаряд|подождите|недостаточно|восстанавлив|cooldown",
+        r"недостаточно\s*энерг|энерги[яи]\s*недостаточно|кулдаун|перезаряд|"
+        r"подождите|восстанавлив|cooldown|нет\s*энерг",
         re.IGNORECASE,
     )
 
@@ -401,6 +403,46 @@ class BrowserService:
             logger.info("Итог боя: %s — %s", result.outcome.value, result.message)
             return result
 
+    async def _open_duel_screen(self, page: Page) -> bool:
+        """Кликнуть пункт меню «ДУЭЛЬ» / 鬥 и дождаться экрана подготовки."""
+        # Уже на дуэли?
+        try:
+            body = (await page.locator("body").inner_text(timeout=3_000) or "").lower()
+            if "подготовка к дуэли" in body or "готов ли ты" in body:
+                return True
+        except Exception:  # noqa: BLE001
+            pass
+
+        menu_candidates = [
+            page.get_by_role("link", name=re.compile(r"дуэль", re.I)),
+            page.get_by_role("button", name=re.compile(r"дуэль", re.I)),
+            page.get_by_text(re.compile(r"^\s*дуэль\s*$", re.I)),
+            page.get_by_text("ДУЭЛЬ", exact=True),
+            page.locator("text=鬥"),
+            page.locator("[href*='duel']"),
+            page.locator("a:has-text('ДУЭЛЬ'), button:has-text('ДУЭЛЬ'), div:has-text('ДУЭЛЬ')"),
+        ]
+        for loc in menu_candidates:
+            try:
+                count = await loc.count()
+                for i in range(min(count, 6)):
+                    item = loc.nth(i)
+                    if not await item.is_visible():
+                        continue
+                    txt = ((await item.inner_text(timeout=800)) or "").strip()
+                    # Пункт меню короткий; длинные блоки пропускаем
+                    if len(txt) > 40 and "дуэль" not in txt.lower():
+                        continue
+                    await item.click(timeout=5_000, force=True)
+                    await asyncio.sleep(2.0)
+                    body = (await page.locator("body").inner_text(timeout=3_000) or "").lower()
+                    if "подготовка к дуэли" in body or "готов ли ты" in body or "в бой" in body:
+                        logger.info("Открыт экран дуэли через меню (%r)", txt[:30])
+                        return True
+            except Exception:  # noqa: BLE001
+                continue
+        return False
+
     async def _dismiss_overlays(self, page: Page) -> None:
         """Закрыть Premium/модалки, мешающие клику и чтению результата."""
         # Escape
@@ -657,32 +699,28 @@ class BrowserService:
         await page.goto("https://remanga.org/", wait_until="domcontentloaded", timeout=self.config.selector_timeout_ms)
         await self._inject_saved_token(page)
 
-        url = self.config.battle_url.strip()
-        # Прямой переход (в т.ч. с #/duel). Затем форсируем hash, если SPA ушла на /map.
-        await page.goto(url, wait_until="domcontentloaded", timeout=self.config.selector_timeout_ms)
+        # База murim-cards (без hash — SPA сама решает; в дуэль зайдём кликом по меню)
+        base_url = self.config.battle_url.strip().split("#", 1)[0] or "https://remanga.org/murim-cards"
+        await page.goto(base_url, wait_until="domcontentloaded", timeout=self.config.selector_timeout_ms)
         await self._inject_saved_token(page)
         await asyncio.sleep(2.0)
+        await self._dismiss_overlays(page)
 
-        if "#" in url:
-            _, _, fragment = url.partition("#")
-            want = fragment if fragment.startswith("/") else f"/{fragment}"
-            # Повторно выставляем hash (murim-cards иногда редиректит на #/map)
-            for _ in range(3):
-                current_hash = await page.evaluate("() => window.location.hash || ''")
-                if want in current_hash or current_hash.lstrip("#") == want.lstrip("#"):
-                    break
-                await page.evaluate("(frag) => { window.location.hash = frag; }", want)
-                await asyncio.sleep(1.5)
+        # Переход в раздел «ДУЭЛЬ» через нижнее/боковое меню (надёжнее hash)
+        opened = await self._open_duel_screen(page)
+        if not opened:
+            # Fallback: hash #/duel
+            await page.evaluate("() => { window.location.hash = '/duel'; }")
+            await asyncio.sleep(2.0)
 
-        # Ждём экран дуэли / кнопку «В БОЙ»
         try:
             await page.wait_for_selector(
-                "text=/в\\s*бой|подготовка к дуэли|戰/i",
+                "text=/в\\s*бой|подготовка к дуэли|готов ли ты/i",
                 timeout=min(self.config.selector_timeout_ms, 20_000),
                 state="visible",
             )
         except Exception:  # noqa: BLE001
-            logger.warning("Экран дуэли не появился сразу, продолжаю поиск кнопки...")
+            logger.warning("Экран дуэли не появился сразу (hash=%s)", await page.evaluate("() => location.hash"))
 
         try:
             await page.wait_for_load_state("load", timeout=8_000)
