@@ -345,6 +345,7 @@ class MangaBuffService:
             ".update-toast__close",
             ".tg-prompt__close",
             ".modal__close",
+            "button.close-adult-modal-btn",
             "button:has-text('Подтвердить')",
             "button:has-text('Мне 18')",
             "button:has-text('Понятно')",
@@ -356,9 +357,9 @@ class MangaBuffService:
                 n = await loc.count()
                 for i in range(min(n, 3)):
                     btn = loc.nth(i)
-                    if await btn.is_visible():
+                    if await btn.is_visible(timeout=800):
                         await btn.click(force=True, timeout=1500)
-                        await self._human_pause(0.3, 0.8)
+                        await self._human_pause(0.2, 0.6)
             except Exception:  # noqa: BLE001
                 continue
 
@@ -525,7 +526,7 @@ class MangaBuffService:
             for i in range(min(count, 4)):
                 btn = loc.nth(i)
                 try:
-                    if not await btn.is_visible():
+                    if not await btn.is_visible(timeout=700):
                         continue
                     label = ((await btn.inner_text(timeout=800)) or text).strip()
                     # не жмём «в бой» без колоды слишком агрессивно
@@ -560,20 +561,22 @@ class MangaBuffService:
             labels = []
 
         for item in labels:
-            text = item.get("t") or ""
+            text = (item.get("t") or "").strip()
+            if not text or len(text) > 40:
+                continue
             try:
-                loc = page.get_by_role("button", name=text).first
-                if await loc.count() == 0:
-                    loc = page.get_by_text(text, exact=True).first
-                if not await loc.is_visible():
+                loc = page.locator("button, a.button").filter(
+                    has_text=re.compile(f"^{re.escape(text)}$", re.I)
+                ).first
+                if not await loc.is_visible(timeout=700):
                     continue
-                await loc.click(force=True, timeout=2500)
+                await loc.click(force=True, timeout=2000)
                 claimed += 1
                 low = text.lower()
                 if "карт" in low or "пак" in low or "card" in low:
                     cards += 1
                 details.append(f"клик: {text[:60]}")
-                await self._human_pause(0.5, 1.2)
+                await self._human_pause(0.4, 1.0)
                 await self._dismiss_overlays(page)
             except Exception:  # noqa: BLE001
                 continue
@@ -581,19 +584,18 @@ class MangaBuffService:
         for sel in (
             ".close-adult-modal-btn",
             ".modal button.button--primary",
-            "[class*='reward'] button",
         ):
             try:
                 loc = page.locator(sel)
                 n = min(await loc.count(), 2)
                 for i in range(n):
                     el = loc.nth(i)
-                    if await el.is_visible():
+                    if await el.is_visible(timeout=700):
                         txt = ((await el.inner_text(timeout=400)) or "modal").strip()[:50]
                         await el.click(force=True, timeout=1500)
                         claimed += 1
                         details.append(f"modal: {txt}")
-                        await self._human_pause(0.4, 1.0)
+                        await self._human_pause(0.3, 0.8)
             except Exception:  # noqa: BLE001
                 continue
         return claimed, cards, details
@@ -725,23 +727,31 @@ class MangaBuffService:
     async def _smooth_read_chapter(self, page: Page) -> int:
         steps = 0
         try:
-            total_height = await page.evaluate("() => document.body.scrollHeight")
-            viewport = await page.evaluate("() => window.innerHeight")
+            total_height = await page.evaluate("() => document.body.scrollHeight || 4000")
+            viewport = await page.evaluate("() => window.innerHeight || 900")
         except Exception:  # noqa: BLE001
             total_height, viewport = 4000, 900
 
+        # лимит шагов — чтобы не зависнуть на бесконечном lazy-load
+        max_steps = 25
         position = 0
-        while position + viewport < total_height - 40:
+        while position + viewport < total_height - 40 and steps < max_steps:
             if self._stop_flag.is_set():
                 break
-            chunk = int(viewport * random.uniform(0.5, 0.85))
+            chunk = int(viewport * random.uniform(0.55, 0.9))
             target = min(position + chunk, total_height)
             await self._animate_scroll(page, position, target)
             position = target
             steps += 1
             self.stats.pages_scrolled += 1
 
+            # короче пауза на шаге, полная «человеческая» — раз в 2–3 шага
             delay = random.uniform(self.delay_min_sec, self.delay_max_sec)
+            if steps % 2 == 0:
+                delay = random.uniform(
+                    max(2.0, self.delay_min_sec * 0.6),
+                    max(4.0, self.delay_max_sec * 0.7),
+                )
             try:
                 await asyncio.wait_for(self._stop_flag.wait(), timeout=delay)
                 break
@@ -749,19 +759,22 @@ class MangaBuffService:
                 pass
 
             try:
-                total_height = await page.evaluate("() => document.body.scrollHeight")
+                total_height = await page.evaluate(
+                    "() => document.body.scrollHeight || 4000"
+                )
             except Exception:  # noqa: BLE001
                 pass
 
-            c, cards, _ = await self._click_reward_buttons(page)
-            self.stats.rewards_claimed += c
-            self.stats.cards_claimed += cards
+            if steps % 3 == 0:
+                c, cards, _ = await self._click_reward_buttons(page)
+                self.stats.rewards_claimed += c
+                self.stats.cards_claimed += cards
 
         try:
             await page.evaluate(
                 "() => window.scrollTo({top: document.body.scrollHeight, behavior: 'smooth'})"
             )
-            await self._human_pause(0.8, 1.6)
+            await self._human_pause(0.6, 1.2)
         except Exception:  # noqa: BLE001
             pass
         return steps
@@ -795,10 +808,10 @@ class MangaBuffService:
             for i in range(min(count, 4)):
                 el = loc.nth(i)
                 try:
-                    if not await el.is_visible():
-                        continue
-                    href = await el.get_attribute("href")
-                    await el.click(force=True)
+                        if not await el.is_visible(timeout=700):
+                            continue
+                        href = await el.get_attribute("href")
+                        await el.click(force=True)
                     await self._human_pause(1.8, 3.2)
                     await self._dismiss_overlays(page)
                     if href or re.search(r"/manga/[^/]+/\d+/\d+", page.url):
@@ -1032,17 +1045,24 @@ class MangaBuffService:
                                 break
                             continue
                         self._read_urls.add(url)
+                        logger.info("MangaBuff scroll chapter %s", url)
 
                         await self._dismiss_overlays(page)
                         c, cards, _ = await self._click_reward_buttons(page)
                         self.stats.rewards_claimed += c
                         self.stats.cards_claimed += cards
 
-                        await self._smooth_read_chapter(page)
+                        steps = await self._smooth_read_chapter(page)
                         self.stats.chapters_read += 1
                         chapters_this_title += 1
                         self.stats.touch("глава прочитана", page.url)
                         self._persist_stats()
+                        logger.info(
+                            "MangaBuff chapter done steps=%s total_chapters=%s url=%s",
+                            steps,
+                            self.stats.chapters_read,
+                            page.url,
+                        )
 
                         await self._maybe_comment(page)
 
