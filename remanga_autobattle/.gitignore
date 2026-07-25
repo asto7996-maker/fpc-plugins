@@ -1,0 +1,27 @@
+# Переменные окружения (секреты)
+.env
+
+# Профиль браузера Playwright (сессия, cookies, localStorage)
+user_data/*
+!user_data/.gitkeep
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+.env.local
+*.egg
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Логи и артефакты
+*.log
+screenshots/
+artifacts/
