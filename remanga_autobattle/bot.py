@@ -10,6 +10,7 @@ bot.py — Telegram-бот: Remanga.org (автобои) + MangaBuff.ru (авт�
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import sys
 from dataclasses import asdict, dataclass, field
@@ -96,6 +97,41 @@ class AutobattleState:
     skipped: int = 0
     errors: int = 0
     last_result: Optional[BattleResult] = field(default=None)
+
+    @classmethod
+    def from_disk(cls) -> "AutobattleState":
+        """Восстановить счётчики из stats.json (чтобы не обнулялись после рестарта)."""
+        try:
+            s = load_stats()
+        except Exception:  # noqa: BLE001
+            return cls()
+        return cls(
+            running=False,
+            total_battles=int(s.total_battles or 0),
+            wins=int(s.wins or 0),
+            losses=int(s.losses or 0),
+            draws=int(s.draws or 0),
+            skipped=int(s.skipped or 0),
+            errors=int(s.errors or 0),
+        )
+
+    def sync_from_disk(self) -> None:
+        seeded = AutobattleState.from_disk()
+        self.total_battles = seeded.total_battles
+        self.wins = seeded.wins
+        self.losses = seeded.losses
+        self.draws = seeded.draws
+        self.skipped = seeded.skipped
+        self.errors = seeded.errors
+
+    def clear_counters(self) -> None:
+        self.total_battles = 0
+        self.wins = 0
+        self.losses = 0
+        self.draws = 0
+        self.skipped = 0
+        self.errors = 0
+        self.last_result = None
 
     def register(self, result: BattleResult) -> None:
         self.last_result = result
@@ -327,7 +363,7 @@ class App:
 
         # Remanga
         self.remanga = BrowserService(config)
-        self.remanga_state = AutobattleState()
+        self.remanga_state = AutobattleState.from_disk()
         self._battle_lock = asyncio.Lock()
 
         # MangaBuff — отдельный профиль
@@ -534,6 +570,7 @@ class App:
             from stats_store import BattleStats
 
             save_stats(BattleStats())
+            self.remanga_state.clear_counters()
             await message.answer("Статистика обнулена.", reply_markup=stats_keyboard())
 
         @self.dp.message(StateFilter(None), F.text.in_({"🏅 Рейтинг", "Рейтинг"}))
@@ -975,7 +1012,7 @@ class App:
     # Remanga jobs
     # ------------------------------------------------------------------
 
-    async def start_remanga_autobattle(self) -> str:
+    async def start_remanga_autobattle(self, *, resume: bool = False) -> str:
         if self.remanga_state.running:
             return "ℹ️ Автобой Remanga уже запущен."
         if not self.remanga.is_started:
@@ -990,7 +1027,13 @@ class App:
         )
         self.scheduler.start()
         self.remanga_state.running = True
-        asyncio.create_task(self.run_remanga_battle(notify=True))
+        update_settings(remanga_autobattle_enabled=True)
+        asyncio.create_task(self.run_remanga_battle(notify=not resume))
+        if resume:
+            return (
+                f"♻️ Автобой Remanga <b>возобновлён</b> после рестарта.\n"
+                f"Интервал: {self.config.auto_battle_interval_sec} сек."
+            )
         return (
             f"✅ Автобой Remanga <b>запущен</b>.\n"
             f"Интервал: {self.config.auto_battle_interval_sec} сек."
@@ -998,9 +1041,11 @@ class App:
 
     async def stop_remanga_autobattle(self) -> str:
         if not self.remanga_state.running:
+            update_settings(remanga_autobattle_enabled=False)
             return "ℹ️ Автобой Remanga уже остановлен."
         self.scheduler.remove_job(JOB_REMANGA_AUTOBATTLE)
         self.remanga_state.running = False
+        update_settings(remanga_autobattle_enabled=False)
         return "⏹ Автобой Remanga <b>остановлен</b>."
 
     async def _scheduled_remanga_battle(self) -> None:
@@ -1106,7 +1151,7 @@ class App:
         self.scheduler.start()
         self._mb_task = asyncio.create_task(_runner(), name=JOB_MANGABUFF_READ)
         self._mb_session_started_at = datetime.now()
-        update_settings(mangabuff_setup_done=True)
+        update_settings(mangabuff_setup_done=True, mangabuff_farm_enabled=True)
         return (
             f"<b>📚 Фарм запущен</b>\n"
             f"────────────────────\n"
@@ -1128,6 +1173,11 @@ class App:
                 pass
         self._mb_task = None
         self.mangabuff.stats.running = False
+        update_settings(mangabuff_farm_enabled=False)
+        try:
+            self.mangabuff._persist_stats()
+        except Exception:  # noqa: BLE001
+            pass
         st = self.mangabuff.stats
         return (
             f"<b>⏹ Фарм остановлен</b>\n"
@@ -1218,16 +1268,7 @@ class App:
             await self.remanga.start(headless=True)
         except Exception as exc:  # noqa: BLE001
             logger.warning("Remanga browser: %s", exc)
-        try:
-            if self.config.mangabuff_email:
-                await self.mangabuff.start(headless=True)
-                ok = await self.mangabuff.ensure_login()
-                logger.info("MangaBuff login on boot: %s", ok)
-                if ok:
-                    asyncio.create_task(self.start_mangabuff_read())
-                    logger.info("MangaBuff farm auto-started")
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("MangaBuff browser: %s", exc)
+
         # Если в settings ещё старые медленные дефолты 5–15 — поднять до «Живой»
         s = load_settings()
         if (
@@ -1242,16 +1283,71 @@ class App:
             )
             self._apply_speed_from_settings()
             logger.info("MangaBuff speed defaulted to Живой 2.8–5.5с")
+            s = load_settings()
+
+        # Восстановить автобой Remanga, если был включён до рестарта/обновления
+        if s.remanga_autobattle_enabled:
+            try:
+                self.remanga_state.sync_from_disk()
+                msg = await self.start_remanga_autobattle(resume=True)
+                logger.info("Remanga autobattle resumed: %s", msg)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Remanga autobattle resume failed: %s", exc)
+
+        # MangaBuff: логин всегда; фарм — если включён в settings (с миграцией)
+        try:
+            if self.config.mangabuff_email:
+                await self.mangabuff.start(headless=True)
+                ok = await self.mangabuff.ensure_login()
+                logger.info("MangaBuff login on boot: %s", ok)
+                if ok and self._should_resume_mangabuff_farm():
+                    asyncio.create_task(self.start_mangabuff_read())
+                    logger.info("MangaBuff farm resumed")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("MangaBuff browser: %s", exc)
         self.scheduler.start()
         try:
             await self.dp.start_polling(self.bot, handle_signals=True)
         finally:
             await self.shutdown()
 
+    def _should_resume_mangabuff_farm(self) -> bool:
+        """
+        True если фарм был включён до рестарта.
+        Миграция: если ключа ещё нет в settings.json, но фарм уже
+        настраивали / есть прогресс — считаем что нужно возобновить.
+        """
+        from settings_store import SETTINGS_PATH
+
+        raw: dict = {}
+        try:
+            if SETTINGS_PATH.exists():
+                raw = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+                if not isinstance(raw, dict):
+                    raw = {}
+        except Exception:  # noqa: BLE001
+            raw = {}
+
+        s = load_settings()
+        if "mangabuff_farm_enabled" in raw:
+            return bool(s.mangabuff_farm_enabled)
+
+        # Старые установки без флага
+        if s.mangabuff_setup_done or self.mangabuff.stats.chapters_read > 0:
+            update_settings(mangabuff_farm_enabled=True)
+            return True
+        return False
+
     async def shutdown(self) -> None:
         logger.info("Shutdown...")
+        # Флаги remanga_autobattle_enabled / mangabuff_farm_enabled не трогаем —
+        # после рестарта/обновления возобновим по settings.json
         self.remanga_state.running = False
         self.mangabuff.request_stop()
+        try:
+            self.mangabuff._persist_stats()
+        except Exception:  # noqa: BLE001
+            pass
         self.scheduler.shutdown()
         await self.remanga.stop()
         await self.mangabuff.stop()

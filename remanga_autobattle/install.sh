@@ -81,16 +81,29 @@ echo "[2/6] Клонирую репозиторий ($REPO_BRANCH)..."
 git clone --depth 1 --branch "$REPO_BRANCH" "$REPO_URL" "$TMP_CLONE" >/dev/null
 
 mkdir -p "$INSTALL_DIR"
+# Сохраняем данные пользователя при обновлении (не только .env/settings)
 KEEP_ENV=""
 KEEP_SETTINGS=""
+KEEP_STATS=""
+KEEP_MB_STATS=""
 [[ -f "$INSTALL_DIR/.env" ]] && KEEP_ENV="$(mktemp)" && cp "$INSTALL_DIR/.env" "$KEEP_ENV"
 [[ -f "$INSTALL_DIR/settings.json" ]] && KEEP_SETTINGS="$(mktemp)" && cp "$INSTALL_DIR/settings.json" "$KEEP_SETTINGS"
+[[ -f "$INSTALL_DIR/stats.json" ]] && KEEP_STATS="$(mktemp)" && cp "$INSTALL_DIR/stats.json" "$KEEP_STATS"
+[[ -f "$INSTALL_DIR/mangabuff_stats.json" ]] && KEEP_MB_STATS="$(mktemp)" && cp "$INSTALL_DIR/mangabuff_stats.json" "$KEEP_MB_STATS"
 find "$INSTALL_DIR" -mindepth 1 -maxdepth 1 \
-  ! -name 'user_data' ! -name '.venv' ! -name '.env' ! -name 'settings.json' \
+  ! -name 'user_data' \
+  ! -name 'user_data_mangabuff' \
+  ! -name '.venv' \
+  ! -name '.env' \
+  ! -name 'settings.json' \
+  ! -name 'stats.json' \
+  ! -name 'mangabuff_stats.json' \
   -exec rm -rf {} + 2>/dev/null || true
 cp -a "$TMP_CLONE/remanga_autobattle/." "$INSTALL_DIR/"
 [[ -n "$KEEP_ENV" ]] && cp "$KEEP_ENV" "$INSTALL_DIR/.env" && rm -f "$KEEP_ENV"
 [[ -n "$KEEP_SETTINGS" ]] && cp "$KEEP_SETTINGS" "$INSTALL_DIR/settings.json" && rm -f "$KEEP_SETTINGS"
+[[ -n "$KEEP_STATS" ]] && cp "$KEEP_STATS" "$INSTALL_DIR/stats.json" && rm -f "$KEEP_STATS"
+[[ -n "$KEEP_MB_STATS" ]] && cp "$KEEP_MB_STATS" "$INSTALL_DIR/mangabuff_stats.json" && rm -f "$KEEP_MB_STATS"
 
 cd "$INSTALL_DIR"
 

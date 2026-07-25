@@ -96,6 +96,8 @@ class RuntimeSettings:
     setup_completed: bool = False
     # Управление уведомлениями Remanga
     notify: Optional[Dict[str, Any]] = field(default=None)
+    # Автобой Remanga: переживает рестарт/обновление
+    remanga_autobattle_enabled: bool = False
 
     # ---- MangaBuff ----
     mangabuff_start_url: str = "https://mangabuff.ru/"
@@ -106,6 +108,8 @@ class RuntimeSettings:
     # Вехи в Telegram каждые N глав (0 = выкл)
     mangabuff_milestone_every: int = 10
     mangabuff_notify_milestones: bool = True
+    # Фарм MangaBuff: переживает рестарт/обновление
+    mangabuff_farm_enabled: bool = False
 
     def __post_init__(self) -> None:
         if self.notify is None:
