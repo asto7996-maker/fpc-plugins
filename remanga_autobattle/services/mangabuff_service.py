@@ -808,10 +808,10 @@ class MangaBuffService:
             for i in range(min(count, 4)):
                 el = loc.nth(i)
                 try:
-                        if not await el.is_visible(timeout=700):
-                            continue
-                        href = await el.get_attribute("href")
-                        await el.click(force=True)
+                    if not await el.is_visible(timeout=700):
+                        continue
+                    href = await el.get_attribute("href")
+                    await el.click(force=True)
                     await self._human_pause(1.8, 3.2)
                     await self._dismiss_overlays(page)
                     if href or re.search(r"/manga/[^/]+/\d+/\d+", page.url):
@@ -819,14 +819,16 @@ class MangaBuffService:
                 except Exception:  # noqa: BLE001
                     continue
 
-        # URL-инкремент
+        # URL-инкремент — основной надёжный путь
         m = re.search(r"(https://mangabuff\.ru/manga/[^/]+/)(\d+)/(\d+)", page.url)
         if m:
             base, vol, ch = m.group(1), int(m.group(2)), int(m.group(3))
             nxt = f"{base}{vol}/{ch + 1}"
             before = page.url
             if await self._safe_goto(page, nxt):
-                if page.url != before and "404" not in (await page.title()):
+                title = await page.title()
+                if page.url != before and "404" not in title:
+                    logger.info("MangaBuff next chapter via URL %s", page.url)
                     return True
         return False
 
@@ -844,7 +846,7 @@ class MangaBuffService:
         try:
             # открыть панель комментариев
             btn = page.locator("button.reader__show-comments-btn").first
-            if await btn.count() and await btn.is_visible():
+            if await btn.count() and await btn.is_visible(timeout=700):
                 await btn.click(force=True)
                 await self._human_pause(1.0, 2.0)
 
