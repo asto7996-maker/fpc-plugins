@@ -297,6 +297,7 @@ class BrowserService:
 
             # Короткая пауза: SPA (#/duel) дорисует кнопку
             await asyncio.sleep(random.uniform(1.5, 3.0))
+            await self._dismiss_overlays(page)
 
             button = await self._find_battle_button(page)
             if button is None:
@@ -377,42 +378,99 @@ class BrowserService:
                     message=f"Клик по «В БОЙ» не удался: {exc}",
                 )
 
-            # Отчёт берём из текста кнопки после боя
+            # Premium/реклама может перекрыть результат — закрываем
+            await asyncio.sleep(1.0)
+            await self._dismiss_overlays(page)
+
+            # Отчёт берём из текста кнопки / экрана результата после боя
             result = await self._wait_and_parse_result_from_button(
                 page,
                 button,
                 text_before=text_before,
             )
+            # Если вместо результата поймали Premium — закрыть и перечитать
+            raw_low = (result.raw_text or "").lower()
+            if "premium" in raw_low or "подписк" in raw_low:
+                await self._dismiss_overlays(page)
+                await asyncio.sleep(1.0)
+                result = await self._wait_and_parse_result_from_button(
+                    page,
+                    button,
+                    text_before=text_before,
+                )
             logger.info("Итог боя: %s — %s", result.outcome.value, result.message)
             return result
+
+    async def _dismiss_overlays(self, page: Page) -> None:
+        """Закрыть Premium/модалки, мешающие клику и чтению результата."""
+        # Escape
+        try:
+            await page.keyboard.press("Escape")
+            await asyncio.sleep(0.3)
+        except Exception:  # noqa: BLE001
+            pass
+
+        close_selectors = [
+            "button:has-text('Закрыть')",
+            "button:has-text('Позже')",
+            "button:has-text('Нет, спасибо')",
+            "[aria-label='Close']",
+            "[aria-label='Закрыть']",
+            "button:has-text('×')",
+            "[class*='modal'] button:has-text('×')",
+            "[class*='close']",
+        ]
+        for sel in close_selectors:
+            try:
+                loc = page.locator(sel).first
+                if await loc.count() > 0 and await loc.is_visible():
+                    await loc.click(timeout=1500, force=True)
+                    await asyncio.sleep(0.4)
+            except Exception:  # noqa: BLE001
+                continue
+
+        # Клик по тёмному фону модалки (backdrop), если есть
+        try:
+            backdrop = page.locator("[class*='overlay'], [class*='backdrop'], [class*='modal-bg']").first
+            if await backdrop.count() > 0 and await backdrop.is_visible():
+                box = await backdrop.bounding_box()
+                if box:
+                    await page.mouse.click(box["x"] + 5, box["y"] + 5)
+                    await asyncio.sleep(0.3)
+        except Exception:  # noqa: BLE001
+            pass
 
     async def _find_battle_button(self, page: Page):
         """
         Найти кнопку «戰 В БОЙ» на экране дуэли murim-cards.
         Всегда возвращает Locator (не ElementHandle).
         """
+        # Сначала ищем в блоке подготовки к дуэли — меньше шанс кликнуть мимо
+        scoped = page.locator("body").filter(has_text=re.compile(r"подготовка к дуэли|готов ли ты", re.I))
         candidates = [
-            # Кликабельный предок текста «В БОЙ»
-            page.locator(
-                "xpath=//*[contains(translate(normalize-space(.),"
-                "'вбойВБОЙ','вбойвбой'),'в бой')]"
-                "[self::button or @role='button' or contains(@class,'button') "
-                "or contains(@class,'btn') or contains(@class,'duel')]"
-            ),
+            scoped.get_by_role("button", name=re.compile(r"в\s*бой|戰", re.I)),
+            scoped.locator("button", has_text=re.compile(r"в\s*бой", re.I)),
+            scoped.locator("[role='button']", has_text=re.compile(r"в\s*бой|戰", re.I)),
+            scoped.get_by_text(re.compile(r"戰\s*В\s*БОЙ|^\s*В\s*БОЙ\s*$", re.I)),
             page.get_by_role("button", name=re.compile(r"в\s*бой|戰", re.I)),
             page.locator("button", has_text=re.compile(r"в\s*бой", re.I)),
             page.locator("[role='button']", has_text=re.compile(r"в\s*бой|戰", re.I)),
             page.get_by_text(re.compile(r"戰\s*В\s*БОЙ", re.I)),
             page.get_by_text(re.compile(r"^\s*В\s*БОЙ\s*$", re.I)),
             page.locator("button:has-text('В БОЙ')"),
-            page.locator("[class*='duel'] >> text=/в\\s*бой/i"),
         ]
         for loc in candidates:
             try:
                 count = await loc.count()
                 for i in range(min(count, 8)):
                     item = loc.nth(i)
-                    if await item.is_visible():
+                    if not await item.is_visible():
+                        continue
+                    txt = ((await item.inner_text(timeout=1000)) or "").lower()
+                    # Не кликаем по premium/рекламе
+                    if "premium" in txt or "подписк" in txt:
+                        continue
+                    if "бой" in txt or "戰" in ((await item.inner_text(timeout=1000)) or ""):
                         return item
             except Exception:  # noqa: BLE001
                 continue
