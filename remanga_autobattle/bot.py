@@ -684,6 +684,27 @@ class App:
 
         @self.dp.message(StateFilter(None), F.text == "📊 Статус MangaBuff")
         async def mb_status(message: Message) -> None:
+            # подтянуть с диска, если фарм ещё не писал в память этого процесса
+            try:
+                disk = self.mangabuff._load_stats()
+                live = self.mangabuff.stats
+                # показываем live, но если диск больше (после рестарта) — мержим максимумы
+                if disk.chapters_read > live.chapters_read:
+                    live.chapters_read = disk.chapters_read
+                    live.pages_scrolled = max(live.pages_scrolled, disk.pages_scrolled)
+                    live.rewards_claimed = max(live.rewards_claimed, disk.rewards_claimed)
+                    live.cards_claimed = max(live.cards_claimed, disk.cards_claimed)
+                    live.comments_posted = max(live.comments_posted, disk.comments_posted)
+                    live.titles_visited = max(live.titles_visited, disk.titles_visited)
+                    live.layouts_visited = max(live.layouts_visited, disk.layouts_visited)
+                    if disk.last_url:
+                        live.last_url = disk.last_url
+                    if disk.last_action:
+                        live.last_action = disk.last_action
+                    if disk.last_at:
+                        live.last_at = disk.last_at
+            except Exception:  # noqa: BLE001
+                pass
             await message.answer(
                 self.mangabuff.stats.to_telegram(
                     (self.config.mangabuff_delay_min_sec, self.config.mangabuff_delay_max_sec)

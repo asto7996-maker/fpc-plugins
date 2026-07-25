@@ -5,9 +5,11 @@
 settings.json
 settings.json.tmp
 
-# Статистика боёв
+# Статистика боёв / MangaBuff
 stats.json
 stats.json.tmp
+mangabuff_stats.json
+mangabuff_stats.json.tmp
 
 # Токен Remanga (секреты — никогда не коммитить)
 .remanga_token.json

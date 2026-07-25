@@ -20,7 +20,8 @@ import logging
 import os
 import random
 import re
-from dataclasses import dataclass, field
+import json
+from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime, time, timedelta
 from pathlib import Path
 from typing import List, Optional, Sequence, Tuple
@@ -34,6 +35,7 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_START_URL = "https://mangabuff.ru/"
 DEFAULT_USER_DATA = BASE_DIR / "user_data_mangabuff"
+STATS_PATH = BASE_DIR / "mangabuff_stats.json"
 MSK = ZoneInfo("Europe/Moscow")
 
 TOP_URL = "https://mangabuff.ru/manga/top"
@@ -86,6 +88,17 @@ class MangaBuffStats:
         self.last_at = datetime.now(MSK).strftime("%d.%m.%Y %H:%M:%S")
         if url:
             self.last_url = url
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "MangaBuffStats":
+        known = {f.name for f in fields(cls)}
+        cleaned = {k: v for k, v in (data or {}).items() if k in known}
+        # running всегда сбрасываем при загрузке с диска
+        cleaned["running"] = False
+        return cls(**cleaned)
 
     def to_telegram(self, delay_range: Tuple[float, float] = (5.0, 15.0)) -> str:
         flag = "🟢 Фарм" if self.running else "🔴 Остановлен"
@@ -171,9 +184,31 @@ class MangaBuffService:
         self._lock = asyncio.Lock()
         self._started = False
         self._stop_flag = asyncio.Event()
-        self.stats = MangaBuffStats()
+        self.stats = self._load_stats()
         self._chapters_since_comment = 0
         self._read_urls: set[str] = set()
+
+    def _load_stats(self) -> MangaBuffStats:
+        if not STATS_PATH.exists():
+            return MangaBuffStats()
+        try:
+            raw = json.loads(STATS_PATH.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                return MangaBuffStats.from_dict(raw)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("mangabuff_stats load: %s", exc)
+        return MangaBuffStats()
+
+    def _persist_stats(self) -> None:
+        try:
+            tmp = STATS_PATH.with_suffix(".json.tmp")
+            tmp.write_text(
+                json.dumps(self.stats.to_dict(), ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            tmp.replace(STATS_PATH)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("mangabuff_stats save: %s", exc)
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -629,9 +664,32 @@ class MangaBuffService:
     async def _open_first_chapter(self, title_href: str) -> Optional[str]:
         assert self._page is not None
         page = self._page
+        slug_m = re.search(r"/manga/([^/?#]+)/?$", title_href.rstrip("/"))
+        slug = slug_m.group(1) if slug_m else ""
+
+        # Прямой URL первой главы — самый надёжный путь
+        if slug:
+            for candidate in (
+                f"https://mangabuff.ru/manga/{slug}/1/1",
+                f"https://mangabuff.ru/manga/{slug}/1/0",
+            ):
+                if await self._safe_goto(page, candidate):
+                    await self._dismiss_overlays(page)
+                    title = await page.title()
+                    if "404" not in title and re.search(
+                        r"/manga/[^/]+/\d+/\d+", page.url
+                    ):
+                        # /1/0 часто редиректит/ведёт в ридер — ок
+                        if page.url.rstrip("/").endswith("/0"):
+                            # попробуем перейти на реальную 1
+                            nxt = f"https://mangabuff.ru/manga/{slug}/1/1"
+                            await self._safe_goto(page, nxt)
+                            await self._dismiss_overlays(page)
+                        return page.url
+
         if not await self._safe_goto(page, title_href):
             return None
-        # «Читать» → /manga/slug/1/0 или /1/1
+        await self._dismiss_overlays(page)
         try:
             read_btn = page.get_by_role("link", name=re.compile(r"^Читать$", re.I))
             if await read_btn.count():
@@ -642,12 +700,7 @@ class MangaBuffService:
                     return page.url
         except Exception:  # noqa: BLE001
             pass
-        # прямая ссылка на первую главу
         try:
-            ch = page.locator("a[href*='/manga/']").filter(
-                has_text=re.compile(r"глава|Читать", re.I)
-            )
-            # ищем численные главы по возрастанию
             hrefs = await page.eval_on_selector_all(
                 "a[href*='/manga/']",
                 """els => els.map(e => e.href)
@@ -660,13 +713,11 @@ class MangaBuffService:
                     nums.append((int(m.group(1)), int(m.group(2)), h.split("?")[0]))
             if nums:
                 nums.sort()
-                # пропускаем  */0  (часто оглавление), берём первую реальную
-                for vol, chn, h in nums:
+                for _vol, chn, h in nums:
                     if chn >= 1:
                         await self._safe_goto(page, h)
+                        await self._dismiss_overlays(page)
                         return page.url
-                await self._safe_goto(page, nums[0][2])
-                return page.url
         except Exception as exc:  # noqa: BLE001
             logger.warning("open first chapter: %s", exc)
         return None
@@ -943,14 +994,21 @@ class MangaBuffService:
                     if self._stop_flag.is_set():
                         break
 
-                        logger.info("MangaBuff open title %s", title.get("slug"))
-                        start_url = await self._open_first_chapter(title["href"])
-                        if not start_url:
-                            logger.warning("MangaBuff cannot open %s", title.get("slug"))
-                            continue
-                        self.stats.titles_visited += 1
-                        self.stats.touch(f"тайтл: {title.get('title','')[:40]}", start_url)
-                        logger.info("MangaBuff reading %s from %s", title.get("slug"), start_url)
+                    logger.info("MangaBuff open title %s", title.get("slug"))
+                    start_url = await self._open_first_chapter(title["href"])
+                    if not start_url or not re.search(
+                        r"/manga/[^/]+/\d+/\d+", start_url
+                    ):
+                        logger.warning("MangaBuff cannot open %s", title.get("slug"))
+                        continue
+                    self.stats.titles_visited += 1
+                    self.stats.touch(f"тайтл: {title.get('title','')[:40]}", start_url)
+                    logger.info(
+                        "MangaBuff reading %s from %s",
+                        title.get("slug"),
+                        start_url,
+                    )
+                    self._persist_stats()
 
                     chapters_this_title = 0
                     max_per_title = random.randint(40, 120)
@@ -963,6 +1021,12 @@ class MangaBuffService:
                             break
 
                         url = page.url.split("?")[0]
+                        if not re.search(r"/manga/[^/]+/\d+/\d+", url):
+                            logger.warning(
+                                "MangaBuff not on chapter page: %s — skip title",
+                                url,
+                            )
+                            break
                         if url in self._read_urls:
                             if not await self._go_next_chapter(page):
                                 break
@@ -978,6 +1042,7 @@ class MangaBuffService:
                         self.stats.chapters_read += 1
                         chapters_this_title += 1
                         self.stats.touch("глава прочитана", page.url)
+                        self._persist_stats()
 
                         await self._maybe_comment(page)
 
