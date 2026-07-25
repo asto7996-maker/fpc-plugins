@@ -699,19 +699,29 @@ class BrowserService:
         await page.goto("https://remanga.org/", wait_until="domcontentloaded", timeout=self.config.selector_timeout_ms)
         await self._inject_saved_token(page)
 
-        # База murim-cards (без hash — SPA сама решает; в дуэль зайдём кликом по меню)
-        base_url = self.config.battle_url.strip().split("#", 1)[0] or "https://remanga.org/murim-cards"
+        # Сначала база (чтобы токен попал в origin), затем полный URL с #/duel
+        url = self.config.battle_url.strip()
+        base_url = url.split("#", 1)[0] or "https://remanga.org/murim-cards"
         await page.goto(base_url, wait_until="domcontentloaded", timeout=self.config.selector_timeout_ms)
         await self._inject_saved_token(page)
-        await asyncio.sleep(2.0)
+        await asyncio.sleep(1.0)
         await self._dismiss_overlays(page)
 
-        # Переход в раздел «ДУЭЛЬ» через нижнее/боковое меню (надёжнее hash)
-        opened = await self._open_duel_screen(page)
-        if not opened:
-            # Fallback: hash #/duel
-            await page.evaluate("() => { window.location.hash = '/duel'; }")
-            await asyncio.sleep(2.0)
+        # Прямой goto с hash работает стабильно на murim-cards
+        target = url if "#" in url else f"{base_url}#/duel"
+        await page.goto(target, wait_until="domcontentloaded", timeout=self.config.selector_timeout_ms)
+        await self._inject_saved_token(page)
+        await asyncio.sleep(2.5)
+        await self._dismiss_overlays(page)
+
+        # Если SPA ушла на map — ещё раз форсируем #/duel
+        href = await page.evaluate("() => location.href")
+        if "#/duel" not in href:
+            logger.info("Не на дуэли (%s) — повторный переход", href)
+            await page.goto(f"{base_url}#/duel", wait_until="domcontentloaded", timeout=self.config.selector_timeout_ms)
+            await asyncio.sleep(2.5)
+            if "#/duel" not in (await page.evaluate("() => location.href")):
+                await self._open_duel_screen(page)
 
         try:
             await page.wait_for_selector(
@@ -720,12 +730,7 @@ class BrowserService:
                 state="visible",
             )
         except Exception:  # noqa: BLE001
-            logger.warning("Экран дуэли не появился сразу (hash=%s)", await page.evaluate("() => location.hash"))
-
-        try:
-            await page.wait_for_load_state("load", timeout=8_000)
-        except Exception:  # noqa: BLE001
-            pass
+            logger.warning("Экран дуэли не появился сразу (href=%s)", await page.evaluate("() => location.href"))
 
     @staticmethod
     def _detect_challenge(body_text: str, current_url: str) -> Optional[str]:
