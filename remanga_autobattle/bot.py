@@ -24,9 +24,6 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
-    CallbackQuery,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
     KeyboardButton,
     Message,
     ReplyKeyboardMarkup,
@@ -130,8 +127,6 @@ class AdminOnlyMiddleware(BaseMiddleware):
             # На личные сообщения можно ответить отказом
             if isinstance(event, Message):
                 await event.answer("⛔ Доступ запрещён. Этот бот приватный.")
-            elif isinstance(event, CallbackQuery):
-                await event.answer("⛔ Нет доступа", show_alert=True)
             logger.warning(
                 "Отклонён запрос от user_id=%s",
                 getattr(user, "id", None),
@@ -141,12 +136,12 @@ class AdminOnlyMiddleware(BaseMiddleware):
 
 
 # ======================================================================
-# Клавиатуры
+# Клавиатура (кнопки прямо в боте — под полем ввода)
 # ======================================================================
 
 
 def main_reply_keyboard() -> ReplyKeyboardMarkup:
-    """Постоянная клавиатура под полем ввода."""
+    """Постоянная reply-клавиатура бота (без отдельного inline-сообщения)."""
     return ReplyKeyboardMarkup(
         keyboard=[
             [
@@ -160,22 +155,6 @@ def main_reply_keyboard() -> ReplyKeyboardMarkup:
         ],
         resize_keyboard=True,
         is_persistent=True,
-    )
-
-
-def main_inline_keyboard() -> InlineKeyboardMarkup:
-    """Дублирующие inline-кнопки (удобно в закреплённом сообщении)."""
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="▶️ Запустить", callback_data="start_auto"),
-                InlineKeyboardButton(text="⏹ Стоп", callback_data="stop_auto"),
-            ],
-            [
-                InlineKeyboardButton(text="⚔️ 1 бой", callback_data="one_battle"),
-                InlineKeyboardButton(text="📊 Статус", callback_data="status"),
-            ],
-        ]
     )
 
 
@@ -200,9 +179,8 @@ class AutobattleApp:
         self._battle_lock = asyncio.Lock()
         self._notify_chat_id: Optional[int] = None
 
-        # Middleware на все сообщения и колбэки
+        # Middleware: только админ
         self.dp.message.middleware(AdminOnlyMiddleware(config.telegram_admin_id))
-        self.dp.callback_query.middleware(AdminOnlyMiddleware(config.telegram_admin_id))
 
         self._register_handlers()
 
@@ -214,33 +192,31 @@ class AutobattleApp:
         @self.dp.message(CommandStart())
         async def cmd_start(message: Message) -> None:
             self._notify_chat_id = message.chat.id
+            # Одно сообщение + reply-кнопки бота (без отдельного inline-сообщения)
             await message.answer(
                 "⚔️ <b>Remanga Autobattle</b>\n\n"
                 "Управление автобоями на remanga.org.\n"
+                f"Интервал: <b>{self.config.auto_battle_interval_sec} сек</b> "
+                "(бесконечно до остановки).\n\n"
                 "Перед первым запуском выполните setup:\n"
-                "<code>python browser_service.py</code>\n\n"
-                "Выберите действие на клавиатуре:",
+                "<code>python bot.py --setup</code>\n\n"
+                "Выберите действие кнопками ниже:",
                 reply_markup=main_reply_keyboard(),
-            )
-            await message.answer(
-                "Быстрые кнопки:",
-                reply_markup=main_inline_keyboard(),
             )
 
         @self.dp.message(Command("help"))
         async def cmd_help(message: Message) -> None:
             await message.answer(
-                "<b>Команды:</b>\n"
-                "/start — меню\n"
-                "/battle — один бой\n"
-                "/auto — запустить автобой\n"
-                "/stop — остановить автобой\n"
-                "/status — статус\n\n"
-                "Также доступны кнопки под полем ввода.",
+                "<b>Кнопки бота:</b>\n"
+                "▶️ Запустить автобой — бесконечный цикл\n"
+                "⏹ Остановить автобой\n"
+                "⚔️ Сделать 1 бой\n"
+                "📊 Статус\n\n"
+                "<b>Команды:</b> /start /auto /stop /battle /status",
                 reply_markup=main_reply_keyboard(),
             )
 
-        # --- Reply-кнопки / текстовые команды ---
+        # --- Кнопки reply-клавиатуры и текстовые команды ---
         @self.dp.message(F.text.in_({"▶️ Запустить автобой", "Запустить автобой"}))
         @self.dp.message(Command("auto"))
         async def start_auto_msg(message: Message) -> None:
@@ -258,7 +234,7 @@ class AutobattleApp:
         @self.dp.message(Command("battle"))
         async def one_battle_msg(message: Message) -> None:
             self._notify_chat_id = message.chat.id
-            await message.answer("⏳ Запускаю один бой...")
+            await message.answer("⏳ Запускаю один бой...", reply_markup=main_reply_keyboard())
             await self.run_single_battle(notify=True)
 
         @self.dp.message(F.text.in_({"📊 Статус", "Статус"}))
@@ -268,40 +244,6 @@ class AutobattleApp:
                 self.state.status_text(self.config.auto_battle_interval_sec),
                 reply_markup=main_reply_keyboard(),
             )
-
-        # --- Inline-колбэки ---
-        @self.dp.callback_query(F.data == "start_auto")
-        async def start_auto_cb(callback: CallbackQuery) -> None:
-            if callback.message:
-                self._notify_chat_id = callback.message.chat.id
-            text = await self.start_autobattle()
-            await callback.answer("Автобой")
-            if callback.message:
-                await callback.message.answer(text)
-
-        @self.dp.callback_query(F.data == "stop_auto")
-        async def stop_auto_cb(callback: CallbackQuery) -> None:
-            text = await self.stop_autobattle()
-            await callback.answer("Стоп")
-            if callback.message:
-                await callback.message.answer(text)
-
-        @self.dp.callback_query(F.data == "one_battle")
-        async def one_battle_cb(callback: CallbackQuery) -> None:
-            if callback.message:
-                self._notify_chat_id = callback.message.chat.id
-            await callback.answer("Запускаю бой...")
-            if callback.message:
-                await callback.message.answer("⏳ Запускаю один бой...")
-            await self.run_single_battle(notify=True)
-
-        @self.dp.callback_query(F.data == "status")
-        async def status_cb(callback: CallbackQuery) -> None:
-            await callback.answer()
-            if callback.message:
-                await callback.message.answer(
-                    self.state.status_text(self.config.auto_battle_interval_sec)
-                )
 
     # ------------------------------------------------------------------
     # Управление планировщиком
@@ -348,9 +290,10 @@ class AutobattleApp:
         asyncio.create_task(self.run_single_battle(notify=True))
 
         return (
-            f"✅ Автобой <b>запущен</b>.\n"
-            f"Интервал: {self.config.auto_battle_interval_sec} сек.\n"
-            "После каждого боя придёт краткий отчёт."
+            f"✅ Автобой <b>запущен</b> (бесконечно).\n"
+            f"⏱ Интервал / таймаут: {self.config.auto_battle_interval_sec} сек.\n"
+            "Остановка — только кнопкой «Остановить автобой».\n"
+            "После каждого боя придёт отчёт (текст с кнопки на сайте)."
         )
 
     async def stop_autobattle(self) -> str:

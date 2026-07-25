@@ -56,7 +56,7 @@ class BattleResult:
     timestamp: datetime = field(default_factory=datetime.now)
 
     def to_telegram(self) -> str:
-        """Краткий человекочитаемый отчёт для чата."""
+        """Краткий человекочитаемый отчёт для чата (основа — текст кнопки)."""
         icons = {
             BattleOutcome.WIN: "🏆 Победа",
             BattleOutcome.LOSE: "💀 Поражение",
@@ -69,16 +69,16 @@ class BattleResult:
             f"{icons.get(self.outcome, '❓')} — {self.message}",
             f"🕒 {self.timestamp.strftime('%d.%m.%Y %H:%M:%S')}",
         ]
+        # Главный отчёт — текст с кнопки на сайте
+        if self.raw_text and self.outcome not in (BattleOutcome.ERROR,):
+            snippet = self.raw_text.strip()
+            if len(snippet) > 400:
+                snippet = snippet[:397] + "..."
+            lines.append(f"📝 Кнопка: {snippet}")
         if self.rating_change:
             lines.append(f"📈 Рейтинг: {self.rating_change}")
         if self.rewards:
             lines.append(f"🎁 Награды: {self.rewards}")
-        if self.raw_text and self.outcome not in (BattleOutcome.SKIPPED, BattleOutcome.ERROR):
-            # Обрезаем длинный сырой текст, чтобы не спамить чат
-            snippet = self.raw_text.strip().replace("\n", " ")
-            if len(snippet) > 280:
-                snippet = snippet[:277] + "..."
-            lines.append(f"📝 {snippet}")
         return "\n".join(lines)
 
 
@@ -329,12 +329,18 @@ class BrowserService:
                     raw_text=(body_text or "")[:500],
                 )
 
+            # Текст кнопки до клика — чтобы понять, когда он обновится
+            try:
+                text_before = ((await button.inner_text(timeout=3_000)) or "").strip()
+            except Exception:  # noqa: BLE001
+                text_before = ""
+
             await self._human_delay("перед кликом «В БОЙ»")
 
             try:
                 await button.scroll_into_view_if_needed()
                 await button.click(timeout=self.config.selector_timeout_ms)
-                logger.info("Клик по «В БОЙ» выполнен.")
+                logger.info("Клик по «В БОЙ» выполнен. Текст до клика: %r", text_before)
             except Exception as exc:  # noqa: BLE001
                 logger.error("Не удалось нажать «В БОЙ»: %s", exc)
                 return BattleResult(
@@ -342,8 +348,12 @@ class BrowserService:
                     message=f"Клик по «В БОЙ» не удался: {exc}",
                 )
 
-            # Ждём появления результата боя
-            result = await self._wait_and_parse_result(page)
+            # Отчёт берём из текста кнопки после боя
+            result = await self._wait_and_parse_result_from_button(
+                page,
+                button,
+                text_before=text_before,
+            )
             logger.info("Итог боя: %s — %s", result.outcome.value, result.message)
             return result
 
@@ -405,51 +415,85 @@ class BrowserService:
 
         return None
 
-    async def _wait_and_parse_result(self, page: Page) -> BattleResult:
+    async def _wait_and_parse_result_from_button(
+        self,
+        page: Page,
+        button,
+        text_before: str = "",
+    ) -> BattleResult:
         """
-        Дождаться появления блока результата и распарсить победу/поражение/рейтинг.
+        Дождаться обновления текста кнопки после боя и собрать отчёт из неё.
+
+        На Remanga результат (победа/поражение/рейтинг) обычно появляется
+        прямо в тексте боевой кнопки — именно его отправляем в Telegram.
         """
-        # Небольшая пауза на анимацию боя / запрос к API
-        await asyncio.sleep(2.0)
+        import time as _time
 
-        # Ждём появления любого маркера результата или модалки
-        result_selectors = [
-            "text=/победа|поражение|ничья|victory|defeat/i",
-            "[class*='result']",
-            "[class*='battle-result']",
-            "[class*='modal']",
-            "[role='dialog']",
-        ]
+        timeout_ms = self.config.selector_timeout_ms  # по умолчанию 30 сек
+        deadline = _time.monotonic() + (timeout_ms / 1000.0)
+        button_text = text_before
+        changed = False
 
-        appeared = False
-        for selector in result_selectors:
+        # Поллим текст кнопки, пока он не изменится или не появится маркер результата
+        while _time.monotonic() < deadline:
+            await asyncio.sleep(0.5)
             try:
-                await page.wait_for_selector(selector, timeout=8_000, state="visible")
-                appeared = True
-                break
-            except Exception:  # noqa: BLE001
-                continue
+                # Кнопка могла перерисоваться — ищем заново, если старый locator «протух»
+                current = button
+                try:
+                    current_text = ((await current.inner_text(timeout=1_500)) or "").strip()
+                except Exception:  # noqa: BLE001
+                    refreshed = await self._find_battle_button(page)
+                    if refreshed is None:
+                        continue
+                    button = refreshed
+                    current_text = ((await button.inner_text(timeout=1_500)) or "").strip()
 
-        # Собираем текст из модалки/диалога, иначе — из body
-        raw_text = ""
-        for scope in ("[role='dialog']", "[class*='modal']", "[class*='result']", "body"):
-            try:
-                loc = page.locator(scope).first
-                if await loc.count() == 0:
+                if not current_text:
                     continue
-                if not await loc.is_visible():
-                    continue
-                raw_text = (await loc.inner_text(timeout=3_000)) or ""
-                if raw_text.strip():
+
+                button_text = current_text
+                text_changed = bool(text_before) and current_text != text_before
+                has_result = bool(
+                    self.WIN_MARKERS.search(current_text)
+                    or self.LOSE_MARKERS.search(current_text)
+                    or self.DRAW_MARKERS.search(current_text)
+                    or self.RATING_MARKERS.search(current_text)
+                    or re.search(r"[+\-−–]\s*\d+", current_text)
+                )
+                # Больше не «В БОЙ» — тоже признак обновления
+                no_longer_battle = not re.search(r"в\s*бой", current_text, re.I)
+
+                if text_changed or has_result or (text_before and no_longer_battle):
+                    changed = True
+                    # Небольшая пауза: текст кнопки может дорисоваться (рейтинг/награда)
+                    await asyncio.sleep(0.8)
+                    try:
+                        button_text = ((await button.inner_text(timeout=1_500)) or current_text).strip()
+                    except Exception:  # noqa: BLE001
+                        button_text = current_text
                     break
             except Exception:  # noqa: BLE001
                 continue
 
-        if not raw_text.strip():
-            raw_text = await self._safe_body_text(page) or ""
+        # Fallback: если кнопка не обновилась — пробуем модалку/диалог, но приоритет у кнопки
+        if not changed or not button_text:
+            for scope in ("[role='dialog']", "[class*='modal']", "[class*='result']"):
+                try:
+                    loc = page.locator(scope).first
+                    if await loc.count() == 0 or not await loc.is_visible():
+                        continue
+                    alt = ((await loc.inner_text(timeout=2_000)) or "").strip()
+                    if alt:
+                        button_text = alt
+                        changed = True
+                        break
+                except Exception:  # noqa: BLE001
+                    continue
 
+        raw_text = button_text or text_before or ""
         outcome = BattleOutcome.UNKNOWN
-        message = "Результат боя распознан неуверенно."
+        message = "Результат считан с кнопки."
 
         if self.WIN_MARKERS.search(raw_text):
             outcome = BattleOutcome.WIN
@@ -460,19 +504,21 @@ class BrowserService:
         elif self.DRAW_MARKERS.search(raw_text):
             outcome = BattleOutcome.DRAW
             message = "Ничья."
-        elif not appeared and self.COOLDOWN_MARKERS.search(raw_text):
+        elif self.COOLDOWN_MARKERS.search(raw_text):
             outcome = BattleOutcome.SKIPPED
-            message = "Бой не запущен (энергия/кулдаун)."
-        elif appeared:
-            message = "Бой завершён, точный исход не определён по тексту."
+            message = "Бой пропущен (энергия/кулдаун) — по тексту кнопки."
+        elif changed:
+            message = "Бой завершён (текст кнопки обновлён)."
+        else:
+            message = f"Текст кнопки не обновился за {timeout_ms // 1000} сек."
+            outcome = BattleOutcome.UNKNOWN
 
         rating_change = None
         rating_match = self.RATING_MARKERS.search(raw_text)
         if rating_match:
             rating_change = rating_match.group(0).strip()
         else:
-            # Запасной поиск «+12» / «−8» рядом со словом рейтинг
-            plus_minus = re.search(r"([+\-−–]\s*\d+)\s*(?:рейтинг|mmr|elo)?", raw_text, re.I)
+            plus_minus = re.search(r"([+\-−–]\s*\d+)", raw_text)
             if plus_minus:
                 rating_change = plus_minus.group(1).replace(" ", "")
 

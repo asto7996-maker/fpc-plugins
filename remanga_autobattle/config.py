@@ -78,17 +78,18 @@ def load_config() -> Config:
         )
 
     battle_url = os.getenv("BATTLE_URL", "https://remanga.org/cards").strip()
-    interval = _get_int("AUTO_BATTLE_INTERVAL_SEC", 90)
-    if interval < 15:
-        # Защита от слишком агрессивного спама запросов
-        raise ValueError("AUTO_BATTLE_INTERVAL_SEC не должен быть меньше 15 секунд.")
+    # По умолчанию 30 сек; автобой крутится бесконечно до ручной остановки
+    interval = _get_int("AUTO_BATTLE_INTERVAL_SEC", 30)
+    if interval < 5:
+        raise ValueError("AUTO_BATTLE_INTERVAL_SEC не должен быть меньше 5 секунд.")
 
     user_data_raw = os.getenv("USER_DATA_DIR", "user_data").strip() or "user_data"
     user_data_dir = Path(user_data_raw)
     if not user_data_dir.is_absolute():
         user_data_dir = BASE_DIR / user_data_dir
 
-    timeout_ms = _get_int("SELECTOR_TIMEOUT_MS", 20_000)
+    # Таймаут ожидания элементов — 30 секунд по умолчанию
+    timeout_ms = _get_int("SELECTOR_TIMEOUT_MS", 30_000)
 
     return Config(
         bot_token=bot_token,
