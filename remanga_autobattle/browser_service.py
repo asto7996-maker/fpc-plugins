@@ -14,6 +14,7 @@ import asyncio
 import logging
 import random
 import re
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
@@ -427,15 +428,13 @@ class BrowserService:
         На Remanga результат (победа/поражение/рейтинг) обычно появляется
         прямо в тексте боевой кнопки — именно его отправляем в Telegram.
         """
-        import time as _time
-
         timeout_ms = self.config.selector_timeout_ms  # по умолчанию 30 сек
-        deadline = _time.monotonic() + (timeout_ms / 1000.0)
+        deadline = time.monotonic() + (timeout_ms / 1000.0)
         button_text = text_before
         changed = False
 
         # Поллим текст кнопки, пока он не изменится или не появится маркер результата
-        while _time.monotonic() < deadline:
+        while time.monotonic() < deadline:
             await asyncio.sleep(0.5)
             try:
                 # Кнопка могла перерисоваться — ищем заново, если старый locator «протух»
