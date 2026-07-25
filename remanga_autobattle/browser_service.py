@@ -335,15 +335,14 @@ class BrowserService:
                     message=f"Кнопка «В БОЙ» не видима: {exc}",
                 )
 
-            disabled = await button.is_disabled()
-            aria_disabled = await button.get_attribute("aria-disabled")
-            class_name = (await button.get_attribute("class")) or ""
-            looks_disabled = (
-                disabled
-                or (aria_disabled or "").lower() in {"true", "1"}
-                or "disabled" in class_name.lower()
-                or "is-disabled" in class_name.lower()
-            )
+            # На murim-cards кнопка часто div/span: is_disabled() и class*disabled
+            # дают ложные срабатывания. Считаем неактивной только явную блокировку.
+            try:
+                disabled = await button.is_disabled()
+            except Exception:  # noqa: BLE001
+                disabled = False
+            aria_disabled = (await button.get_attribute("aria-disabled") or "").lower()
+            looks_disabled = disabled or aria_disabled in {"true", "1"}
             if looks_disabled:
                 body_text = await self._safe_body_text(page)
                 return BattleResult(
@@ -386,13 +385,41 @@ class BrowserService:
 
     async def _find_battle_button(self, page: Page):
         """
-        Найти кнопку «В БОЙ» несколькими стратегиями (устойчивость к смене вёрстки).
+        Найти кнопку «戰 В БОЙ» на экране дуэли murim-cards.
 
-        Приоритет:
-        1) role=button с текстом «В БОЙ»
-        2) любой кликабельный элемент с текстом «В БОЙ»
-        3) CSS-кнопки, содержащие подстроку в тексте
+        На UI текст часто разбит на строки: «戰» + «В БОЙ».
         """
+        # 0. Самый надёжный вариант для текущего UI: regex по тексту
+        try:
+            loc = page.get_by_text(re.compile(r"戰\s*В\s*БОЙ|В\s*БОЙ", re.I))
+            count = await loc.count()
+            for i in range(min(count, 12)):
+                el = loc.nth(i)
+                if not await el.is_visible():
+                    continue
+                # Поднимаемся к кликабельному родителю (button / role=button / кликабельный div)
+                handle = await el.evaluate_handle(
+                    """(node) => {
+                        let n = node;
+                        for (let i = 0; i < 6 && n; i++) {
+                            const tag = (n.tagName || '').toLowerCase();
+                            const role = n.getAttribute && n.getAttribute('role');
+                            const style = window.getComputedStyle(n);
+                            const clickable = tag === 'button' || tag === 'a' || role === 'button'
+                                || style.cursor === 'pointer';
+                            const txt = (n.innerText || '').replace(/\\s+/g, ' ');
+                            if (clickable && /в\\s*бой/i.test(txt)) return n;
+                            n = n.parentElement;
+                        }
+                        return node;
+                    }"""
+                )
+                element = handle.as_element()
+                if element is not None:
+                    return element
+        except Exception:  # noqa: BLE001
+            pass
+
         # 1. Семантический поиск по роли
         for pattern in self.BATTLE_BUTTON_PATTERNS:
             locator = page.get_by_role("button", name=pattern)
@@ -404,36 +431,17 @@ class BrowserService:
             except Exception:  # noqa: BLE001
                 pass
 
-        # 2. Любой элемент с точным/похожим текстом
-        for text in ("戰 В БОЙ", "В БОЙ", "В бой", "в бой", "Fight", "Battle"):
-            locator = page.get_by_text(text, exact=False)
-            try:
-                count = await locator.count()
-                for i in range(min(count, 8)):
-                    el = locator.nth(i)
-                    if not await el.is_visible():
-                        continue
-                    tag = await el.evaluate("e => e.tagName.toLowerCase()")
-                    role = await el.get_attribute("role")
-                    if tag in {"button", "a", "div", "span"} or role == "button":
-                        return el
-            except Exception:  # noqa: BLE001
-                continue
-
-        # 3. CSS-fallback: кнопки / элементы с data-атрибутами
+        # 2. CSS-fallback
         css_candidates = [
-            "button:has-text('戰 В БОЙ')",
             "button:has-text('В БОЙ')",
             "button:has-text('В бой')",
             "[role='button']:has-text('В БОЙ')",
             "[role='button']:has-text('戰')",
             "a:has-text('В БОЙ')",
-            "div:has-text('戰 В БОЙ')",
-            "[data-testid*='battle']",
+            "[class*='duel'] button",
             "[class*='battle'] button",
             "[class*='fight'] button",
-            "[class*='duel'] button",
-        )
+        ]
         for css in css_candidates:
             locator = page.locator(css)
             try:
@@ -628,25 +636,34 @@ class BrowserService:
         await self._inject_saved_token(page)
 
         url = self.config.battle_url.strip()
-        if "#" in url:
-            base, _, fragment = url.partition("#")
-            await page.goto(base or url, wait_until="domcontentloaded", timeout=self.config.selector_timeout_ms)
-            await self._inject_saved_token(page)
-            # Даём каркасу SPA загрузиться, затем переходим по hash-маршруту
-            await asyncio.sleep(1.5)
-            await page.evaluate(
-                """(frag) => { window.location.hash = frag; }""",
-                fragment if fragment.startswith("/") else f"/{fragment}",
-            )
-            await asyncio.sleep(2.5)
-        else:
-            await page.goto(url, wait_until="domcontentloaded", timeout=self.config.selector_timeout_ms)
-            await self._inject_saved_token(page)
-            await asyncio.sleep(2.0)
+        # Прямой переход (в т.ч. с #/duel). Затем форсируем hash, если SPA ушла на /map.
+        await page.goto(url, wait_until="domcontentloaded", timeout=self.config.selector_timeout_ms)
+        await self._inject_saved_token(page)
+        await asyncio.sleep(2.0)
 
-        # Мягко ждём load (не критично, если таймаут)
+        if "#" in url:
+            _, _, fragment = url.partition("#")
+            want = fragment if fragment.startswith("/") else f"/{fragment}"
+            # Повторно выставляем hash (murim-cards иногда редиректит на #/map)
+            for _ in range(3):
+                current_hash = await page.evaluate("() => window.location.hash || ''")
+                if want in current_hash or current_hash.lstrip("#") == want.lstrip("#"):
+                    break
+                await page.evaluate("(frag) => { window.location.hash = frag; }", want)
+                await asyncio.sleep(1.5)
+
+        # Ждём экран дуэли / кнопку «В БОЙ»
         try:
-            await page.wait_for_load_state("load", timeout=10_000)
+            await page.wait_for_selector(
+                "text=/в\\s*бой|подготовка к дуэли|戰/i",
+                timeout=min(self.config.selector_timeout_ms, 20_000),
+                state="visible",
+            )
+        except Exception:  # noqa: BLE001
+            logger.warning("Экран дуэли не появился сразу, продолжаю поиск кнопки...")
+
+        try:
+            await page.wait_for_load_state("load", timeout=8_000)
         except Exception:  # noqa: BLE001
             pass
 
