@@ -63,6 +63,67 @@ NIGHT_BREAK_END = time(5, 0)
 # Комментарии каждые 5–15 глав на случайной главе текущего тайтла
 COMMENT_EVERY_MIN = 5
 COMMENT_EVERY_MAX = 15
+COMMENT_WORDS_MIN = 5
+COMMENT_WORDS_MAX = 20
+
+# Синонимы / близкие слова для «человеческого» перефраза чужих комментов
+_COMMENT_SYNONYMS = {
+    "норм": ("нормально", "норм", "ок", "нормас", "неплохо"),
+    "нормально": ("норм", "нормально", "ок", "нормас"),
+    "нормас": ("норм", "нормально", "нормас"),
+    "ок": ("норм", "ок", "нормально"),
+    "огонь": ("огонь", "кайф", "топ", "круто", "зашло"),
+    "кайф": ("кайф", "огонь", "зашло", "топ"),
+    "топ": ("топ", "огонь", "круто", "кайф"),
+    "круто": ("круто", "топ", "огонь", "классно"),
+    "классно": ("классно", "круто", "норм", "зашло"),
+    "зашло": ("зашло", "заходит", "нравится", "кайф"),
+    "заходит": ("заходит", "зашло", "держится", "нравится"),
+    "нравится": ("нравится", "зашло", "импонирует", "заходит"),
+    "держится": ("держится", "держит", "не проседает", "заходит"),
+    "держит": ("держит", "держится", "тянет"),
+    "интересно": ("интересно", "занятно", "интригует", "интереснее"),
+    "интереснее": ("интереснее", "интереснее стало", "живее", "занятнее"),
+    "занятно": ("занятно", "интересно", "прикольненько"),
+    "жду": ("жду", "жду дальше", "интересно что дальше"),
+    "дальше": ("дальше", "продолжения", "следующее"),
+    "глава": ("глава", "серия", "часть"),
+    "серия": ("серия", "глава", "часть"),
+    "сюжет": ("сюжет", "история", "линия"),
+    "история": ("история", "сюжет", "линия"),
+    "арт": ("арт", "рисунок", "рисовка"),
+    "рисунок": ("рисунок", "рисовка", "арт"),
+    "рисовка": ("рисовка", "рисунок", "арт"),
+    "персонаж": ("персонаж", "герой", "гг"),
+    "герой": ("герой", "гг", "персонаж"),
+    "гг": ("гг", "герой", "главный"),
+    "странно": ("странно", "weird", "как-то странно", "необычно"),
+    "необычно": ("необычно", "странно", "по-своему"),
+    "плохо": ("слабо", "так себе", "не очень", "средне"),
+    "слабо": ("слабо", "так себе", "не очень"),
+    "средне": ("средне", "так себе", "на троечку"),
+    "бомба": ("бомба", "огонь", "пушка", "топ"),
+    "пушка": ("пушка", "бомба", "огонь"),
+    "атмосфера": ("атмосфера", "вайб", "настроение"),
+    "вайб": ("вайб", "атмосфера", "настроение"),
+    "напряг": ("напряг", "напряжение", "интрига"),
+    "интрига": ("интрига", "напряг", "завязка"),
+    "смешно": ("смешно", "угар", "прикол", "забавно"),
+    "угар": ("угар", "смешно", "прикол"),
+    "грустно": ("грустно", "печально", "тяжеловато"),
+    "мило": ("мило", "миленько", "милота"),
+    "милота": ("милота", "мило", "миленько"),
+    "тянет": ("тянет", "держит", "затягивает"),
+    "затягивает": ("затягивает", "тянет", "не отпускает"),
+    "не": ("не", "типа не", "как будто не"),
+    "очень": ("очень", "прям", "довольно", "реально"),
+    "прям": ("прям", "очень", "реально"),
+    "реально": ("реально", "правда", "прям"),
+    "конечно": ("конечно", "ясн", "ну да"),
+    "вообще": ("вообще", "в целом", "если честно"),
+    "кажется": ("кажется", "мне кажется", "по-моему"),
+    "имхо": ("имхо", "по-мне", "мне кажется"),
+}
 
 
 @dataclass
@@ -1048,22 +1109,135 @@ class MangaBuffService:
             logger.warning("MangaBuff comment send failed: %s", exc)
             return False
 
+    def _normalize_comment_sample(self, raw: str) -> str:
+        s = (raw or "").strip().lower()
+        s = re.sub(r"https?://\S+", "", s)
+        s = re.sub(r"[\U0001F300-\U0010ffff\u2600-\u27BF]", "", s)
+        s = re.sub(r"[^\w\sа-яА-ЯёЁ\-']", " ", s, flags=re.UNICODE)
+        s = re.sub(r"\s+", " ", s).strip(" -'")
+        return s
+
+    def _synonymize_token(self, token: str) -> str:
+        key = token.lower().strip(".,!?;:-")
+        if not key:
+            return token
+        variants = _COMMENT_SYNONYMS.get(key)
+        if variants:
+            return random.choice(variants)
+        return key
+
+    def _comment_word_set(self, text: str) -> set:
+        return {w for w in re.findall(r"[а-яёa-z0-9\-']+", text.lower()) if len(w) > 1}
+
+    def _comment_similarity(self, a: str, b: str) -> float:
+        sa, sb = self._comment_word_set(a), self._comment_word_set(b)
+        if not sa or not sb:
+            return 0.0
+        return len(sa & sb) / max(1, len(sa | sb))
+
+    def _extract_comment_ideas(self, cleaned: Sequence[str]) -> List[str]:
+        """Достать короткие смысловые куски (2–5 слов) из разных комментов."""
+        ideas: List[str] = []
+        stop = {
+            "и",
+            "а",
+            "но",
+            "же",
+            "ли",
+            "бы",
+            "то",
+            "это",
+            "как",
+            "что",
+            "уже",
+            "ещё",
+            "еще",
+            "вот",
+            "там",
+            "тут",
+            "для",
+            "про",
+            "при",
+            "над",
+            "под",
+            "без",
+            "или",
+            "если",
+            "когда",
+            "просто",
+            "типа",
+            "вообще",
+            "очень",
+            "прям",
+            "просто",
+        }
+        for s in cleaned:
+            words = [w for w in s.split() if w and w not in stop]
+            if len(words) < 2:
+                continue
+            # окна по 2–4 значимых слова
+            for i in range(len(words)):
+                for n in (2, 3, 4):
+                    chunk = words[i : i + n]
+                    if len(chunk) < 2:
+                        continue
+                    ideas.append(" ".join(chunk))
+        random.shuffle(ideas)
+        return ideas
+
+    def _paraphrase_idea(self, idea: str) -> str:
+        """Синонимизировать значимые слова, служебные оставить."""
+        keep = {
+            "и",
+            "а",
+            "но",
+            "же",
+            "не",
+            "бы",
+            "то",
+            "в",
+            "на",
+            "с",
+            "у",
+            "по",
+            "из",
+            "к",
+            "от",
+            "за",
+            "мне",
+            "ему",
+            "её",
+            "ее",
+            "его",
+            "уже",
+            "ещё",
+            "еще",
+        }
+        out: List[str] = []
+        for w in idea.split():
+            if w in keep or w not in _COMMENT_SYNONYMS:
+                # иногда всё же заменить если есть словарь
+                if w in _COMMENT_SYNONYMS and random.random() < 0.7:
+                    out.append(self._synonymize_token(w))
+                else:
+                    out.append(w)
+            else:
+                out.append(self._synonymize_token(w))
+        return " ".join(out)
+
     def _craft_comment(self, samples: Sequence[str]) -> str:
         """
-        Сделать комментарий похожим на чужие:
-        взять 1–2 реальных, укоротить/переставить, строчными, без точки в конце.
+        Анализирует чужие комменты и пишет свой:
+        синонимы + куски из разных сообщений, длина 5–20 слов.
+        Не копирует чужой текст почти дословно.
         """
         cleaned: List[str] = []
         for s in samples:
-            s = s.strip()
-            s = re.sub(r"https?://\S+", "", s)
-            s = re.sub(r"[\U0001F300-\U0010ffff\u2600-\u27BF]", "", s)
-            s = re.sub(r"[^\w\sа-яА-ЯёЁ.,!?\-']", "", s, flags=re.UNICODE)
-            s = re.sub(r"\s+", " ", s).strip(" .!?,;:-")
-            if 5 <= len(s) <= 100 and self._is_safe_comment(s.lower()):
-                cleaned.append(s.lower())
+            norm = self._normalize_comment_sample(s)
+            if 8 <= len(norm) <= 160 and self._is_safe_comment(norm):
+                cleaned.append(norm)
 
-        fillers = (
+        openers = (
             "ну",
             "блин",
             "кста",
@@ -1072,64 +1246,127 @@ class MangaBuffService:
             "ладно",
             "хз",
             "короче",
+            "по-моему",
+            "мне кажется",
+            "если честно",
         )
-        endings = (
+        bridges = ("и", "но", "хотя", "кста", "ещё", "плюс")
+        tails = (
             "норм",
             "зашло",
-            "держится",
-            "интереснее стало",
+            "держит",
             "жду дальше",
+            "интереснее стало",
             "неплохо",
-            "огонь",
-            "странно конечно",
+            "вайб зашёл",
             "пока ок",
+            "странно конечно",
+            "тянет читать",
+            "атмосфера кайф",
+        )
+        fallbacks = (
+            "ну глава в целом норм зашло",
+            "имхо интереснее стало жду дальше",
+            "кста сюжет держит и вайб кайф",
+            "честно рисовка приятная и тянет читать",
+            "по-моему пока ок и интрига есть",
+            "ладно зашло сильнее чем думал",
+            "хз но атмосфера огонь и держит",
+            "короче норм глава жду продолжение",
         )
 
+        target_words = random.randint(COMMENT_WORDS_MIN, COMMENT_WORDS_MAX)
+        text = ""
+        used_sources: List[str] = []
+
         if cleaned:
-            base = random.choice(cleaned)
-            words = [w for w in base.split() if w]
-            # иногда взять кусок из второго коммента
-            if len(cleaned) > 1 and random.random() < 0.45:
-                other = random.choice(cleaned).split()
-                cut_a = words[: random.randint(2, min(6, len(words)))]
-                cut_b = other[: random.randint(1, min(4, len(other)))]
-                words = cut_a + cut_b
-            elif len(words) > 7:
-                words = words[: random.randint(4, 8)]
-            elif len(words) < 3 and random.random() < 0.5:
-                words = words + random.choice(endings).split()
-
-            # лёгкая «очеловечивающая» правка
-            if random.random() < 0.35:
-                words = [random.choice(fillers)] + words
-            if random.random() < 0.25 and words:
-                # убрать одно слово — как небрежный набор
-                drop = random.randrange(len(words))
-                words = words[:drop] + words[drop + 1 :]
-            text = " ".join(words)
-        else:
-            text = random.choice(
-                [
-                    "ну глава норм",
-                    "мне зашло",
-                    "интереснее стало",
-                    "жду дальше уже",
-                    "пока держит",
-                    "неплохо закрутили",
-                    "рисуют приятно кста",
-                    "атмосфера огонь",
+            # 2–3 идеи из разных комментов
+            pool = list(cleaned)
+            random.shuffle(pool)
+            picked: List[str] = []
+            for src in pool:
+                if len(picked) >= 3:
+                    break
+                src_ideas = [
+                    i
+                    for i in self._extract_comment_ideas([src])
+                    if 2 <= len(i.split()) <= 4
                 ]
-            )
+                if not src_ideas:
+                    continue
+                used_sources.append(src)
+                picked.append(self._paraphrase_idea(random.choice(src_ideas)))
 
-        text = re.sub(r"\s+", " ", text).strip().lower()
-        text = text.rstrip(".,!?;:…")
-        # без эмодзи, с маленькой буквы, без финальной точки
+            if not picked:
+                text = random.choice(fallbacks)
+            else:
+                chunks: List[str] = []
+                if random.random() < 0.6:
+                    chunks.append(random.choice(openers))
+                chunks.append(picked[0])
+                for idea in picked[1:]:
+                    if random.random() < 0.75:
+                        chunks.append(random.choice(bridges))
+                    chunks.append(idea)
+                if random.random() < 0.65:
+                    chunks.append(random.choice(tails))
+
+                words = " ".join(chunks).split()
+                # убрать обрывки в конце: одиночные союзы/частицы
+                dangling = {
+                    "и",
+                    "а",
+                    "но",
+                    "хотя",
+                    "кста",
+                    "ещё",
+                    "еще",
+                    "плюс",
+                    "типа",
+                    "не",
+                    "как",
+                    "что",
+                }
+                while words and words[-1] in dangling:
+                    words.pop()
+                if len(words) < COMMENT_WORDS_MIN:
+                    words.extend(random.choice(tails).split())
+                if len(words) > target_words:
+                    words = words[:target_words]
+                    while words and words[-1] in dangling:
+                        words.pop()
+                if len(words) < COMMENT_WORDS_MIN:
+                    words.extend(random.choice(tails).split())
+                words = words[:COMMENT_WORDS_MAX]
+                text = " ".join(words)
+
+            # если слишком похоже на исходник — ещё синонимизация по словам из словаря
+            for _ in range(3):
+                if not used_sources:
+                    break
+                if all(
+                    self._comment_similarity(text, src) < 0.5 for src in used_sources
+                ):
+                    break
+                text = self._paraphrase_idea(text)
+        else:
+            text = random.choice(fallbacks)
+
+        text = re.sub(r"\s+", " ", text).strip().lower().rstrip(".,!?;:…")
+        words = []
+        for w in text.split():
+            if words and words[-1] == w:
+                continue
+            words.append(w)
+        if len(words) < COMMENT_WORDS_MIN:
+            words.extend(random.choice(tails).split())
+        words = words[:COMMENT_WORDS_MAX]
+        text = " ".join(words).strip()
         if text:
             text = text[0].lower() + text[1:]
-        # отсечь слишком короткое/длинное
-        if len(text) < 5:
-            text = "ну норм вроде"
-        return text[:85]
+        if not self._is_safe_comment(text) or len(text.split()) < COMMENT_WORDS_MIN:
+            text = random.choice(fallbacks)
+        return text
 
     def _is_safe_comment(self, text: str) -> bool:
         if not text or len(text) < 4:
