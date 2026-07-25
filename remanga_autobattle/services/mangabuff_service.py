@@ -60,9 +60,9 @@ LAYOUT_URLS = (
 NIGHT_BREAK_START = time(1, 0)
 NIGHT_BREAK_END = time(5, 0)
 
-# Комментарии очень редко — снижение риска жалоб
-COMMENT_CHANCE = 0.04
-MIN_CHAPTERS_BETWEEN_COMMENTS = 18
+# Комментарии каждые 10–30 глав (случайный интервал)
+COMMENT_EVERY_MIN = 10
+COMMENT_EVERY_MAX = 30
 
 
 @dataclass
@@ -186,6 +186,7 @@ class MangaBuffService:
         self._stop_flag = asyncio.Event()
         self.stats = self._load_stats()
         self._chapters_since_comment = 0
+        self._next_comment_after = random.randint(COMMENT_EVERY_MIN, COMMENT_EVERY_MAX)
         self._read_urls: set[str] = set()
         self._skip_title = asyncio.Event()
         self.steps_min = 8
@@ -859,14 +860,12 @@ class MangaBuffService:
     # ------------------------------------------------------------------
 
     async def _maybe_comment(self, page: Page) -> bool:
+        """Писать комментарий каждые 10–30 глав (случайный интервал)."""
         self._chapters_since_comment += 1
-        if self._chapters_since_comment < MIN_CHAPTERS_BETWEEN_COMMENTS:
-            return False
-        if random.random() > COMMENT_CHANCE:
+        if self._chapters_since_comment < self._next_comment_after:
             return False
 
         try:
-            # открыть панель комментариев
             btn = page.locator("button.reader__show-comments-btn").first
             if await btn.count() and await btn.is_visible(timeout=700):
                 await btn.click(force=True)
@@ -875,19 +874,17 @@ class MangaBuffService:
             samples = await page.locator(".comments__body").all_inner_texts()
             samples = [s.strip() for s in samples if s and 8 <= len(s.strip()) <= 120]
             text = self._craft_comment(samples)
-            if not text:
-                return False
-
-            # фильтр риска жалоб
-            if not self._is_safe_comment(text):
+            if not text or not self._is_safe_comment(text):
+                # не сбрасываем счётчик полностью — попробуем через 2–4 главы
+                self._next_comment_after = self._chapters_since_comment + random.randint(2, 4)
                 return False
 
             area = page.locator(".comments__send-form textarea").first
             if await area.count() == 0:
+                self._next_comment_after = self._chapters_since_comment + random.randint(2, 4)
                 return False
             await area.click()
             await self._human_pause(0.4, 1.0)
-            # печать по символам
             for ch in text:
                 await area.type(ch, delay=random.randint(40, 140))
             await self._human_pause(0.8, 2.0)
@@ -896,11 +893,18 @@ class MangaBuffService:
             await self._human_pause(1.5, 3.0)
             self.stats.comments_posted += 1
             self._chapters_since_comment = 0
+            self._next_comment_after = random.randint(COMMENT_EVERY_MIN, COMMENT_EVERY_MAX)
             self.stats.touch(f"коммент: {text[:40]}")
-            logger.info("MangaBuff comment posted: %s", text)
+            self._persist_stats()
+            logger.info(
+                "MangaBuff comment posted (next in %s chapters): %s",
+                self._next_comment_after,
+                text,
+            )
             return True
         except Exception as exc:  # noqa: BLE001
             logger.debug("comment skip: %s", exc)
+            self._next_comment_after = self._chapters_since_comment + random.randint(2, 4)
             return False
 
     def _craft_comment(self, samples: Sequence[str]) -> str:
