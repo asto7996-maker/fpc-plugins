@@ -1,13 +1,15 @@
 """
-config.py — загрузка и валидация конфигурации проекта Remanga Autobattle.
+config.py — загрузка конфигурации Remanga Autobattle.
 
-Все секреты и настройки читаются из файла `.env` (или переменных окружения).
+Минимум для старта: BOT_TOKEN в .env (или переменной окружения).
+Остальные настройки (admin, URL боёв, интервал) вводятся в Telegram
+и хранятся в settings.json.
 """
 
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -19,15 +21,8 @@ BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
 
 
-def _require_str(name: str) -> str:
-    """Вернуть обязательную строковую переменную или выбросить понятную ошибку."""
-    value = os.getenv(name, "").strip()
-    if not value:
-        raise ValueError(
-            f"Не задана обязательная переменная окружения: {name}. "
-            f"Скопируйте .env.example в .env и заполните значения."
-        )
-    return value
+def _get_str(name: str, default: str = "") -> str:
+    return os.getenv(name, default).strip()
 
 
 def _get_int(name: str, default: int) -> int:
@@ -41,9 +36,9 @@ def _get_int(name: str, default: int) -> int:
         raise ValueError(f"Переменная {name} должна быть целым числом, получено: {raw!r}") from exc
 
 
-@dataclass(frozen=True)
+@dataclass
 class Config:
-    """Неизменяемый контейнер настроек приложения."""
+    """Контейнер настроек приложения (может обновляться из Telegram)."""
 
     bot_token: str
     telegram_admin_id: int
@@ -61,35 +56,51 @@ class Config:
     human_delay_min_sec: float
     human_delay_max_sec: float
 
+    def apply_runtime(self, settings) -> None:
+        """Применить RuntimeSettings поверх текущего Config (in-place)."""
+        if settings.telegram_admin_id > 0:
+            self.telegram_admin_id = settings.telegram_admin_id
+        if settings.battle_url:
+            self.battle_url = settings.battle_url.strip()
+        if settings.auto_battle_interval_sec >= 5:
+            self.auto_battle_interval_sec = settings.auto_battle_interval_sec
+        if settings.selector_timeout_ms >= 1000:
+            self.selector_timeout_ms = settings.selector_timeout_ms
+
 
 def load_config() -> Config:
     """
-    Собрать Config из переменных окружения.
+    Собрать Config: BOT_TOKEN из .env, остальное из settings.json / дефолтов.
 
     Raises:
-        ValueError: если обязательные поля отсутствуют или некорректны.
+        ValueError: если не задан BOT_TOKEN.
     """
-    bot_token = _require_str("BOT_TOKEN")
-    admin_id = _get_int("TELEGRAM_ADMIN_ID", 0)
-    if admin_id <= 0:
+    # Импорт здесь, чтобы избежать циклов при первом импорте BASE_DIR
+    from settings_store import load_settings
+
+    bot_token = _get_str("BOT_TOKEN")
+    if not bot_token or bot_token in {"replace_me", "YOUR_TOKEN", "xxx"}:
         raise ValueError(
-            "TELEGRAM_ADMIN_ID должен быть положительным числом "
-            "(ваш Telegram user id, например из @userinfobot)."
+            "Не задан BOT_TOKEN. Укажите его в .env или при установке "
+            "(install.sh спросит токен сам)."
         )
 
-    battle_url = os.getenv("BATTLE_URL", "https://remanga.org/cards").strip()
-    # По умолчанию 30 сек; автобой крутится бесконечно до ручной остановки
-    interval = _get_int("AUTO_BATTLE_INTERVAL_SEC", 30)
-    if interval < 5:
-        raise ValueError("AUTO_BATTLE_INTERVAL_SEC не должен быть меньше 5 секунд.")
+    runtime = load_settings()
 
-    user_data_raw = os.getenv("USER_DATA_DIR", "user_data").strip() or "user_data"
+    # Admin: приоритет settings.json, затем .env (0 = ещё не задан, возьмём из Telegram)
+    admin_id = runtime.telegram_admin_id or _get_int("TELEGRAM_ADMIN_ID", 0)
+
+    battle_url = runtime.battle_url or _get_str("BATTLE_URL", "https://remanga.org/cards")
+    interval = runtime.auto_battle_interval_sec or _get_int("AUTO_BATTLE_INTERVAL_SEC", 30)
+    if interval < 5:
+        interval = 30
+
+    user_data_raw = _get_str("USER_DATA_DIR", "user_data") or "user_data"
     user_data_dir = Path(user_data_raw)
     if not user_data_dir.is_absolute():
         user_data_dir = BASE_DIR / user_data_dir
 
-    # Таймаут ожидания элементов — 30 секунд по умолчанию
-    timeout_ms = _get_int("SELECTOR_TIMEOUT_MS", 30_000)
+    timeout_ms = runtime.selector_timeout_ms or _get_int("SELECTOR_TIMEOUT_MS", 30_000)
 
     return Config(
         bot_token=bot_token,
@@ -98,7 +109,6 @@ def load_config() -> Config:
         auto_battle_interval_sec=interval,
         user_data_dir=user_data_dir,
         selector_timeout_ms=timeout_ms,
-        # Реалистичный Chrome UA под Windows + Full HD
         user_agent=(
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "

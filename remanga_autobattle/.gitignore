@@ -1,6 +1,10 @@
 # Переменные окружения (секреты)
 .env
 
+# Настройки из Telegram
+settings.json
+settings.json.tmp
+
 # Профиль браузера Playwright (сессия, cookies, localStorage)
 user_data/*
 !user_data/.gitkeep
