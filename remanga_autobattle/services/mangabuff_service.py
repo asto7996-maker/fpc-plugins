@@ -408,7 +408,7 @@ class MangaBuffService:
         async with self._lock:
             return await self._claim_rewards_unlocked()
 
-    async def _claim_rewards_unlocked(self) -> ClaimResult:
+    async def _claim_rewards_unlocked(self, quick: bool = False) -> ClaimResult:
         if not self.is_started:
             await self.start(headless=True)
         assert self._page is not None
@@ -416,13 +416,22 @@ class MangaBuffService:
         await self.ensure_login()
         result = ClaimResult()
 
-        urls = list(LAYOUT_URLS) + [
-            "https://mangabuff.ru/promo-code",
-            "https://mangabuff.ru/battle",
-        ]
+        if quick:
+            urls = [
+                "https://mangabuff.ru/",
+                "https://mangabuff.ru/notifications",
+                "https://mangabuff.ru/battle",
+                "https://mangabuff.ru/cards",
+            ]
+        else:
+            urls = list(LAYOUT_URLS) + [
+                "https://mangabuff.ru/promo-code",
+                "https://mangabuff.ru/battle",
+            ]
         for url in urls:
             if self._stop_flag.is_set():
                 break
+            logger.info("MangaBuff claim visit %s", url)
             if not await self._safe_goto(page, url):
                 continue
             c, cards, details = await self._click_reward_buttons(page)
@@ -440,6 +449,7 @@ class MangaBuffService:
             result.message = "Активных кнопок наград не найдено (или уже собрано)."
         else:
             result.message = "Сбор завершён."
+        self.stats.touch(f"сбор: +{result.claimed}")
         return result
 
     async def explore_layouts(self) -> int:
@@ -499,62 +509,56 @@ class MangaBuffService:
         details: List[str] = []
         await self._dismiss_overlays(page)
 
-        for text in self.REWARD_TEXTS:
-            for getter in (
-                lambda t=text: page.get_by_role("button", name=re.compile(re.escape(t), re.I)),
-                lambda t=text: page.get_by_text(re.compile(rf"^{re.escape(t)}$", re.I)),
-            ):
-                try:
-                    loc = getter()
-                    count = await loc.count()
-                except Exception:  # noqa: BLE001
-                    continue
-                for i in range(min(count, 5)):
-                    btn = loc.nth(i)
-                    try:
-                        if not await btn.is_visible():
-                            continue
-                        label = ((await btn.inner_text(timeout=800)) or text).strip()
-                        if len(label) > 80:
-                            continue
-                        await btn.scroll_into_view_if_needed()
-                        await self._human_pause(0.3, 0.9)
-                        box = await btn.bounding_box()
-                        if box:
-                            await page.mouse.click(
-                                box["x"] + box["width"] / 2,
-                                box["y"] + box["height"] / 2,
-                            )
-                        else:
-                            await btn.click(force=True)
-                        claimed += 1
-                        low = label.lower()
-                        if "карт" in low or "пак" in low or "card" in low:
-                            cards += 1
-                        details.append(f"клик: {label[:60]}")
-                        await self._human_pause(0.8, 1.8)
-                    except Exception:  # noqa: BLE001
-                        continue
+        # Один проход по видимым primary-кнопкам — быстрее десятков regex-локаторов
+        try:
+            labels = await page.evaluate(
+                """() => [...document.querySelectorAll('button, a.button, [role=button]')]
+                  .filter(el => {
+                    const s = getComputedStyle(el);
+                    return s && s.display !== 'none' && s.visibility !== 'hidden' && el.offsetParent !== null;
+                  })
+                  .map(el => ({t: (el.innerText||'').trim().slice(0,80), c: el.className}))
+                  .filter(x => x.t && /забрать|получить|собрать|открыть|подтвердить|claim|ежеднев/i.test(x.t))
+                  .slice(0, 12)"""
+            )
+        except Exception:  # noqa: BLE001
+            labels = []
 
-        # модалки карт после чтения
+        for item in labels:
+            text = item.get("t") or ""
+            try:
+                loc = page.get_by_role("button", name=text).first
+                if await loc.count() == 0:
+                    loc = page.get_by_text(text, exact=True).first
+                if not await loc.is_visible():
+                    continue
+                await loc.click(force=True, timeout=2500)
+                claimed += 1
+                low = text.lower()
+                if "карт" in low or "пак" in low or "card" in low:
+                    cards += 1
+                details.append(f"клик: {text[:60]}")
+                await self._human_pause(0.5, 1.2)
+                await self._dismiss_overlays(page)
+            except Exception:  # noqa: BLE001
+                continue
+
         for sel in (
-            ".card-modal button",
+            ".close-adult-modal-btn",
             ".modal button.button--primary",
-            "[class*='card'] button",
             "[class*='reward'] button",
         ):
             try:
                 loc = page.locator(sel)
-                n = await loc.count()
-                for i in range(min(n, 3)):
+                n = min(await loc.count(), 2)
+                for i in range(n):
                     el = loc.nth(i)
                     if await el.is_visible():
-                        txt = ((await el.inner_text(timeout=500)) or "modal").strip()
-                        await el.click(force=True, timeout=2000)
+                        txt = ((await el.inner_text(timeout=400)) or "modal").strip()[:50]
+                        await el.click(force=True, timeout=1500)
                         claimed += 1
-                        cards += 1
-                        details.append(f"modal: {txt[:50]}")
-                        await self._human_pause(0.6, 1.4)
+                        details.append(f"modal: {txt}")
+                        await self._human_pause(0.4, 1.0)
             except Exception:  # noqa: BLE001
                 continue
         return claimed, cards, details
@@ -915,15 +919,22 @@ class MangaBuffService:
 
             cycle += 1
             try:
-                await self._claim_rewards_unlocked()
-                if cycle == 1 or cycle % 3 == 0:
+                logger.info("MangaBuff farm cycle %s: rewards", cycle)
+                await self._claim_rewards_unlocked(quick=True)
+                if cycle == 1 or cycle % 4 == 0:
+                    logger.info("MangaBuff farm cycle %s: layouts", cycle)
                     await self._explore_layouts_unlocked()
 
+                logger.info("MangaBuff farm cycle %s: fetch popular", cycle)
                 titles = await self.fetch_popular_titles(limit=24)
                 if not titles:
                     self.stats.touch("каталог пуст — пауза")
                     await self._human_pause(20, 40)
                     continue
+                logger.info(
+                    "MangaBuff titles: %s",
+                    ", ".join(t["slug"] for t in titles[:8]),
+                )
 
                 for title in titles:
                     if self._stop_flag.is_set():
@@ -932,11 +943,14 @@ class MangaBuffService:
                     if self._stop_flag.is_set():
                         break
 
-                    start_url = await self._open_first_chapter(title["href"])
-                    if not start_url:
-                        continue
-                    self.stats.titles_visited += 1
-                    self.stats.touch(f"тайтл: {title.get('title','')[:40]}", start_url)
+                        logger.info("MangaBuff open title %s", title.get("slug"))
+                        start_url = await self._open_first_chapter(title["href"])
+                        if not start_url:
+                            logger.warning("MangaBuff cannot open %s", title.get("slug"))
+                            continue
+                        self.stats.titles_visited += 1
+                        self.stats.touch(f"тайтл: {title.get('title','')[:40]}", start_url)
+                        logger.info("MangaBuff reading %s from %s", title.get("slug"), start_url)
 
                     chapters_this_title = 0
                     max_per_title = random.randint(40, 120)
