@@ -1523,9 +1523,10 @@ class App:
                 ok = await self.mangabuff.ensure_login()
                 logger.info("MangaBuff login on boot: %s", ok)
                 if ok and self._should_resume_mangabuff_farm():
+                    # start_mangabuff_read сам поднимет автофарм карт
                     asyncio.create_task(self.start_mangabuff_read())
                     logger.info("MangaBuff farm resumed")
-                if ok and load_settings().mangabuff_events_farm_enabled:
+                elif ok and load_settings().mangabuff_events_farm_enabled:
                     asyncio.create_task(self.start_events_farm(resume=True))
                     logger.info("MangaBuff events farm resumed")
         except Exception as exc:  # noqa: BLE001

@@ -1146,8 +1146,19 @@ class MangaBuffService:
     async def ensure_login(self) -> bool:
         if not self.is_started:
             await self.start(headless=True)
+        # лок: параллельный events/read не должен уводить вкладку во время логина
+        if self._lock.locked():
+            return await self._ensure_login_unlocked()
+        async with self._lock:
+            return await self._ensure_login_unlocked()
+
+    async def _ensure_login_unlocked(self) -> bool:
         assert self._page is not None
         page = self._page
+
+        if await self._is_logged_in(page):
+            self.stats.touch("уже авторизован", page.url)
+            return True
 
         await self._safe_goto(page, "https://mangabuff.ru/")
         if await self._is_logged_in(page):
@@ -1162,12 +1173,13 @@ class MangaBuffService:
         try:
             email = page.locator("input[name=email]").first
             pwd = page.locator("input[name=password]").first
-            await email.fill(self.email)
-            await self._human_pause(0.4, 1.0)
-            await pwd.fill(self.password)
-            await self._human_pause(0.5, 1.2)
-            await page.locator("button.login-button").first.click()
-            await self._human_pause(2.5, 4.5)
+            await email.wait_for(state="visible", timeout=8000)
+            await email.fill(self.email, timeout=8000)
+            await self._human_pause(0.3, 0.7)
+            await pwd.fill(self.password, timeout=8000)
+            await self._human_pause(0.4, 0.9)
+            await page.locator("button.login-button").first.click(timeout=8000)
+            await self._human_pause(2.0, 3.5)
             await self._dismiss_overlays(page)
             ok = await self._is_logged_in(page)
             self.stats.touch("логин ok" if ok else "логин fail", page.url)
@@ -1238,9 +1250,11 @@ class MangaBuffService:
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("events_loop: %s", exc)
                     self.stats.errors += 1
-                # пауза между проходами: турбо/быстрый — плотнее
+                # пока идёт чтение — реже (лок и так сериализует), иначе плотнее
                 tier = self._tempo_tier()
-                if tier == "turbo":
+                if self.stats.running:
+                    pause = 120.0 if tier in ("turbo", "fast") else 180.0
+                elif tier == "turbo":
                     pause = 28.0
                 elif tier == "fast":
                     pause = 40.0
@@ -1263,7 +1277,7 @@ class MangaBuffService:
             await self.start(headless=True)
         assert self._page is not None
         page = self._page
-        await self.ensure_login()
+        await self._ensure_login_unlocked()
         result = ClaimResult()
         before_cards = int(self.stats.cards_claimed or 0)
 
