@@ -2524,7 +2524,11 @@ class MangaBuffService:
                     result.details.append(
                         f"{format_rank_label(rank)} {name}: {msg}"
                     )
-                await self._tempo_pause(0.22, 0.4)
+                    # при 429 не долбим дальше пачкой — часовой job доберёт
+                    if "429" in msg or "too many" in msg.lower():
+                        result.details.append("пауза из‑за лимита сайта, продолжим позже")
+                        break
+                await self._tempo_pause(0.8, 1.4)
 
         # привязать market_id по картинкам одним проходом
         if result.listed or result.repriced:
@@ -2558,18 +2562,31 @@ class MangaBuffService:
         price_rank: str,
         price_value: int,
     ) -> Tuple[bool, str]:
-        """POST /market/ без перезагрузки страницы."""
-        resp = await self._post_market_lot(
-            page, user_card_id, price_rank, price_value
-        )
-        status = int((resp or {}).get("status") or 0)
-        payload = (resp or {}).get("data") if isinstance(resp, dict) else {}
+        """POST /market/ без перезагрузки страницы (с backoff на 429)."""
         msg = ""
-        if isinstance(payload, dict):
-            msg = str(payload.get("message") or payload.get("raw") or "")
-        if not (200 <= status < 300):
+        for attempt in range(4):
+            resp = await self._post_market_lot(
+                page, user_card_id, price_rank, price_value
+            )
+            status = int((resp or {}).get("status") or 0)
+            payload = (resp or {}).get("data") if isinstance(resp, dict) else {}
+            msg = ""
+            if isinstance(payload, dict):
+                msg = str(payload.get("message") or payload.get("raw") or "")
+            if 200 <= status < 300:
+                return True, msg or "ok"
+            if status == 429 or "too many" in msg.lower():
+                wait_for = 8.0 + attempt * 6.0
+                logger.warning(
+                    "MangaBuff market 429 id=%s — sleep %.0fs (try %s)",
+                    user_card_id,
+                    wait_for,
+                    attempt + 1,
+                )
+                await asyncio.sleep(wait_for)
+                continue
             return False, (msg or f"HTTP {status}")[:120]
-        return True, msg or "ok"
+        return False, (msg or "HTTP 429")[:120]
 
     async def _harvest_notifications_feed(self, page: Page) -> CardDropInfo:
         """
