@@ -1221,13 +1221,17 @@ class MangaBuffService:
         self.stats.night_break_until = until.strftime("%d.%m.%Y %H:%M")
         self.stats.touch(f"ночной перерыв до {self.stats.night_break_until}")
         logger.info("MangaBuff night break %s sec", int(remaining.total_seconds()))
-        # Спим кусками, чтобы реагировать на stop
-        end_ts = asyncio.get_event_loop().time() + remaining.total_seconds()
-        while asyncio.get_event_loop().time() < end_ts:
-            if self._stop_flag.is_set():
-                return
-            await asyncio.sleep(min(30.0, end_ts - asyncio.get_event_loop().time()))
+        # Спим кусками по wall-clock, чтобы не «залипнуть» после сдвига времени
+        while not self._stop_flag.is_set():
+            left = self._night_break_remaining()
+            if left is None:
+                break
+            chunk = min(30.0, max(0.5, left.total_seconds()))
+            await asyncio.sleep(chunk)
         self.stats.night_break_until = ""
+        logger.info("MangaBuff night break finished, resume farm")
+        self.stats.touch("ночной перерыв окончен")
+        self._persist_stats()
 
     # ------------------------------------------------------------------
     # Human helpers

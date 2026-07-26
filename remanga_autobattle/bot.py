@@ -643,6 +643,7 @@ class App:
             result = await self.mangabuff.list_cards_on_market(
                 user_card_ids=info.user_card_ids or None,
                 maintain=True,
+                lock_timeout=25.0,
             )
             if not chat or (not result.listed and not result.errors):
                 return
@@ -950,9 +951,11 @@ class App:
                 if ok and self._should_resume_mangabuff_farm():
                     asyncio.create_task(self.start_mangabuff_read())
                     logger.info("MangaBuff farm resumed")
-                elif ok and load_settings().mangabuff_events_farm_enabled:
-                    asyncio.create_task(self.start_events_farm(resume=True))
-                    logger.info("MangaBuff events farm resumed")
+                if ok and load_settings().mangabuff_events_farm_enabled:
+                    # параллельно с чтением (общий lock), не elif
+                    if not (self._events_task and not self._events_task.done()):
+                        asyncio.create_task(self.start_events_farm(resume=True))
+                        logger.info("MangaBuff events farm resumed")
         except Exception as exc:  # noqa: BLE001
             logger.warning("MangaBuff browser: %s", exc)
 
