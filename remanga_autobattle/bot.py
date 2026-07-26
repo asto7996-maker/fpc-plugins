@@ -482,15 +482,15 @@ class App:
         async def cards_list_market(message: Message) -> None:
             self._notify_chat_id = message.chat.id
             await message.answer(
-                "⏳ Выставляю <b>все</b> карты на площадку…\n"
-                "<i>1× ранг выше · X→2×X · сутки↔2× та же</i>",
+                "⏳ Выставляю <b>топ-10</b> самых дорогих карт…\n"
+                "<i>лимит лотов 10 · 1× выше · X→2×X · сутки↔2× та же</i>",
                 reply_markup=cards_events_keyboard(),
             )
             try:
                 if not self.mangabuff.is_started:
                     await self.mangabuff.start(headless=True)
                 result = await self.mangabuff.list_cards_on_market(
-                    limit=None, maintain=True
+                    maintain=True
                 )
                 await message.answer(
                     result.to_telegram(),
@@ -512,8 +512,8 @@ class App:
             on = not s.mangabuff_auto_market
             update_settings(mangabuff_auto_market=on)
             await message.answer(
-                f"📤 Авто-лоты (новые карты): <b>{'вкл' if on else 'выкл'}</b>\n"
-                f"<i>1× выше · X→2×X · раз в сутки ↔ 2× та же редкость</i>",
+                f"📤 Авто-лоты (топ-10): <b>{'вкл' if on else 'выкл'}</b>\n"
+                f"<i>только самые дорогие · 1× выше · X→2×X · сутки↔2× та же</i>",
                 reply_markup=cards_events_keyboard(),
             )
 
@@ -641,9 +641,8 @@ class App:
             if not self.mangabuff.is_started:
                 await self.mangabuff.start(headless=True)
             result = await self.mangabuff.list_cards_on_market(
-                limit=max(1, info.cards or 1),
                 user_card_ids=info.user_card_ids or None,
-                maintain=False,
+                maintain=True,
             )
             if not chat or (not result.listed and not result.errors):
                 return

@@ -94,10 +94,30 @@ _CARD_NOTIFY_RE = re.compile(
 # Индекс больше = карта дороже / реже.
 CARD_RANK_LADDER = ("E", "D", "C", "B", "G", "P", "A", "S", "X")
 MARKET_LOTS_PATH = BASE_DIR / "market_lots.json"
+# Лимит сайта: одновременно не больше 10 лотов — берём самые дорогие.
+MARKET_LOT_LIMIT = 10
 # Режим цены: higher = 1× ранг выше (для X — 2×X); same2 = 2× тот же ранг.
 MARKET_MODE_HIGHER = "higher"
 MARKET_MODE_SAME2 = "same2"
 MARKET_REPRICE_AFTER = timedelta(hours=24)
+
+
+def rank_value(rank: str) -> int:
+    """Чем выше — тем дороже карта (X максимум)."""
+    r = (rank or "").strip().upper()
+    if r in CARD_RANK_LADDER:
+        return CARD_RANK_LADDER.index(r)
+    return -1
+
+
+def card_value_key(row: Dict[str, Any]) -> Tuple[int, int, int, int]:
+    """Ключ сортировки «дороже → дешевле» (для reverse=True)."""
+    return (
+        rank_value(str(row.get("rank") or "")),
+        int(row.get("has_shadow") or 0),
+        -int(row.get("copy_number") or 10**9),  # меньший номер экземпляра ценнее
+        int(row.get("id") or 0),
+    )
 
 
 def next_higher_rank(rank: str) -> Optional[str]:
@@ -2246,7 +2266,7 @@ class MangaBuffService:
         maintain: bool = True,
     ) -> MarketListResult:
         """
-        Выставить карты на площадку (по умолчанию — все доступные).
+        Выставить до MARKET_LOT_LIMIT самых дорогих карт.
         Цена: 1× ранг выше; для X (нет выше) — 2×X.
         При maintain=True также переключает цену раз в сутки (1×выше ↔ 2×та же).
         """
@@ -2254,19 +2274,19 @@ class MangaBuffService:
             await self.start(headless=True)
         async with self._lock:
             return await self._maintain_market_unlocked(
-                limit=limit,
+                limit=limit if limit is not None else MARKET_LOT_LIMIT,
                 user_card_ids=user_card_ids,
                 do_list=True,
                 do_reprice=maintain,
             )
 
     async def maintain_market_lots(self) -> MarketListResult:
-        """Фоновая поддержка: новые лоты + суточная смена цены."""
+        """Фоновая поддержка: топ-10 лотов + суточная смена цены."""
         if not self.is_started:
             await self.start(headless=True)
         async with self._lock:
             return await self._maintain_market_unlocked(
-                limit=None,
+                limit=MARKET_LOT_LIMIT,
                 user_card_ids=None,
                 do_list=True,
                 do_reprice=True,
@@ -2280,7 +2300,7 @@ class MangaBuffService:
         do_list: bool = True,
         do_reprice: bool = True,
     ) -> MarketListResult:
-        """Листинг всех карт + суточный флип цены. Под self._lock."""
+        """Топ-N самых дорогих лотов + суточный флип цены. Под self._lock."""
         result = MarketListResult()
         page = self._page
         assert page is not None
@@ -2291,6 +2311,9 @@ class MangaBuffService:
             result.errors += 1
             result.details.append("не открылась /market")
             return result
+
+        lot_cap = max(1, int(limit) if limit is not None else MARKET_LOT_LIMIT)
+        lot_cap = min(lot_cap, MARKET_LOT_LIMIT)
 
         state = self._load_market_lots_state()
         now = datetime.now(MSK)
@@ -2359,10 +2382,54 @@ class MangaBuffService:
                 )
                 del state[key]
 
-        # суточная смена режима цены
+        # топ самых дорогих карт, которые можно держать в лотах
+        tradable_pool = [
+            r
+            for r in inv
+            if int(r.get("id") or 0)
+            and not int(r.get("is_not_tradable") or 0)
+            and not int(r.get("is_lock") or 0)
+            and str(r.get("rank") or "").strip()
+        ]
+        tradable_pool.sort(key=card_value_key, reverse=True)
+        desired_rows = tradable_pool[:lot_cap]
+        desired_ids = {int(r.get("id") or 0) for r in desired_rows}
+
+        # снять лишние / более дешёвые лоты, чтобы освободить слоты под топ
+        for key in list(state.keys()):
+            uid = int(key)
+            if uid in desired_ids:
+                continue
+            st = state[key]
+            mid = int(st.get("market_id") or 0)
+            rank = str(st.get("card_rank") or "")
+            name = str(st.get("name") or f"#{uid}")
+            if mid:
+                del_resp = await self._delete_market_lot(page, mid)
+                del_status = int((del_resp or {}).get("status") or 0)
+                if 200 <= del_status < 300:
+                    result.removed += 1
+                    result.details.append(
+                        f"{format_rank_label(rank)} {name}: снят (не в топ-{lot_cap})"
+                    )
+                    live_user_ids.discard(uid)
+                    state.pop(key, None)
+                else:
+                    result.errors += 1
+                    result.details.append(
+                        f"{format_rank_label(rank)} {name}: не снят лишний лот"
+                    )
+                await self._tempo_pause(0.3, 0.55)
+            else:
+                state.pop(key, None)
+                live_user_ids.discard(uid)
+
+        # суточная смена режима цены — только для лотов из топа
         if do_reprice:
             for key, st in list(state.items()):
                 uid = int(key)
+                if uid not in desired_ids:
+                    continue
                 row = inv_by_id.get(uid)
                 if not row:
                     continue
@@ -2445,38 +2512,29 @@ class MangaBuffService:
                     state.pop(key, None)
                 await self._tempo_pause(0.25, 0.45)
 
-        # выставить все / выбранные, которых ещё нет в лотах
+        # выставить недостающие из топ-N (самые дорогие)
         if do_list:
             want_ids = {int(x) for x in (user_card_ids or []) if x}
-            if want_ids:
-                candidates = [
-                    inv_by_id[i] for i in want_ids if i in inv_by_id
-                ] + [
-                    {"id": i, "rank": "", "card_name": f"#{i}", "image": ""}
-                    for i in want_ids
-                    if i not in inv_by_id
-                ]
-            else:
-                candidates = [
-                    r
-                    for r in inv
-                    if not int(r.get("is_not_tradable") or 0)
-                    and not int(r.get("is_lock") or 0)
-                    and str(r.get("rank") or "").strip()
-                ]
+            # если передали конкретные id дропа — всё равно только если они в топе
+            candidates = [
+                r
+                for r in desired_rows
+                if (not want_ids or int(r.get("id") or 0) in want_ids)
+            ]
+            # при общем maintain — весь топ; при дропе без попадания в топ — пусто
+            if not want_ids:
+                candidates = list(desired_rows)
 
-            listed_n = 0
-            max_list = int(limit) if limit is not None else 10_000
+            free_slots = max(0, lot_cap - len(live_user_ids))
             for row in candidates:
-                if listed_n >= max_list:
+                if free_slots <= 0:
                     break
                 uid = int(row.get("id") or 0)
-                if not uid:
-                    continue
-                if uid in live_user_ids or int(row.get("in_trade") or 0):
+                if not uid or uid in live_user_ids:
                     result.skipped += 1
                     continue
-                if int(row.get("is_not_tradable") or 0) or int(row.get("is_lock") or 0):
+                if int(row.get("in_trade") or 0):
+                    # уже в лоте, но не в live_user_ids — пропускаем
                     result.skipped += 1
                     continue
 
@@ -2485,7 +2543,6 @@ class MangaBuffService:
                 image = _normalize_card_image(str(row.get("image") or ""))
                 if not rank:
                     result.skipped += 1
-                    result.details.append(f"{name}: нет ранга")
                     continue
 
                 mode = MARKET_MODE_HIGHER
@@ -2494,7 +2551,7 @@ class MangaBuffService:
                     page, uid, price_rank, price_value
                 )
                 if ok:
-                    listed_n += 1
+                    free_slots -= 1
                     result.listed += 1
                     live_user_ids.add(uid)
                     state[str(uid)] = {
@@ -2524,14 +2581,15 @@ class MangaBuffService:
                     result.details.append(
                         f"{format_rank_label(rank)} {name}: {msg}"
                     )
-                    # при 429 не долбим дальше пачкой — часовой job доберёт
                     if "429" in msg or "too many" in msg.lower():
-                        result.details.append("пауза из‑за лимита сайта, продолжим позже")
+                        result.details.append(
+                            "пауза из‑за лимита сайта, продолжим позже"
+                        )
                         break
                 await self._tempo_pause(0.8, 1.4)
 
         # привязать market_id по картинкам одним проходом
-        if result.listed or result.repriced:
+        if result.listed or result.repriced or result.removed:
             await self._safe_goto(page, "https://mangabuff.ru/market")
             await self._tempo_pause(0.3, 0.6)
             own = await self._fetch_own_market_lots(page)
@@ -2542,14 +2600,18 @@ class MangaBuffService:
                 if not lot:
                     continue
                 st["market_id"] = int(lot.get("market_id") or 0)
-                st["price_rank"] = str(lot.get("price_rank") or st.get("price_rank") or "")
-                st["price_value"] = int(lot.get("price_value") or st.get("price_value") or 0)
+                st["price_rank"] = str(
+                    lot.get("price_rank") or st.get("price_rank") or ""
+                )
+                st["price_value"] = int(
+                    lot.get("price_value") or st.get("price_value") or 0
+                )
                 state[key] = st
 
         self._save_market_lots_state(state)
-        if result.listed or result.repriced:
+        if result.listed or result.repriced or result.removed:
             self.stats.touch(
-                f"площадка: +{result.listed} / ↔{result.repriced}",
+                f"площадка: +{result.listed} / ↔{result.repriced} / −{result.removed}",
                 page.url,
             )
             self._persist_stats()
