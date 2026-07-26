@@ -2264,6 +2264,7 @@ class MangaBuffService:
         limit: Optional[int] = None,
         user_card_ids: Optional[Sequence[int]] = None,
         maintain: bool = True,
+        lock_timeout: float = 120.0,
     ) -> MarketListResult:
         """
         Выставить до MARKET_LOT_LIMIT самых дорогих карт.
@@ -2272,25 +2273,42 @@ class MangaBuffService:
         """
         if not self.is_started:
             await self.start(headless=True)
-        async with self._lock:
+        try:
+            await asyncio.wait_for(self._lock.acquire(), timeout=float(lock_timeout))
+        except asyncio.TimeoutError:
+            logger.warning("market list skipped — browser busy (farm)")
+            return MarketListResult(
+                details=["пропуск: идёт чтение, повторю позже"]
+            )
+        try:
             return await self._maintain_market_unlocked(
                 limit=limit if limit is not None else MARKET_LOT_LIMIT,
                 user_card_ids=user_card_ids,
                 do_list=True,
                 do_reprice=maintain,
             )
+        finally:
+            self._lock.release()
 
     async def maintain_market_lots(self) -> MarketListResult:
         """Фоновая поддержка: топ-10 лотов + суточная смена цены."""
         if not self.is_started:
             await self.start(headless=True)
-        async with self._lock:
+        # не отбираем браузер у фарма надолго — лучше пропустить час
+        try:
+            await asyncio.wait_for(self._lock.acquire(), timeout=20.0)
+        except asyncio.TimeoutError:
+            logger.info("market maintain deferred — farm holds lock")
+            return MarketListResult(details=["отложено: идёт фарм глав"])
+        try:
             return await self._maintain_market_unlocked(
                 limit=MARKET_LOT_LIMIT,
                 user_card_ids=None,
                 do_list=True,
                 do_reprice=True,
             )
+        finally:
+            self._lock.release()
 
     async def _maintain_market_unlocked(
         self,
@@ -2515,15 +2533,15 @@ class MangaBuffService:
         # выставить недостающие из топ-N (самые дорогие)
         if do_list:
             want_ids = {int(x) for x in (user_card_ids or []) if x}
-            # если передали конкретные id дропа — всё равно только если они в топе
-            candidates = [
-                r
-                for r in desired_rows
-                if (not want_ids or int(r.get("id") or 0) in want_ids)
-            ]
-            # при общем maintain — весь топ; при дропе без попадания в топ — пусто
-            if not want_ids:
-                candidates = list(desired_rows)
+            candidates = list(desired_rows)
+            # новые дропы из want_ids — первыми среди топа
+            if want_ids:
+                candidates.sort(
+                    key=lambda r: (
+                        0 if int(r.get("id") or 0) in want_ids else 1,
+                        -rank_value(str(r.get("rank") or "")),
+                    )
+                )
 
             free_slots = max(0, lot_cap - len(live_user_ids))
             for row in candidates:
@@ -4308,6 +4326,7 @@ class MangaBuffService:
                         break
 
                     slug = str(title.get("slug") or "")
+                    logger.info("MangaBuff start title %s", slug or title.get("href"))
                     async with self._lock:
                         chapters_this_title = await self._read_title_almost_end(
                             page,
