@@ -730,6 +730,12 @@ def _do_new_rental(api, mapping, chat_id, buyer_name, order, hours: int, notify_
     if err or not data:
         if err == "insufficient_balance":
             _balance_alerted["low"] = True
+        if err == "no_stock":
+            try:
+                _last_stock_avail[int(product_id)] = 0
+            except Exception:
+                pass
+            _hide_product_lots(product_id, "stock", fast=True)
         if notify_fail:
             notify_buyer_problem(chat_id)
             notify_admins(f"Не удалось выдать аккаунт: {_human_err(err or 'unknown')}",
@@ -762,6 +768,14 @@ def _do_new_rental(api, mapping, chat_id, buyer_name, order, hours: int, notify_
         "review_bonus_given": False,
     }
     _add_rental(_buyer_key(chat_id), rec)
+
+    try:
+        pid = int(product_id)
+        prev = _last_stock_avail.get(pid)
+        if prev is not None:
+            _last_stock_avail[pid] = max(0, int(prev) - 1)
+    except Exception:
+        pass
 
     _send(chat_id, fmt("text_delivery", login=login, password=password, game=game,
                        hours=hours, expires=_fmt_expires(expires_raw)))
@@ -818,6 +832,16 @@ def _process_order(cardinal: "Cardinal", order, lot_id):
     buyer_key = _buyer_key(chat_id)
 
     logger.info(f"{LP} order {order.id} matched product={mapping.get('product_id')} qty={qty} hours_unit={hours_unit}")
+
+    avail = _product_avail(api, mapping["product_id"])
+    if avail is not None and avail <= 0:
+        logger.warning(f"{LP} order {order.id}: stock=0 для product {mapping.get('product_id')}, скрываю лоты")
+        _hide_product_lots(mapping["product_id"], "stock", fast=True)
+        notify_buyer_problem(chat_id)
+        notify_admins(f"Заказ при нулевом наличии на KOSell — выдача отменена ({mapping.get('product_name')})",
+                      order=order, dedup_key=f"nostock:{order.id}")
+        _maybe_refund(order)
+        return
 
     if _friend_active(buyer_key):
         delivered = 0
@@ -1107,6 +1131,11 @@ def on_last_chat_message_changed(cardinal: "Cardinal", event):
 _LOT_RETRY_WAITS = [6.0, 15.0, 20.0]
 
 
+def _lot_is_active_on_fp(lf) -> bool:
+    """Фактическая активность лота на FunPay (поле формы, не свойство lf.active)."""
+    return lf.fields.get("active") == "on"
+
+
 def _set_lot_active(lot_id, active: bool, fast: bool = False) -> bool:
     if not cardinal_instance:
         return False
@@ -1115,7 +1144,7 @@ def _set_lot_active(lot_id, active: bool, fast: bool = False) -> bool:
     for i in range(attempts):
         try:
             lf = cardinal_instance.account.get_lot_fields(int(lot_id))
-            if lf.active == active:
+            if _lot_is_active_on_fp(lf) == active:
                 return True
             lf.active = active
             cardinal_instance.account.save_lot(lf)
@@ -1135,15 +1164,15 @@ def _set_lot_active(lot_id, active: bool, fast: bool = False) -> bool:
 
 def _hide_lot(lot_id, reason: str, persist: bool = True, fast: bool = False):
     global _hidden_dirty
-    if str(lot_id) in HIDDEN:
-        return False
+    already_tracked = str(lot_id) in HIDDEN
     if _set_lot_active(lot_id, False, fast=fast):
-        HIDDEN[str(lot_id)] = reason
-        if persist:
-            save_hidden()
-        else:
-            _hidden_dirty = True
-        logger.info(f"{LP} lot {lot_id} hidden ({reason})")
+        if not already_tracked:
+            HIDDEN[str(lot_id)] = reason
+            if persist:
+                save_hidden()
+            else:
+                _hidden_dirty = True
+            logger.info(f"{LP} lot {lot_id} hidden ({reason})")
         return True
     return False
 
@@ -1161,6 +1190,34 @@ def _restore_lot(lot_id, persist: bool = True, fast: bool = False):
         logger.info(f"{LP} lot {lot_id} restored")
         return True
     return False
+
+
+def _product_avail(api: "KOSellAPI", product_id: int) -> "int | None":
+    """Свободные аккаунты на KOSell для product_id (None = ошибка API)."""
+    try:
+        pid = int(product_id)
+    except Exception:
+        return None
+    snap = _last_stock_avail.get(pid)
+    if snap is not None:
+        return int(snap)
+    products = api.products()
+    if products is None:
+        return None
+    for p in products:
+        try:
+            if int(p.get("id")) == pid:
+                return int(p.get("available_accounts", 0) or 0)
+        except Exception:
+            continue
+    return 0
+
+
+def _hide_product_lots(product_id: int, reason: str = "stock", fast: bool = True):
+    for m in MAPPINGS:
+        if m.get("lot_id") and str(m.get("product_id")) == str(product_id):
+            _hide_lot(m["lot_id"], reason, persist=False, fast=fast)
+    _flush_hidden()
 
 
 def _poll_cycle():
