@@ -1080,7 +1080,11 @@ class App:
         if info.names:
             shown = ", ".join(info.names[:4])
             names = f"\n{shown}"
-        src = f"\n<i>{info.source}</i>" if info.source else ""
+        src = ""
+        if info.source and "notifications" in info.source:
+            src = "\n<i>из уведомлений MangaBuff</i>"
+        elif info.source:
+            src = f"\n<i>{info.source}</i>"
         scrolls = f" · 📜 +{info.scrolls}" if info.scrolls else ""
         try:
             await self.bot.send_message(

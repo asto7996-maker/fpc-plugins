@@ -62,6 +62,7 @@ LAYOUT_URLS = (
 EVENT_FARM_URLS = (
     "https://mangabuff.ru/",
     "https://mangabuff.ru/notifications",
+    "https://mangabuff.ru/notifications?type=other",
     "https://mangabuff.ru/battle",
     "https://mangabuff.ru/battle/awakening",
     "https://mangabuff.ru/battle/reroll",
@@ -74,6 +75,19 @@ EVENT_FARM_URLS = (
     "https://mangabuff.ru/quiz",
     "https://mangabuff.ru/promo-code",
     "https://mangabuff.ru/club",
+)
+
+# Карты за чтение приходят в ленту уведомлений (вкладки ВСЕ / ДРУГОЕ)
+CARD_NOTIFY_URLS = (
+    "https://mangabuff.ru/notifications",
+    "https://mangabuff.ru/notifications?type=other",
+)
+
+# Текст сайта про дроп карт/свитков в уведомлениях и reader-тостах
+_CARD_NOTIFY_RE = re.compile(
+    r"(карточк|получил[аи]?\s+карт|получен[ао]?\s+карт|новая\s+карт|"
+    r"вам\s+выпал|выпал[аи]?\s+карт|забрать\s+карт|свит(ок|ка|ки))",
+    re.I,
 )
 
 # Ночной перерыв: 01:00–05:00 МСК (ровно 4 часа)
@@ -653,6 +667,8 @@ class MangaBuffStats:
     last_card_drop: str = ""
     # Ключи глав, куда уже писали комментарий: "slug/vol/ch" — строго 1 на главу
     commented_chapters: List[str] = field(default_factory=list)
+    # Уже обработанные уведомления сайта (id/hash) — без повторных TG-алертов
+    seen_notifications: List[str] = field(default_factory=list)
 
     def touch(self, action: str, url: str = "") -> None:
         self.last_action = action
@@ -674,6 +690,11 @@ class MangaBuffStats:
             cleaned["commented_chapters"] = []
         else:
             cleaned["commented_chapters"] = [str(x) for x in ch if x][-5000:]
+        seen = cleaned.get("seen_notifications")
+        if not isinstance(seen, list):
+            cleaned["seen_notifications"] = []
+        else:
+            cleaned["seen_notifications"] = [str(x) for x in seen if x][-800:]
         return cls(**cleaned)
 
     def to_telegram(self, delay_range: Tuple[float, float] = (5.0, 15.0)) -> str:
@@ -809,6 +830,8 @@ class MangaBuffService:
         self._events_running: bool = False
         # колбэк: async (CardDropInfo) -> None — уведомление о картах
         self.on_card_drop = None
+        self._seen_notifications: set[str] = set(self.stats.seen_notifications or [])
+        self._mb_user_id: str = ""
 
     def mark_farm_session_start(self) -> None:
         """Зафиксировать начало сессии: главы «за сессию» считаются отсюда."""
@@ -1146,9 +1169,8 @@ class MangaBuffService:
     async def ensure_login(self) -> bool:
         if not self.is_started:
             await self.start(headless=True)
-        # лок: параллельный events/read не должен уводить вкладку во время логина
-        if self._lock.locked():
-            return await self._ensure_login_unlocked()
+        # лок: параллельный events/read не уводит вкладку во время логина.
+        # Из кода под уже взятым _lock вызывайте _ensure_login_unlocked().
         async with self._lock:
             return await self._ensure_login_unlocked()
 
@@ -1281,17 +1303,18 @@ class MangaBuffService:
         result = ClaimResult()
         before_cards = int(self.stats.cards_claimed or 0)
 
+        await self._refresh_user_id(page)
         if quick:
-            # быстрый цикл: максимум дропов/сундуков за минимум навигации
-            urls = [
-                "https://mangabuff.ru/notifications",
+            # лента уведомлений — главный источник дропов карт за чтение
+            urls = list(self._card_notify_urls()) + [
                 "https://mangabuff.ru/battle",
                 "https://mangabuff.ru/cards/pack",
-                "https://mangabuff.ru/cards",
                 "https://mangabuff.ru/transactions",
             ]
         else:
-            urls = list(EVENT_FARM_URLS)
+            urls = list(self._card_notify_urls()) + [
+                u for u in EVENT_FARM_URLS if "notifications" not in u
+            ]
 
         for url in urls:
             if self._stop_flag.is_set() or self._events_stop.is_set():
@@ -1299,6 +1322,18 @@ class MangaBuffService:
             logger.info("MangaBuff event visit %s", url)
             if not await self._safe_goto(page, url):
                 continue
+
+            if "/notifications" in url:
+                feed = await self._harvest_notifications_feed(page)
+                if feed.cards or feed.scrolls:
+                    result.cards += feed.cards
+                    result.scrolls += feed.scrolls
+                    result.card_names.extend(feed.names)
+                    result.details.append(
+                        f"уведомления: +{feed.cards} карт / +{feed.scrolls} свитков"
+                    )
+                continue
+
             # сундуки / паки / награды
             c, cards, scrolls, chests, packs, details = await self._click_reward_buttons(page)
             result.claimed += c
@@ -1646,6 +1681,206 @@ class MangaBuffService:
         except Exception as exc:  # noqa: BLE001
             logger.warning("on_card_drop: %s", exc)
 
+    def _card_notify_urls(self) -> List[str]:
+        urls = list(CARD_NOTIFY_URLS)
+        if self._mb_user_id:
+            # персональная ссылка вида /notifications?<user_id>
+            urls.insert(0, f"https://mangabuff.ru/notifications?{self._mb_user_id}")
+        return urls
+
+    async def _refresh_user_id(self, page: Page) -> None:
+        try:
+            uid = await page.evaluate(
+                "() => (window.user_id != null ? String(window.user_id) : '')"
+            )
+            if uid and uid.isdigit():
+                self._mb_user_id = uid
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _remember_notification(self, key: str) -> bool:
+        """True если ключ новый (ещё не видели)."""
+        key = (key or "").strip()
+        if not key or key in self._seen_notifications:
+            return False
+        self._seen_notifications.add(key)
+        # trim + persist
+        recent = list(self._seen_notifications)[-800:]
+        self._seen_notifications = set(recent)
+        self.stats.seen_notifications = recent
+        return True
+
+    def _parse_card_notify_text(self, text: str) -> Tuple[int, int, List[str]]:
+        """Из текста уведомления → (cards, scrolls, names)."""
+        raw = (text or "").strip()
+        if not raw or not _CARD_NOTIFY_RE.search(raw):
+            return 0, 0, []
+        low = raw.lower()
+        # не путать с навбаром/вкладками
+        if re.search(r"список уведомлений пуст|показать все", low):
+            return 0, 0, []
+        m = re.search(r"(?:\+|получен[ао]?\s*)(\d+)\s*карт", low)
+        n_cards = min(10, int(m.group(1))) if m else (1 if "карт" in low else 0)
+        m2 = re.search(r"(?:\+|получен[ао]?\s*)(\d+)\s*свит", low)
+        n_scroll = min(5, int(m2.group(1))) if m2 else (1 if "свит" in low else 0)
+        names: List[str] = []
+        for line in raw.splitlines():
+            line = line.strip()
+            if not (2 <= len(line) <= 80):
+                continue
+            if re.search(
+                r"уведомл|забрать|получить|закрыть|продолж|отлично|манга|коммент|обмен",
+                line,
+                re.I,
+            ):
+                continue
+            if _CARD_NOTIFY_RE.search(line) and len(line) < 24:
+                continue
+            names.append(line)
+            if len(names) >= 3:
+                break
+        return n_cards, n_scroll, names
+
+    async def _harvest_notifications_feed(self, page: Page) -> CardDropInfo:
+        """
+        Главный источник: лента https://mangabuff.ru/notifications
+        Элементы .notifications__item — карты за чтение попадают сюда.
+        """
+        info = CardDropInfo(source=page.url)
+        try:
+            # непрочитанные — приоритет
+            try:
+                await page.select_option(
+                    "select.sort-select, select[name=sort]", value="not_read"
+                )
+                await self._tempo_pause(0.35, 0.8)
+            except Exception:  # noqa: BLE001
+                pass
+
+            items = await page.evaluate(
+                """() => {
+                  const nodes = [...document.querySelectorAll('.notifications__item')];
+                  return nodes.slice(0, 40).map((el, idx) => {
+                    const id = el.getAttribute('data-id')
+                      || el.dataset.id
+                      || el.id
+                      || '';
+                    const link = el.getAttribute('href')
+                      || (el.querySelector('a') && el.querySelector('a').getAttribute('href'))
+                      || '';
+                    return {
+                      id: String(id || ''),
+                      unread: el.classList.contains('notifications__item--not-read'),
+                      text: (el.innerText || '').trim().slice(0, 400),
+                      href: String(link || ''),
+                      idx: idx
+                    };
+                  });
+                }"""
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("notifications feed: %s", exc)
+            return info
+
+        if not items:
+            logger.info("MangaBuff notifications: empty feed on %s", page.url)
+            return info
+
+        for it in items:
+            text = (it.get("text") or "").strip()
+            n_cards, n_scroll, names = self._parse_card_notify_text(text)
+            if n_cards <= 0 and n_scroll <= 0:
+                continue
+            key = (
+                str(it.get("id") or "").strip()
+                or str(it.get("href") or "").strip()
+                or f"hash:{hash(text) & 0xFFFFFFFF:x}"
+            )
+            if not self._remember_notification(key):
+                continue
+            info.cards += n_cards
+            info.scrolls += n_scroll
+            for n in names:
+                if n not in info.names:
+                    info.names.append(n)
+            info.raw = text[:200]
+            logger.info(
+                "MangaBuff notify-feed card +%s scroll +%s key=%s unread=%s text=%s",
+                n_cards,
+                n_scroll,
+                key,
+                it.get("unread"),
+                text[:120].replace("\n", " | "),
+            )
+
+        if info.cards or info.scrolls:
+            if info.cards:
+                self.stats.cards_claimed += info.cards
+                self.stats.last_card_drop = (
+                    f"+{info.cards} · {', '.join(info.names[:2])}"
+                    if info.names
+                    else f"+{info.cards}"
+                )
+            if info.scrolls:
+                self.stats.scrolls_claimed += info.scrolls
+            self.stats.touch(
+                f"уведомления: карт +{info.cards}"
+                + (f" свит +{info.scrolls}" if info.scrolls else ""),
+                page.url,
+            )
+            self._persist_stats()
+            await self._emit_card_drop(info)
+        else:
+            self._persist_stats()
+        return info
+
+    async def _harvest_reader_toast(self, page: Page) -> CardDropInfo:
+        """Тост .reader__notification в читалке (socket new-notify)."""
+        info = CardDropInfo(source="reader-toast")
+        try:
+            blobs = await page.evaluate(
+                """() => [...document.querySelectorAll('.reader__notification, .club-card-notify, .mb-toast-wrap .mb-toast')]
+                  .map(el => (el.innerText || el.innerHTML || '').trim().slice(0, 300))
+                  .filter(Boolean)
+                  .slice(0, 6)"""
+            )
+        except Exception:  # noqa: BLE001
+            blobs = []
+        for raw in blobs or []:
+            # strip tags if html slipped in
+            text = re.sub(r"<[^>]+>", " ", raw)
+            text = re.sub(r"\s+", " ", text).strip()
+            n_cards, n_scroll, names = self._parse_card_notify_text(text)
+            if n_cards <= 0 and n_scroll <= 0:
+                continue
+            key = f"toast:{hash(text) & 0xFFFFFFFF:x}"
+            if not self._remember_notification(key):
+                continue
+            info.cards += n_cards
+            info.scrolls += n_scroll
+            info.names.extend(names)
+            info.raw = text[:200]
+        if info.cards or info.scrolls:
+            if info.cards:
+                self.stats.cards_claimed += info.cards
+                self.stats.last_card_drop = (
+                    f"+{info.cards} · {', '.join(info.names[:2])}"
+                    if info.names
+                    else f"+{info.cards}"
+                )
+            if info.scrolls:
+                self.stats.scrolls_claimed += info.scrolls
+            self.stats.touch(f"тост: карт +{info.cards}", page.url)
+            self._persist_stats()
+            logger.info(
+                "MangaBuff reader toast +%s scrolls +%s names=%s",
+                info.cards,
+                info.scrolls,
+                info.names[:3],
+            )
+            await self._emit_card_drop(info)
+        return info
+
     # ------------------------------------------------------------------
     # Catalog / reading
     # ------------------------------------------------------------------
@@ -1953,6 +2188,7 @@ class MangaBuffService:
             self.stats.scrolls_claimed += scrolls
             self.stats.chests_opened += chests
             self.stats.packs_opened += packs
+            await self._harvest_reader_toast(page)
             await self._harvest_card_drops(page, source="chapter-end")
         except Exception:  # noqa: BLE001
             pass
@@ -2785,11 +3021,25 @@ class MangaBuffService:
                     break
                 continue
 
-            # дроп карт/свитков после главы (лимит ~10 карт/сутки)
+            # дроп карт: тост в читалке + модалка (лимит ~10 карт/сутки)
+            try:
+                await self._harvest_reader_toast(page)
+            except Exception:  # noqa: BLE001
+                pass
             try:
                 await self._harvest_card_drops(page, source=final_url)
             except Exception:  # noqa: BLE001
                 pass
+            # каждые 5 глав — сверка с лентой /notifications
+            if (self.session_chapters + 1) % 5 == 0:
+                try:
+                    here = page.url
+                    for nurl in self._card_notify_urls()[:2]:
+                        if await self._safe_goto(page, nurl):
+                            await self._harvest_notifications_feed(page)
+                    await self._safe_goto(page, here)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("chapter notify poll: %s", exc)
 
             self.stats.chapters_read += 1
             chapters_this_title += 1
