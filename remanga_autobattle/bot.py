@@ -1357,14 +1357,23 @@ class App:
         self._mb_session_titles_base = int(self.mangabuff.stats.titles_visited or 0)
         self.mangabuff.mark_farm_session_start()
         update_settings(mangabuff_setup_done=True, mangabuff_farm_enabled=True)
+        # карты/эвенты — параллельно с чтением (основной источник дропов)
+        try:
+            if not (
+                self.mangabuff._events_running
+                or (self._events_task and not self._events_task.done())
+            ):
+                await self.start_events_farm()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("auto-start events farm: %s", exc)
         return (
             f"<b>📚 Фарм запущен</b>\n"
             f"────────────────────\n"
-            f"• топ тайтлы из каталога\n"
-            f"• чтение · награды · ивенты\n"
+            f"• топ тайтлы · чтение до 90%\n"
+            f"• карты · сундуки · эвенты\n"
             f"• ночь 01:00–05:00 МСК\n"
             f"🎚 Темп: <b>{self._speed_label()}</b>\n"
-            f"Остановка — «Стоп фарм» · пропуск — «След. тайтл»."
+            f"Карты — «Карты · Эвенты» · стоп чтения — «Стоп»."
         )
 
     async def stop_mangabuff_read(self) -> str:
