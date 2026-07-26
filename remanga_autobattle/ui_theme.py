@@ -1,15 +1,15 @@
 """
-ui_theme.py — оформление сообщений и пресеты скорости Orion Autopilot.
+ui_theme.py — оформление и пресеты скорости MangaBuff Autopilot.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional
 
 
-BRAND = "Orion Autopilot"
-BRAND_LINE = "Remanga × MangaBuff"
+BRAND = "MangaBuff Autopilot"
+BRAND_LINE = "чтение · карты · эвенты"
 
 
 @dataclass(frozen=True)
@@ -23,10 +23,7 @@ class SpeedPreset:
     blurb: str
 
 
-# Чуть выше среднего по умолчанию — «Живой»
 SPEED_PRESETS: Dict[str, SpeedPreset] = {
-    # delay = пауза между шагами скролла (не время на всю главу).
-    # blurb = ожидаемое время полной главы с переходом (скролл + next).
     "turbo": SpeedPreset("turbo", "Турбо", 0.03, 0.08, 2, 4, "~4–7 с/глава · ~500–900 гл/ч"),
     "fast": SpeedPreset("fast", "Быстрый", 0.08, 0.18, 3, 6, "~7–12 с/глава · ~300–500 гл/ч"),
     "lively": SpeedPreset("lively", "Живой", 0.20, 0.45, 5, 8, "~12–20 с/глава · ~180–300 гл/ч"),
@@ -56,38 +53,27 @@ def hr() -> str:
     return "────────────────────"
 
 
-def card(title: str, body: str) -> str:
-    return f"<b>{title}</b>\n{hr()}\n{body}"
-
-
 def welcome_text(
-    remanga_on: bool,
     mb_on: bool,
     speed_label: str,
     chapters: int,
-    battles: int,
     chapters_total: int = 0,
+    events_on: bool = False,
+    cards_session: int = 0,
 ) -> str:
-    r = "● online" if remanga_on else "○ idle"
     m = "● online" if mb_on else "○ idle"
+    e = "● on" if events_on else "○ off"
     total_line = (
-        f"📚 Всего прочитано: <b>{chapters_total}</b>\n" if chapters_total > 0 else ""
+        f"📚 Всего: <b>{chapters_total}</b>\n" if chapters_total > 0 else ""
     )
     return (
         f"<b>{BRAND}</b>\n"
         f"<i>{BRAND_LINE}</i>\n"
         f"{hr()}\n"
-        f"Личный автопилот для двух миров.\n"
-        f"Чистый интерфейс · живые паузы · полный контроль.\n\n"
-        f"<b>Модули</b>\n"
-        f"⚔️ Remanga   <code>{r}</code>\n"
-        f"📚 MangaBuff <code>{m}</code>\n\n"
-        f"<b>Сейчас</b>\n"
-        f"🎚 Скорость: <b>{speed_label}</b>\n"
-        f"📖 Глав за сессию: <b>{chapters}</b>\n"
+        f"Чтение: <code>{m}</code> · Карты: <code>{e}</code>\n"
+        f"🎚 {speed_label}\n"
+        f"📖 Сессия: <b>{chapters}</b> гл · 🃏 <b>{cards_session}</b>\n"
         f"{total_line}"
-        f"🗡 Боёв за сессию: <b>{battles}</b>\n\n"
-        f"Выберите модуль ниже — или откройте «Пульс»."
     )
 
 
@@ -98,11 +84,9 @@ def speed_menu_text(dmin: float, dmax: float, preset_key: str = "") -> str:
         "<b>🎚 Темп чтения</b>",
         hr(),
         f"Сейчас: <b>{cur}</b>",
-        f"Пауза шага скролла: <code>{dmin:.2f}–{dmax:.2f}</code> сек",
+        f"Пауза шага: <code>{dmin:.2f}–{dmax:.2f}</code> сек",
         "",
-        "В описании — время <b>целой главы</b> (скролл + переход).",
-        "Число в пресете — пауза между шагами скролла.",
-        "Рекомендация: <b>Турбо</b> для фарма, <b>Живой</b> для баланса.",
+        "В описании — время целой главы (скролл + переход).",
         "",
     ]
     for p in SPEED_PRESETS.values():
@@ -112,7 +96,7 @@ def speed_menu_text(dmin: float, dmax: float, preset_key: str = "") -> str:
             f" · {p.steps_min}–{p.steps_max} шаг.\n"
             f"   <i>{p.blurb}</i>"
         )
-    lines += ["", "Или задайте свою: кнопка «Своя скорость»."]
+    lines += ["", "Своя скорость — кнопка ниже."]
     return "\n".join(lines)
 
 
@@ -136,7 +120,6 @@ def mangabuff_home(
     session_titles: int = 0,
 ) -> str:
     state = "● фарм идёт" if running else "○ пауза"
-    # прогресс до следующей «вехи» из 10 глав сессии
     bar = progress_bar(chapters, 10)
     if sec_per_chapter > 0:
         pace = f"~{sec_per_chapter:.1f} с/гл"
@@ -198,32 +181,15 @@ def cards_events_home(
         f"🎯 Эвенты <b>{events}</b> · 🎁 Награды <b>{rewards}</b>\n\n"
         f"Последний дроп: <i>{last_drop or '—'}</i>\n"
         f"📝 {last_action or '—'}\n\n"
-        f"<i>Карты за чтение — из /notifications (до 10/сутки).\n"
-        f"Сундуки/дейлики — /battle · паки — /cards/pack.</i>"
-    )
-
-
-def remanga_home(running: bool, interval: int, wins: int, losses: int, draws: int, total: int) -> str:
-    state = "● автобой" if running else "○ пауза"
-    wr = (wins / total * 100) if total else 0.0
-    return (
-        f"<b>⚔️ Remanga</b>\n"
-        f"<i>murim-cards · дуэли</i>\n"
-        f"{hr()}\n"
-        f"Статус: <code>{state}</code>\n"
-        f"Интервал: <b>{interval}</b> сек\n\n"
-        f"Боёв: <b>{total}</b>\n"
-        f"🏆 {wins}   💀 {losses}   🤝 {draws}\n"
-        f"Winrate: <b>{wr:.1f}%</b>"
+        f"<i>Карты за чтение — /notifications (до 10/сутки).\n"
+        f"Сундуки — /battle · паки — /cards/pack.</i>"
     )
 
 
 def pulse_text(
-    remanga_on: bool,
     mb_on: bool,
     chapters: int,
     cph: float,
-    battles: int,
     speed: str,
     last_mb: str,
     chapters_total: int = 0,
@@ -236,12 +202,10 @@ def pulse_text(
     return (
         f"<b>✦ Пульс</b>\n"
         f"{hr()}\n"
-        f"⚔️ Remanga     {'●' if remanga_on else '○'}\n"
         f"📚 Чтение      {'●' if mb_on else '○'}\n"
         f"🃏 Карты/эвент {'●' if events_on else '○'}\n\n"
         f"📖 {chapters} гл{total} · {cph:.0f}/ч{pace}\n"
         f"🃏 Карт за сессию: <b>{cards_session}</b>\n"
-        f"🗡 Боёв: <b>{battles}</b>\n"
         f"🎚 {speed}\n\n"
         f"<i>{last_mb or 'ожидание'}</i>"
     )
@@ -251,11 +215,9 @@ def help_text() -> str:
     return (
         f"<b>{BRAND}</b>\n"
         f"{hr()}\n"
-        f"<b>Remanga</b> — автобои и уведомления.\n"
-        f"<b>MangaBuff</b> — быстрое чтение тайтлов до 90%.\n"
-        f"<b>Карты · Эвенты</b> — сундуки, паки, дейлики, дропы карт.\n\n"
-        f"Карты за чтение смотрим в ленте /notifications.\n"
-        f"Лимит: до 10 карт/сутки · свитки до 5/сутки (~1ч).\n"
-        f"В Telegram — сразу при новом уведомлении о карте.\n\n"
-        f"Ночь 01:00–05:00 МСК — пауза фарма."
+        f"<b>Фарм</b> — чтение тайтлов до 90%, главы через addHistory.\n"
+        f"<b>Карты · Эвенты</b> — сундуки, паки, дейлики, дропы.\n\n"
+        f"Карты — лента /notifications · до 10/сутки.\n"
+        f"Свитки — до 5/сутки (~1ч).\n"
+        f"Ночь 01:00–05:00 МСК — пауза."
     )

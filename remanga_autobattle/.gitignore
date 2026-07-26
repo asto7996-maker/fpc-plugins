@@ -1,24 +1,14 @@
-# Переменные окружения (секреты)
+# Секреты
 .env
+.env.local
 
-# Настройки из Telegram
+# Настройки / статистика
 settings.json
 settings.json.tmp
-
-# Статистика боёв / MangaBuff
-stats.json
-stats.json.tmp
 mangabuff_stats.json
 mangabuff_stats.json.tmp
 
-# Токен Remanga (секреты — никогда не коммитить)
-.remanga_token.json
-login_check.png
-last_battle_error.png
-
-# Профили браузера Playwright (сессии)
-user_data/*
-!user_data/.gitkeep
+# Профиль браузера Playwright
 user_data_mangabuff/
 user_data_mangabuff/*
 
@@ -29,7 +19,6 @@ __pycache__/
 *.egg-info/
 .venv/
 venv/
-.env.local
 *.egg
 
 # IDE / OS

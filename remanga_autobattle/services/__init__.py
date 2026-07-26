@@ -1,12 +1,9 @@
-"""Сервисы автоматизации: Remanga и MangaBuff."""
+"""Сервис автоматизации MangaBuff."""
 
-from services.remanga_service import BattleOutcome, BattleResult, BrowserService
-from services.mangabuff_service import MangaBuffService, MangaBuffStats
+from services.mangabuff_service import MangaBuffService, MangaBuffStats, CardDropInfo
 
 __all__ = [
-    "BattleOutcome",
-    "BattleResult",
-    "BrowserService",
     "MangaBuffService",
     "MangaBuffStats",
+    "CardDropInfo",
 ]

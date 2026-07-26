@@ -2271,18 +2271,17 @@ class MangaBuffService:
             ccl,
         )
 
-        # flush пакетом как сайт (ccl), с паузой против 429
+        # flush пакетом как сайт (ccl). Между POST ≥16с — иначе 429.
+        min_gap = 16.0
         now = time_mod.time()
-        due = (now - self._last_history_post_at) >= 9.0
-        if (force_flush or pool >= ccl) and due:
-            gift = await self._flush_history_pool(page)
-            if gift and (gift.cards or gift.scrolls):
-                await self._emit_card_drop(gift)
-        elif pool >= ccl and not due:
-            # подождать остаток антифлуда, затем сбросить пакет
-            wait_for = max(0.2, 9.0 - (now - self._last_history_post_at))
-            logger.info("MangaBuff addHistory throttle %.1fs (pool=%s)", wait_for, pool)
-            await asyncio.sleep(wait_for)
+        due = (now - self._last_history_post_at) >= min_gap
+        if pool >= ccl or force_flush:
+            if not due:
+                wait_for = max(0.2, min_gap - (now - self._last_history_post_at))
+                logger.info(
+                    "MangaBuff addHistory throttle %.1fs (pool=%s)", wait_for, pool
+                )
+                await asyncio.sleep(wait_for)
             gift = await self._flush_history_pool(page)
             if gift and (gift.cards or gift.scrolls):
                 await self._emit_card_drop(gift)
@@ -2353,8 +2352,8 @@ class MangaBuffService:
             ),
         )
         if status == 429 or status >= 400:
-            # небольшая пауза после лимита
-            await asyncio.sleep(3.0)
+            # после 429 — длиннее пауза, пул сохранён
+            await asyncio.sleep(12.0)
             return None
 
         payload = data.get("data") if isinstance(data.get("data"), dict) else {}
