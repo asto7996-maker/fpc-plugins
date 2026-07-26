@@ -832,6 +832,7 @@ class MangaBuffService:
         self.on_card_drop = None
         self._seen_notifications: set[str] = set(self.stats.seen_notifications or [])
         self._mb_user_id: str = ""
+        self._last_history_post_at: float = 0.0
         # сброс ложных дропов («Тайтлы» из навбара) — портили статистику карт
         if "тайтл" in (self.stats.last_card_drop or "").lower():
             logger.warning(
@@ -2210,14 +2211,12 @@ class MangaBuffService:
             pass
         return steps
 
-    async def _register_chapter_read(self, page: Page, *, force_flush: bool = True) -> bool:
+    async def _register_chapter_read(self, page: Page, *, force_flush: bool = False) -> bool:
         """
         Засчитать главу на сайте через history_pool + POST /addHistory.
 
-        reader.js делает это только если:
-          1) скролл > 50% (is_read=true)
-          2) прошло ≥10с на странице (setTimeout) — в турбо мы уходим раньше.
-        Поэтому форсим is_read + push + flush сами.
+        reader.js: скролл >50% (is_read) и пакетная отправка при pool>=ccl (обычно 2).
+        Не спамим /addHistory каждый раз — иначе 429 и главы не засчитываются.
         """
         try:
             meta = await page.evaluate(
@@ -2239,13 +2238,6 @@ class MangaBuffService:
                     localStorage.setItem('history_pool', JSON.stringify(items));
                   }
                   try { read_status_send = true; } catch (e) {}
-                  // нативный путь сайта (если доступен)
-                  try {
-                    if (typeof addHistory === 'function') addHistory();
-                  } catch (e) {}
-                  try {
-                    items = JSON.parse(localStorage.getItem('history_pool') || '[]') || [];
-                  } catch (e) {}
                   return {
                     ok: true,
                     manga_id: ch.id,
@@ -2269,16 +2261,28 @@ class MangaBuffService:
             )
             return False
 
+        pool = int(meta.get("pool") or 0)
+        ccl = max(1, int(meta.get("ccl") or 2))
         logger.info(
             "MangaBuff site-read queued manga=%s ch=%s pool=%s/%s",
             meta.get("manga_id"),
             meta.get("chapter") or meta.get("chapter_id"),
-            meta.get("pool"),
-            meta.get("ccl"),
+            pool,
+            ccl,
         )
 
-        # flush пула — иначе при ccl=2 глава «висит» до следующей и турбо её теряет
-        if force_flush or int(meta.get("pool") or 0) >= int(meta.get("ccl") or 2):
+        # flush пакетом как сайт (ccl), с паузой против 429
+        now = time_mod.time()
+        due = (now - self._last_history_post_at) >= 9.0
+        if (force_flush or pool >= ccl) and due:
+            gift = await self._flush_history_pool(page)
+            if gift and (gift.cards or gift.scrolls):
+                await self._emit_card_drop(gift)
+        elif pool >= ccl and not due:
+            # подождать остаток антифлуда, затем сбросить пакет
+            wait_for = max(0.2, 9.0 - (now - self._last_history_post_at))
+            logger.info("MangaBuff addHistory throttle %.1fs (pool=%s)", wait_for, pool)
+            await asyncio.sleep(wait_for)
             gift = await self._flush_history_pool(page)
             if gift and (gift.cards or gift.scrolls):
                 await self._emit_card_drop(gift)
@@ -2311,12 +2315,21 @@ class MangaBuffService:
                     body: body.toString(),
                     credentials: 'same-origin'
                   });
-                  localStorage.setItem('history_pool', JSON.stringify([]));
                   let json = null;
                   try { json = await resp.json(); } catch (e) {
                     try { json = {raw: await resp.text()}; } catch (e2) { json = null; }
                   }
-                  return {posted: true, status: resp.status, count: items.length, data: json};
+                  // пул чистим ТОЛЬКО при успехе — иначе 429 съест главы
+                  if (resp.status >= 200 && resp.status < 300) {
+                    localStorage.setItem('history_pool', JSON.stringify([]));
+                  }
+                  return {
+                    posted: true,
+                    status: resp.status,
+                    count: items.length,
+                    data: json,
+                    cleared: resp.status >= 200 && resp.status < 300
+                  };
                 }"""
             )
         except Exception as exc:  # noqa: BLE001
@@ -2326,18 +2339,26 @@ class MangaBuffService:
         if not data or not data.get("posted"):
             return None
 
+        status = int(data.get("status") or 0)
+        self._last_history_post_at = time_mod.time()
         logger.info(
-            "MangaBuff addHistory ok status=%s chapters=%s data_keys=%s",
-            data.get("status"),
+            "MangaBuff addHistory status=%s chapters=%s cleared=%s data=%s",
+            status,
             data.get("count"),
-            list((data.get("data") or {}).keys())[:8]
-            if isinstance(data.get("data"), dict)
-            else type(data.get("data")).__name__,
+            data.get("cleared"),
+            (
+                list((data.get("data") or {}).keys())[:8]
+                if isinstance(data.get("data"), dict)
+                else data.get("data")
+            ),
         )
+        if status == 429 or status >= 400:
+            # небольшая пауза после лимита
+            await asyncio.sleep(3.0)
+            return None
 
         payload = data.get("data") if isinstance(data.get("data"), dict) else {}
         info = CardDropInfo(source="addHistory")
-        # ответ сайта при дропе карты: image + name
         if payload.get("image") or payload.get("name"):
             info.cards = 1
             name = str(payload.get("name") or "").strip()
@@ -2350,7 +2371,6 @@ class MangaBuffService:
             self._persist_stats()
             logger.info("MangaBuff card from addHistory: %s", name or payload.get("image"))
 
-        # UI подарка / тост
         await self._tempo_pause(0.25, 0.6)
         try:
             toast = await self._harvest_reader_toast(page)
@@ -3196,7 +3216,7 @@ class MangaBuffService:
             # критично: засчитать главу на сайте (иначе турбо уходит до addHistory)
             site_ok = False
             try:
-                site_ok = await self._register_chapter_read(page, force_flush=True)
+                site_ok = await self._register_chapter_read(page, force_flush=False)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("register chapter read: %s", exc)
 
@@ -3302,12 +3322,7 @@ class MangaBuffService:
                 # Лок на навигацию: параллельные «Награды/Макеты» больше
                 # не уводят вкладку во время чтения.
                 async with self._lock:
-                    logger.info("MangaBuff farm cycle %s: events/cards", cycle)
-                    await self._farm_events_unlocked(quick=True)
-                    # макеты редко — не отбираем время у чтения
-                    if cycle % 10 == 0:
-                        logger.info("MangaBuff farm cycle %s: layouts", cycle)
-                        await self._explore_layouts_unlocked()
+                    # сначала каталог и чтение — эвенты не блокируют старт сессии
                     logger.info("MangaBuff farm cycle %s: fetch popular", cycle)
                     titles = await self.fetch_popular_titles(limit=24)
 
@@ -3433,7 +3448,7 @@ class MangaBuffService:
             await self._await_night_break_if_needed()
             await self._dismiss_overlays(page)
             await self._smooth_read_chapter(page)
-            site_ok = await self._register_chapter_read(page, force_flush=True)
+            site_ok = await self._register_chapter_read(page, force_flush=False)
             if not site_ok:
                 if not await self._go_next_chapter(page):
                     break
