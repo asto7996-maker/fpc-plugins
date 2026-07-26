@@ -61,13 +61,11 @@ LAYOUT_URLS = (
 NIGHT_BREAK_START = time(1, 0)
 NIGHT_BREAK_END = time(5, 0)
 
-# Комментарии каждые 5–15 глав на случайной главе текущего тайтла
+# Комментарии каждые 5–15 глав (на текущую главу, без прыжков)
 COMMENT_EVERY_MIN = 5
 COMMENT_EVERY_MAX = 15
-# Читать тайтл почти до конца: оставить хвост 1–8 глав (или ~1–4%)
-TITLE_LEAVE_MIN = 1
-TITLE_LEAVE_MAX = 8
-TITLE_LEAVE_PCT = (0.01, 0.04)
+# Читать ровно до 90% тайтла
+TITLE_READ_RATIO = 0.90
 # Запасной потолок, если число глав неизвестно (идём пока есть «след. глава»)
 TITLE_READ_HARD_CAP = 5000
 COMMENT_WORDS_MIN = 5
@@ -877,7 +875,12 @@ class MangaBuffService:
                 wait_until="domcontentloaded",
                 timeout=self.config.selector_timeout_ms,
             )
-            await self._human_pause(1.2, 2.8)
+            if self.delay_min_sec <= 0.25:
+                await self._human_pause(0.25, 0.55)
+            elif self.delay_min_sec <= 0.6:
+                await self._human_pause(0.4, 0.9)
+            else:
+                await self._human_pause(0.8, 1.8)
             await self._dismiss_overlays(page)
             self.stats.touch("переход", page.url)
             return True
@@ -1236,20 +1239,30 @@ class MangaBuffService:
             return 0
 
     def _chapters_target_for_title(self, total_chapters: int) -> int:
-        """Сколько глав читать: почти до конца, с небольшим хвостом."""
+        """Сколько глав читать: не меньше 90% тайтла (по порядку с 1-й)."""
         if total_chapters <= 0:
             return TITLE_READ_HARD_CAP
         if total_chapters <= 3:
             return total_chapters
-        leave_pct = int(total_chapters * random.uniform(*TITLE_LEAVE_PCT))
-        leave = max(TITLE_LEAVE_MIN, min(TITLE_LEAVE_MAX, leave_pct or TITLE_LEAVE_MIN))
-        # на коротких тайтлах хвост меньше
-        if total_chapters < 20:
-            leave = min(leave, max(1, total_chapters // 10))
-        target = max(1, total_chapters - leave)
-        # никогда не меньше ~90% тайтла
-        target = max(target, int(total_chapters * 0.90))
-        return min(target, total_chapters)
+        # ceil, чтобы на коротких тайтлах не уйти ниже 90%
+        target = int(total_chapters * TITLE_READ_RATIO + 0.999999)
+        return max(1, min(target, total_chapters))
+
+    def _is_sequential_next(self, before_url: str, after_url: str) -> bool:
+        """True только если after = следующая глава (ch+1) или следующий том /1."""
+        a = self._parse_chapter_url(before_url)
+        b = self._parse_chapter_url(after_url)
+        if not a or not b:
+            return False
+        slug_a, vol_a, ch_a = a
+        slug_b, vol_b, ch_b = b
+        if slug_a != slug_b:
+            return False
+        if vol_b == vol_a and ch_b == ch_a + 1:
+            return True
+        if vol_b == vol_a + 1 and ch_b == 1:
+            return True
+        return False
 
     async def _open_first_chapter(self, title_href: str) -> Optional[str]:
         assert self._page is not None
@@ -1447,13 +1460,40 @@ class MangaBuffService:
             await asyncio.sleep(random.uniform(*frame_sleep))
 
     async def _go_next_chapter(self, page: Page) -> bool:
+        """Строго следующая глава по порядку — без перескоков."""
         before = page.url.split("?")[0]
-        # Текст вида «След. глава 1 - 3»
+        parsed = self._parse_chapter_url(before)
+        if not parsed:
+            return False
+        slug, vol, ch = parsed
+        ordered = [
+            f"https://mangabuff.ru/manga/{slug}/{vol}/{ch + 1}",
+            f"https://mangabuff.ru/manga/{slug}/{vol + 1}/1",
+        ]
+
+        # 1) Сначала точный URL следующей главы
+        for nxt in ordered:
+            if not await self._safe_goto(page, nxt):
+                continue
+            title = ""
+            try:
+                title = await page.title()
+            except Exception:  # noqa: BLE001
+                pass
+            now = page.url.split("?")[0]
+            if "404" in title.lower() or now == before:
+                continue
+            if self._is_sequential_next(before, now):
+                logger.info("MangaBuff next chapter via URL %s", now)
+                return True
+            # попали не туда — вернёмся и попробуем следующий кандидат
+            await self._safe_goto(page, before)
+
+        # 2) Кнопка «След. глава» — принимаем ТОЛЬКО если это +1
         candidates = (
             page.get_by_role("link", name=re.compile(r"След\.?\s*глава", re.I)),
-            page.get_by_text(re.compile(r"След\.?\s*глава", re.I)),
             page.locator("a[href*='/manga/']").filter(
-                has_text=re.compile(r"След", re.I)
+                has_text=re.compile(r"След\.?\s*глава", re.I)
             ),
         )
         for loc in candidates:
@@ -1461,40 +1501,36 @@ class MangaBuffService:
                 count = await loc.count()
             except Exception:  # noqa: BLE001
                 continue
-            for i in range(min(count, 4)):
+            for i in range(min(count, 3)):
                 el = loc.nth(i)
                 try:
                     if not await el.is_visible(timeout=700):
                         continue
+                    href = (await el.get_attribute("href")) or ""
                     await el.click(force=True)
-                    await self._human_pause(1.8, 3.2)
+                    gap_lo, gap_hi = self._chapter_gap_pause()
+                    await self._human_pause(gap_lo, gap_hi)
                     await self._dismiss_overlays(page)
                     now = page.url.split("?")[0]
-                    if now != before and re.search(r"/manga/[^/]+/\d+/\d+", now):
+                    if self._is_sequential_next(before, now):
                         logger.info("MangaBuff next chapter via click %s", now)
                         return True
+                    logger.warning(
+                        "MangaBuff reject chapter jump %s → %s (href=%s)",
+                        before,
+                        now,
+                        href[:80],
+                    )
+                    await self._safe_goto(page, before)
                 except Exception:  # noqa: BLE001
-                    continue
-
-        # URL-инкремент: следующая глава или следующий том
-        m = re.search(r"(https://mangabuff\.ru/manga/[^/]+/)(\d+)/(\d+)", before)
-        if not m:
-            return False
-        base, vol, ch = m.group(1), int(m.group(2)), int(m.group(3))
-        for nxt in (f"{base}{vol}/{ch + 1}", f"{base}{vol + 1}/1"):
-            if not await self._safe_goto(page, nxt):
-                continue
-            title = await page.title()
-            now = page.url.split("?")[0]
-            if now == before or "404" in title.lower():
-                continue
-            if re.search(r"/manga/[^/]+/\d+/\d+", now):
-                logger.info("MangaBuff next chapter via URL %s", now)
-                return True
+                    try:
+                        await self._safe_goto(page, before)
+                    except Exception:  # noqa: BLE001
+                        pass
         return False
 
     # ------------------------------------------------------------------
-    # Comments — каждые 5–15 глав, на рандомной главе тайтла
+    # Comments — каждые 5–15 глав, только на текущую главу
     # ------------------------------------------------------------------
 
     def _parse_chapter_url(self, url: str) -> Optional[Tuple[str, int, int]]:
@@ -1517,109 +1553,76 @@ class MangaBuffService:
         # не раздувать файл бесконечно
         self.stats.commented_chapters = lst[-5000:]
 
-    def _pick_uncommented_chapter(
-        self, slug: str, vol: int, cur_ch: int
-    ) -> Optional[int]:
-        """Случайная глава тайтла, куда ещё не писали. Строго 1 коммент на главу."""
-        hi = max(cur_ch, 3)
-        # сначала в уже «доступном» диапазоне, включая текущую
-        for span in (hi, hi + 20, hi + 60, max(hi, 120)):
-            candidates = [
-                c
-                for c in range(1, span + 1)
-                if self._chapter_comment_key(slug, vol, c) not in self._commented_chapters
-            ]
-            if candidates:
-                return random.choice(candidates)
+    async def _open_first_chapter_with_retry(
+        self, title_href: str, slug: str, attempts: int = 4
+    ) -> Optional[str]:
+        """Не скипаем тайтл с первого фейла — несколько попыток открыть 1-ю главу."""
+        assert self._page is not None
+        page = self._page
+        for attempt in range(1, attempts + 1):
+            start_url = await self._open_first_chapter(title_href)
+            if start_url and re.search(r"/manga/[^/]+/\d+/\d+", start_url):
+                return start_url
+            logger.warning(
+                "MangaBuff cannot open %s (attempt %s/%s)",
+                slug or title_href,
+                attempt,
+                attempts,
+            )
+            await self._human_pause(1.0, 2.2)
+            if slug:
+                await self._safe_goto(page, f"https://mangabuff.ru/manga/{slug}")
         return None
 
     async def _maybe_comment(self, page: Page) -> bool:
-        """Каждые 5–15 глав: 1 комментарий на ещё не комментированную главу тайтла."""
+        """Каждые 5–15 глав: коммент на ТЕКУЩУЮ главу (без прыжков по тайтлу)."""
         self._chapters_since_comment += 1
         if self._chapters_since_comment < self._next_comment_after:
             return False
 
-        resume_url = page.url.split("?")[0]
-        parsed = self._parse_chapter_url(resume_url)
+        current_url = page.url.split("?")[0]
+        parsed = self._parse_chapter_url(current_url)
         if not parsed:
-            logger.info("MangaBuff comment skip: not on chapter url %s", resume_url)
+            logger.info("MangaBuff comment skip: not on chapter url %s", current_url)
             self._next_comment_after = self._chapters_since_comment + random.randint(1, 3)
             return False
 
         slug, vol, cur_ch = parsed
-        target_ch = self._pick_uncommented_chapter(slug, vol, cur_ch)
-        if target_ch is None:
-            logger.info(
-                "MangaBuff comment skip: no uncommented chapters for %s/%s (known=%s)",
-                slug,
-                vol,
-                sum(1 for k in self._commented_chapters if k.startswith(f"{slug}/{vol}/")),
-            )
-            self._next_comment_after = self._chapters_since_comment + random.randint(
-                COMMENT_EVERY_MIN, COMMENT_EVERY_MAX
-            )
+        key = self._chapter_comment_key(slug, vol, cur_ch)
+        if key in self._commented_chapters:
+            self._next_comment_after = self._chapters_since_comment + random.randint(1, 3)
             return False
-
-        target_key = self._chapter_comment_key(slug, vol, target_ch)
-        # двойная защита от гонки / повтора
-        if target_key in self._commented_chapters:
-            self._next_comment_after = self._chapters_since_comment + random.randint(1, 2)
-            return False
-
-        target_url = f"https://mangabuff.ru/manga/{slug}/{vol}/{target_ch}"
 
         logger.info(
-            "MangaBuff comment due after %s chapters → chapter %s (resume %s)",
+            "MangaBuff comment due after %s chapters → current %s",
             self._chapters_since_comment,
-            target_url,
-            resume_url,
+            current_url,
         )
-
         try:
-            if not await self._safe_goto(page, target_url):
-                self._next_comment_after = self._chapters_since_comment + random.randint(1, 2)
-                return False
-            await self._dismiss_overlays(page)
-            await self._human_pause(1.0, 2.0)
-
-            # ещё раз проверить ключ по фактическому URL
-            landed = self._parse_chapter_url(page.url)
-            if not landed:
-                self._next_comment_after = self._chapters_since_comment + random.randint(1, 2)
-                return False
-            land_slug, land_vol, land_ch = landed
-            land_key = self._chapter_comment_key(land_slug, land_vol, land_ch)
-            if land_key in self._commented_chapters:
-                logger.info("MangaBuff comment skip: already commented %s", land_key)
-                self._next_comment_after = self._chapters_since_comment + random.randint(1, 3)
-                if page.url.split("?")[0] != resume_url:
-                    await self._safe_goto(page, resume_url)
-                return False
-
-            ok = await self._post_human_comment(page, slug=land_slug)
+            ok = await self._post_human_comment(page, slug=slug)
+            # всегда остаёмся / возвращаемся на ту же главу
+            if page.url.split("?")[0] != current_url:
+                await self._safe_goto(page, current_url)
+                await self._dismiss_overlays(page)
             if ok:
-                self._mark_chapter_commented(land_slug, land_vol, land_ch)
+                self._mark_chapter_commented(slug, vol, cur_ch)
                 self._chapters_since_comment = 0
                 self._next_comment_after = random.randint(
                     COMMENT_EVERY_MIN, COMMENT_EVERY_MAX
                 )
                 self._persist_stats()
-                logger.info("MangaBuff comment locked to chapter %s", land_key)
+                logger.info("MangaBuff comment locked to chapter %s", key)
             else:
                 self._next_comment_after = self._chapters_since_comment + random.randint(
                     1, 3
                 )
-
-            # вернуться к чтению
-            if page.url.split("?")[0] != resume_url:
-                await self._safe_goto(page, resume_url)
-                await self._dismiss_overlays(page)
             return ok
         except Exception as exc:  # noqa: BLE001
             logger.warning("MangaBuff comment flow failed: %s", exc)
             self._next_comment_after = self._chapters_since_comment + random.randint(1, 3)
             try:
-                await self._safe_goto(page, resume_url)
+                if page.url.split("?")[0] != current_url:
+                    await self._safe_goto(page, current_url)
             except Exception:  # noqa: BLE001
                 pass
             return False
@@ -2120,33 +2123,57 @@ class MangaBuffService:
     # Main farm loop
     # ------------------------------------------------------------------
 
+    async def _go_next_chapter_with_retry(self, page: Page, attempts: int = 3) -> bool:
+        """Несколько попыток строго следующей главы, прежде чем сдаться."""
+        for attempt in range(1, attempts + 1):
+            if await self._go_next_chapter(page):
+                return True
+            logger.warning(
+                "MangaBuff next chapter retry %s/%s from %s",
+                attempt,
+                attempts,
+                page.url.split("?")[0],
+            )
+            await self._human_pause(0.6, 1.4)
+        return False
+
     async def _read_title_almost_end(
         self,
         page: Page,
         title: Dict[str, Any],
         on_progress=None,
     ) -> int:
-        """Прочитать один тайтл почти до конца. Вызывать под self._lock."""
+        """Прочитать один тайтл по порядку до ~90%. Вызывать под self._lock."""
         slug = str(title.get("slug") or "")
+        # новый тайтл — не путаем с уже прочитанными URL прошлого
+        self._read_urls.clear()
+        self._skip_title.clear()
+
         logger.info("MangaBuff open title %s", slug)
         total_chapters = await self._estimate_title_chapters(slug)
         max_per_title = self._chapters_target_for_title(total_chapters)
+        pct = (
+            (100.0 * max_per_title / total_chapters) if total_chapters > 0 else 90.0
+        )
         logger.info(
-            "MangaBuff will read ~%s/%s chapters of %s",
+            "MangaBuff will read %s/%s chapters of %s (~%.0f%%)",
             max_per_title,
             total_chapters or "?",
             slug,
+            pct,
         )
 
-        start_url = await self._open_first_chapter(title.get("href") or "")
-        if not start_url or not re.search(r"/manga/[^/]+/\d+/\d+", start_url):
-            logger.warning("MangaBuff cannot open %s", slug)
+        start_url = await self._open_first_chapter_with_retry(
+            title.get("href") or "", slug
+        )
+        if not start_url:
+            logger.error("MangaBuff defer title %s: cannot open first chapter", slug)
             return 0
 
         self.stats.titles_visited += 1
         self.stats.touch(f"тайтл: {str(title.get('title') or '')[:40]}", start_url)
         logger.info(
-            "MangaBuff reading %s from %s (target=%s)",
+            "MangaBuff reading %s sequentially from %s (target=%s)",
             slug,
             start_url,
             max_per_title,
@@ -2155,7 +2182,6 @@ class MangaBuffService:
 
         chapters_this_title = 0
         last_chapter_url = start_url.split("?")[0]
-        self._skip_title.clear()
 
         while (
             not self._stop_flag.is_set()
@@ -2185,7 +2211,7 @@ class MangaBuffService:
                     break
 
             if url in self._read_urls:
-                if not await self._go_next_chapter(page):
+                if not await self._go_next_chapter_with_retry(page):
                     break
                 continue
 
@@ -2242,11 +2268,12 @@ class MangaBuffService:
             await self._human_pause(gap_lo, gap_hi)
             if chapters_this_title >= max_per_title:
                 break
-            if not await self._go_next_chapter(page):
+            if not await self._go_next_chapter_with_retry(page):
                 logger.info(
-                    "MangaBuff title %s ended naturally after %s chapters",
+                    "MangaBuff title %s stopped at %s/%s (no sequential next)",
                     slug,
                     chapters_this_title,
+                    max_per_title,
                 )
                 break
 
@@ -2310,6 +2337,7 @@ class MangaBuffService:
                     ", ".join(t["slug"] for t in titles[:8]),
                 )
 
+                deferred: List[Dict[str, Any]] = []
                 for title in titles:
                     if self._stop_flag.is_set():
                         break
@@ -2324,12 +2352,49 @@ class MangaBuffService:
                             title,
                             on_progress=on_progress,
                         )
+                    if chapters_this_title <= 0:
+                        # не скипаем навсегда — вернёмся в конце цикла
+                        deferred.append(title)
+                        logger.warning(
+                            "MangaBuff title %s deferred (0 chapters) — retry later",
+                            slug,
+                        )
+                        await self._human_pause(2.0, 4.0)
+                        continue
                     logger.info(
                         "MangaBuff finished title %s: read %s chapters",
                         slug,
                         chapters_this_title,
                     )
                     await self._human_pause(5.0, 12.0)
+
+                # повтор отложенных тайтлов в том же цикле
+                for title in deferred:
+                    if self._stop_flag.is_set():
+                        break
+                    await self._await_night_break_if_needed()
+                    if self._stop_flag.is_set():
+                        break
+                    slug = str(title.get("slug") or "")
+                    logger.info("MangaBuff retry deferred title %s", slug)
+                    async with self._lock:
+                        chapters_this_title = await self._read_title_almost_end(
+                            page,
+                            title,
+                            on_progress=on_progress,
+                        )
+                    if chapters_this_title <= 0:
+                        logger.error(
+                            "MangaBuff title %s still unreadable — next cycle",
+                            slug,
+                        )
+                    else:
+                        logger.info(
+                            "MangaBuff finished deferred title %s: read %s chapters",
+                            slug,
+                            chapters_this_title,
+                        )
+                    await self._human_pause(3.0, 7.0)
 
             except Exception as exc:  # noqa: BLE001
                 logger.exception("MangaBuff farm_loop")
