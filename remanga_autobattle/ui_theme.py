@@ -159,7 +159,7 @@ def mangabuff_home(
         f"Пауза шага: <code>{dmin:.2f}–{dmax:.2f}с</code>\n"
         f"Факт: <b>{cph:.0f}</b> гл/час · {pace}\n"
         f"Сессия: <code>{bar}</code>  {chapters} гл.\n\n"
-        f"📖 За сессию <b>{chapters}</b>\n"
+        f"📖 За сессию <b>{chapters}</b> <i>(зачтено сайтом)</i>\n"
         f"📚 Всего     <b>{total}</b>\n"
         f"📄 Скроллы   <b>{pages}</b>\n"
         f"{titles_line}"
