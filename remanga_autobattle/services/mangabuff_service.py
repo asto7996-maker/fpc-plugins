@@ -1494,56 +1494,99 @@ class MangaBuffService:
         return claimed, cards, scrolls, chests, packs, details
 
     async def _harvest_card_drops(self, page: Page, source: str = "") -> CardDropInfo:
-        """Детект модалок/тостов о получении карт и свитков."""
+        """Детект только реальных модалок дропа карт/свитков (без навбара)."""
         info = CardDropInfo(source=source)
         try:
             blobs = await page.evaluate(
                 """() => {
-                  const sel = '.modal, [class*=modal], [class*=toast], [class*=notify],'
-                    + '[class*=drop], [class*=reward], [class*=popup], [class*=card-drop],'
-                    + '[class*=received], [class*=prize]';
+                  const sel = '.modal.show, .modal.is-active, .modal[style*="display"],'
+                    + '[class*=toast]:not(nav):not(header),'
+                    + '[class*=reward-modal], [class*=card-drop], [class*=prize],'
+                    + '[class*=received], .swal2-popup, [role=dialog]';
                   const roots = [...document.querySelectorAll(sel)];
+                  // fallback: любой видимый modal с кнопкой забрать карту
+                  if (!roots.length) {
+                    roots.push(...document.querySelectorAll('.modal, [class*=modal]'));
+                  }
                   const out = [];
                   for (const el of roots) {
                     const st = getComputedStyle(el);
-                    if (st && (st.display === 'none' || st.visibility === 'hidden')) continue;
+                    if (!st || st.display === 'none' || st.visibility === 'hidden'
+                        || Number(st.opacity||1) < 0.05) continue;
+                    const rect = el.getBoundingClientRect();
+                    if (rect.width < 80 || rect.height < 40) continue;
                     const t = (el.innerText || '').trim();
-                    if (!t || t.length > 600) continue;
-                    if (/карт|свит|пак|алмаз|получен|выпал|наград|новая/i.test(t)) {
-                      out.push(t.slice(0, 280));
+                    if (!t || t.length < 8 || t.length > 500) continue;
+                    // строго: фразы получения, не меню «Карты / Тайтлы»
+                    if (!/(получен|выпал|выпала|новая карт|забрать карт|вам карт|получил|открыт|свиток|свитк)/i.test(t)) {
+                      continue;
                     }
+                    if (/тайтлы|колоды|уведомления|главное меню|каталог/i.test(t)
+                        && !/(получен|выпал|забрать карт)/i.test(t)) {
+                      continue;
+                    }
+                    out.push(t.slice(0, 280));
                   }
-                  return out.slice(0, 8);
+                  return out.slice(0, 4);
                 }"""
             )
         except Exception:  # noqa: BLE001
             blobs = []
 
+        nav_noise = re.compile(
+            r"^(тайтлы|карты|колоды|уведомления|профиль|битва|магазин|лента)$",
+            re.I,
+        )
         for raw in blobs or []:
             low = raw.lower()
-            # количество: «+2 карты», «получено 3 карты»
-            m = re.search(r"(\d+)\s*карт", low)
-            n_cards = int(m.group(1)) if m else (1 if "карт" in low else 0)
-            m2 = re.search(r"(\d+)\s*свит", low)
-            n_scroll = int(m2.group(1)) if m2 else (1 if "свит" in low else 0)
-            if n_cards <= 0 and "карт" in low:
+            # явные количества: «+2 карты», «получено 3 карты»
+            m = re.search(r"(?:\+|получен[оа]?\s*)(\d+)\s*карт", low)
+            if m:
+                n_cards = min(10, int(m.group(1)))
+            elif re.search(r"(получен|выпал|новая карт|забрать карт|вам карт)", low):
                 n_cards = 1
+            else:
+                n_cards = 0
+            m2 = re.search(r"(?:\+|получен[оа]?\s*)(\d+)\s*свит", low)
+            if m2:
+                n_scroll = min(5, int(m2.group(1)))
+            elif "свит" in low and re.search(r"(получен|выпал|забрать)", low):
+                n_scroll = 1
+            else:
+                n_scroll = 0
             info.cards += max(0, n_cards)
             info.scrolls += max(0, n_scroll)
-            # имя/ранг — первая осмысленная строка
             for line in raw.splitlines():
                 line = line.strip()
-                if 2 <= len(line) <= 60 and not re.search(
-                    r"забрать|получить|закрыть|продолж|отлично|понятно", line, re.I
+                if not (2 <= len(line) <= 60):
+                    continue
+                if nav_noise.match(line):
+                    continue
+                if re.search(
+                    r"забрать|получить|закрыть|продолж|отлично|понятно|уведомл|тайтл",
+                    line,
+                    re.I,
                 ):
-                    if line not in info.names:
-                        info.names.append(line)
-                    break
+                    continue
+                if line not in info.names:
+                    info.names.append(line)
+                break
             info.raw = raw[:200]
 
+        info.cards = min(10, info.cards)
+        info.scrolls = min(5, info.scrolls)
+
         if info.cards or info.scrolls:
-            # подтвердить модалку
-            for text in ("Забрать", "Забрать карту", "Отлично", "Круто", "Продолжить", "Понятно", "OK", "Ок"):
+            for text in (
+                "Забрать карту",
+                "Забрать",
+                "Отлично",
+                "Круто",
+                "Продолжить",
+                "Понятно",
+                "OK",
+                "Ок",
+            ):
                 try:
                     loc = page.get_by_role(
                         "button", name=re.compile(f"^{re.escape(text)}$", re.I)
@@ -1563,7 +1606,8 @@ class MangaBuffService:
             if info.scrolls:
                 self.stats.scrolls_claimed += info.scrolls
             self.stats.touch(
-                f"дроп карт +{info.cards}" + (f" свит +{info.scrolls}" if info.scrolls else ""),
+                f"дроп карт +{info.cards}"
+                + (f" свит +{info.scrolls}" if info.scrolls else ""),
                 page.url,
             )
             self._persist_stats()
