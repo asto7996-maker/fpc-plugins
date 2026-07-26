@@ -25,13 +25,13 @@ class SpeedPreset:
 
 # Чуть выше среднего по умолчанию — «Живой»
 SPEED_PRESETS: Dict[str, SpeedPreset] = {
-    # delay = пауза между шагами скролла; в турбо шаги крупные → глава за секунды
-    "turbo": SpeedPreset("turbo", "Турбо", 0.12, 0.28, 4, 6, "максимум темпа"),
-    "fast": SpeedPreset("fast", "Быстрый", 0.25, 0.55, 5, 8, "быстрое чтение"),
-    "lively": SpeedPreset("lively", "Живой", 0.45, 0.90, 6, 10, "чуть выше среднего · по умолчанию"),
-    "normal": SpeedPreset("normal", "Норма", 0.8, 1.6, 8, 12, "спокойный человеческий ритм"),
-    "slow": SpeedPreset("slow", "Неспешно", 1.4, 2.8, 10, 14, "медленнее и «живее»"),
-    "crawl": SpeedPreset("crawl", "Медленно", 2.2, 4.0, 12, 16, "очень осторожное чтение"),
+    # delay = пауза между шагами; steps = жёсткий потолок шагов на главу
+    "turbo": SpeedPreset("turbo", "Турбо", 0.03, 0.08, 2, 4, "~1.5–3 с/глава · максимум темпа"),
+    "fast": SpeedPreset("fast", "Быстрый", 0.08, 0.18, 3, 6, "~3–5 с/глава · быстрое чтение"),
+    "lively": SpeedPreset("lively", "Живой", 0.20, 0.45, 5, 8, "~6–10 с/глава · по умолчанию"),
+    "normal": SpeedPreset("normal", "Норма", 0.50, 1.00, 7, 11, "~12–20 с/глава · спокойный ритм"),
+    "slow": SpeedPreset("slow", "Неспешно", 1.00, 2.00, 9, 14, "~20–35 с/глава · медленнее"),
+    "crawl": SpeedPreset("crawl", "Медленно", 1.80, 3.50, 12, 18, "~35–55 с/глава · очень осторожно"),
 }
 
 DEFAULT_SPEED_KEY = "lively"
@@ -86,16 +86,17 @@ def speed_menu_text(dmin: float, dmax: float, preset_key: str = "") -> str:
         "<b>🎚 Темп чтения</b>",
         hr(),
         f"Сейчас: <b>{cur}</b>",
-        f"Пауза на шаг: <code>{dmin:.1f}–{dmax:.1f}</code> сек",
+        f"Пауза на шаг: <code>{dmin:.2f}–{dmax:.2f}</code> сек",
         "",
-        "Пресеты подобраны под «живого» читателя.",
-        "Рекомендация: <b>Живой</b> — чуть выше среднего.",
+        "Пресеты реально отличаются по скорости главы.",
+        "Рекомендация: <b>Турбо</b> для фарма, <b>Живой</b> для баланса.",
         "",
     ]
     for p in SPEED_PRESETS.values():
         mark = "›" if preset and preset.key == p.key else "·"
         lines.append(
-            f"{mark} <b>{p.title}</b>  <code>{p.delay_min:.1f}–{p.delay_max:.1f}с</code>\n"
+            f"{mark} <b>{p.title}</b>  <code>{p.delay_min:.2f}–{p.delay_max:.2f}с</code>"
+            f" · {p.steps_min}–{p.steps_max} шаг.\n"
             f"   <i>{p.blurb}</i>"
         )
     lines += ["", "Или задайте свою: кнопка «Своя скорость»."]

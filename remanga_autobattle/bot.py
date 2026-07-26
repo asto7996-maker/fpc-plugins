@@ -397,20 +397,26 @@ class App:
                 preset.steps_min,
                 preset.steps_max,
             )
+            # синхронизировать числа пресета (после обновления кода турбо стал быстрее)
+            update_settings(
+                mangabuff_delay_min_sec=preset.delay_min,
+                mangabuff_delay_max_sec=preset.delay_max,
+                mangabuff_speed_preset=preset.key,
+            )
         else:
             self.mangabuff.set_delay(
-                s.mangabuff_delay_min_sec or 2.8,
-                s.mangabuff_delay_max_sec or 5.5,
+                s.mangabuff_delay_min_sec or 0.20,
+                s.mangabuff_delay_max_sec or 0.45,
             )
 
     def _speed_label(self) -> str:
         s = load_settings()
         preset = SPEED_PRESETS.get(s.mangabuff_speed_preset or "")
         if preset:
-            return f"{preset.title} ({preset.delay_min:.1f}–{preset.delay_max:.1f}с)"
+            return f"{preset.title} ({preset.delay_min:.2f}–{preset.delay_max:.2f}с)"
         return (
-            f"Своя ({self.config.mangabuff_delay_min_sec:.1f}–"
-            f"{self.config.mangabuff_delay_max_sec:.1f}с)"
+            f"Своя ({self.config.mangabuff_delay_min_sec:.2f}–"
+            f"{self.config.mangabuff_delay_max_sec:.2f}с)"
         )
 
     def _chapters_per_hour(self) -> float:
@@ -1002,7 +1008,7 @@ class App:
         label = SPEED_PRESETS[preset_key].title if preset_key in SPEED_PRESETS else "Своя"
         await message.answer(
             f"🎚 Темп: <b>{label}</b>\n"
-            f"Пауза на шаг: <code>{dmin:.1f}–{dmax:.1f}</code> сек\n"
+            f"Пауза на шаг: <code>{dmin:.2f}–{dmax:.2f}</code> сек\n"
             f"Шагов на главу: <code>{steps_min}–{steps_max}</code>\n"
             f"<i>Применяется сразу, без перезапуска фарма.</i>",
             reply_markup=mangabuff_menu_keyboard(),

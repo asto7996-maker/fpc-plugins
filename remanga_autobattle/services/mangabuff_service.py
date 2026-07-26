@@ -858,32 +858,82 @@ class MangaBuffService:
         steps_min: int = 8,
         steps_max: int = 12,
     ) -> None:
-        self.delay_min_sec = max(0.08, float(delay_min))
+        self.delay_min_sec = max(0.02, float(delay_min))
         self.delay_max_sec = max(self.delay_min_sec, float(delay_max))
-        self.steps_min = max(3, int(steps_min))
+        self.steps_min = max(1, int(steps_min))
         self.steps_max = max(self.steps_min, int(steps_max))
+        logger.info(
+            "MangaBuff tempo set delay=%.2f-%.2f steps=%s-%s tier=%s",
+            self.delay_min_sec,
+            self.delay_max_sec,
+            self.steps_min,
+            self.steps_max,
+            self._tempo_tier(),
+        )
 
-    def _scroll_chunk_factor(self) -> float:
-        """Крупнее прыжок скролла → меньше шагов (особенно в турбо)."""
-        if self.delay_min_sec <= 0.2:
-            return random.uniform(2.2, 3.2)
-        if self.delay_min_sec <= 0.4:
-            return random.uniform(1.7, 2.5)
-        if self.delay_min_sec <= 0.8:
-            return random.uniform(1.2, 1.8)
-        if self.delay_min_sec <= 1.5:
-            return random.uniform(0.95, 1.35)
-        return random.uniform(0.70, 0.95)
+    def _tempo_tier(self) -> str:
+        d = self.delay_min_sec
+        if d <= 0.06:
+            return "turbo"
+        if d <= 0.14:
+            return "fast"
+        if d <= 0.35:
+            return "lively"
+        if d <= 0.75:
+            return "normal"
+        if d <= 1.40:
+            return "slow"
+        return "crawl"
+
+    def _tempo_factor(self) -> float:
+        """Множитель для «человеческих» пауз вне скролла."""
+        return {
+            "turbo": 0.06,
+            "fast": 0.14,
+            "lively": 0.32,
+            "normal": 0.65,
+            "slow": 1.0,
+            "crawl": 1.35,
+        }[self._tempo_tier()]
+
+    async def _tempo_pause(self, a: float, b: float) -> None:
+        """Пауза, масштабируемая текущим темпом (в турбо почти исчезает)."""
+        f = self._tempo_factor()
+        lo = max(0.0, a * f)
+        hi = max(lo, b * f)
+        if hi < 0.015:
+            return
+        await self._human_pause(max(0.01, lo), hi)
+
+    def _scroll_plan(self, total_height: int, viewport: int) -> Tuple[int, int]:
+        """
+        Жёсткий план: steps из пресета, chunk подогнан под высоту главы.
+        Больше не раздуваем шаги от высоты страницы.
+        """
+        viewport = max(int(viewport), 600)
+        total_height = max(int(total_height), viewport + 1)
+        target_steps = random.randint(self.steps_min, self.steps_max)
+        cover = max(total_height - int(viewport * 0.35), viewport)
+        chunk = max(int(viewport * 0.9), int(cover / max(1, target_steps - 1)))
+        tier = self._tempo_tier()
+        # в турбо/быстром — ещё крупнее прыжки
+        if tier == "turbo":
+            chunk = max(chunk, int(viewport * random.uniform(6.0, 10.0)))
+            target_steps = min(target_steps, self.steps_max)
+        elif tier == "fast":
+            chunk = max(chunk, int(viewport * random.uniform(3.5, 5.5)))
+        return target_steps, chunk
 
     def _chapter_gap_pause(self) -> Tuple[float, float]:
         """Пауза между главами по темпу."""
-        if self.delay_min_sec <= 0.2:
-            return 0.25, 0.7
-        if self.delay_min_sec <= 0.5:
-            return 0.4, 1.1
-        if self.delay_min_sec <= 1.0:
-            return 0.8, 1.8
-        return 1.5, 4.0
+        return {
+            "turbo": (0.05, 0.18),
+            "fast": (0.12, 0.35),
+            "lively": (0.30, 0.70),
+            "normal": (0.70, 1.50),
+            "slow": (1.20, 2.80),
+            "crawl": (2.00, 4.50),
+        }[self._tempo_tier()]
 
     async def run_setup(self) -> None:
         await self.start(headless=False)
@@ -973,12 +1023,8 @@ class MangaBuffService:
                 wait_until="domcontentloaded",
                 timeout=self.config.selector_timeout_ms,
             )
-            if self.delay_min_sec <= 0.25:
-                await self._human_pause(0.25, 0.55)
-            elif self.delay_min_sec <= 0.6:
-                await self._human_pause(0.4, 0.9)
-            else:
-                await self._human_pause(0.8, 1.8)
+            # короткая пауза после загрузки — сильно зависит от темпа
+            await self._tempo_pause(0.35, 0.90)
             await self._dismiss_overlays(page)
             self.stats.touch("переход", page.url)
             return True
@@ -1150,7 +1196,7 @@ class MangaBuffService:
                         continue
                     await btn.click(force=True, timeout=2500)
                     details.append(f"battle: {label[:50]}")
-                    await self._human_pause(1.0, 2.2)
+                    await self._tempo_pause(1.0, 2.2)
                 except Exception:  # noqa: BLE001
                     continue
         return details
@@ -1211,7 +1257,7 @@ class MangaBuffService:
                         await el.click(force=True, timeout=1500)
                         claimed += 1
                         details.append(f"modal: {txt}")
-                        await self._human_pause(0.3, 0.8)
+                        await self._tempo_pause(0.3, 0.8)
             except Exception:  # noqa: BLE001
                 continue
         return claimed, cards, details
@@ -1292,7 +1338,7 @@ class MangaBuffService:
             if not await self._safe_goto(page, title_url):
                 return 0
             await self._dismiss_overlays(page)
-            await self._human_pause(0.8, 1.6)
+            await self._tempo_pause(0.8, 1.6)
             data = await page.evaluate(
                 """() => {
                   const text = document.body ? (document.body.innerText || '') : '';
@@ -1410,7 +1456,7 @@ class MangaBuffService:
                 read_btn = page.get_by_role("link", name=re.compile(name, re.I))
                 if await read_btn.count():
                     await read_btn.first.click()
-                    await self._human_pause(2.0, 3.5)
+                    await self._tempo_pause(2.0, 3.5)
                     got = await _ok_reader()
                     if got:
                         return got
@@ -1439,9 +1485,10 @@ class MangaBuffService:
         return None
 
     async def _smooth_read_chapter(self, page: Page) -> int:
-        """Доскроллить главу до конца; темп зависит от пресета (турбо = крупные шаги)."""
+        """Доскроллить главу до конца строго по пресету steps/delay."""
         steps = 0
         chapter_url = page.url.split("?")[0]
+        tier = self._tempo_tier()
         try:
             total_height = await page.evaluate(
                 "() => document.body.scrollHeight || 4000"
@@ -1451,23 +1498,24 @@ class MangaBuffService:
             total_height, viewport = 4000, 900
 
         viewport = max(int(viewport), 600)
-        chunk_factor = self._scroll_chunk_factor()
-        avg_chunk = max(viewport * 0.8, viewport * chunk_factor)
-        pages_approx = max(1, int(total_height / avg_chunk))
-        # запас на lazy-load, но без сотен мелких шагов
-        max_steps = min(80, max(self.steps_max, pages_approx + random.randint(1, 3)))
+        max_steps, chunk = self._scroll_plan(int(total_height), viewport)
+        # turbo/fast: почти без запаса; медленные: чуть больше на lazy-load
+        hard_cap = max_steps + (0 if tier in ("turbo", "fast") else 2)
         position = 0
         logger.info(
-            "MangaBuff scroll start height=%s viewport=%s max_steps=%s "
-            "chunk=%.1fx delay=%.2f-%.2f",
+            "MangaBuff scroll start height=%s viewport=%s steps=%s/%s "
+            "chunk=%spx(%.1fx) delay=%.2f-%.2f tier=%s",
             total_height,
             viewport,
             max_steps,
-            chunk_factor,
+            hard_cap,
+            chunk,
+            chunk / viewport,
             self.delay_min_sec,
             self.delay_max_sec,
+            tier,
         )
-        while position + viewport < total_height - 60 and steps < max_steps:
+        while position + viewport < total_height - 60 and steps < hard_cap:
             if self._stop_flag.is_set() or self._skip_title.is_set():
                 break
             if page.url.split("?")[0] != chapter_url and not re.search(
@@ -1482,8 +1530,6 @@ class MangaBuffService:
                     break
                 await self._dismiss_overlays(page)
 
-            factor = self._scroll_chunk_factor()
-            chunk = int(viewport * factor)
             target = min(position + chunk, int(total_height))
             await self._animate_scroll(page, position, target)
             position = target
@@ -1498,30 +1544,25 @@ class MangaBuffService:
                 pass
 
             try:
-                new_h = await page.evaluate(
-                    "() => document.body.scrollHeight || 4000"
+                new_h = int(
+                    await page.evaluate("() => document.body.scrollHeight || 4000")
                 )
                 if new_h > total_height:
-                    total_height = min(new_h, total_height + int(viewport * factor * 2))
-                    if steps > max_steps - 2 and new_h > position + viewport:
-                        max_steps = min(80, max_steps + 3)
+                    total_height = new_h
+                    left = max(1, hard_cap - steps)
+                    # добить остаток крупнее, не добавляя шагов в турбо
+                    chunk = max(chunk, int((total_height - position) / left))
             except Exception:  # noqa: BLE001
                 pass
 
         try:
-            # мгновенный доскролл вниз в турбо, иначе smooth
-            if self.delay_min_sec <= 0.35:
-                await page.evaluate(
-                    "() => window.scrollTo(0, document.body.scrollHeight)"
-                )
-                await self._human_pause(0.15, 0.35)
-            else:
-                await page.evaluate(
-                    "() => window.scrollTo({top: document.body.scrollHeight, behavior: 'smooth'})"
-                )
-                await self._human_pause(0.35, 0.8)
+            await page.evaluate(
+                "() => window.scrollTo(0, document.body.scrollHeight)"
+            )
+            await self._tempo_pause(0.12, 0.35)
+            reward_timeout = 3.0 if tier in ("turbo", "fast") else 8.0
             c, cards, _ = await asyncio.wait_for(
-                self._click_reward_buttons(page), timeout=8
+                self._click_reward_buttons(page), timeout=reward_timeout
             )
             self.stats.rewards_claimed += c
             self.stats.cards_claimed += cards
@@ -1530,12 +1571,14 @@ class MangaBuffService:
         return steps
 
     async def _animate_scroll(self, page: Page, start: int, end: int) -> None:
-        # В турбо — почти без анимации кадров
-        if self.delay_min_sec <= 0.2:
+        tier = self._tempo_tier()
+        if tier == "turbo":
             frames, frame_sleep = 1, (0.0, 0.0)
-        elif self.delay_min_sec <= 0.4:
+        elif tier == "fast":
+            frames, frame_sleep = 1, (0.0, 0.01)
+        elif tier == "lively":
             frames, frame_sleep = random.randint(2, 3), (0.01, 0.03)
-        elif self.delay_min_sec <= 0.9:
+        elif tier == "normal":
             frames, frame_sleep = random.randint(3, 5), (0.02, 0.05)
         else:
             frames, frame_sleep = random.randint(6, 12), (0.04, 0.12)
@@ -1667,7 +1710,7 @@ class MangaBuffService:
                 attempt,
                 attempts,
             )
-            await self._human_pause(1.0, 2.2)
+            await self._tempo_pause(1.0, 2.2)
             if slug:
                 await self._safe_goto(page, f"https://mangabuff.ru/manga/{slug}")
         return None
@@ -1746,7 +1789,7 @@ class MangaBuffService:
                 loc = page.locator(sel).first
                 if await loc.count() and await loc.is_visible(timeout=800):
                     await loc.click(force=True)
-                    await self._human_pause(1.2, 2.2)
+                    await self._tempo_pause(1.2, 2.2)
                     break
             except Exception:  # noqa: BLE001
                 continue
@@ -1756,7 +1799,7 @@ class MangaBuffService:
             pop = page.locator("button.comments__change-sort", has_text="Популярные")
             if await pop.count() and await pop.first.is_visible(timeout=600):
                 await pop.first.click(force=True)
-                await self._human_pause(0.8, 1.5)
+                await self._tempo_pause(0.8, 1.5)
         except Exception:  # noqa: BLE001
             pass
 
@@ -1800,7 +1843,7 @@ class MangaBuffService:
                 neu = page.locator("button.comments__change-sort", has_text="Новые")
                 if await neu.count():
                     await neu.first.click(force=True)
-                    await self._human_pause(0.8, 1.4)
+                    await self._tempo_pause(0.8, 1.4)
                     samples = await self._collect_comment_samples(page)
             except Exception:  # noqa: BLE001
                 pass
@@ -1822,20 +1865,30 @@ class MangaBuffService:
 
         try:
             await area.click(force=True)
-            await self._human_pause(0.3, 0.8)
+            await self._tempo_pause(0.3, 0.8)
             await area.fill("")
             # «печатает» с паузами
+            tier = self._tempo_tier()
+            if tier == "turbo":
+                type_delay = (8, 25)
+                think_p = 0.01
+            elif tier == "fast":
+                type_delay = (15, 40)
+                think_p = 0.02
+            else:
+                type_delay = (35, 120)
+                think_p = 0.04
             for ch in text:
-                await area.type(ch, delay=random.randint(35, 120))
-                if random.random() < 0.04:
-                    await asyncio.sleep(random.uniform(0.15, 0.45))
-            await self._human_pause(0.7, 1.8)
+                await area.type(ch, delay=random.randint(*type_delay))
+                if random.random() < think_p:
+                    await asyncio.sleep(random.uniform(0.05, 0.25))
+            await self._tempo_pause(0.7, 1.8)
 
             send = page.locator("button.comments__send-btn").first
             if await send.count() == 0:
                 send = page.get_by_role("button", name=re.compile(r"отправ", re.I)).first
             await send.click(force=True, timeout=4000)
-            await self._human_pause(1.5, 3.0)
+            await self._tempo_pause(1.5, 3.0)
 
             self.stats.comments_posted += 1
             self.stats.touch(f"коммент: {text[:50]}", page.url)
@@ -2203,7 +2256,7 @@ class MangaBuffService:
                 attempts,
                 page.url.split("?")[0],
             )
-            await self._human_pause(0.6, 1.4)
+            await self._tempo_pause(0.6, 1.4)
         return False
 
     async def _read_title_almost_end(
@@ -2288,13 +2341,15 @@ class MangaBuffService:
             last_chapter_url = url
             logger.info("MangaBuff scroll chapter %s", url)
 
+            overlay_t = 2.5 if self._tempo_tier() in ("turbo", "fast") else 8.0
+            reward_t = 3.0 if self._tempo_tier() in ("turbo", "fast") else 12.0
             try:
-                await asyncio.wait_for(self._dismiss_overlays(page), timeout=8)
+                await asyncio.wait_for(self._dismiss_overlays(page), timeout=overlay_t)
             except Exception:  # noqa: BLE001
                 pass
             try:
                 c, cards, _ = await asyncio.wait_for(
-                    self._click_reward_buttons(page), timeout=12
+                    self._click_reward_buttons(page), timeout=reward_t
                 )
                 self.stats.rewards_claimed += c
                 self.stats.cards_claimed += cards
@@ -2399,7 +2454,7 @@ class MangaBuffService:
 
                 if not titles:
                     self.stats.touch("каталог пуст — пауза")
-                    await self._human_pause(20, 40)
+                    await self._tempo_pause(20, 40)
                     continue
                 logger.info(
                     "MangaBuff titles: %s",
@@ -2428,14 +2483,14 @@ class MangaBuffService:
                             "MangaBuff title %s deferred (0 chapters) — retry later",
                             slug,
                         )
-                        await self._human_pause(2.0, 4.0)
+                        await self._tempo_pause(2.0, 4.0)
                         continue
                     logger.info(
                         "MangaBuff finished title %s: read %s chapters",
                         slug,
                         chapters_this_title,
                     )
-                    await self._human_pause(5.0, 12.0)
+                    await self._tempo_pause(5.0, 12.0)
 
                 # повтор отложенных тайтлов в том же цикле
                 for title in deferred:
@@ -2463,13 +2518,13 @@ class MangaBuffService:
                             slug,
                             chapters_this_title,
                         )
-                    await self._human_pause(3.0, 7.0)
+                    await self._tempo_pause(3.0, 7.0)
 
             except Exception as exc:  # noqa: BLE001
                 logger.exception("MangaBuff farm_loop")
                 self.stats.errors += 1
                 self.stats.touch(f"ошибка: {exc}")
-                await self._human_pause(5.0, 12.0)
+                await self._tempo_pause(5.0, 12.0)
 
         self.stats.running = False
         self.stats.touch("фарм остановлен", page.url if self._page else "")

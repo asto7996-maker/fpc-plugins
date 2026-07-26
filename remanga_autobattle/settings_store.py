@@ -101,8 +101,8 @@ class RuntimeSettings:
 
     # ---- MangaBuff ----
     mangabuff_start_url: str = "https://mangabuff.ru/"
-    mangabuff_delay_min_sec: float = 2.8
-    mangabuff_delay_max_sec: float = 5.5
+    mangabuff_delay_min_sec: float = 0.20
+    mangabuff_delay_max_sec: float = 0.45
     mangabuff_setup_done: bool = False
     mangabuff_speed_preset: str = "lively"
     # Вехи в Telegram каждые N глав (0 = выкл)
