@@ -118,7 +118,7 @@ DEFAULT_SETTINGS = {
     "balance_threshold": 0,
     "notify_rental_end": True,
     "tz_offset_hours": 3,
-    "poll_sec": 60,
+    "poll_sec": 30,
     "extend_cooldown": 30,
     "texts": {},
     "map_url": "https://www.kosell.store/downloads/kosell_funpay_map.json",
@@ -185,6 +185,8 @@ _processed_msgs: set = set()
 _processed_review: set = set()
 _admin_alert_dedup: dict = {}
 _balance_alerted = {"low": False}
+_last_stock_avail: dict = {}   # product_id -> available_accounts (мгновенная реакция на изменение)
+_hidden_dirty: bool = False
 
 _map_cache: dict = {"data": None, "ts": 0}
 _misc_cache: dict = {}
@@ -233,6 +235,15 @@ def load_all():
     global SETTINGS, MAPPINGS, RENTALS, HIDDEN, HANDLED
     SETTINGS = {**DEFAULT_SETTINGS, **_load_json(SETTINGS_FILE, {})}
     SETTINGS["texts"] = {**DEFAULT_TEXTS, **(SETTINGS.get("texts") or {})}
+    # Разовая миграция: ускоряем проверку наличия (старый дефолт был 60с).
+    if not SETTINGS.get("_poll_interval_migrated"):
+        try:
+            if int(SETTINGS.get("poll_sec", 30) or 30) >= 60:
+                SETTINGS["poll_sec"] = 30
+        except Exception:
+            SETTINGS["poll_sec"] = 30
+        SETTINGS["_poll_interval_migrated"] = True
+        save_settings()
     mp = _load_json(MAPPINGS_FILE, [])
     MAPPINGS = mp if isinstance(mp, list) else []
     RENTALS = _load_json(RENTALS_FILE, {})
@@ -262,7 +273,15 @@ def save_rentals():
 
 
 def save_hidden():
+    global _hidden_dirty
     _save_json(HIDDEN_FILE, HIDDEN)
+    _hidden_dirty = False
+
+
+def _flush_hidden():
+    global _hidden_dirty
+    if _hidden_dirty:
+        save_hidden()
 
 
 def save_handled():
@@ -711,6 +730,12 @@ def _do_new_rental(api, mapping, chat_id, buyer_name, order, hours: int, notify_
     if err or not data:
         if err == "insufficient_balance":
             _balance_alerted["low"] = True
+        if err == "no_stock":
+            try:
+                _last_stock_avail[int(product_id)] = 0
+            except Exception:
+                pass
+            _hide_product_lots(product_id, "stock", fast=True)
         if notify_fail:
             notify_buyer_problem(chat_id)
             notify_admins(f"Не удалось выдать аккаунт: {_human_err(err or 'unknown')}",
@@ -743,6 +768,14 @@ def _do_new_rental(api, mapping, chat_id, buyer_name, order, hours: int, notify_
         "review_bonus_given": False,
     }
     _add_rental(_buyer_key(chat_id), rec)
+
+    try:
+        pid = int(product_id)
+        prev = _last_stock_avail.get(pid)
+        if prev is not None:
+            _last_stock_avail[pid] = max(0, int(prev) - 1)
+    except Exception:
+        pass
 
     _send(chat_id, fmt("text_delivery", login=login, password=password, game=game,
                        hours=hours, expires=_fmt_expires(expires_raw)))
@@ -799,6 +832,16 @@ def _process_order(cardinal: "Cardinal", order, lot_id):
     buyer_key = _buyer_key(chat_id)
 
     logger.info(f"{LP} order {order.id} matched product={mapping.get('product_id')} qty={qty} hours_unit={hours_unit}")
+
+    avail = _product_avail(api, mapping["product_id"])
+    if avail is not None and avail <= 0:
+        logger.warning(f"{LP} order {order.id}: stock=0 для product {mapping.get('product_id')}, скрываю лоты")
+        _hide_product_lots(mapping["product_id"], "stock", fast=True)
+        notify_buyer_problem(chat_id)
+        notify_admins(f"Заказ при нулевом наличии на KOSell — выдача отменена ({mapping.get('product_name')})",
+                      order=order, dedup_key=f"nostock:{order.id}")
+        _maybe_refund(order)
+        return
 
     if _friend_active(buyer_key):
         delivered = 0
@@ -1088,7 +1131,12 @@ def on_last_chat_message_changed(cardinal: "Cardinal", event):
 _LOT_RETRY_WAITS = [6.0, 15.0, 20.0]
 
 
-def _set_lot_active(lot_id, active: bool) -> bool:
+def _lot_is_active_on_fp(lf) -> bool:
+    """Фактическая активность лота на FunPay (поле формы, не свойство lf.active)."""
+    return lf.fields.get("active") == "on"
+
+
+def _set_lot_active(lot_id, active: bool, fast: bool = False) -> bool:
     if not cardinal_instance:
         return False
     last_err = None
@@ -1096,11 +1144,12 @@ def _set_lot_active(lot_id, active: bool) -> bool:
     for i in range(attempts):
         try:
             lf = cardinal_instance.account.get_lot_fields(int(lot_id))
-            if lf.active == active:
+            if _lot_is_active_on_fp(lf) == active:
                 return True
             lf.active = active
             cardinal_instance.account.save_lot(lf)
-            time.sleep(0.5)
+            if not fast:
+                time.sleep(0.5)
             return True
         except Exception as e:
             last_err = e
@@ -1113,22 +1162,62 @@ def _set_lot_active(lot_id, active: bool) -> bool:
     return False
 
 
-def _hide_lot(lot_id, reason: str):
-    if str(lot_id) in HIDDEN:
-        return
-    if _set_lot_active(lot_id, False):
-        HIDDEN[str(lot_id)] = reason
-        save_hidden()
-        logger.info(f"{LP} lot {lot_id} hidden ({reason})")
+def _hide_lot(lot_id, reason: str, persist: bool = True, fast: bool = False):
+    global _hidden_dirty
+    already_tracked = str(lot_id) in HIDDEN
+    if _set_lot_active(lot_id, False, fast=fast):
+        if not already_tracked:
+            HIDDEN[str(lot_id)] = reason
+            if persist:
+                save_hidden()
+            else:
+                _hidden_dirty = True
+            logger.info(f"{LP} lot {lot_id} hidden ({reason})")
+        return True
+    return False
 
 
-def _restore_lot(lot_id):
+def _restore_lot(lot_id, persist: bool = True, fast: bool = False):
+    global _hidden_dirty
     if str(lot_id) not in HIDDEN:
-        return
-    if _set_lot_active(lot_id, True):
+        return False
+    if _set_lot_active(lot_id, True, fast=fast):
         HIDDEN.pop(str(lot_id), None)
-        save_hidden()
+        if persist:
+            save_hidden()
+        else:
+            _hidden_dirty = True
         logger.info(f"{LP} lot {lot_id} restored")
+        return True
+    return False
+
+
+def _product_avail(api: "KOSellAPI", product_id: int) -> "int | None":
+    """Свободные аккаунты на KOSell для product_id (None = ошибка API)."""
+    try:
+        pid = int(product_id)
+    except Exception:
+        return None
+    snap = _last_stock_avail.get(pid)
+    if snap is not None:
+        return int(snap)
+    products = api.products()
+    if products is None:
+        return None
+    for p in products:
+        try:
+            if int(p.get("id")) == pid:
+                return int(p.get("available_accounts", 0) or 0)
+        except Exception:
+            continue
+    return 0
+
+
+def _hide_product_lots(product_id: int, reason: str = "stock", fast: bool = True):
+    for m in MAPPINGS:
+        if m.get("lot_id") and str(m.get("product_id")) == str(product_id):
+            _hide_lot(m["lot_id"], reason, persist=False, fast=fast)
+    _flush_hidden()
 
 
 def _poll_cycle():
@@ -1162,6 +1251,7 @@ def _poll_cycle():
     if SETTINGS.get("auto_hide_no_stock"):
         products = api.products()
         if products is None:
+            # Транзиентная ошибка API — не трогаем лоты, чтобы не скрыть всё зря.
             return
         avail = {}
         for p in products:
@@ -1169,19 +1259,46 @@ def _poll_cycle():
                 avail[int(p.get("id"))] = int(p.get("available_accounts", 0) or 0)
             except Exception:
                 continue
+        # Реагируем только на изменение наличия на KOSell (или первый проход после старта).
+        changed_pids = set()
+        if not _last_stock_avail:
+            changed_pids = set(avail.keys())
+        else:
+            for pid, count in avail.items():
+                if _last_stock_avail.get(pid) != count:
+                    changed_pids.add(pid)
+            for pid in _last_stock_avail:
+                if pid not in avail:
+                    changed_pids.add(pid)
+        _last_stock_avail.clear()
+        _last_stock_avail.update(avail)
+        stock_fast = True
+        stock_persist = False
         for m in mapped_lots:
             pid = m.get("product_id")
             try:
                 pid_int = int(pid)
             except Exception:
+                # Ручная привязка без product_id — не управляем наличием.
                 continue
-            if pid_int not in avail:
-                continue
-            if avail[pid_int] <= 0:
-                _hide_lot(m["lot_id"], "stock")
-            else:
-                if HIDDEN.get(str(m["lot_id"])) == "stock":
-                    _restore_lot(m["lot_id"])
+            count = avail.get(pid_int)
+            lid = str(m["lot_id"])
+            in_hidden_stock = HIDDEN.get(lid) == "stock"
+            if pid_int not in changed_pids:
+                inconsistent = (
+                    ((count is None or count <= 0) and lid not in HIDDEN)
+                    or ((count is not None and count > 0) and in_hidden_stock)
+                )
+                if not inconsistent:
+                    continue
+            if count is None:
+                # Товара больше нет в каталоге KOSell → в наличии его точно нет → скрываем.
+                _hide_lot(m["lot_id"], "stock", persist=stock_persist, fast=stock_fast)
+            elif count <= 0:
+                _hide_lot(m["lot_id"], "stock", persist=stock_persist, fast=stock_fast)
+            elif in_hidden_stock:
+                _restore_lot(m["lot_id"], persist=stock_persist, fast=stock_fast)
+        _flush_hidden()
 
 
 def _notify_expirations():
@@ -1390,7 +1507,7 @@ def _poller_loop():
     except Exception as e:
         logger.error(f"{LP} startup update check error: {e}")
     while not _poll_stop.is_set():
-        _poll_stop.wait(max(15, SETTINGS.get("poll_sec", 60)))
+        _poll_stop.wait(max(10, SETTINGS.get("poll_sec", 30)))
         if _poll_stop.is_set():
             break
         try:
