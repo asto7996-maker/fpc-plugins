@@ -108,8 +108,12 @@ class RuntimeSettings:
     # Вехи в Telegram каждые N глав (0 = выкл)
     mangabuff_milestone_every: int = 10
     mangabuff_notify_milestones: bool = True
+    # Уведомления о дропе карт
+    mangabuff_notify_cards: bool = True
     # Фарм MangaBuff: переживает рестарт/обновление
     mangabuff_farm_enabled: bool = False
+    # Отдельный автофарм эвентов/карт
+    mangabuff_events_farm_enabled: bool = False
 
     def __post_init__(self) -> None:
         if self.notify is None:

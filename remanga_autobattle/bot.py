@@ -37,7 +37,7 @@ from scheduler import (
     JOB_REMANGA_AUTOBATTLE,
     AppScheduler,
 )
-from services.mangabuff_service import MangaBuffService
+from services.mangabuff_service import CardDropInfo, MangaBuffService
 from services.remanga_service import BattleOutcome, BattleResult, BrowserService
 from settings_store import (
     load_settings,
@@ -56,6 +56,7 @@ from ui_theme import (
     BRAND_LINE,
     DEFAULT_SPEED_KEY,
     SPEED_PRESETS,
+    cards_events_home,
     help_text,
     mangabuff_home,
     pulse_text,
@@ -209,8 +210,8 @@ def main_menu_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="⚔️ Remanga"), KeyboardButton(text="📚 MangaBuff")],
-            [KeyboardButton(text="✦ Пульс"), KeyboardButton(text="🎚 Темп чтения")],
-            [KeyboardButton(text="ℹ️ О боте")],
+            [KeyboardButton(text="🃏 Карты · Эвенты"), KeyboardButton(text="✦ Пульс")],
+            [KeyboardButton(text="🎚 Темп"), KeyboardButton(text="ℹ️ О боте")],
         ],
         resize_keyboard=True,
         is_persistent=True,
@@ -245,27 +246,43 @@ def remanga_menu_keyboard() -> ReplyKeyboardMarkup:
 def mangabuff_menu_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
+            [KeyboardButton(text="▶️ Фарм"), KeyboardButton(text="⏹ Стоп")],
+            [KeyboardButton(text="📊 Статус"), KeyboardButton(text="⏭ Тайтл")],
+            [KeyboardButton(text="🎚 Темп"), KeyboardButton(text="🔔 Оповещения")],
+            [KeyboardButton(text="🃏 Карты · Эвенты"), KeyboardButton(text="⌂ Домой")],
+        ],
+        resize_keyboard=True,
+    )
+
+
+def cards_events_keyboard() -> ReplyKeyboardMarkup:
+    s = load_settings()
+    notify = "🔔 Карты: вкл" if s.mangabuff_notify_cards else "🔕 Карты: выкл"
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="▶️ Автофарм карт"), KeyboardButton(text="⏹ Стоп карт")],
+            [KeyboardButton(text="🎁 Собрать сейчас"), KeyboardButton(text="📊 Статус карт")],
+            [KeyboardButton(text=notify), KeyboardButton(text="📡 Вехи")],
+            [KeyboardButton(text="◀️ MangaBuff"), KeyboardButton(text="⌂ Домой")],
+        ],
+        resize_keyboard=True,
+    )
+
+
+def mb_notify_keyboard() -> ReplyKeyboardMarkup:
+    s = load_settings()
+    return ReplyKeyboardMarkup(
+        keyboard=[
             [
-                KeyboardButton(text="▶️ Фарм"),
-                KeyboardButton(text="⏹ Стоп фарм"),
+                KeyboardButton(
+                    text=("✅" if s.mangabuff_notify_cards else "❌") + " Дроп карт"
+                ),
+                KeyboardButton(
+                    text=("✅" if s.mangabuff_notify_milestones else "❌") + " Вехи глав"
+                ),
             ],
-            [
-                KeyboardButton(text="⏭ След. тайтл"),
-                KeyboardButton(text="📊 Статус MangaBuff"),
-            ],
-            [
-                KeyboardButton(text="🎁 Награды"),
-                KeyboardButton(text="🗺 Макеты"),
-            ],
-            [
-                KeyboardButton(text="🎚 Темп чтения"),
-                KeyboardButton(text="📡 Вехи"),
-            ],
-            [
-                KeyboardButton(text="🔗 URL"),
-                KeyboardButton(text="🔐 Сессия"),
-            ],
-            [KeyboardButton(text="⌂ Домой")],
+            [KeyboardButton(text="📡 Интервал вех")],
+            [KeyboardButton(text="◀️ MangaBuff")],
         ],
         resize_keyboard=True,
     )
@@ -278,7 +295,7 @@ def delay_keyboard() -> ReplyKeyboardMarkup:
             [KeyboardButton(text="✨ Живой"), KeyboardButton(text="📖 Норма")],
             [KeyboardButton(text="🐢 Неспешно"), KeyboardButton(text="🕯 Медленно")],
             [KeyboardButton(text="🎛 Своя скорость")],
-            [KeyboardButton(text="◀️ MangaBuff")],
+            [KeyboardButton(text="⌂ Домой")],
         ],
         resize_keyboard=True,
     )
@@ -377,9 +394,11 @@ class App:
             password=config.mangabuff_password,
         )
         self._mb_task: Optional[asyncio.Task] = None
+        self._events_task: Optional[asyncio.Task] = None
         self._mb_session_started_at: Optional[datetime] = None
         self._mb_session_titles_base: int = 0
         self._apply_speed_from_settings()
+        self.mangabuff.on_card_drop = self._on_card_drop
 
         self._notify_chat_id: Optional[int] = None
         self.dp.message.middleware(AdminOnlyMiddleware(self))
@@ -512,8 +531,22 @@ class App:
                     last_mb=self.mangabuff.stats.last_action,
                     chapters_total=self.mangabuff.stats.chapters_read,
                     sec_per_chapter=self._sec_per_chapter(),
+                    events_on=bool(self.mangabuff._events_running),
+                    cards_session=self.mangabuff.session_cards,
                 ),
                 reply_markup=main_menu_keyboard(),
+            )
+
+        @self.dp.message(
+            StateFilter(None),
+            F.text.in_({"🃏 Карты · Эвенты", "Карты · Эвенты", "Карты", "Эвенты"}),
+        )
+        @self.dp.message(Command("cards"))
+        async def open_cards_events(message: Message) -> None:
+            self._notify_chat_id = message.chat.id
+            await message.answer(
+                self._cards_status_card(),
+                reply_markup=cards_events_keyboard(),
             )
 
         @self.dp.message(F.text.in_({"⚔️ Remanga", "⚔️ Remanga.org", "Remanga.org", "Remanga"}))
@@ -773,13 +806,24 @@ class App:
 
         @self.dp.message(
             StateFilter(None),
-            F.text.in_({"⏹ Стоп фарм", "⏹ Остановить фарм", "⏹ Остановить авточтение", "Остановить фарм"}),
+            F.text.in_(
+                {
+                    "⏹ Стоп",
+                    "⏹ Стоп фарм",
+                    "⏹ Остановить фарм",
+                    "⏹ Остановить авточтение",
+                    "Остановить фарм",
+                }
+            ),
         )
         async def mb_stop(message: Message) -> None:
             text = await self.stop_mangabuff_read()
             await message.answer(text, reply_markup=mangabuff_menu_keyboard())
 
-        @self.dp.message(StateFilter(None), F.text.in_({"⏭ След. тайтл", "След. тайтл"}))
+        @self.dp.message(
+            StateFilter(None),
+            F.text.in_({"⏭ Тайтл", "⏭ След. тайтл", "След. тайтл"}),
+        )
         async def mb_skip(message: Message) -> None:
             if not self.mangabuff.stats.running:
                 await message.answer("Фарм не запущен.", reply_markup=mangabuff_menu_keyboard())
@@ -790,57 +834,48 @@ class App:
                 reply_markup=mangabuff_menu_keyboard(),
             )
 
-        @self.dp.message(StateFilter(None), F.text.in_({"🎁 Награды", "🎁 Собрать награды"}))
-        async def mb_claim(message: Message) -> None:
-            self._notify_chat_id = message.chat.id
-            await message.answer("⏳ Собираю награды…", reply_markup=mangabuff_menu_keyboard())
-            try:
-                if not self.mangabuff.is_started:
-                    await self.mangabuff.start(headless=True)
-                result = await self.mangabuff.claim_rewards()
-                await message.answer(result.to_telegram(), reply_markup=mangabuff_menu_keyboard())
-            except Exception as exc:  # noqa: BLE001
-                logger.exception("mangabuff claim")
-                await message.answer(
-                    f"⚠️ Ошибка сбора: <code>{exc}</code>",
-                    reply_markup=mangabuff_menu_keyboard(),
-                )
-
-        @self.dp.message(StateFilter(None), F.text.in_({"🗺 Макеты", "🗺 Изучить макеты"}))
-        async def mb_layouts(message: Message) -> None:
-            await message.answer("⏳ Обхожу разделы…", reply_markup=mangabuff_menu_keyboard())
-            try:
-                if not self.mangabuff.is_started:
-                    await self.mangabuff.start(headless=True)
-                n = await self.mangabuff.explore_layouts()
-                await message.answer(
-                    f"✅ Пройдено разделов: <b>{n}</b>",
-                    reply_markup=mangabuff_menu_keyboard(),
-                )
-            except Exception as exc:  # noqa: BLE001
-                await message.answer(f"⚠️ {exc}", reply_markup=mangabuff_menu_keyboard())
-
-        @self.dp.message(StateFilter(None), F.text.in_({"🔐 Сессия", "🔐 Логин MangaBuff"}))
-        async def mb_login(message: Message) -> None:
-            await message.answer("⏳ Проверяю сессию…", reply_markup=mangabuff_menu_keyboard())
-            try:
-                if not self.mangabuff.is_started:
-                    await self.mangabuff.start(headless=True)
-                ok = await self.mangabuff.ensure_login()
-                if ok:
-                    update_settings(mangabuff_setup_done=True)
-                await message.answer(
-                    "✅ Сессия MangaBuff активна" if ok else "⚠️ Логин не удался",
-                    reply_markup=mangabuff_menu_keyboard(),
-                )
-            except Exception as exc:  # noqa: BLE001
-                await message.answer(f"⚠️ {exc}", reply_markup=mangabuff_menu_keyboard())
-
-        @self.dp.message(StateFilter(None), F.text == "📊 Статус MangaBuff")
+        @self.dp.message(
+            StateFilter(None),
+            F.text.in_({"📊 Статус", "📊 Статус MangaBuff"}),
+        )
         async def mb_status(message: Message) -> None:
             await message.answer(self._mb_status_card(), reply_markup=mangabuff_menu_keyboard())
 
-        @self.dp.message(StateFilter(None), F.text.in_({"🎚 Темп чтения", "⏱ Настройки задержки"}))
+        @self.dp.message(StateFilter(None), F.text.in_({"🔔 Оповещения", "Оповещения"}))
+        async def mb_notify_menu(message: Message) -> None:
+            s = load_settings()
+            await message.answer(
+                "<b>🔔 Оповещения MangaBuff</b>\n"
+                f"Карты: <b>{'вкл' if s.mangabuff_notify_cards else 'выкл'}</b>\n"
+                f"Вехи: <b>{'вкл' if s.mangabuff_notify_milestones else 'выкл'}</b>"
+                f" · каждые <b>{s.mangabuff_milestone_every}</b> гл",
+                reply_markup=mb_notify_keyboard(),
+            )
+
+        @self.dp.message(StateFilter(None), F.text.regexp(r"^[✅❌] Дроп карт$"))
+        async def mb_toggle_card_notify(message: Message) -> None:
+            s = load_settings()
+            on = not s.mangabuff_notify_cards
+            update_settings(mangabuff_notify_cards=on)
+            await message.answer(
+                f"🃏 Дроп карт: <b>{'вкл' if on else 'выкл'}</b>",
+                reply_markup=mb_notify_keyboard(),
+            )
+
+        @self.dp.message(StateFilter(None), F.text.regexp(r"^[✅❌] Вехи глав$"))
+        async def mb_toggle_milestones(message: Message) -> None:
+            s = load_settings()
+            on = not s.mangabuff_notify_milestones
+            update_settings(mangabuff_notify_milestones=on)
+            await message.answer(
+                f"📡 Вехи: <b>{'вкл' if on else 'выкл'}</b>",
+                reply_markup=mb_notify_keyboard(),
+            )
+
+        @self.dp.message(
+            StateFilter(None),
+            F.text.in_({"🎚 Темп", "🎚 Темп чтения", "⏱ Настройки задержки"}),
+        )
         async def mb_delay_menu(message: Message) -> None:
             s = load_settings()
             await message.answer(
@@ -850,6 +885,51 @@ class App:
                     s.mangabuff_speed_preset or "",
                 ),
                 reply_markup=delay_keyboard(),
+            )
+
+        # ===== Карты · Эвенты =====
+        @self.dp.message(StateFilter(None), F.text.in_({"▶️ Автофарм карт", "Автофарм карт"}))
+        async def cards_start(message: Message) -> None:
+            self._notify_chat_id = message.chat.id
+            text = await self.start_events_farm()
+            await message.answer(text, reply_markup=cards_events_keyboard())
+
+        @self.dp.message(StateFilter(None), F.text.in_({"⏹ Стоп карт", "Стоп карт"}))
+        async def cards_stop(message: Message) -> None:
+            text = await self.stop_events_farm()
+            await message.answer(text, reply_markup=cards_events_keyboard())
+
+        @self.dp.message(
+            StateFilter(None),
+            F.text.in_({"🎁 Собрать сейчас", "🎁 Награды", "🎁 Собрать награды"}),
+        )
+        async def cards_claim_now(message: Message) -> None:
+            self._notify_chat_id = message.chat.id
+            await message.answer("⏳ Обхожу эвенты и карты…", reply_markup=cards_events_keyboard())
+            try:
+                if not self.mangabuff.is_started:
+                    await self.mangabuff.start(headless=True)
+                result = await self.mangabuff.claim_rewards()
+                await message.answer(result.to_telegram(), reply_markup=cards_events_keyboard())
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("cards claim")
+                await message.answer(
+                    f"⚠️ Ошибка сбора: <code>{exc}</code>",
+                    reply_markup=cards_events_keyboard(),
+                )
+
+        @self.dp.message(StateFilter(None), F.text.in_({"📊 Статус карт", "Статус карт"}))
+        async def cards_status(message: Message) -> None:
+            await message.answer(self._cards_status_card(), reply_markup=cards_events_keyboard())
+
+        @self.dp.message(StateFilter(None), F.text.regexp(r"^🔔 Карты: (вкл|выкл)$|^🔕 Карты: (вкл|выкл)$"))
+        async def cards_toggle_notify(message: Message) -> None:
+            s = load_settings()
+            on = not s.mangabuff_notify_cards
+            update_settings(mangabuff_notify_cards=on)
+            await message.answer(
+                f"🃏 Уведомления о картах: <b>{'вкл' if on else 'выкл'}</b>",
+                reply_markup=cards_events_keyboard(),
             )
 
         @self.dp.message(StateFilter(None), F.text == "⚡ Турбо")
@@ -906,7 +986,7 @@ class App:
             await state.clear()
             await self._set_mb_delay(message, dmin, dmax, preset_key="custom")
 
-        @self.dp.message(StateFilter(None), F.text == "📡 Вехи")
+        @self.dp.message(StateFilter(None), F.text.in_({"📡 Вехи", "📡 Интервал вех"}))
         async def mb_milestones(message: Message, state: FSMContext) -> None:
             s = load_settings()
             flag = "вкл" if s.mangabuff_notify_milestones else "выкл"
@@ -936,29 +1016,8 @@ class App:
             await state.clear()
             await message.answer(
                 "📡 Вехи выключены" if n == 0 else f"📡 Буду писать каждые <b>{n}</b> глав",
-                reply_markup=mangabuff_menu_keyboard(),
+                reply_markup=cards_events_keyboard(),
             )
-
-        @self.dp.message(StateFilter(None), F.text.in_({"🔗 URL", "🔗 URL чтения"}))
-        async def mb_url_ask(message: Message, state: FSMContext) -> None:
-            await state.set_state(SettingsStates.waiting_mangabuff_url)
-            await message.answer(
-                "URL главы или тайтла MangaBuff:\n"
-                f"Сейчас: <code>{self.config.mangabuff_start_url}</code>",
-                reply_markup=cancel_keyboard(),
-            )
-
-        @self.dp.message(SettingsStates.waiting_mangabuff_url)
-        async def mb_url_set(message: Message, state: FSMContext) -> None:
-            text = (message.text or "").strip()
-            if "mangabuff.ru" not in text and not text.startswith("http"):
-                await message.answer("Нужен URL вида https://mangabuff.ru/...")
-                return
-            self.config.mangabuff_start_url = text
-            self.mangabuff.start_url = text
-            update_settings(mangabuff_start_url=text)
-            await state.clear()
-            await message.answer(f"✅ URL: <code>{text}</code>", reply_markup=mangabuff_menu_keyboard())
 
     def _sync_mb_stats_from_disk(self) -> None:
         try:
@@ -972,15 +1031,67 @@ class App:
                 live.comments_posted = max(live.comments_posted, disk.comments_posted)
                 live.titles_visited = max(live.titles_visited, disk.titles_visited)
                 live.layouts_visited = max(live.layouts_visited, disk.layouts_visited)
+                live.scrolls_claimed = max(live.scrolls_claimed, disk.scrolls_claimed)
+                live.chests_opened = max(live.chests_opened, disk.chests_opened)
+                live.packs_opened = max(live.packs_opened, disk.packs_opened)
+                live.events_actions = max(live.events_actions, disk.events_actions)
                 if disk.last_url:
                     live.last_url = disk.last_url
                 if disk.last_action:
                     live.last_action = disk.last_action
                 if disk.last_at:
                     live.last_at = disk.last_at
+                if disk.last_card_drop:
+                    live.last_card_drop = disk.last_card_drop
             # running берём из live-процесса
         except Exception:  # noqa: BLE001
             pass
+
+    def _cards_status_card(self) -> str:
+        self._sync_mb_stats_from_disk()
+        st = self.mangabuff.stats
+        s = load_settings()
+        return cards_events_home(
+            events_on=bool(self.mangabuff._events_running)
+            or bool(self._events_task and not self._events_task.done()),
+            read_on=bool(st.running),
+            cards_total=int(st.cards_claimed or 0),
+            cards_session=self.mangabuff.session_cards,
+            scrolls=int(st.scrolls_claimed or 0),
+            chests=int(st.chests_opened or 0),
+            packs=int(st.packs_opened or 0),
+            events=int(st.events_actions or 0),
+            rewards=int(st.rewards_claimed or 0),
+            notify_cards=bool(s.mangabuff_notify_cards),
+            last_drop=st.last_card_drop or "",
+            last_action=st.last_action or "",
+        )
+
+    async def _on_card_drop(self, info: CardDropInfo) -> None:
+        """Telegram: новая карта (+N) и имена, если есть."""
+        if not info.cards:
+            return
+        if not load_settings().mangabuff_notify_cards:
+            return
+        chat = self._notify_chat_id or self.config.telegram_admin_id
+        if not chat:
+            return
+        names = ""
+        if info.names:
+            shown = ", ".join(info.names[:4])
+            names = f"\n{shown}"
+        src = f"\n<i>{info.source}</i>" if info.source else ""
+        scrolls = f" · 📜 +{info.scrolls}" if info.scrolls else ""
+        try:
+            await self.bot.send_message(
+                chat,
+                f"<b>🃏 +{info.cards} карт{scrolls}</b>"
+                f"{names}{src}\n"
+                f"Всего: <b>{self.mangabuff.stats.cards_claimed}</b>"
+                f" · сессия <b>{self.mangabuff.session_cards}</b>",
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("card drop notify: %s", exc)
 
     def _mb_status_card(self) -> str:
         self._sync_mb_stats_from_disk()
@@ -1156,6 +1267,59 @@ class App:
     # MangaBuff jobs
     # ------------------------------------------------------------------
 
+    async def start_events_farm(self, *, resume: bool = False) -> str:
+        if self.mangabuff._events_running or (
+            self._events_task and not self._events_task.done()
+        ):
+            return "ℹ️ Автофарм карт уже запущен."
+
+        async def _runner() -> None:
+            try:
+                if not self.mangabuff.is_started:
+                    await self.mangabuff.start(headless=True)
+                await self.mangabuff.events_loop(interval_sec=75.0)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("events farm")
+                if self._notify_chat_id:
+                    try:
+                        await self.bot.send_message(
+                            self._notify_chat_id,
+                            f"⚠️ Автофарм карт упал: <code>{exc}</code>",
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass
+            finally:
+                self.mangabuff._events_running = False
+
+        self._events_task = asyncio.create_task(_runner(), name="mangabuff_events")
+        update_settings(mangabuff_events_farm_enabled=True)
+        if resume:
+            return "♻️ Автофарм карт <b>возобновлён</b>."
+        return (
+            "<b>🃏 Автофарм карт запущен</b>\n"
+            "────────────────────\n"
+            "• /battle · сундук · дейлики\n"
+            "• /cards/pack · бесплатные паки\n"
+            "• уведомления · notifications\n"
+            "• быстрый цикл каждые ~35–75 сек\n"
+            "Стоп — «Стоп карт»."
+        )
+
+    async def stop_events_farm(self) -> str:
+        self.mangabuff.request_stop_events()
+        if self._events_task and not self._events_task.done():
+            self._events_task.cancel()
+            try:
+                await self._events_task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+        self._events_task = None
+        self.mangabuff._events_running = False
+        update_settings(mangabuff_events_farm_enabled=False)
+        return "⏹ Автофарм карт <b>остановлен</b>."
+
     async def start_mangabuff_read(self) -> str:
         if self.mangabuff.stats.running or (self._mb_task and not self._mb_task.done()):
             return "ℹ️ Фарм MangaBuff уже запущен."
@@ -1294,8 +1458,9 @@ class App:
             await self.bot.set_my_commands(
                 [
                     BotCommand(command="start", description="Домой · панель Orion"),
-                    BotCommand(command="pulse", description="Пульс обоих модулей"),
+                    BotCommand(command="pulse", description="Пульс модулей"),
                     BotCommand(command="menu", description="Главное меню"),
+                    BotCommand(command="cards", description="Карты · эвенты"),
                     BotCommand(command="auto", description="Remanga: автобой"),
                     BotCommand(command="battle", description="Remanga: один бой"),
                     BotCommand(command="help", description="О боте"),
@@ -1351,6 +1516,9 @@ class App:
                 if ok and self._should_resume_mangabuff_farm():
                     asyncio.create_task(self.start_mangabuff_read())
                     logger.info("MangaBuff farm resumed")
+                if ok and load_settings().mangabuff_events_farm_enabled:
+                    asyncio.create_task(self.start_events_farm(resume=True))
+                    logger.info("MangaBuff events farm resumed")
         except Exception as exc:  # noqa: BLE001
             logger.warning("MangaBuff browser: %s", exc)
         self.scheduler.start()
@@ -1392,6 +1560,13 @@ class App:
         # после рестарта/обновления возобновим по settings.json
         self.remanga_state.running = False
         self.mangabuff.request_stop()
+        self.mangabuff.request_stop_events()
+        if self._events_task and not self._events_task.done():
+            self._events_task.cancel()
+            try:
+                await self._events_task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
         try:
             self.mangabuff._persist_stats()
         except Exception:  # noqa: BLE001

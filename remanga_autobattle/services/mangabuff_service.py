@@ -58,6 +58,24 @@ LAYOUT_URLS = (
     "https://mangabuff.ru/genres",
 )
 
+# Эвенты / карты / сундуки / паки — быстрый обход для автофарма
+EVENT_FARM_URLS = (
+    "https://mangabuff.ru/",
+    "https://mangabuff.ru/notifications",
+    "https://mangabuff.ru/battle",
+    "https://mangabuff.ru/battle/awakening",
+    "https://mangabuff.ru/battle/reroll",
+    "https://mangabuff.ru/cards",
+    "https://mangabuff.ru/cards/pack",
+    "https://mangabuff.ru/cards?scroll_enable=1",
+    "https://mangabuff.ru/decks",
+    "https://mangabuff.ru/products",
+    "https://mangabuff.ru/transactions",
+    "https://mangabuff.ru/quiz",
+    "https://mangabuff.ru/promo-code",
+    "https://mangabuff.ru/club",
+)
+
 # Ночной перерыв: 01:00–05:00 МСК (ровно 4 часа)
 NIGHT_BREAK_START = time(1, 0)
 NIGHT_BREAK_END = time(5, 0)
@@ -623,12 +641,16 @@ class MangaBuffStats:
     titles_visited: int = 0
     layouts_visited: int = 0
     events_actions: int = 0
+    chests_opened: int = 0
+    packs_opened: int = 0
+    scrolls_claimed: int = 0
     errors: int = 0
     last_url: str = ""
     last_action: str = ""
     last_at: str = ""
     started_at: str = ""
     night_break_until: str = ""
+    last_card_drop: str = ""
     # Ключи глав, куда уже писали комментарий: "slug/vol/ch" — строго 1 на главу
     commented_chapters: List[str] = field(default_factory=list)
 
@@ -680,37 +702,65 @@ class MangaBuffStats:
 class ClaimResult:
     claimed: int = 0
     cards: int = 0
+    scrolls: int = 0
+    chests: int = 0
+    packs: int = 0
+    events: int = 0
     details: List[str] = field(default_factory=list)
     message: str = ""
+    card_names: List[str] = field(default_factory=list)
 
     def to_telegram(self) -> str:
         lines = [
-            "<b>🎁 MangaBuff — сбор наград</b>",
+            "<b>🃏 Сбор · карты / эвенты</b>",
             "",
-            f"Забрано: <b>{self.claimed}</b>",
-            f"Карт: <b>{self.cards}</b>",
+            f"Действий: <b>{self.claimed}</b>",
+            f"🃏 Карт: <b>{self.cards}</b>",
+            f"📜 Свитков: <b>{self.scrolls}</b>",
+            f"📦 Сундуков: <b>{self.chests}</b> · Паков: <b>{self.packs}</b>",
+            f"🎯 Эвентов: <b>{self.events}</b>",
         ]
+        if self.card_names:
+            lines += ["", "Карты:"] + [f"• {n}" for n in self.card_names[:8]]
         if self.details:
-            lines += ["", "Детали:"] + [f"• {d}" for d in self.details[:12]]
+            lines += ["", "Детали:"] + [f"• {d}" for d in self.details[:10]]
         if self.message:
             lines += ["", self.message]
         return "\n".join(lines)
+
+
+@dataclass
+class CardDropInfo:
+    """Один дроп карт/свитков во время чтения или сбора."""
+
+    cards: int = 0
+    scrolls: int = 0
+    names: List[str] = field(default_factory=list)
+    raw: str = ""
+    source: str = ""
 
 
 class MangaBuffService:
     REWARD_TEXTS = (
         "Забрать",
         "Забрать награду",
+        "Забрать карту",
+        "Забрать свиток",
+        "Забрать всё",
+        "Забрать бонус",
         "Получить",
         "Получить награду",
         "Получить карту",
         "Собрать",
         "Открыть",
         "Открыть пак",
+        "Открыть сундук",
         "Ежедневная награда",
         "Подтвердить",
-        "Забрать бонус",
-        "Забрать всё",
+        "Продолжить",
+        "Отлично",
+        "Круто",
+        "Понятно",
         "Claim",
     )
 
@@ -753,16 +803,26 @@ class MangaBuffService:
         self._commented_chapters: set[str] = set(self.stats.commented_chapters or [])
         # База глав на старт текущей сессии фарма + таймстемпы для живого темпа
         self._session_chapters_base: int = int(self.stats.chapters_read or 0)
+        self._session_cards_base: int = int(self.stats.cards_claimed or 0)
         self._chapter_ts: List[float] = []
+        self._events_stop = asyncio.Event()
+        self._events_running: bool = False
+        # колбэк: async (CardDropInfo) -> None — уведомление о картах
+        self.on_card_drop = None
 
     def mark_farm_session_start(self) -> None:
         """Зафиксировать начало сессии: главы «за сессию» считаются отсюда."""
         self._session_chapters_base = int(self.stats.chapters_read or 0)
+        self._session_cards_base = int(self.stats.cards_claimed or 0)
         self._chapter_ts.clear()
 
     @property
     def session_chapters(self) -> int:
         return max(0, int(self.stats.chapters_read or 0) - int(self._session_chapters_base or 0))
+
+    @property
+    def session_cards(self) -> int:
+        return max(0, int(self.stats.cards_claimed or 0) - int(self._session_cards_base or 0))
 
     def note_chapter_finished(self) -> None:
         """Вызывать после успешного прочтения главы — для живого замера темпа."""
@@ -1137,60 +1197,149 @@ class MangaBuffService:
         return False
 
     # ------------------------------------------------------------------
-    # Rewards / events / layouts
+    # Rewards / events / cards
     # ------------------------------------------------------------------
 
     async def claim_rewards(self) -> ClaimResult:
-        # Во время фарма не уводим вкладку с главы — сбор уже есть в цикле
-        if self.stats.running:
-            return ClaimResult(
-                message="Сейчас идёт чтение глав. Награды собираются в цикле фарма."
-            )
+        """Полный сбор наград/эвентов (ручной или из раздела Карты)."""
         async with self._lock:
-            return await self._claim_rewards_unlocked()
+            return await self._farm_events_unlocked(quick=False)
+
+    async def farm_events_once(self, *, quick: bool = True) -> ClaimResult:
+        """Один быстрый проход по эвентам/картам под локом."""
+        async with self._lock:
+            return await self._farm_events_unlocked(quick=quick)
+
+    def request_stop_events(self) -> None:
+        self._events_stop.set()
+
+    async def events_loop(self, on_progress=None, interval_sec: float = 90.0) -> None:
+        """
+        Отдельный автофарм эвентов/карт: быстрые циклы сбора.
+        Можно запускать параллельно с чтением — берёт тот же lock.
+        """
+        self._events_stop.clear()
+        self._events_running = True
+        self.stats.touch("эвент-фарм запущен")
+        if not self.is_started:
+            await self.start(headless=True)
+        try:
+            while not self._events_stop.is_set() and not self._stop_flag.is_set():
+                await self._await_night_break_if_needed()
+                if self._events_stop.is_set() or self._stop_flag.is_set():
+                    break
+                try:
+                    result = await self.farm_events_once(quick=True)
+                    if on_progress is not None:
+                        try:
+                            await on_progress(result)
+                        except Exception:  # noqa: BLE001
+                            pass
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("events_loop: %s", exc)
+                    self.stats.errors += 1
+                # пауза между проходами: турбо/быстрый — плотнее
+                tier = self._tempo_tier()
+                if tier == "turbo":
+                    pause = 28.0
+                elif tier == "fast":
+                    pause = 40.0
+                else:
+                    pause = float(interval_sec)
+                end = asyncio.get_event_loop().time() + pause
+                while asyncio.get_event_loop().time() < end:
+                    if self._events_stop.is_set() or self._stop_flag.is_set():
+                        break
+                    await asyncio.sleep(1.0)
+        finally:
+            self._events_running = False
+            self.stats.touch("эвент-фарм остановлен")
 
     async def _claim_rewards_unlocked(self, quick: bool = False) -> ClaimResult:
+        return await self._farm_events_unlocked(quick=quick)
+
+    async def _farm_events_unlocked(self, quick: bool = False) -> ClaimResult:
         if not self.is_started:
             await self.start(headless=True)
         assert self._page is not None
         page = self._page
         await self.ensure_login()
         result = ClaimResult()
+        before_cards = int(self.stats.cards_claimed or 0)
 
         if quick:
+            # быстрый цикл: максимум дропов/сундуков за минимум навигации
             urls = [
-                "https://mangabuff.ru/",
                 "https://mangabuff.ru/notifications",
                 "https://mangabuff.ru/battle",
+                "https://mangabuff.ru/cards/pack",
                 "https://mangabuff.ru/cards",
+                "https://mangabuff.ru/transactions",
             ]
         else:
-            urls = list(LAYOUT_URLS) + [
-                "https://mangabuff.ru/promo-code",
-                "https://mangabuff.ru/battle",
-            ]
+            urls = list(EVENT_FARM_URLS)
+
         for url in urls:
-            if self._stop_flag.is_set():
+            if self._stop_flag.is_set() or self._events_stop.is_set():
                 break
-            logger.info("MangaBuff claim visit %s", url)
+            logger.info("MangaBuff event visit %s", url)
             if not await self._safe_goto(page, url):
                 continue
-            c, cards, details = await self._click_reward_buttons(page)
+            # сундуки / паки / награды
+            c, cards, scrolls, chests, packs, details = await self._click_reward_buttons(page)
             result.claimed += c
             result.cards += cards
+            result.scrolls += scrolls
+            result.chests += chests
+            result.packs += packs
             result.details.extend(details)
             self.stats.rewards_claimed += c
             self.stats.cards_claimed += cards
+            self.stats.scrolls_claimed += scrolls
+            self.stats.chests_opened += chests
+            self.stats.packs_opened += packs
+
+            drop = await self._harvest_card_drops(page, source=url)
+            if drop.cards or drop.scrolls:
+                result.cards += drop.cards
+                result.scrolls += drop.scrolls
+                result.card_names.extend(drop.names)
+                result.details.append(
+                    f"дроп: +{drop.cards} карт / +{drop.scrolls} свитков"
+                )
+
             if "/battle" in url:
                 ev = await self._farm_battle_events(page)
+                result.events += len(ev)
                 result.details.extend(ev)
                 self.stats.events_actions += len(ev)
+                # ещё раз сундук после дейликов
+                c2, cards2, sc2, ch2, pk2, d2 = await self._click_reward_buttons(page)
+                result.claimed += c2
+                result.cards += cards2
+                result.scrolls += sc2
+                result.chests += ch2
+                result.packs += pk2
+                result.details.extend(d2)
+                self.stats.rewards_claimed += c2
+                self.stats.cards_claimed += cards2
+                self.stats.scrolls_claimed += sc2
+                self.stats.chests_opened += ch2
+                self.stats.packs_opened += pk2
 
-        if result.claimed == 0 and result.cards == 0:
-            result.message = "Активных кнопок наград не найдено (или уже собрано)."
+        gained = max(0, int(self.stats.cards_claimed or 0) - before_cards)
+        if gained > 0 and not result.cards:
+            result.cards = gained
+        if result.claimed == 0 and result.cards == 0 and result.events == 0:
+            result.message = "Сейчас забирать нечего — всё собрано."
         else:
             result.message = "Сбор завершён."
-        self.stats.touch(f"сбор: +{result.claimed}")
+        self.stats.touch(
+            f"эвенты: +{result.claimed} · карт +{result.cards}",
+            page.url if self._page else "",
+        )
+        self._persist_stats()
+        # уведомление уже шлёт _harvest_card_drops — без второго emit
         return result
 
     async def explore_layouts(self) -> int:
@@ -1214,77 +1363,106 @@ class MangaBuffService:
                 visited += 1
                 self.stats.layouts_visited += 1
                 await self._click_reward_buttons(page)
+                await self._harvest_card_drops(page, source=url)
                 try:
                     await page.mouse.wheel(0, random.randint(400, 1200))
                 except Exception:  # noqa: BLE001
                     pass
-                await self._human_pause(1.5, 3.5)
+                await self._tempo_pause(0.8, 1.8)
         self.stats.touch(f"макеты: {visited}")
         return visited
 
     async def _farm_battle_events(self, page: Page) -> List[str]:
         details: List[str] = []
-        # Кнопки забрать награду за выполненные дейлики / усиления
-        for text in ("Забрать", "Получить", "Забрать награду", "Выбрать", "На арену", "В бой"):
+        # сундук / забрать дейлик / усиление — без агрессивного старта боёв
+        for text in (
+            "Открыть сундук",
+            "Забрать",
+            "Получить",
+            "Забрать награду",
+            "Забрать всё",
+            "Выбрать",
+        ):
             loc = page.get_by_role("button", name=re.compile(re.escape(text), re.I))
             try:
                 count = await loc.count()
             except Exception:  # noqa: BLE001
                 count = 0
-            for i in range(min(count, 4)):
+            # также текстовые ссылки/кнопки
+            if count == 0:
+                loc = page.get_by_text(re.compile(f"^{re.escape(text)}$", re.I))
+                try:
+                    count = await loc.count()
+                except Exception:  # noqa: BLE001
+                    count = 0
+            for i in range(min(count, 6)):
                 btn = loc.nth(i)
                 try:
-                    if not await btn.is_visible(timeout=700):
+                    if not await btn.is_visible(timeout=400):
                         continue
-                    label = ((await btn.inner_text(timeout=800)) or text).strip()
-                    # не жмём «в бой» без колоды слишком агрессивно
-                    if re.search(r"бой|арену", label, re.I) and random.random() > 0.25:
-                        continue
-                    await btn.click(force=True, timeout=2500)
+                    label = ((await btn.inner_text(timeout=600)) or text).strip()
+                    await btn.click(force=True, timeout=2000)
                     details.append(f"battle: {label[:50]}")
-                    await self._tempo_pause(1.0, 2.2)
+                    await self._tempo_pause(0.35, 0.9)
+                    drop = await self._harvest_card_drops(page, source="battle")
+                    if drop.cards:
+                        details.append(f"battle-drop: +{drop.cards} карт")
                 except Exception:  # noqa: BLE001
                     continue
         return details
 
-    async def _click_reward_buttons(self, page: Page) -> Tuple[int, int, List[str]]:
+    async def _click_reward_buttons(
+        self, page: Page
+    ) -> Tuple[int, int, int, int, int, List[str]]:
+        """returns claimed, cards, scrolls, chests, packs, details"""
         claimed = 0
         cards = 0
+        scrolls = 0
+        chests = 0
+        packs = 0
         details: List[str] = []
         await self._dismiss_overlays(page)
 
-        # Один проход по видимым primary-кнопкам — быстрее десятков regex-локаторов
         try:
             labels = await page.evaluate(
-                """() => [...document.querySelectorAll('button, a.button, [role=button]')]
+                """() => [...document.querySelectorAll('button, a.button, a.btn, [role=button]')]
                   .filter(el => {
                     const s = getComputedStyle(el);
-                    return s && s.display !== 'none' && s.visibility !== 'hidden' && el.offsetParent !== null;
+                    return s && s.display !== 'none' && s.visibility !== 'hidden'
+                      && (el.offsetParent !== null || s.position === 'fixed');
                   })
-                  .map(el => ({t: (el.innerText||'').trim().slice(0,80), c: el.className}))
-                  .filter(x => x.t && /забрать|получить|собрать|открыть|подтвердить|claim|ежеднев/i.test(x.t))
-                  .slice(0, 12)"""
+                  .map(el => (el.innerText||'').trim().slice(0,80))
+                  .filter(t => t && /забрать|получить|собрать|открыть|подтвердить|claim|ежеднев|продолж|отлично|круто|понятно|сундук|пак|свит/i.test(t))
+                  .slice(0, 16)"""
             )
         except Exception:  # noqa: BLE001
             labels = []
 
-        for item in labels:
-            text = (item.get("t") or "").strip()
-            if not text or len(text) > 40:
+        for text in labels:
+            text = (text or "").strip()
+            if not text or len(text) > 48:
                 continue
-            try:
-                loc = page.locator("button, a.button").filter(
-                    has_text=re.compile(f"^{re.escape(text)}$", re.I)
-                ).first
-                if not await loc.is_visible(timeout=700):
+            # не тратим алмазы на платные паки без пометки «бесплат»
+            low = text.lower()
+            if "пак" in low and "бесплат" not in low and "ежеднев" not in low:
+                if re.search(r"\d+\s*алмаз", low):
                     continue
-                await loc.click(force=True, timeout=2000)
+            try:
+                loc = page.locator("button, a.button, a.btn, [role=button]").filter(
+                    has_text=re.compile(re.escape(text), re.I)
+                ).first
+                if not await loc.is_visible(timeout=500):
+                    continue
+                await loc.click(force=True, timeout=1800)
                 claimed += 1
-                low = text.lower()
-                if "карт" in low or "пак" in low or "card" in low:
-                    cards += 1
+                if "сундук" in low:
+                    chests += 1
+                if "пак" in low:
+                    packs += 1
+                # карты/свитки считаем только из модалок (_harvest_card_drops),
+                # иначе кнопка «Забрать карту» + модалка дают двойной счёт
                 details.append(f"клик: {text[:60]}")
-                await self._human_pause(0.4, 1.0)
+                await self._tempo_pause(0.25, 0.7)
                 await self._dismiss_overlays(page)
             except Exception:  # noqa: BLE001
                 continue
@@ -1292,21 +1470,123 @@ class MangaBuffService:
         for sel in (
             ".close-adult-modal-btn",
             ".modal button.button--primary",
+            "button:has-text('Забрать')",
+            "button:has-text('Открыть сундук')",
         ):
             try:
                 loc = page.locator(sel)
-                n = min(await loc.count(), 2)
+                n = min(await loc.count(), 3)
                 for i in range(n):
                     el = loc.nth(i)
-                    if await el.is_visible(timeout=700):
-                        txt = ((await el.inner_text(timeout=400)) or "modal").strip()[:50]
+                    if await el.is_visible(timeout=400):
+                        txt = ((await el.inner_text(timeout=300)) or "modal").strip()[:50]
                         await el.click(force=True, timeout=1500)
                         claimed += 1
+                        low = txt.lower()
+                        if "сундук" in low:
+                            chests += 1
+                        if "пак" in low:
+                            packs += 1
                         details.append(f"modal: {txt}")
-                        await self._tempo_pause(0.3, 0.8)
+                        await self._tempo_pause(0.2, 0.5)
             except Exception:  # noqa: BLE001
                 continue
-        return claimed, cards, details
+        return claimed, cards, scrolls, chests, packs, details
+
+    async def _harvest_card_drops(self, page: Page, source: str = "") -> CardDropInfo:
+        """Детект модалок/тостов о получении карт и свитков."""
+        info = CardDropInfo(source=source)
+        try:
+            blobs = await page.evaluate(
+                """() => {
+                  const sel = '.modal, [class*=modal], [class*=toast], [class*=notify],'
+                    + '[class*=drop], [class*=reward], [class*=popup], [class*=card-drop],'
+                    + '[class*=received], [class*=prize]';
+                  const roots = [...document.querySelectorAll(sel)];
+                  const out = [];
+                  for (const el of roots) {
+                    const st = getComputedStyle(el);
+                    if (st && (st.display === 'none' || st.visibility === 'hidden')) continue;
+                    const t = (el.innerText || '').trim();
+                    if (!t || t.length > 600) continue;
+                    if (/карт|свит|пак|алмаз|получен|выпал|наград|новая/i.test(t)) {
+                      out.push(t.slice(0, 280));
+                    }
+                  }
+                  return out.slice(0, 8);
+                }"""
+            )
+        except Exception:  # noqa: BLE001
+            blobs = []
+
+        for raw in blobs or []:
+            low = raw.lower()
+            # количество: «+2 карты», «получено 3 карты»
+            m = re.search(r"(\d+)\s*карт", low)
+            n_cards = int(m.group(1)) if m else (1 if "карт" in low else 0)
+            m2 = re.search(r"(\d+)\s*свит", low)
+            n_scroll = int(m2.group(1)) if m2 else (1 if "свит" in low else 0)
+            if n_cards <= 0 and "карт" in low:
+                n_cards = 1
+            info.cards += max(0, n_cards)
+            info.scrolls += max(0, n_scroll)
+            # имя/ранг — первая осмысленная строка
+            for line in raw.splitlines():
+                line = line.strip()
+                if 2 <= len(line) <= 60 and not re.search(
+                    r"забрать|получить|закрыть|продолж|отлично|понятно", line, re.I
+                ):
+                    if line not in info.names:
+                        info.names.append(line)
+                    break
+            info.raw = raw[:200]
+
+        if info.cards or info.scrolls:
+            # подтвердить модалку
+            for text in ("Забрать", "Забрать карту", "Отлично", "Круто", "Продолжить", "Понятно", "OK", "Ок"):
+                try:
+                    loc = page.get_by_role(
+                        "button", name=re.compile(f"^{re.escape(text)}$", re.I)
+                    )
+                    if await loc.count() and await loc.first.is_visible(timeout=300):
+                        await loc.first.click(force=True, timeout=1200)
+                        await self._tempo_pause(0.15, 0.4)
+                        break
+                except Exception:  # noqa: BLE001
+                    continue
+            if info.cards:
+                self.stats.cards_claimed += info.cards
+                self.stats.last_card_drop = (
+                    f"+{info.cards} · {', '.join(info.names[:2])}" if info.names
+                    else f"+{info.cards}"
+                )
+            if info.scrolls:
+                self.stats.scrolls_claimed += info.scrolls
+            self.stats.touch(
+                f"дроп карт +{info.cards}" + (f" свит +{info.scrolls}" if info.scrolls else ""),
+                page.url,
+            )
+            self._persist_stats()
+            logger.info(
+                "MangaBuff card drop +%s scrolls +%s from %s names=%s",
+                info.cards,
+                info.scrolls,
+                source,
+                info.names[:3],
+            )
+            await self._emit_card_drop(info)
+        return info
+
+    async def _emit_card_drop(self, info: CardDropInfo) -> None:
+        if not info.cards and not info.scrolls:
+            return
+        cb = self.on_card_drop
+        if cb is None:
+            return
+        try:
+            await cb(info)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("on_card_drop: %s", exc)
 
     # ------------------------------------------------------------------
     # Catalog / reading
@@ -1607,11 +1887,15 @@ class MangaBuffService:
             )
             await self._tempo_pause(0.12, 0.35)
             reward_timeout = 3.0 if tier in ("turbo", "fast") else 8.0
-            c, cards, _ = await asyncio.wait_for(
+            c, cards, scrolls, chests, packs, _ = await asyncio.wait_for(
                 self._click_reward_buttons(page), timeout=reward_timeout
             )
             self.stats.rewards_claimed += c
             self.stats.cards_claimed += cards
+            self.stats.scrolls_claimed += scrolls
+            self.stats.chests_opened += chests
+            self.stats.packs_opened += packs
+            await self._harvest_card_drops(page, source="chapter-end")
         except Exception:  # noqa: BLE001
             pass
         return steps
@@ -2422,11 +2706,14 @@ class MangaBuffService:
             except Exception:  # noqa: BLE001
                 pass
             try:
-                c, cards, _ = await asyncio.wait_for(
+                c, cards, scrolls, chests, packs, _ = await asyncio.wait_for(
                     self._click_reward_buttons(page), timeout=reward_t
                 )
                 self.stats.rewards_claimed += c
                 self.stats.cards_claimed += cards
+                self.stats.scrolls_claimed += scrolls
+                self.stats.chests_opened += chests
+                self.stats.packs_opened += packs
             except Exception:  # noqa: BLE001
                 pass
 
@@ -2439,6 +2726,12 @@ class MangaBuffService:
                 if not await self._safe_goto(page, url):
                     break
                 continue
+
+            # дроп карт/свитков после главы (лимит ~10 карт/сутки)
+            try:
+                await self._harvest_card_drops(page, source=final_url)
+            except Exception:  # noqa: BLE001
+                pass
 
             self.stats.chapters_read += 1
             chapters_this_title += 1
@@ -2521,9 +2814,9 @@ class MangaBuffService:
                 # Лок на навигацию: параллельные «Награды/Макеты» больше
                 # не уводят вкладку во время чтения.
                 async with self._lock:
-                    logger.info("MangaBuff farm cycle %s: rewards", cycle)
-                    await self._claim_rewards_unlocked(quick=True)
-                    if cycle == 1 or cycle % 4 == 0:
+                    logger.info("MangaBuff farm cycle %s: events/cards", cycle)
+                    await self._farm_events_unlocked(quick=True)
+                    if cycle == 1 or cycle % 3 == 0:
                         logger.info("MangaBuff farm cycle %s: layouts", cycle)
                         await self._explore_layouts_unlocked()
                     logger.info("MangaBuff farm cycle %s: fetch popular", cycle)
@@ -2567,7 +2860,13 @@ class MangaBuffService:
                         slug,
                         chapters_this_title,
                     )
-                    await self._tempo_pause(5.0, 12.0)
+                    # между тайтлами — быстрый сбор эвентов/сундуков/паков
+                    try:
+                        async with self._lock:
+                            await self._farm_events_unlocked(quick=True)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("inter-title events: %s", exc)
+                    await self._tempo_pause(2.0, 6.0)
 
                 # повтор отложенных тайтлов в том же цикле
                 for title in deferred:

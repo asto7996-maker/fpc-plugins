@@ -171,6 +171,38 @@ def mangabuff_home(
     )
 
 
+def cards_events_home(
+    events_on: bool,
+    read_on: bool,
+    cards_total: int,
+    cards_session: int,
+    scrolls: int,
+    chests: int,
+    packs: int,
+    events: int,
+    rewards: int,
+    notify_cards: bool,
+    last_drop: str,
+    last_action: str,
+) -> str:
+    return (
+        f"<b>🃏 Карты · Эвенты</b>\n"
+        f"<i>дропы · сундуки · паки · дейлики</i>\n"
+        f"{hr()}\n"
+        f"Автофарм: <code>{'● on' if events_on else '○ off'}</code>\n"
+        f"Чтение: <code>{'● on' if read_on else '○ off'}</code>\n"
+        f"Уведомления карт: <code>{'●' if notify_cards else '○'}</code>\n\n"
+        f"🃏 Карт всего <b>{cards_total}</b> · сессия <b>{cards_session}</b>\n"
+        f"📜 Свитки <b>{scrolls}</b>\n"
+        f"📦 Сундуки <b>{chests}</b> · Паки <b>{packs}</b>\n"
+        f"🎯 Эвенты <b>{events}</b> · 🎁 Награды <b>{rewards}</b>\n\n"
+        f"Последний дроп: <i>{last_drop or '—'}</i>\n"
+        f"📝 {last_action or '—'}\n\n"
+        f"<i>Карты падают за чтение (до 10/сутки).\n"
+        f"Сундуки/дейлики — /battle · паки — /cards/pack.</i>"
+    )
+
+
 def remanga_home(running: bool, interval: int, wins: int, losses: int, draws: int, total: int) -> str:
     state = "● автобой" if running else "○ пауза"
     wr = (wins / total * 100) if total else 0.0
@@ -196,19 +228,22 @@ def pulse_text(
     last_mb: str,
     chapters_total: int = 0,
     sec_per_chapter: float = 0.0,
+    events_on: bool = False,
+    cards_session: int = 0,
 ) -> str:
     pace = f" · ~{sec_per_chapter:.1f} с/гл" if sec_per_chapter > 0 else ""
     total = f" / всего {chapters_total}" if chapters_total > 0 else ""
     return (
-        f"<b>✦ Пульс системы</b>\n"
+        f"<b>✦ Пульс</b>\n"
         f"{hr()}\n"
-        f"⚔️ Remanga   {'●' if remanga_on else '○'}\n"
-        f"📚 MangaBuff {'●' if mb_on else '○'}\n\n"
-        f"📖 Сессия {chapters} гл{total}\n"
-        f"📈 {cph:.0f} гл/час{pace}\n"
-        f"🗡 {battles} боёв за сессию\n"
+        f"⚔️ Remanga     {'●' if remanga_on else '○'}\n"
+        f"📚 Чтение      {'●' if mb_on else '○'}\n"
+        f"🃏 Карты/эвент {'●' if events_on else '○'}\n\n"
+        f"📖 {chapters} гл{total} · {cph:.0f}/ч{pace}\n"
+        f"🃏 Карт за сессию: <b>{cards_session}</b>\n"
+        f"🗡 Боёв: <b>{battles}</b>\n"
         f"🎚 {speed}\n\n"
-        f"<i>{last_mb or 'ожидание активности'}</i>"
+        f"<i>{last_mb or 'ожидание'}</i>"
     )
 
 
@@ -216,11 +251,11 @@ def help_text() -> str:
     return (
         f"<b>{BRAND}</b>\n"
         f"{hr()}\n"
-        f"<b>Remanga</b> — автобои, статус, рейтинг, тонкие уведомления.\n"
-        f"<b>MangaBuff</b> — фарм популярных тайтлов, награды, макеты, "
-        f"редкие комментарии, ночной сон 01:00–05:00 МСК.\n\n"
-        f"<b>Темп</b> регулируется пресетами или своей парой секунд.\n"
-        f"<b>Пульс</b> — мгновенный снимок обоих модулей.\n"
-        f"<b>Отчёт</b> — вехи каждые N глав в чат.\n\n"
-        f"Сессии браузера раздельные и переживают перезапуск."
+        f"<b>Remanga</b> — автобои и уведомления.\n"
+        f"<b>MangaBuff</b> — быстрое чтение тайтлов до 90%.\n"
+        f"<b>Карты · Эвенты</b> — сундуки, паки, дейлики, дропы карт.\n\n"
+        f"Карты падают за чтение (до 10/сутки).\n"
+        f"Свитки — до 5/сутки с интервалом ~1ч.\n"
+        f"Уведомление приходит на каждый дроп карт.\n\n"
+        f"Ночь 01:00–05:00 МСК — пауза фарма."
     )
