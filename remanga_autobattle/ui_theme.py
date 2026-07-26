@@ -25,13 +25,14 @@ class SpeedPreset:
 
 # Чуть выше среднего по умолчанию — «Живой»
 SPEED_PRESETS: Dict[str, SpeedPreset] = {
-    # delay = пауза между шагами; steps = жёсткий потолок шагов на главу
-    "turbo": SpeedPreset("turbo", "Турбо", 0.03, 0.08, 2, 4, "~1.5–3 с/глава · максимум темпа"),
-    "fast": SpeedPreset("fast", "Быстрый", 0.08, 0.18, 3, 6, "~3–5 с/глава · быстрое чтение"),
-    "lively": SpeedPreset("lively", "Живой", 0.20, 0.45, 5, 8, "~6–10 с/глава · по умолчанию"),
-    "normal": SpeedPreset("normal", "Норма", 0.50, 1.00, 7, 11, "~12–20 с/глава · спокойный ритм"),
-    "slow": SpeedPreset("slow", "Неспешно", 1.00, 2.00, 9, 14, "~20–35 с/глава · медленнее"),
-    "crawl": SpeedPreset("crawl", "Медленно", 1.80, 3.50, 12, 18, "~35–55 с/глава · очень осторожно"),
+    # delay = пауза между шагами скролла (не время на всю главу).
+    # blurb = ожидаемое время полной главы с переходом (скролл + next).
+    "turbo": SpeedPreset("turbo", "Турбо", 0.03, 0.08, 2, 4, "~4–7 с/глава · ~500–900 гл/ч"),
+    "fast": SpeedPreset("fast", "Быстрый", 0.08, 0.18, 3, 6, "~7–12 с/глава · ~300–500 гл/ч"),
+    "lively": SpeedPreset("lively", "Живой", 0.20, 0.45, 5, 8, "~12–20 с/глава · ~180–300 гл/ч"),
+    "normal": SpeedPreset("normal", "Норма", 0.50, 1.00, 7, 11, "~20–35 с/глава · ~100–180 гл/ч"),
+    "slow": SpeedPreset("slow", "Неспешно", 1.00, 2.00, 9, 14, "~35–60 с/глава · ~60–100 гл/ч"),
+    "crawl": SpeedPreset("crawl", "Медленно", 1.80, 3.50, 12, 18, "~60–100 с/глава · ~35–60 гл/ч"),
 }
 
 DEFAULT_SPEED_KEY = "lively"
@@ -59,9 +60,19 @@ def card(title: str, body: str) -> str:
     return f"<b>{title}</b>\n{hr()}\n{body}"
 
 
-def welcome_text(remanga_on: bool, mb_on: bool, speed_label: str, chapters: int, battles: int) -> str:
+def welcome_text(
+    remanga_on: bool,
+    mb_on: bool,
+    speed_label: str,
+    chapters: int,
+    battles: int,
+    chapters_total: int = 0,
+) -> str:
     r = "● online" if remanga_on else "○ idle"
     m = "● online" if mb_on else "○ idle"
+    total_line = (
+        f"📚 Всего прочитано: <b>{chapters_total}</b>\n" if chapters_total > 0 else ""
+    )
     return (
         f"<b>{BRAND}</b>\n"
         f"<i>{BRAND_LINE}</i>\n"
@@ -74,6 +85,7 @@ def welcome_text(remanga_on: bool, mb_on: bool, speed_label: str, chapters: int,
         f"<b>Сейчас</b>\n"
         f"🎚 Скорость: <b>{speed_label}</b>\n"
         f"📖 Глав за сессию: <b>{chapters}</b>\n"
+        f"{total_line}"
         f"🗡 Боёв за сессию: <b>{battles}</b>\n\n"
         f"Выберите модуль ниже — или откройте «Пульс»."
     )
@@ -81,21 +93,22 @@ def welcome_text(remanga_on: bool, mb_on: bool, speed_label: str, chapters: int,
 
 def speed_menu_text(dmin: float, dmax: float, preset_key: str = "") -> str:
     preset = SPEED_PRESETS.get(preset_key) or preset_by_delays(dmin, dmax)
-    cur = preset.title if preset else f"Своя {dmin:.1f}–{dmax:.1f}с"
+    cur = preset.title if preset else f"Своя {dmin:.2f}–{dmax:.2f}с"
     lines = [
         "<b>🎚 Темп чтения</b>",
         hr(),
         f"Сейчас: <b>{cur}</b>",
-        f"Пауза на шаг: <code>{dmin:.2f}–{dmax:.2f}</code> сек",
+        f"Пауза шага скролла: <code>{dmin:.2f}–{dmax:.2f}</code> сек",
         "",
-        "Пресеты реально отличаются по скорости главы.",
+        "В описании — время <b>целой главы</b> (скролл + переход).",
+        "Число в пресете — пауза между шагами скролла.",
         "Рекомендация: <b>Турбо</b> для фарма, <b>Живой</b> для баланса.",
         "",
     ]
     for p in SPEED_PRESETS.values():
         mark = "›" if preset and preset.key == p.key else "·"
         lines.append(
-            f"{mark} <b>{p.title}</b>  <code>{p.delay_min:.2f}–{p.delay_max:.2f}с</code>"
+            f"{mark} <b>{p.title}</b>  шаг <code>{p.delay_min:.2f}–{p.delay_max:.2f}с</code>"
             f" · {p.steps_min}–{p.steps_max} шаг.\n"
             f"   <i>{p.blurb}</i>"
         )
@@ -118,22 +131,40 @@ def mangabuff_home(
     last_url: str,
     night: str,
     preset_title: str,
+    chapters_total: int = 0,
+    sec_per_chapter: float = 0.0,
+    session_titles: int = 0,
 ) -> str:
     state = "● фарм идёт" if running else "○ пауза"
+    # прогресс до следующей «вехи» из 10 глав сессии
     bar = progress_bar(chapters, 10)
+    if sec_per_chapter > 0:
+        pace = f"~{sec_per_chapter:.1f} с/гл"
+    elif cph > 0:
+        pace = f"~{3600.0 / cph:.1f} с/гл"
+    else:
+        pace = "замер…"
+    total = chapters_total if chapters_total > 0 else chapters
+    titles_line = (
+        f"🏷 Тайтлы    <b>{session_titles}</b> за сессию · всего <b>{titles}</b>\n"
+        if session_titles > 0
+        else f"🏷 Тайтлы    <b>{titles}</b>\n"
+    )
     return (
         f"<b>📚 MangaBuff</b>\n"
         f"<i>авточтение · награды · ивенты</i>\n"
         f"{hr()}\n"
         f"Статус: <code>{state}</code>\n"
-        f"Темп: <b>{preset_title}</b> · <code>{dmin:.1f}–{dmax:.1f}с</code>\n"
-        f"Прогресс: <code>{bar}</code>  {chapters} гл.\n\n"
-        f"📖 Главы     <b>{chapters}</b>\n"
+        f"Пресет: <b>{preset_title}</b>\n"
+        f"Пауза шага: <code>{dmin:.2f}–{dmax:.2f}с</code>\n"
+        f"Факт: <b>{cph:.0f}</b> гл/час · {pace}\n"
+        f"Сессия: <code>{bar}</code>  {chapters} гл.\n\n"
+        f"📖 За сессию <b>{chapters}</b>\n"
+        f"📚 Всего     <b>{total}</b>\n"
         f"📄 Скроллы   <b>{pages}</b>\n"
-        f"🏷 Тайтлы    <b>{titles}</b>\n"
+        f"{titles_line}"
         f"🎁 Награды   <b>{rewards}</b> · 🃏 <b>{cards}</b>\n"
-        f"💬 Комменты  <b>{comments}</b>\n"
-        f"📈 Темп      <b>{cph:.1f}</b> гл/час\n\n"
+        f"💬 Комменты  <b>{comments}</b>\n\n"
         f"🌙 Ночь: <code>{night or 'выкл до 01:00 МСК'}</code>\n"
         f"📝 {last_action or '—'}\n"
         f"🔗 <code>{(last_url or '—')[:100]}</code>"
@@ -163,13 +194,18 @@ def pulse_text(
     battles: int,
     speed: str,
     last_mb: str,
+    chapters_total: int = 0,
+    sec_per_chapter: float = 0.0,
 ) -> str:
+    pace = f" · ~{sec_per_chapter:.1f} с/гл" if sec_per_chapter > 0 else ""
+    total = f" / всего {chapters_total}" if chapters_total > 0 else ""
     return (
         f"<b>✦ Пульс системы</b>\n"
         f"{hr()}\n"
         f"⚔️ Remanga   {'●' if remanga_on else '○'}\n"
         f"📚 MangaBuff {'●' if mb_on else '○'}\n\n"
-        f"📖 {chapters} гл · {cph:.1f}/час\n"
+        f"📖 Сессия {chapters} гл{total}\n"
+        f"📈 {cph:.0f} гл/час{pace}\n"
         f"🗡 {battles} боёв за сессию\n"
         f"🎚 {speed}\n\n"
         f"<i>{last_mb or 'ожидание активности'}</i>"

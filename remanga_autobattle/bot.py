@@ -378,6 +378,7 @@ class App:
         )
         self._mb_task: Optional[asyncio.Task] = None
         self._mb_session_started_at: Optional[datetime] = None
+        self._mb_session_titles_base: int = 0
         self._apply_speed_from_settings()
 
         self._notify_chat_id: Optional[int] = None
@@ -412,29 +413,54 @@ class App:
     def _speed_label(self) -> str:
         s = load_settings()
         preset = SPEED_PRESETS.get(s.mangabuff_speed_preset or "")
+        # фактический темп, если уже есть замер
+        spc = self.mangabuff.measured_sec_per_chapter()
+        fact = f" · факт ~{spc:.1f} с/гл" if spc > 0 else ""
         if preset:
-            return f"{preset.title} ({preset.delay_min:.2f}–{preset.delay_max:.2f}с)"
+            return (
+                f"{preset.title} · шаг {preset.delay_min:.2f}–{preset.delay_max:.2f}с"
+                f"{fact}"
+            )
         return (
-            f"Своя ({self.config.mangabuff_delay_min_sec:.2f}–"
-            f"{self.config.mangabuff_delay_max_sec:.2f}с)"
+            f"Своя · шаг {self.config.mangabuff_delay_min_sec:.2f}–"
+            f"{self.config.mangabuff_delay_max_sec:.2f}с{fact}"
         )
 
+    def _session_chapters(self) -> int:
+        return int(self.mangabuff.session_chapters)
+
+    def _session_titles(self) -> int:
+        total = int(self.mangabuff.stats.titles_visited or 0)
+        return max(0, total - int(self._mb_session_titles_base or 0))
+
     def _chapters_per_hour(self) -> float:
-        stats = self.mangabuff.stats
-        if not self._mb_session_started_at or stats.chapters_read <= 0:
+        """Живой темп: сначала замер по последним главам, иначе среднее за сессию."""
+        measured = self.mangabuff.measured_cph()
+        if measured > 0:
+            return measured
+        session = self._session_chapters()
+        if not self._mb_session_started_at or session <= 0:
             return 0.0
         elapsed = (datetime.now() - self._mb_session_started_at).total_seconds() / 3600.0
         if elapsed <= 0.01:
             return 0.0
-        return stats.chapters_read / elapsed
+        return session / elapsed
+
+    def _sec_per_chapter(self) -> float:
+        spc = self.mangabuff.measured_sec_per_chapter()
+        if spc > 0:
+            return spc
+        cph = self._chapters_per_hour()
+        return (3600.0 / cph) if cph > 0 else 0.0
 
     def _dashboard_text(self) -> str:
         return welcome_text(
             remanga_on=self.remanga_state.running,
             mb_on=self.mangabuff.stats.running,
             speed_label=self._speed_label(),
-            chapters=self.mangabuff.stats.chapters_read,
+            chapters=self._session_chapters(),
             battles=self.remanga_state.total_battles,
+            chapters_total=self.mangabuff.stats.chapters_read,
         )
 
     def bind_admin(self, user_id: int) -> None:
@@ -479,11 +505,13 @@ class App:
                 pulse_text(
                     remanga_on=self.remanga_state.running,
                     mb_on=self.mangabuff.stats.running,
-                    chapters=self.mangabuff.stats.chapters_read,
+                    chapters=self._session_chapters(),
                     cph=self._chapters_per_hour(),
                     battles=self.remanga_state.total_battles,
                     speed=self._speed_label(),
                     last_mb=self.mangabuff.stats.last_action,
+                    chapters_total=self.mangabuff.stats.chapters_read,
+                    sec_per_chapter=self._sec_per_chapter(),
                 ),
                 reply_markup=main_menu_keyboard(),
             )
@@ -964,7 +992,7 @@ class App:
             running=st.running,
             dmin=self.config.mangabuff_delay_min_sec,
             dmax=self.config.mangabuff_delay_max_sec,
-            chapters=st.chapters_read,
+            chapters=self._session_chapters(),
             pages=st.pages_scrolled,
             titles=st.titles_visited,
             rewards=st.rewards_claimed,
@@ -975,6 +1003,9 @@ class App:
             last_url=st.last_url,
             night=st.night_break_until,
             preset_title=title,
+            chapters_total=st.chapters_read,
+            sec_per_chapter=self._sec_per_chapter(),
+            session_titles=self._session_titles(),
         )
 
     async def _apply_speed_preset(self, message: Message, key: str) -> None:
@@ -1006,11 +1037,13 @@ class App:
             mangabuff_speed_preset=preset_key,
         )
         label = SPEED_PRESETS[preset_key].title if preset_key in SPEED_PRESETS else "Своя"
+        preset = SPEED_PRESETS.get(preset_key)
+        blurb = f"\n<i>{preset.blurb}</i>" if preset else ""
         await message.answer(
-            f"🎚 Темп: <b>{label}</b>\n"
-            f"Пауза на шаг: <code>{dmin:.2f}–{dmax:.2f}</code> сек\n"
+            f"🎚 Темп: <b>{label}</b>{blurb}\n"
+            f"Пауза шага скролла: <code>{dmin:.2f}–{dmax:.2f}</code> сек\n"
             f"Шагов на главу: <code>{steps_min}–{steps_max}</code>\n"
-            f"<i>Применяется сразу, без перезапуска фарма.</i>",
+            f"<i>Применяется сразу. «С/глава» в описании — полное время главы с переходом.</i>",
             reply_markup=mangabuff_menu_keyboard(),
         )
 
@@ -1157,6 +1190,8 @@ class App:
         self.scheduler.start()
         self._mb_task = asyncio.create_task(_runner(), name=JOB_MANGABUFF_READ)
         self._mb_session_started_at = datetime.now()
+        self._mb_session_titles_base = int(self.mangabuff.stats.titles_visited or 0)
+        self.mangabuff.mark_farm_session_start()
         update_settings(mangabuff_setup_done=True, mangabuff_farm_enabled=True)
         return (
             f"<b>📚 Фарм запущен</b>\n"
@@ -1185,11 +1220,14 @@ class App:
         except Exception:  # noqa: BLE001
             pass
         st = self.mangabuff.stats
+        spc = self._sec_per_chapter()
+        pace = f" · ~{spc:.1f} с/гл" if spc > 0 else ""
         return (
             f"<b>⏹ Фарм остановлен</b>\n"
             f"────────────────────\n"
-            f"📖 Глав: <b>{st.chapters_read}</b>\n"
-            f"📈 Темп: <b>{self._chapters_per_hour():.1f}</b> гл/час"
+            f"📖 За сессию: <b>{self._session_chapters()}</b>\n"
+            f"📚 Всего: <b>{st.chapters_read}</b>\n"
+            f"📈 Темп: <b>{self._chapters_per_hour():.0f}</b> гл/час{pace}"
         )
 
     async def _mb_progress(self, stats) -> None:
@@ -1201,21 +1239,25 @@ class App:
         )
         s = load_settings()
         every = int(s.mangabuff_milestone_every or 0)
+        session_n = self._session_chapters()
         if (
             not s.mangabuff_notify_milestones
             or every <= 0
             or self._notify_chat_id is None
-            or stats.chapters_read <= 0
-            or stats.chapters_read % every != 0
+            or session_n <= 0
+            or session_n % every != 0
         ):
             return
         try:
+            spc = self._sec_per_chapter()
+            pace = f" · ~{spc:.1f} с/гл" if spc > 0 else ""
             await self.bot.send_message(
                 self._notify_chat_id,
-                f"<b>📡 Веха · {stats.chapters_read} глав</b>\n"
+                f"<b>📡 Веха · сессия {session_n} гл</b>\n"
                 f"────────────────────\n"
-                f"📈 {self._chapters_per_hour():.1f} гл/час\n"
-                f"🏷 Тайтлов: {stats.titles_visited}\n"
+                f"📚 Всего: {stats.chapters_read}\n"
+                f"📈 {self._chapters_per_hour():.0f} гл/час{pace}\n"
+                f"🏷 Тайтлов за сессию: {self._session_titles()}\n"
                 f"🎁 Наград: {stats.rewards_claimed} · 🃏 {stats.cards_claimed}\n"
                 f"🎚 {self._speed_label()}\n"
                 f"🔗 <code>{(stats.last_url or '—')[:100]}</code>",
@@ -1288,7 +1330,7 @@ class App:
                 mangabuff_speed_preset=preset.key,
             )
             self._apply_speed_from_settings()
-            logger.info("MangaBuff speed defaulted to Живой 2.8–5.5с")
+            logger.info("MangaBuff speed defaulted to Живой 0.20–0.45с")
             s = load_settings()
 
         # Восстановить автобой Remanga, если был включён до рестарта/обновления

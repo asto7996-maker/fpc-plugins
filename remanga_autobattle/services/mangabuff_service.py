@@ -22,6 +22,7 @@ import os
 import random
 import re
 import json
+import time as time_mod
 from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime, time, timedelta
 from pathlib import Path
@@ -658,7 +659,7 @@ class MangaBuffStats:
         return (
             f"<b>📚 MangaBuff — статус</b>\n\n"
             f"Состояние: {flag}\n"
-            f"📖 Глав: <b>{self.chapters_read}</b>\n"
+            f"📖 Глав всего: <b>{self.chapters_read}</b>\n"
             f"📄 Скроллов: <b>{self.pages_scrolled}</b>\n"
             f"📚 Тайтлов: <b>{self.titles_visited}</b>\n"
             f"🎁 Наград: <b>{self.rewards_claimed}</b>\n"
@@ -667,7 +668,7 @@ class MangaBuffStats:
             f"🗺 Макеты: <b>{self.layouts_visited}</b>\n"
             f"🎯 Ивент-действия: <b>{self.events_actions}</b>\n"
             f"⚠️ Ошибки: {self.errors}\n"
-            f"⏱ Задержка: {delay_range[0]:.0f}–{delay_range[1]:.0f} сек\n"
+            f"⏱ Пауза шага: {delay_range[0]:.2f}–{delay_range[1]:.2f} сек\n"
             f"🌙 Ночной стоп: <code>{self.night_break_until or '—'}</code>\n"
             f"🔗 <code>{(self.last_url or '—')[:120]}</code>\n"
             f"📝 {self.last_action or '—'}\n"
@@ -750,6 +751,38 @@ class MangaBuffService:
         self._current_comment_slug: str = ""
         # Главы, куда уже писали (строго 1 комментарий на главу)
         self._commented_chapters: set[str] = set(self.stats.commented_chapters or [])
+        # База глав на старт текущей сессии фарма + таймстемпы для живого темпа
+        self._session_chapters_base: int = int(self.stats.chapters_read or 0)
+        self._chapter_ts: List[float] = []
+
+    def mark_farm_session_start(self) -> None:
+        """Зафиксировать начало сессии: главы «за сессию» считаются отсюда."""
+        self._session_chapters_base = int(self.stats.chapters_read or 0)
+        self._chapter_ts.clear()
+
+    @property
+    def session_chapters(self) -> int:
+        return max(0, int(self.stats.chapters_read or 0) - int(self._session_chapters_base or 0))
+
+    def note_chapter_finished(self) -> None:
+        """Вызывать после успешного прочтения главы — для живого замера темпа."""
+        now = time_mod.time()
+        self._chapter_ts.append(now)
+        if len(self._chapter_ts) > 40:
+            self._chapter_ts = self._chapter_ts[-40:]
+
+    def measured_sec_per_chapter(self) -> float:
+        """Среднее время на главу по последним ~40 главам текущей сессии."""
+        ts = self._chapter_ts
+        if len(ts) < 2:
+            return 0.0
+        return max(0.01, (ts[-1] - ts[0]) / (len(ts) - 1))
+
+    def measured_cph(self) -> float:
+        spc = self.measured_sec_per_chapter()
+        if spc <= 0:
+            return 0.0
+        return 3600.0 / spc
 
     def _load_stats(self) -> MangaBuffStats:
         if not STATS_PATH.exists():
@@ -2409,12 +2442,14 @@ class MangaBuffService:
 
             self.stats.chapters_read += 1
             chapters_this_title += 1
+            self.note_chapter_finished()
             last_chapter_url = final_url
             self.stats.touch("глава прочитана", final_url)
             self._persist_stats()
             logger.info(
-                "MangaBuff chapter done steps=%s total_chapters=%s url=%s",
+                "MangaBuff chapter done steps=%s session=%s total=%s url=%s",
                 steps,
+                self.session_chapters,
                 self.stats.chapters_read,
                 final_url,
             )
@@ -2462,6 +2497,7 @@ class MangaBuffService:
         self._stop_flag.clear()
         self.stats.running = True
         self.stats.started_at = datetime.now(MSK).strftime("%d.%m.%Y %H:%M:%S")
+        self.mark_farm_session_start()
         self.stats.touch("фарм запущен")
 
         if not self.is_started:
@@ -2610,6 +2646,7 @@ class MangaBuffService:
             await self._dismiss_overlays(page)
             await self._smooth_read_chapter(page)
             self.stats.chapters_read += 1
+            self.note_chapter_finished()
             done += 1
             await self._maybe_comment(page)
             if on_progress:
