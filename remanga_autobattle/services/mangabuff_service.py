@@ -3278,6 +3278,11 @@ class MangaBuffService:
                 )
                 break
 
+        # добить остаток history_pool перед уходом с тайтла
+        try:
+            await self._flush_history_pool(page)
+        except Exception:  # noqa: BLE001
+            pass
         logger.info(
             "MangaBuff title %s progress: read %s (target %s, total≈%s)",
             slug,
