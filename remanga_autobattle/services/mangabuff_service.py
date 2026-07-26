@@ -1018,14 +1018,27 @@ class MangaBuffService:
 
     async def _safe_goto(self, page: Page, url: str) -> bool:
         try:
-            await page.goto(
-                url,
-                wait_until="domcontentloaded",
-                timeout=self.config.selector_timeout_ms,
-            )
-            # короткая пауза после загрузки — сильно зависит от темпа
-            await self._tempo_pause(0.35, 0.90)
-            await self._dismiss_overlays(page)
+            tier = self._tempo_tier()
+            # turbo/fast: не ждём полной отрисовки — хватает commit/domcontentloaded
+            wait_until = "commit" if tier == "turbo" else "domcontentloaded"
+            timeout = 20000 if tier in ("turbo", "fast") else self.config.selector_timeout_ms
+            await page.goto(url, wait_until=wait_until, timeout=timeout)
+            if tier == "turbo":
+                try:
+                    await page.wait_for_load_state("domcontentloaded", timeout=2500)
+                except Exception:  # noqa: BLE001
+                    pass
+                await self._tempo_pause(0.08, 0.20)
+            else:
+                await self._tempo_pause(0.35, 0.90)
+            # в турбо оверлеи гасим быстро и без долгих таймаутов
+            try:
+                await asyncio.wait_for(
+                    self._dismiss_overlays(page),
+                    timeout=1.2 if tier in ("turbo", "fast") else 6.0,
+                )
+            except Exception:  # noqa: BLE001
+                pass
             self.stats.touch("переход", page.url)
             return True
         except Exception as exc:  # noqa: BLE001
@@ -1600,37 +1613,10 @@ class MangaBuffService:
                 break
             await asyncio.sleep(random.uniform(*frame_sleep))
 
-    async def _go_next_chapter(self, page: Page) -> bool:
-        """Строго следующая глава по порядку — без перескоков."""
-        before = page.url.split("?")[0]
-        parsed = self._parse_chapter_url(before)
-        if not parsed:
-            return False
-        slug, vol, ch = parsed
-        ordered = [
-            f"https://mangabuff.ru/manga/{slug}/{vol}/{ch + 1}",
-            f"https://mangabuff.ru/manga/{slug}/{vol + 1}/1",
-        ]
-
-        # 1) Сначала точный URL следующей главы
-        for nxt in ordered:
-            if not await self._safe_goto(page, nxt):
-                continue
-            title = ""
-            try:
-                title = await page.title()
-            except Exception:  # noqa: BLE001
-                pass
-            now = page.url.split("?")[0]
-            if "404" in title.lower() or now == before:
-                continue
-            if self._is_sequential_next(before, now):
-                logger.info("MangaBuff next chapter via URL %s", now)
-                return True
-            # попали не туда — вернёмся и попробуем следующий кандидат
-            await self._safe_goto(page, before)
-
-        # 2) Кнопка «След. глава» — принимаем ТОЛЬКО если это +1
+    async def _click_sequential_next(self, page: Page, before: str) -> bool:
+        """Клик «След. глава» только если href/URL строго следующая."""
+        tier = self._tempo_tier()
+        vis_timeout = 250 if tier in ("turbo", "fast") else 700
         candidates = (
             page.get_by_role("link", name=re.compile(r"След\.?\s*глава", re.I)),
             page.locator("a[href*='/manga/']").filter(
@@ -1645,12 +1631,26 @@ class MangaBuffService:
             for i in range(min(count, 3)):
                 el = loc.nth(i)
                 try:
-                    if not await el.is_visible(timeout=700):
+                    if not await el.is_visible(timeout=vis_timeout):
                         continue
                     href = (await el.get_attribute("href")) or ""
+                    # заранее отсечь прыжки по href
+                    if href:
+                        abs_href = href
+                        if href.startswith("/"):
+                            abs_href = "https://mangabuff.ru" + href
+                        if not self._is_sequential_next(before, abs_href):
+                            continue
                     await el.click(force=True)
                     gap_lo, gap_hi = self._chapter_gap_pause()
                     await self._human_pause(gap_lo, gap_hi)
+                    try:
+                        await page.wait_for_load_state(
+                            "domcontentloaded",
+                            timeout=2000 if tier in ("turbo", "fast") else 8000,
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass
                     await self._dismiss_overlays(page)
                     now = page.url.split("?")[0]
                     if self._is_sequential_next(before, now):
@@ -1668,6 +1668,47 @@ class MangaBuffService:
                         await self._safe_goto(page, before)
                     except Exception:  # noqa: BLE001
                         pass
+        return False
+
+    async def _go_next_chapter(self, page: Page) -> bool:
+        """Строго следующая глава по порядку — без перескоков."""
+        before = page.url.split("?")[0]
+        parsed = self._parse_chapter_url(before)
+        if not parsed:
+            return False
+        slug, vol, ch = parsed
+        ordered = [
+            f"https://mangabuff.ru/manga/{slug}/{vol}/{ch + 1}",
+            f"https://mangabuff.ru/manga/{slug}/{vol + 1}/1",
+        ]
+        tier = self._tempo_tier()
+
+        # turbo/fast: клик быстрее полного goto, если кнопка есть
+        if tier in ("turbo", "fast"):
+            if await self._click_sequential_next(page, before):
+                return True
+
+        # URL следующей главы
+        for nxt in ordered:
+            if not await self._safe_goto(page, nxt):
+                continue
+            title = ""
+            try:
+                title = await page.title()
+            except Exception:  # noqa: BLE001
+                pass
+            now = page.url.split("?")[0]
+            if "404" in title.lower() or now == before:
+                continue
+            if self._is_sequential_next(before, now):
+                logger.info("MangaBuff next chapter via URL %s", now)
+                return True
+            await self._safe_goto(page, before)
+
+        # медленные режимы / fallback: клик
+        if tier not in ("turbo", "fast"):
+            if await self._click_sequential_next(page, before):
+                return True
         return False
 
     # ------------------------------------------------------------------
