@@ -26,7 +26,7 @@ from aiogram.types import (
 )
 
 from config import Config, load_config
-from scheduler import JOB_MANGABUFF_READ, AppScheduler
+from scheduler import JOB_MANGABUFF_MARKET, JOB_MANGABUFF_READ, AppScheduler
 from services.mangabuff_service import CardDropInfo, MangaBuffService
 from settings_store import load_settings, update_settings
 from ui_theme import (
@@ -482,14 +482,16 @@ class App:
         async def cards_list_market(message: Message) -> None:
             self._notify_chat_id = message.chat.id
             await message.answer(
-                "⏳ Выставляю карты на площадку…\n"
-                "<i>цена лота = 1 карта ранга выше</i>",
+                "⏳ Выставляю <b>все</b> карты на площадку…\n"
+                "<i>1× ранг выше · X→2×X · сутки↔2× та же</i>",
                 reply_markup=cards_events_keyboard(),
             )
             try:
                 if not self.mangabuff.is_started:
                     await self.mangabuff.start(headless=True)
-                result = await self.mangabuff.list_cards_on_market(limit=15)
+                result = await self.mangabuff.list_cards_on_market(
+                    limit=None, maintain=True
+                )
                 await message.answer(
                     result.to_telegram(),
                     reply_markup=cards_events_keyboard(),
@@ -510,8 +512,8 @@ class App:
             on = not s.mangabuff_auto_market
             update_settings(mangabuff_auto_market=on)
             await message.answer(
-                f"📤 Авто-лоты при дропе: <b>{'вкл' if on else 'выкл'}</b>\n"
-                f"<i>цена = 1 карта ранга выше (E→D→…→S→X)</i>",
+                f"📤 Авто-лоты (новые карты): <b>{'вкл' if on else 'выкл'}</b>\n"
+                f"<i>1× выше · X→2×X · раз в сутки ↔ 2× та же редкость</i>",
                 reply_markup=cards_events_keyboard(),
             )
 
@@ -632,17 +634,18 @@ class App:
             asyncio.create_task(self._auto_list_dropped_cards(info))
 
     async def _auto_list_dropped_cards(self, info: CardDropInfo) -> None:
-        """Авто-выставление дропа: цена = 1 карта ранга выше."""
-        await asyncio.sleep(8.0)
+        """Авто-выставление дропа на площадку."""
+        await asyncio.sleep(10.0)
         chat = self._notify_chat_id or self.config.telegram_admin_id
         try:
             if not self.mangabuff.is_started:
                 await self.mangabuff.start(headless=True)
             result = await self.mangabuff.list_cards_on_market(
-                limit=max(1, info.cards),
+                limit=max(1, info.cards or 1),
                 user_card_ids=info.user_card_ids or None,
+                maintain=False,
             )
-            if not chat:
+            if not chat or (not result.listed and not result.errors):
                 return
             await self.bot.send_message(chat, result.to_telegram())
         except Exception as exc:  # noqa: BLE001
@@ -654,6 +657,21 @@ class App:
                     )
                 except Exception:  # noqa: BLE001
                     pass
+
+    async def _market_maintain_job(self) -> None:
+        """Раз в час: доложить новые карты + суточная смена цены."""
+        if not load_settings().mangabuff_auto_market:
+            return
+        try:
+            if not self.mangabuff.is_started:
+                await self.mangabuff.start(headless=True)
+            result = await self.mangabuff.maintain_market_lots()
+            if result.listed or result.repriced or result.errors:
+                chat = self._notify_chat_id or self.config.telegram_admin_id
+                if chat:
+                    await self.bot.send_message(chat, result.to_telegram())
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("market maintain job: %s", exc)
 
     def _mb_status_card(self) -> str:
         self._sync_mb_stats_from_disk()
@@ -940,6 +958,20 @@ class App:
             logger.warning("MangaBuff browser: %s", exc)
 
         self.scheduler.start()
+        try:
+            if not self.scheduler.raw.get_job(JOB_MANGABUFF_MARKET):
+                self.scheduler.raw.add_job(
+                    self._market_maintain_job,
+                    trigger="interval",
+                    hours=1,
+                    id=JOB_MANGABUFF_MARKET,
+                    replace_existing=True,
+                    max_instances=1,
+                    coalesce=True,
+                )
+                logger.info("MangaBuff market maintain job scheduled (1h)")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("market job schedule: %s", exc)
         try:
             await self.dp.start_polling(self.bot, handle_signals=True)
         finally:

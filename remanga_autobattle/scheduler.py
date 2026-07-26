@@ -12,6 +12,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 logger = logging.getLogger(__name__)
 
 JOB_MANGABUFF_READ = "mangabuff_autoread"
+JOB_MANGABUFF_MARKET = "mangabuff_market_maintain"
 
 
 class AppScheduler:

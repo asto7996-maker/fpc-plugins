@@ -93,6 +93,13 @@ _CARD_NOTIFY_RE = re.compile(
 # Лестница редкости MangaBuff (как getNextRank на сайте) + X выше S.
 # Индекс больше = карта дороже / реже.
 CARD_RANK_LADDER = ("E", "D", "C", "B", "G", "P", "A", "S", "X")
+MARKET_LOTS_PATH = BASE_DIR / "market_lots.json"
+# Режим цены: higher = 1× ранг выше (для X — 2×X); same2 = 2× тот же ранг.
+MARKET_MODE_HIGHER = "higher"
+MARKET_MODE_SAME2 = "same2"
+MARKET_REPRICE_AFTER = timedelta(hours=24)
+
+
 def next_higher_rank(rank: str) -> Optional[str]:
     """Следующий ранг выше (цена лота: 1 карта этого ранга)."""
     r = (rank or "").strip().upper()
@@ -107,6 +114,41 @@ def next_higher_rank(rank: str) -> Optional[str]:
 def format_rank_label(rank: str) -> str:
     r = (rank or "").strip().upper()
     return f"[{r}]" if r else ""
+
+
+def market_price_for_mode(card_rank: str, mode: str) -> Tuple[str, int]:
+    """
+    Цена лота по режиму.
+    higher → 1× ранг выше; если выше нет (X и пр.) → 2× тот же ранг.
+    same2 → 2× тот же ранг.
+    """
+    r = (card_rank or "").strip().upper() or "E"
+    m = (mode or MARKET_MODE_HIGHER).strip().lower()
+    if m == MARKET_MODE_SAME2:
+        return r, 2
+    higher = next_higher_rank(r)
+    if higher:
+        return higher, 1
+    return r, 2
+
+
+def _normalize_card_image(image: str) -> str:
+    raw = (image or "").strip()
+    if not raw:
+        return ""
+    raw = raw.split("?")[0]
+    raw = raw.replace("\\/", "/")
+    if "/img/cards/" in raw:
+        raw = raw.split("/img/cards/")[-1]
+    return raw.lstrip("/").lower()
+
+
+def _parse_lot_price_text(text: str) -> Tuple[int, str]:
+    """'1 G' / '2X' → (value, rank)."""
+    m = re.search(r"(\d+)\s*([A-Za-z])", text or "")
+    if not m:
+        return 0, ""
+    return int(m.group(1)), m.group(2).upper()
 
 # Ночной перерыв: 01:00–05:00 МСК (ровно 4 часа)
 NIGHT_BREAK_START = time(1, 0)
@@ -799,11 +841,13 @@ class CardDropInfo:
 
 @dataclass
 class MarketListResult:
-    """Результат выставления карт на торговую площадку."""
+    """Результат выставления / обслуживания лотов на площадке."""
 
     listed: int = 0
     skipped: int = 0
     errors: int = 0
+    repriced: int = 0
+    removed: int = 0
     details: List[str] = field(default_factory=list)
 
     def to_telegram(self) -> str:
@@ -811,11 +855,13 @@ class MarketListResult:
             "<b>📤 Площадка</b>",
             "",
             f"Выставлено: <b>{self.listed}</b>",
+            f"Переценено: <b>{self.repriced}</b>",
             f"Пропущено: <b>{self.skipped}</b>",
+            f"Снято/продано: <b>{self.removed}</b>",
             f"Ошибки: <b>{self.errors}</b>",
         ]
         if self.details:
-            lines += ["", "Детали:"] + [f"• {d}" for d in self.details[:12]]
+            lines += ["", "Детали:"] + [f"• {d}" for d in self.details[:14]]
         return "\n".join(lines)
 
 
@@ -1844,25 +1890,52 @@ class MangaBuffService:
         ranks = self._parse_ranks_from_text(raw)
         return n_cards, n_scroll, names, ranks
 
+    def _load_market_lots_state(self) -> Dict[str, Dict[str, Any]]:
+        if not MARKET_LOTS_PATH.exists():
+            return {}
+        try:
+            raw = json.loads(MARKET_LOTS_PATH.read_text(encoding="utf-8"))
+            lots = raw.get("lots") if isinstance(raw, dict) else raw
+            if not isinstance(lots, dict):
+                return {}
+            out: Dict[str, Dict[str, Any]] = {}
+            for k, v in lots.items():
+                if isinstance(v, dict) and str(k).isdigit():
+                    out[str(k)] = v
+            return out
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("market_lots load: %s", exc)
+            return {}
+
+    def _save_market_lots_state(self, lots: Dict[str, Dict[str, Any]]) -> None:
+        try:
+            MARKET_LOTS_PATH.write_text(
+                json.dumps({"lots": lots}, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("market_lots save: %s", exc)
+
     async def _fetch_inventory_cards(
         self,
         page: Page,
         limit: int = 40,
         rank: str = "",
         search: str = "",
+        page_no: int = 1,
     ) -> List[Dict[str, Any]]:
-        """POST /cards-filter/<user_id> — инвентарь с rank/name/id."""
+        """POST /cards-filter/<user_id> — одна страница инвентаря."""
         await self._refresh_user_id(page)
         uid = self._mb_user_id
         if not uid:
             return []
         try:
             data = await page.evaluate(
-                """async ({uid, limit, rank, search}) => {
+                """async ({uid, limit, rank, search, pageNo}) => {
                   const csrf = (document.querySelector('meta[name="csrf-token"]')
                     || {}).content || '';
                   const body = new URLSearchParams();
-                  body.set('page', '1');
+                  body.set('page', String(pageNo || 1));
                   body.set('per_page', String(limit || 40));
                   body.set('search', search || '');
                   body.set('rank', (rank || '').toLowerCase());
@@ -1876,17 +1949,24 @@ class MangaBuffService:
                     body: body.toString(),
                     credentials: 'same-origin'
                   });
-                  if (!resp.ok) return {ok: false, status: resp.status, data: []};
+                  if (!resp.ok) return {ok: false, status: resp.status, data: [], last: 1};
                   let json = null;
                   try { json = await resp.json(); } catch (e) { json = null; }
                   const rows = (json && json.data) ? json.data : (Array.isArray(json) ? json : []);
-                  return {ok: true, status: resp.status, data: rows};
+                  return {
+                    ok: true,
+                    status: resp.status,
+                    data: rows,
+                    last: (json && json.last_page) ? json.last_page : 1,
+                    total: (json && json.total) ? json.total : rows.length
+                  };
                 }""",
                 {
                     "uid": uid,
                     "limit": int(limit),
                     "rank": (rank or "").strip(),
                     "search": (search or "").strip(),
+                    "pageNo": int(page_no),
                 },
             )
         except Exception as exc:  # noqa: BLE001
@@ -1898,6 +1978,66 @@ class MangaBuffService:
         rows = data.get("data") or []
         return [r for r in rows if isinstance(r, dict)]
 
+    async def _fetch_all_inventory_cards(
+        self,
+        page: Page,
+        per_page: int = 70,
+        rank: str = "",
+        search: str = "",
+    ) -> List[Dict[str, Any]]:
+        """Все страницы инвентаря."""
+        await self._refresh_user_id(page)
+        uid = self._mb_user_id
+        if not uid:
+            return []
+        try:
+            data = await page.evaluate(
+                """async ({uid, perPage, rank, search}) => {
+                  const csrf = (document.querySelector('meta[name="csrf-token"]')
+                    || {}).content || '';
+                  const all = [];
+                  let pageNo = 1;
+                  let last = 1;
+                  while (pageNo <= last && pageNo <= 40) {
+                    const body = new URLSearchParams();
+                    body.set('page', String(pageNo));
+                    body.set('per_page', String(perPage || 70));
+                    body.set('search', search || '');
+                    body.set('rank', (rank || '').toLowerCase());
+                    const resp = await fetch('/cards-filter/' + uid, {
+                      method: 'POST',
+                      headers: {
+                        'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+                        'X-CSRF-TOKEN': csrf,
+                        'X-Requested-With': 'XMLHttpRequest'
+                      },
+                      body: body.toString(),
+                      credentials: 'same-origin'
+                    });
+                    if (!resp.ok) break;
+                    let json = null;
+                    try { json = await resp.json(); } catch (e) { break; }
+                    const rows = (json && json.data) ? json.data : [];
+                    all.push(...rows);
+                    last = (json && json.last_page) ? Number(json.last_page) : pageNo;
+                    if (!rows.length) break;
+                    pageNo += 1;
+                  }
+                  return {ok: true, data: all};
+                }""",
+                {
+                    "uid": uid,
+                    "perPage": int(per_page),
+                    "rank": (rank or "").strip(),
+                    "search": (search or "").strip(),
+                },
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("cards-filter all: %s", exc)
+            return []
+        rows = (data or {}).get("data") or []
+        return [r for r in rows if isinstance(r, dict)]
+
     async def _enrich_card_drop_rarity(self, page: Page, info: CardDropInfo) -> None:
         """Подтянуть редкость/id из инвентаря, если в уведомлении её нет."""
         if info.cards <= 0:
@@ -1905,7 +2045,7 @@ class MangaBuffService:
         if info.ranks and len(info.ranks) >= min(info.cards, 1) and info.user_card_ids:
             return
         inv = await self._fetch_inventory_cards(
-            page, limit=max(24, info.cards * 4)
+            page, limit=max(40, info.cards * 6)
         )
         if not inv:
             return
@@ -1999,135 +2139,440 @@ class MangaBuffService:
         except Exception as exc:  # noqa: BLE001
             return {"status": 0, "data": {"message": str(exc)}}
 
+    async def _delete_market_lot(self, page: Page, market_id: int) -> Dict[str, Any]:
+        """POST /market/<id>/delete — снять лот."""
+        try:
+            return await page.evaluate(
+                """async (id) => {
+                  const csrf = (document.querySelector('meta[name="csrf-token"]')
+                    || {}).content || '';
+                  const resp = await fetch('/market/' + id + '/delete', {
+                    method: 'POST',
+                    headers: {
+                      'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+                      'X-CSRF-TOKEN': csrf,
+                      'X-Requested-With': 'XMLHttpRequest'
+                    },
+                    body: '',
+                    credentials: 'same-origin'
+                  });
+                  let data = null;
+                  try { data = await resp.json(); } catch (e) {
+                    try { data = {raw: await resp.text()}; } catch (e2) { data = null; }
+                  }
+                  return {status: resp.status, data};
+                }""",
+                int(market_id),
+            )
+        except Exception as exc:  # noqa: BLE001
+            return {"status": 0, "data": {"message": str(exc)}}
+
+    async def _fetch_own_market_lots(self, page: Page) -> List[Dict[str, Any]]:
+        """Свои лоты с /market: market_id, image, price_rank, price_value."""
+        if "mangabuff.ru/market" not in (page.url or ""):
+            if not await self._safe_goto(page, "https://mangabuff.ru/market"):
+                return []
+            await self._tempo_pause(0.3, 0.6)
+        try:
+            items = await page.evaluate(
+                """() => {
+                  const root = document.querySelector('.market-list__cards--my');
+                  if (!root) return [];
+                  return [...root.querySelectorAll('.manga-cards__item-wrapper')].map(el => {
+                    const imgEl = el.querySelector('.manga-cards__image, img');
+                    let image = '';
+                    if (imgEl) {
+                      image = imgEl.getAttribute('src')
+                        || (imgEl.style && imgEl.style.backgroundImage)
+                        || '';
+                      const m = String(image).match(/url\\([\"']?([^\"')]+)[\"']?\\)/);
+                      if (m) image = m[1];
+                    }
+                    const priceBtn = el.querySelector('.market-list__cards-button:not(.market-list__cards-del-btn)');
+                    const priceText = (priceBtn && priceBtn.innerText || el.innerText || '')
+                      .replace(/\\s+/g, ' ').trim();
+                    return {
+                      market_id: String(el.dataset.id || ''),
+                      image: String(image || ''),
+                      price_text: priceText
+                    };
+                  });
+                }"""
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("own market lots: %s", exc)
+            return []
+        out: List[Dict[str, Any]] = []
+        for it in items or []:
+            mid = int(str(it.get("market_id") or "0") or 0)
+            if not mid:
+                continue
+            value, price_rank = _parse_lot_price_text(str(it.get("price_text") or ""))
+            out.append(
+                {
+                    "market_id": mid,
+                    "image": _normalize_card_image(str(it.get("image") or "")),
+                    "price_rank": price_rank,
+                    "price_value": value,
+                    "price_text": str(it.get("price_text") or ""),
+                }
+            )
+        return out
+
+    def _infer_price_mode(
+        self, card_rank: str, price_rank: str, price_value: int
+    ) -> str:
+        exp_h_rank, exp_h_val = market_price_for_mode(card_rank, MARKET_MODE_HIGHER)
+        exp_s_rank, exp_s_val = market_price_for_mode(card_rank, MARKET_MODE_SAME2)
+        pr = (price_rank or "").upper()
+        pv = int(price_value or 0)
+        if pr == exp_s_rank and pv == exp_s_val and (
+            exp_h_rank != exp_s_rank or exp_h_val != exp_s_val
+        ):
+            # явно режим 2× тот же (и он отличается от higher)
+            if pr == (card_rank or "").upper() and pv == 2:
+                return MARKET_MODE_SAME2
+        if pr == exp_h_rank and pv == exp_h_val:
+            return MARKET_MODE_HIGHER
+        if pr == (card_rank or "").upper() and pv == 2:
+            return MARKET_MODE_SAME2
+        return MARKET_MODE_HIGHER
+
     async def list_cards_on_market(
         self,
         *,
-        limit: int = 15,
+        limit: Optional[int] = None,
         user_card_ids: Optional[Sequence[int]] = None,
+        maintain: bool = True,
     ) -> MarketListResult:
         """
-        Выставить карты на площадку.
-        Цена лота: 1 карта ранга на ступень выше (E→D→C→B→G→P→A→S→X).
+        Выставить карты на площадку (по умолчанию — все доступные).
+        Цена: 1× ранг выше; для X (нет выше) — 2×X.
+        При maintain=True также переключает цену раз в сутки (1×выше ↔ 2×та же).
         """
         if not self.is_started:
             await self.start(headless=True)
         async with self._lock:
-            return await self._list_cards_on_market_unlocked(
-                limit=limit, user_card_ids=user_card_ids
+            return await self._maintain_market_unlocked(
+                limit=limit,
+                user_card_ids=user_card_ids,
+                do_list=True,
+                do_reprice=maintain,
             )
 
-    async def _list_cards_on_market_unlocked(
+    async def maintain_market_lots(self) -> MarketListResult:
+        """Фоновая поддержка: новые лоты + суточная смена цены."""
+        if not self.is_started:
+            await self.start(headless=True)
+        async with self._lock:
+            return await self._maintain_market_unlocked(
+                limit=None,
+                user_card_ids=None,
+                do_list=True,
+                do_reprice=True,
+            )
+
+    async def _maintain_market_unlocked(
         self,
         *,
-        limit: int = 15,
+        limit: Optional[int] = None,
         user_card_ids: Optional[Sequence[int]] = None,
+        do_list: bool = True,
+        do_reprice: bool = True,
     ) -> MarketListResult:
-        """Выставление лотов. Вызывать под self._lock."""
+        """Листинг всех карт + суточный флип цены. Под self._lock."""
         result = MarketListResult()
         page = self._page
         assert page is not None
         await self._ensure_login_unlocked()
         await self._refresh_user_id(page)
-        if not await self._safe_goto(page, "https://mangabuff.ru/market/create"):
+
+        if not await self._safe_goto(page, "https://mangabuff.ru/market"):
             result.errors += 1
-            result.details.append("не открылась /market/create")
+            result.details.append("не открылась /market")
             return result
 
-        want_ids = {int(x) for x in (user_card_ids or []) if x}
-        inv = await self._fetch_inventory_cards(page, limit=max(80, limit * 3))
-        if want_ids:
-            candidates = [r for r in inv if int(r.get("id") or 0) in want_ids]
-            have = {int(r.get("id") or 0) for r in candidates}
-            for uid in want_ids:
-                if uid not in have:
-                    candidates.append(
-                        {"id": uid, "rank": "", "card_name": f"#{uid}"}
-                    )
-        else:
-            candidates = [
-                r
-                for r in inv
-                if not int(r.get("in_trade") or 0)
-                and not int(r.get("is_not_tradable") or 0)
-                and not int(r.get("is_lock") or 0)
-                and str(r.get("rank") or "").upper() in CARD_RANK_LADDER
-            ]
+        state = self._load_market_lots_state()
+        now = datetime.now(MSK)
+        now_iso = now.isoformat()
 
-        listed_ids: List[int] = []
-        for row in candidates:
-            if len(listed_ids) >= max(1, int(limit)):
-                break
+        inv = await self._fetch_all_inventory_cards(page, per_page=70)
+        inv_by_id: Dict[int, Dict[str, Any]] = {}
+        inv_by_image: Dict[str, Dict[str, Any]] = {}
+        for row in inv:
             uid = int(row.get("id") or 0)
             if not uid:
                 continue
+            inv_by_id[uid] = row
+            img = _normalize_card_image(str(row.get("image") or ""))
+            if img:
+                inv_by_image[img] = row
+
+        own_lots = await self._fetch_own_market_lots(page)
+        own_by_market: Dict[int, Dict[str, Any]] = {
+            int(x["market_id"]): x for x in own_lots
+        }
+        own_by_image: Dict[str, Dict[str, Any]] = {
+            x["image"]: x for x in own_lots if x.get("image")
+        }
+
+        # синхронизация state ↔ живые лоты
+        live_user_ids: set[int] = set()
+        for lot in own_lots:
+            img = lot.get("image") or ""
+            row = inv_by_image.get(img)
+            if not row:
+                continue
+            uid = int(row.get("id") or 0)
+            if not uid:
+                continue
+            live_user_ids.add(uid)
+            key = str(uid)
             rank = str(row.get("rank") or "").strip().upper()
             name = str(row.get("card_name") or "").strip() or f"#{uid}"
-            if not rank:
-                more = await self._fetch_inventory_cards(
-                    page,
-                    limit=5,
-                    search=name if not name.startswith("#") else "",
-                )
-                for mrow in more:
-                    if int(mrow.get("id") or 0) == uid:
-                        rank = str(mrow.get("rank") or "").strip().upper()
-                        name = str(mrow.get("card_name") or name).strip()
-                        row = mrow
-                        break
-            if int(row.get("in_trade") or 0):
-                result.skipped += 1
-                result.details.append(f"{format_rank_label(rank)} {name}: уже в лоте")
-                continue
-            if int(row.get("is_not_tradable") or 0) or int(row.get("is_lock") or 0):
-                result.skipped += 1
-                result.details.append(
-                    f"{format_rank_label(rank)} {name}: нельзя обменять"
-                )
-                continue
-            price_rank = next_higher_rank(rank)
-            if not price_rank:
-                result.skipped += 1
-                result.details.append(
-                    f"{format_rank_label(rank)} {name}: нет ранга выше"
-                )
-                continue
-            resp = await self._post_market_lot(page, uid, price_rank, 1)
-            status = int((resp or {}).get("status") or 0)
-            payload = (resp or {}).get("data") if isinstance(resp, dict) else {}
-            msg = ""
-            if isinstance(payload, dict):
-                msg = str(payload.get("message") or payload.get("raw") or "")
-            if 200 <= status < 300:
-                result.listed += 1
-                listed_ids.append(uid)
-                result.details.append(
-                    f"{format_rank_label(rank)} {name} → 1×{price_rank}"
-                )
-                logger.info(
-                    "MangaBuff market listed id=%s rank=%s price=%s×1",
-                    uid,
-                    rank,
-                    price_rank,
-                )
-            else:
-                result.errors += 1
-                short = (msg or f"HTTP {status}")[:120]
-                result.details.append(f"{format_rank_label(rank)} {name}: {short}")
-                logger.warning(
-                    "MangaBuff market list fail id=%s status=%s msg=%s",
-                    uid,
-                    status,
-                    short,
-                )
-            await self._tempo_pause(0.35, 0.7)
+            mode = self._infer_price_mode(
+                rank, str(lot.get("price_rank") or ""), int(lot.get("price_value") or 0)
+            )
+            prev = state.get(key) or {}
+            state[key] = {
+                "user_card_id": uid,
+                "market_id": int(lot["market_id"]),
+                "card_rank": rank,
+                "name": name,
+                "image": img,
+                "mode": prev.get("mode") or mode,
+                "price_rank": str(lot.get("price_rank") or ""),
+                "price_value": int(lot.get("price_value") or 0),
+                "listed_at": prev.get("listed_at") or now_iso,
+                "mode_since": prev.get("mode_since") or now_iso,
+            }
 
-        if result.listed:
+        # проданные / снятые вручную
+        for key in list(state.keys()):
+            uid = int(key)
+            st = state[key]
+            mid = int(st.get("market_id") or 0)
+            if uid in live_user_ids:
+                continue
+            if mid and mid not in own_by_market:
+                result.removed += 1
+                result.details.append(
+                    f"{format_rank_label(str(st.get('card_rank') or ''))} "
+                    f"{st.get('name') or key}: продана/снята"
+                )
+                del state[key]
+
+        # суточная смена режима цены
+        if do_reprice:
+            for key, st in list(state.items()):
+                uid = int(key)
+                row = inv_by_id.get(uid)
+                if not row:
+                    continue
+                rank = str(st.get("card_rank") or row.get("rank") or "").upper()
+                name = str(st.get("name") or row.get("card_name") or f"#{uid}")
+                mode = str(st.get("mode") or MARKET_MODE_HIGHER)
+                mode_since_raw = str(st.get("mode_since") or "")
+                try:
+                    mode_since = datetime.fromisoformat(mode_since_raw)
+                    if mode_since.tzinfo is None:
+                        mode_since = mode_since.replace(tzinfo=MSK)
+                except Exception:  # noqa: BLE001
+                    mode_since = now - MARKET_REPRICE_AFTER - timedelta(minutes=1)
+
+                exp_rank, exp_val = market_price_for_mode(rank, mode)
+                cur_rank = str(st.get("price_rank") or "").upper()
+                cur_val = int(st.get("price_value") or 0)
+                due = (now - mode_since) >= MARKET_REPRICE_AFTER
+                mismatch = cur_rank != exp_rank or cur_val != exp_val
+
+                if due:
+                    new_mode = (
+                        MARKET_MODE_SAME2
+                        if mode == MARKET_MODE_HIGHER
+                        else MARKET_MODE_HIGHER
+                    )
+                    new_rank, new_val = market_price_for_mode(rank, new_mode)
+                    # для X higher==same2 (оба 2×X) — флип бессмысленен
+                    if (new_rank, new_val) == (exp_rank, exp_val) and not mismatch:
+                        st["mode_since"] = now_iso
+                        state[key] = st
+                        continue
+                    mode = new_mode
+                    exp_rank, exp_val = new_rank, new_val
+                    mismatch = True
+
+                if not mismatch:
+                    continue
+
+                mid = int(st.get("market_id") or 0)
+                if mid:
+                    del_resp = await self._delete_market_lot(page, mid)
+                    del_status = int((del_resp or {}).get("status") or 0)
+                    if not (200 <= del_status < 300):
+                        result.errors += 1
+                        result.details.append(
+                            f"{format_rank_label(rank)} {name}: не снялся лот {mid}"
+                        )
+                        await self._tempo_pause(0.25, 0.5)
+                        continue
+                    await self._tempo_pause(0.35, 0.7)
+
+                ok, msg = await self._create_lot_only(
+                    page, uid, exp_rank, exp_val
+                )
+                if ok:
+                    result.repriced += 1
+                    state[key] = {
+                        "user_card_id": uid,
+                        "market_id": 0,  # привяжем пачкой ниже
+                        "card_rank": rank,
+                        "name": name,
+                        "image": _normalize_card_image(str(row.get("image") or "")),
+                        "mode": mode,
+                        "price_rank": exp_rank,
+                        "price_value": exp_val,
+                        "listed_at": st.get("listed_at") or now_iso,
+                        "mode_since": now_iso,
+                    }
+                    result.details.append(
+                        f"{format_rank_label(rank)} {name}: "
+                        f"{cur_val}×{cur_rank or '?'} → {exp_val}×{exp_rank}"
+                    )
+                    live_user_ids.add(uid)
+                else:
+                    result.errors += 1
+                    result.details.append(
+                        f"{format_rank_label(rank)} {name}: переоценка — {msg}"
+                    )
+                    state.pop(key, None)
+                await self._tempo_pause(0.25, 0.45)
+
+        # выставить все / выбранные, которых ещё нет в лотах
+        if do_list:
+            want_ids = {int(x) for x in (user_card_ids or []) if x}
+            if want_ids:
+                candidates = [
+                    inv_by_id[i] for i in want_ids if i in inv_by_id
+                ] + [
+                    {"id": i, "rank": "", "card_name": f"#{i}", "image": ""}
+                    for i in want_ids
+                    if i not in inv_by_id
+                ]
+            else:
+                candidates = [
+                    r
+                    for r in inv
+                    if not int(r.get("is_not_tradable") or 0)
+                    and not int(r.get("is_lock") or 0)
+                    and str(r.get("rank") or "").strip()
+                ]
+
+            listed_n = 0
+            max_list = int(limit) if limit is not None else 10_000
+            for row in candidates:
+                if listed_n >= max_list:
+                    break
+                uid = int(row.get("id") or 0)
+                if not uid:
+                    continue
+                if uid in live_user_ids or int(row.get("in_trade") or 0):
+                    result.skipped += 1
+                    continue
+                if int(row.get("is_not_tradable") or 0) or int(row.get("is_lock") or 0):
+                    result.skipped += 1
+                    continue
+
+                rank = str(row.get("rank") or "").strip().upper()
+                name = str(row.get("card_name") or "").strip() or f"#{uid}"
+                image = _normalize_card_image(str(row.get("image") or ""))
+                if not rank:
+                    result.skipped += 1
+                    result.details.append(f"{name}: нет ранга")
+                    continue
+
+                mode = MARKET_MODE_HIGHER
+                price_rank, price_value = market_price_for_mode(rank, mode)
+                ok, msg = await self._create_lot_only(
+                    page, uid, price_rank, price_value
+                )
+                if ok:
+                    listed_n += 1
+                    result.listed += 1
+                    live_user_ids.add(uid)
+                    state[str(uid)] = {
+                        "user_card_id": uid,
+                        "market_id": 0,
+                        "card_rank": rank,
+                        "name": name,
+                        "image": image,
+                        "mode": mode,
+                        "price_rank": price_rank,
+                        "price_value": price_value,
+                        "listed_at": now_iso,
+                        "mode_since": now_iso,
+                    }
+                    result.details.append(
+                        f"{format_rank_label(rank)} {name} → {price_value}×{price_rank}"
+                    )
+                    logger.info(
+                        "MangaBuff market listed id=%s rank=%s price=%s×%s",
+                        uid,
+                        rank,
+                        price_rank,
+                        price_value,
+                    )
+                else:
+                    result.errors += 1
+                    result.details.append(
+                        f"{format_rank_label(rank)} {name}: {msg}"
+                    )
+                await self._tempo_pause(0.22, 0.4)
+
+        # привязать market_id по картинкам одним проходом
+        if result.listed or result.repriced:
+            await self._safe_goto(page, "https://mangabuff.ru/market")
+            await self._tempo_pause(0.3, 0.6)
+            own = await self._fetch_own_market_lots(page)
+            by_img = {x["image"]: x for x in own if x.get("image")}
+            for key, st in list(state.items()):
+                img = st.get("image") or ""
+                lot = by_img.get(img)
+                if not lot:
+                    continue
+                st["market_id"] = int(lot.get("market_id") or 0)
+                st["price_rank"] = str(lot.get("price_rank") or st.get("price_rank") or "")
+                st["price_value"] = int(lot.get("price_value") or st.get("price_value") or 0)
+                state[key] = st
+
+        self._save_market_lots_state(state)
+        if result.listed or result.repriced:
             self.stats.touch(
-                f"площадка: +{result.listed} лот(ов)",
+                f"площадка: +{result.listed} / ↔{result.repriced}",
                 page.url,
             )
             self._persist_stats()
         return result
+
+    async def _create_lot_only(
+        self,
+        page: Page,
+        user_card_id: int,
+        price_rank: str,
+        price_value: int,
+    ) -> Tuple[bool, str]:
+        """POST /market/ без перезагрузки страницы."""
+        resp = await self._post_market_lot(
+            page, user_card_id, price_rank, price_value
+        )
+        status = int((resp or {}).get("status") or 0)
+        payload = (resp or {}).get("data") if isinstance(resp, dict) else {}
+        msg = ""
+        if isinstance(payload, dict):
+            msg = str(payload.get("message") or payload.get("raw") or "")
+        if not (200 <= status < 300):
+            return False, (msg or f"HTTP {status}")[:120]
+        return True, msg or "ok"
 
     async def _harvest_notifications_feed(self, page: Page) -> CardDropInfo:
         """
