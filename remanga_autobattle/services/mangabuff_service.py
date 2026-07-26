@@ -2312,9 +2312,6 @@ class MangaBuffService:
         own_by_market: Dict[int, Dict[str, Any]] = {
             int(x["market_id"]): x for x in own_lots
         }
-        own_by_image: Dict[str, Dict[str, Any]] = {
-            x["image"]: x for x in own_lots if x.get("image")
-        }
 
         # синхронизация state ↔ живые лоты
         live_user_ids: set[int] = set()
