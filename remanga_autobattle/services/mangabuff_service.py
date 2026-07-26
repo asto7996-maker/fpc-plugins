@@ -1759,12 +1759,17 @@ class MangaBuffService:
         """
         info = CardDropInfo(source=page.url)
         try:
-            # непрочитанные — приоритет
+            # фильтр «непрочитанные» — без select_option (скрытый select часто висит)
             try:
-                await page.select_option(
-                    "select.sort-select, select[name=sort]", value="not_read"
+                await page.evaluate(
+                    """() => {
+                      const sel = document.querySelector('select.sort-select, select[name=sort]');
+                      if (!sel) return;
+                      sel.value = 'not_read';
+                      sel.dispatchEvent(new Event('change', {bubbles: true}));
+                    }"""
                 )
-                await self._tempo_pause(0.35, 0.8)
+                await self._tempo_pause(0.2, 0.45)
             except Exception:  # noqa: BLE001
                 pass
 
@@ -3299,7 +3304,8 @@ class MangaBuffService:
                 async with self._lock:
                     logger.info("MangaBuff farm cycle %s: events/cards", cycle)
                     await self._farm_events_unlocked(quick=True)
-                    if cycle == 1 or cycle % 3 == 0:
+                    # макеты редко — не отбираем время у чтения
+                    if cycle % 10 == 0:
                         logger.info("MangaBuff farm cycle %s: layouts", cycle)
                         await self._explore_layouts_unlocked()
                     logger.info("MangaBuff farm cycle %s: fetch popular", cycle)
