@@ -92,10 +92,12 @@ def main_menu_keyboard() -> ReplyKeyboardMarkup:
 def cards_events_keyboard() -> ReplyKeyboardMarkup:
     s = load_settings()
     notify = "🔔 Карты: вкл" if s.mangabuff_notify_cards else "🔕 Карты: выкл"
+    auto_m = "📤 Авто-лоты: вкл" if s.mangabuff_auto_market else "📤 Авто-лоты: выкл"
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="▶️ Автофарм карт"), KeyboardButton(text="⏹ Стоп карт")],
             [KeyboardButton(text="🎁 Собрать сейчас"), KeyboardButton(text="📊 Статус карт")],
+            [KeyboardButton(text="📤 На площадку"), KeyboardButton(text=auto_m)],
             [KeyboardButton(text=notify), KeyboardButton(text="📡 Вехи")],
             [KeyboardButton(text="⌂ Домой")],
         ],
@@ -473,6 +475,46 @@ class App:
                 reply_markup=cards_events_keyboard(),
             )
 
+        @self.dp.message(
+            StateFilter(None),
+            F.text.in_({"📤 На площадку", "На площадку"}),
+        )
+        async def cards_list_market(message: Message) -> None:
+            self._notify_chat_id = message.chat.id
+            await message.answer(
+                "⏳ Выставляю карты на площадку…\n"
+                "<i>цена лота = 1 карта ранга выше</i>",
+                reply_markup=cards_events_keyboard(),
+            )
+            try:
+                if not self.mangabuff.is_started:
+                    await self.mangabuff.start(headless=True)
+                result = await self.mangabuff.list_cards_on_market(limit=15)
+                await message.answer(
+                    result.to_telegram(),
+                    reply_markup=cards_events_keyboard(),
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("market list")
+                await message.answer(
+                    f"⚠️ <code>{exc}</code>",
+                    reply_markup=cards_events_keyboard(),
+                )
+
+        @self.dp.message(
+            StateFilter(None),
+            F.text.regexp(r"^📤 Авто-лоты: (вкл|выкл)$"),
+        )
+        async def cards_toggle_auto_market(message: Message) -> None:
+            s = load_settings()
+            on = not s.mangabuff_auto_market
+            update_settings(mangabuff_auto_market=on)
+            await message.answer(
+                f"📤 Авто-лоты при дропе: <b>{'вкл' if on else 'выкл'}</b>\n"
+                f"<i>цена = 1 карта ранга выше (E→D→…→S→X)</i>",
+                reply_markup=cards_events_keyboard(),
+            )
+
         @self.dp.message(StateFilter(None), F.text.in_({"📡 Вехи", "📡 Интервал вех"}))
         async def mb_milestones(message: Message, state: FSMContext) -> None:
             s = load_settings()
@@ -549,35 +591,69 @@ class App:
             notify_cards=bool(s.mangabuff_notify_cards),
             last_drop=st.last_card_drop or "",
             last_action=st.last_action or "",
+            auto_market=bool(s.mangabuff_auto_market),
         )
 
     async def _on_card_drop(self, info: CardDropInfo) -> None:
         if not info.cards:
             return
-        if not load_settings().mangabuff_notify_cards:
-            return
+        settings = load_settings()
         chat = self._notify_chat_id or self.config.telegram_admin_id
-        if not chat:
-            return
-        names = ""
-        if info.names:
-            names = "\n" + ", ".join(info.names[:4])
-        src = ""
-        if info.source and "notifications" in info.source:
-            src = "\n<i>из уведомлений MangaBuff</i>"
-        elif info.source:
-            src = f"\n<i>{info.source}</i>"
-        scrolls = f" · 📜 +{info.scrolls}" if info.scrolls else ""
+        if settings.mangabuff_notify_cards and chat:
+            cards_line = info.cards_line(4)
+            ranks_only = ""
+            if info.ranks and not cards_line:
+                ranks_only = "\nРедкость: " + ", ".join(
+                    f"<b>{r}</b>" for r in info.ranks[:4]
+                )
+            detail = f"\n{cards_line}" if cards_line else ranks_only
+            src = ""
+            if info.source and "notifications" in info.source:
+                src = "\n<i>из уведомлений MangaBuff</i>"
+            elif info.source:
+                src = f"\n<i>{info.source}</i>"
+            scrolls = f" · 📜 +{info.scrolls}" if info.scrolls else ""
+            rarity_hint = ""
+            if info.ranks:
+                rarity_hint = f" · редкость <b>{'/'.join(info.ranks[:3])}</b>"
+            try:
+                await self.bot.send_message(
+                    chat,
+                    f"<b>🃏 +{info.cards} карт{scrolls}</b>{rarity_hint}"
+                    f"{detail}{src}\n"
+                    f"Всего: <b>{self.mangabuff.stats.cards_claimed}</b>"
+                    f" · сессия <b>{self.mangabuff.session_cards}</b>",
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("card drop notify: %s", exc)
+
+        if settings.mangabuff_auto_market:
+            # отложенно — не держим lock фарма и даём карте стать tradable
+            asyncio.create_task(self._auto_list_dropped_cards(info))
+
+    async def _auto_list_dropped_cards(self, info: CardDropInfo) -> None:
+        """Авто-выставление дропа: цена = 1 карта ранга выше."""
+        await asyncio.sleep(8.0)
+        chat = self._notify_chat_id or self.config.telegram_admin_id
         try:
-            await self.bot.send_message(
-                chat,
-                f"<b>🃏 +{info.cards} карт{scrolls}</b>"
-                f"{names}{src}\n"
-                f"Всего: <b>{self.mangabuff.stats.cards_claimed}</b>"
-                f" · сессия <b>{self.mangabuff.session_cards}</b>",
+            if not self.mangabuff.is_started:
+                await self.mangabuff.start(headless=True)
+            result = await self.mangabuff.list_cards_on_market(
+                limit=max(1, info.cards),
+                user_card_ids=info.user_card_ids or None,
             )
+            if not chat:
+                return
+            await self.bot.send_message(chat, result.to_telegram())
         except Exception as exc:  # noqa: BLE001
-            logger.warning("card drop notify: %s", exc)
+            logger.warning("auto market list: %s", exc)
+            if chat:
+                try:
+                    await self.bot.send_message(
+                        chat, f"⚠️ Авто-лот: <code>{exc}</code>"
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
 
     def _mb_status_card(self) -> str:
         self._sync_mb_stats_from_disk()

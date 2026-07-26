@@ -31,6 +31,7 @@ class RuntimeSettings:
     mangabuff_milestone_every: int = 10
     mangabuff_notify_milestones: bool = True
     mangabuff_notify_cards: bool = True
+    mangabuff_auto_market: bool = False
     mangabuff_farm_enabled: bool = False
     mangabuff_events_farm_enabled: bool = False
 

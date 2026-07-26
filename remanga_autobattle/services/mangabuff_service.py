@@ -90,6 +90,24 @@ _CARD_NOTIFY_RE = re.compile(
     re.I,
 )
 
+# Лестница редкости MangaBuff (как getNextRank на сайте) + X выше S.
+# Индекс больше = карта дороже / реже.
+CARD_RANK_LADDER = ("E", "D", "C", "B", "G", "P", "A", "S", "X")
+def next_higher_rank(rank: str) -> Optional[str]:
+    """Следующий ранг выше (цена лота: 1 карта этого ранга)."""
+    r = (rank or "").strip().upper()
+    if r not in CARD_RANK_LADDER:
+        return None
+    i = CARD_RANK_LADDER.index(r)
+    if i >= len(CARD_RANK_LADDER) - 1:
+        return None
+    return CARD_RANK_LADDER[i + 1]
+
+
+def format_rank_label(rank: str) -> str:
+    r = (rank or "").strip().upper()
+    return f"[{r}]" if r else ""
+
 # Ночной перерыв: 01:00–05:00 МСК (ровно 4 часа)
 NIGHT_BREAK_START = time(1, 0)
 NIGHT_BREAK_END = time(5, 0)
@@ -757,8 +775,48 @@ class CardDropInfo:
     cards: int = 0
     scrolls: int = 0
     names: List[str] = field(default_factory=list)
+    ranks: List[str] = field(default_factory=list)
+    user_card_ids: List[int] = field(default_factory=list)
     raw: str = ""
     source: str = ""
+
+    def cards_line(self, limit: int = 4) -> str:
+        """Строка для Telegram: [C] Имя, [E] Имя2."""
+        parts: List[str] = []
+        n = max(len(self.names), len(self.ranks), self.cards)
+        for i in range(min(n, limit)):
+            rank = self.ranks[i] if i < len(self.ranks) else ""
+            name = self.names[i] if i < len(self.names) else ""
+            bit = format_rank_label(rank)
+            if name:
+                bit = f"{bit} {name}".strip() if bit else name
+            if bit:
+                parts.append(bit)
+        if not parts and self.ranks:
+            parts = [format_rank_label(r) for r in self.ranks[:limit] if r]
+        return ", ".join(p for p in parts if p)
+
+
+@dataclass
+class MarketListResult:
+    """Результат выставления карт на торговую площадку."""
+
+    listed: int = 0
+    skipped: int = 0
+    errors: int = 0
+    details: List[str] = field(default_factory=list)
+
+    def to_telegram(self) -> str:
+        lines = [
+            "<b>📤 Площадка</b>",
+            "",
+            f"Выставлено: <b>{self.listed}</b>",
+            f"Пропущено: <b>{self.skipped}</b>",
+            f"Ошибки: <b>{self.errors}</b>",
+        ]
+        if self.details:
+            lines += ["", "Детали:"] + [f"• {d}" for d in self.details[:12]]
+        return "\n".join(lines)
 
 
 class MangaBuffService:
@@ -1660,9 +1718,9 @@ class MangaBuffService:
                     continue
             if info.cards:
                 self.stats.cards_claimed += info.cards
+                line = info.cards_line(2)
                 self.stats.last_card_drop = (
-                    f"+{info.cards} · {', '.join(info.names[:2])}" if info.names
-                    else f"+{info.cards}"
+                    f"+{info.cards} · {line}" if line else f"+{info.cards}"
                 )
             if info.scrolls:
                 self.stats.scrolls_claimed += info.scrolls
@@ -1673,18 +1731,32 @@ class MangaBuffService:
             )
             self._persist_stats()
             logger.info(
-                "MangaBuff card drop +%s scrolls +%s from %s names=%s",
+                "MangaBuff card drop +%s scrolls +%s from %s ranks=%s names=%s",
                 info.cards,
                 info.scrolls,
                 source,
+                info.ranks[:3],
                 info.names[:3],
             )
-            await self._emit_card_drop(info)
+            await self._emit_card_drop(info, page)
         return info
 
-    async def _emit_card_drop(self, info: CardDropInfo) -> None:
+    async def _emit_card_drop(
+        self, info: CardDropInfo, page: Optional[Page] = None
+    ) -> None:
         if not info.cards and not info.scrolls:
             return
+        if page is not None and info.cards:
+            try:
+                await self._enrich_card_drop_rarity(page, info)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("enrich card rarity: %s", exc)
+            if info.ranks:
+                line = info.cards_line(3)
+                self.stats.last_card_drop = (
+                    f"+{info.cards} · {line}" if line else f"+{info.cards}"
+                )
+                self._persist_stats()
         cb = self.on_card_drop
         if cb is None:
             return
@@ -1722,15 +1794,31 @@ class MangaBuffService:
         self.stats.seen_notifications = recent
         return True
 
-    def _parse_card_notify_text(self, text: str) -> Tuple[int, int, List[str]]:
-        """Из текста уведомления → (cards, scrolls, names)."""
+    def _parse_ranks_from_text(self, text: str) -> List[str]:
+        ranks: List[str] = []
+        for m in re.finditer(r"ранг\s*[:\-]?\s*([A-Za-z])", text or "", re.I):
+            r = m.group(1).upper()
+            if r in CARD_RANK_LADDER or r in "HNVQLK":
+                ranks.append(r)
+        for m in re.finditer(
+            r"\[([XSAPGBCDEHNVQLK])\]|\b([XSAPGBCDE])\s*ранг", text or "", re.I
+        ):
+            r = (m.group(1) or m.group(2) or "").upper()
+            if r and r not in ranks:
+                ranks.append(r)
+        return ranks[:5]
+
+    def _parse_card_notify_text(
+        self, text: str
+    ) -> Tuple[int, int, List[str], List[str]]:
+        """Из текста уведомления → (cards, scrolls, names, ranks)."""
         raw = (text or "").strip()
         if not raw or not _CARD_NOTIFY_RE.search(raw):
-            return 0, 0, []
+            return 0, 0, [], []
         low = raw.lower()
         # не путать с навбаром/вкладками
         if re.search(r"список уведомлений пуст|показать все", low):
-            return 0, 0, []
+            return 0, 0, [], []
         m = re.search(r"(?:\+|получен[ао]?\s*)(\d+)\s*карт", low)
         n_cards = min(10, int(m.group(1))) if m else (1 if "карт" in low else 0)
         m2 = re.search(r"(?:\+|получен[ао]?\s*)(\d+)\s*свит", low)
@@ -1748,10 +1836,298 @@ class MangaBuffService:
                 continue
             if _CARD_NOTIFY_RE.search(line) and len(line) < 24:
                 continue
+            if re.fullmatch(r"[XSAPGBCDEHNVQLK]", line, re.I):
+                continue
             names.append(line)
             if len(names) >= 3:
                 break
-        return n_cards, n_scroll, names
+        ranks = self._parse_ranks_from_text(raw)
+        return n_cards, n_scroll, names, ranks
+
+    async def _fetch_inventory_cards(
+        self,
+        page: Page,
+        limit: int = 40,
+        rank: str = "",
+        search: str = "",
+    ) -> List[Dict[str, Any]]:
+        """POST /cards-filter/<user_id> — инвентарь с rank/name/id."""
+        await self._refresh_user_id(page)
+        uid = self._mb_user_id
+        if not uid:
+            return []
+        try:
+            data = await page.evaluate(
+                """async ({uid, limit, rank, search}) => {
+                  const csrf = (document.querySelector('meta[name="csrf-token"]')
+                    || {}).content || '';
+                  const body = new URLSearchParams();
+                  body.set('page', '1');
+                  body.set('per_page', String(limit || 40));
+                  body.set('search', search || '');
+                  body.set('rank', (rank || '').toLowerCase());
+                  const resp = await fetch('/cards-filter/' + uid, {
+                    method: 'POST',
+                    headers: {
+                      'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+                      'X-CSRF-TOKEN': csrf,
+                      'X-Requested-With': 'XMLHttpRequest'
+                    },
+                    body: body.toString(),
+                    credentials: 'same-origin'
+                  });
+                  if (!resp.ok) return {ok: false, status: resp.status, data: []};
+                  let json = null;
+                  try { json = await resp.json(); } catch (e) { json = null; }
+                  const rows = (json && json.data) ? json.data : (Array.isArray(json) ? json : []);
+                  return {ok: true, status: resp.status, data: rows};
+                }""",
+                {
+                    "uid": uid,
+                    "limit": int(limit),
+                    "rank": (rank or "").strip(),
+                    "search": (search or "").strip(),
+                },
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("cards-filter: %s", exc)
+            return []
+        if not data or not data.get("ok"):
+            logger.warning("cards-filter fail: %s", data)
+            return []
+        rows = data.get("data") or []
+        return [r for r in rows if isinstance(r, dict)]
+
+    async def _enrich_card_drop_rarity(self, page: Page, info: CardDropInfo) -> None:
+        """Подтянуть редкость/id из инвентаря, если в уведомлении её нет."""
+        if info.cards <= 0:
+            return
+        if info.ranks and len(info.ranks) >= min(info.cards, 1) and info.user_card_ids:
+            return
+        inv = await self._fetch_inventory_cards(
+            page, limit=max(24, info.cards * 4)
+        )
+        if not inv:
+            return
+        matched: List[Dict[str, Any]] = []
+        used: set[int] = set(int(x) for x in info.user_card_ids if x)
+
+        def _take(row: Dict[str, Any]) -> None:
+            rid = int(row.get("id") or 0)
+            if not rid or rid in used:
+                return
+            matched.append(row)
+            used.add(rid)
+
+        for name in info.names:
+            name_l = (name or "").strip().lower()
+            if not name_l:
+                continue
+            for row in inv:
+                cname = str(row.get("card_name") or "").strip().lower()
+                if not cname:
+                    continue
+                if name_l == cname or name_l in cname or cname in name_l:
+                    _take(row)
+                    break
+
+        need = max(0, info.cards - len(matched))
+        if need:
+            for row in inv:
+                if int(row.get("in_trade") or 0):
+                    continue
+                _take(row)
+                need -= 1
+                if need <= 0:
+                    break
+
+        if not matched:
+            return
+
+        info.user_card_ids = [int(r.get("id") or 0) for r in matched if r.get("id")]
+        info.ranks = [
+            str(r.get("rank") or "").strip().upper() for r in matched if r.get("rank")
+        ]
+        inv_names = [
+            str(r.get("card_name") or "").strip() for r in matched if r.get("card_name")
+        ]
+        if inv_names:
+            info.names = inv_names
+        logger.info(
+            "MangaBuff rarity enrich ranks=%s names=%s ids=%s",
+            info.ranks[:4],
+            info.names[:4],
+            info.user_card_ids[:4],
+        )
+
+    async def _post_market_lot(
+        self, page: Page, user_card_id: int, price_rank: str, value: int = 1
+    ) -> Dict[str, Any]:
+        """POST /market/ — выставить карту: цена = value карт ранга price_rank."""
+        try:
+            return await page.evaluate(
+                """async ({id, rank, value}) => {
+                  const csrf = (document.querySelector('meta[name="csrf-token"]')
+                    || {}).content || '';
+                  const body = new URLSearchParams({
+                    id: String(id),
+                    rank: String(rank),
+                    value: String(value)
+                  });
+                  const resp = await fetch('/market/', {
+                    method: 'POST',
+                    headers: {
+                      'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+                      'X-CSRF-TOKEN': csrf,
+                      'X-Requested-With': 'XMLHttpRequest'
+                    },
+                    body: body.toString(),
+                    credentials: 'same-origin'
+                  });
+                  let data = null;
+                  try { data = await resp.json(); } catch (e) {
+                    try { data = {raw: await resp.text()}; } catch (e2) { data = null; }
+                  }
+                  return {status: resp.status, data};
+                }""",
+                {
+                    "id": int(user_card_id),
+                    "rank": str(price_rank).upper(),
+                    "value": int(value),
+                },
+            )
+        except Exception as exc:  # noqa: BLE001
+            return {"status": 0, "data": {"message": str(exc)}}
+
+    async def list_cards_on_market(
+        self,
+        *,
+        limit: int = 15,
+        user_card_ids: Optional[Sequence[int]] = None,
+    ) -> MarketListResult:
+        """
+        Выставить карты на площадку.
+        Цена лота: 1 карта ранга на ступень выше (E→D→C→B→G→P→A→S→X).
+        """
+        if not self.is_started:
+            await self.start(headless=True)
+        async with self._lock:
+            return await self._list_cards_on_market_unlocked(
+                limit=limit, user_card_ids=user_card_ids
+            )
+
+    async def _list_cards_on_market_unlocked(
+        self,
+        *,
+        limit: int = 15,
+        user_card_ids: Optional[Sequence[int]] = None,
+    ) -> MarketListResult:
+        """Выставление лотов. Вызывать под self._lock."""
+        result = MarketListResult()
+        page = self._page
+        assert page is not None
+        await self._ensure_login_unlocked()
+        await self._refresh_user_id(page)
+        if not await self._safe_goto(page, "https://mangabuff.ru/market/create"):
+            result.errors += 1
+            result.details.append("не открылась /market/create")
+            return result
+
+        want_ids = {int(x) for x in (user_card_ids or []) if x}
+        inv = await self._fetch_inventory_cards(page, limit=max(80, limit * 3))
+        if want_ids:
+            candidates = [r for r in inv if int(r.get("id") or 0) in want_ids]
+            have = {int(r.get("id") or 0) for r in candidates}
+            for uid in want_ids:
+                if uid not in have:
+                    candidates.append(
+                        {"id": uid, "rank": "", "card_name": f"#{uid}"}
+                    )
+        else:
+            candidates = [
+                r
+                for r in inv
+                if not int(r.get("in_trade") or 0)
+                and not int(r.get("is_not_tradable") or 0)
+                and not int(r.get("is_lock") or 0)
+                and str(r.get("rank") or "").upper() in CARD_RANK_LADDER
+            ]
+
+        listed_ids: List[int] = []
+        for row in candidates:
+            if len(listed_ids) >= max(1, int(limit)):
+                break
+            uid = int(row.get("id") or 0)
+            if not uid:
+                continue
+            rank = str(row.get("rank") or "").strip().upper()
+            name = str(row.get("card_name") or "").strip() or f"#{uid}"
+            if not rank:
+                more = await self._fetch_inventory_cards(
+                    page,
+                    limit=5,
+                    search=name if not name.startswith("#") else "",
+                )
+                for mrow in more:
+                    if int(mrow.get("id") or 0) == uid:
+                        rank = str(mrow.get("rank") or "").strip().upper()
+                        name = str(mrow.get("card_name") or name).strip()
+                        row = mrow
+                        break
+            if int(row.get("in_trade") or 0):
+                result.skipped += 1
+                result.details.append(f"{format_rank_label(rank)} {name}: уже в лоте")
+                continue
+            if int(row.get("is_not_tradable") or 0) or int(row.get("is_lock") or 0):
+                result.skipped += 1
+                result.details.append(
+                    f"{format_rank_label(rank)} {name}: нельзя обменять"
+                )
+                continue
+            price_rank = next_higher_rank(rank)
+            if not price_rank:
+                result.skipped += 1
+                result.details.append(
+                    f"{format_rank_label(rank)} {name}: нет ранга выше"
+                )
+                continue
+            resp = await self._post_market_lot(page, uid, price_rank, 1)
+            status = int((resp or {}).get("status") or 0)
+            payload = (resp or {}).get("data") if isinstance(resp, dict) else {}
+            msg = ""
+            if isinstance(payload, dict):
+                msg = str(payload.get("message") or payload.get("raw") or "")
+            if 200 <= status < 300:
+                result.listed += 1
+                listed_ids.append(uid)
+                result.details.append(
+                    f"{format_rank_label(rank)} {name} → 1×{price_rank}"
+                )
+                logger.info(
+                    "MangaBuff market listed id=%s rank=%s price=%s×1",
+                    uid,
+                    rank,
+                    price_rank,
+                )
+            else:
+                result.errors += 1
+                short = (msg or f"HTTP {status}")[:120]
+                result.details.append(f"{format_rank_label(rank)} {name}: {short}")
+                logger.warning(
+                    "MangaBuff market list fail id=%s status=%s msg=%s",
+                    uid,
+                    status,
+                    short,
+                )
+            await self._tempo_pause(0.35, 0.7)
+
+        if result.listed:
+            self.stats.touch(
+                f"площадка: +{result.listed} лот(ов)",
+                page.url,
+            )
+            self._persist_stats()
+        return result
 
     async def _harvest_notifications_feed(self, page: Page) -> CardDropInfo:
         """
@@ -1785,11 +2161,22 @@ class MangaBuffService:
                     const link = el.getAttribute('href')
                       || (el.querySelector('a') && el.querySelector('a').getAttribute('href'))
                       || '';
+                    const ranks = [...el.querySelectorAll('[data-rank]')]
+                      .map(n => (n.dataset.rank || '').toUpperCase())
+                      .filter(Boolean);
+                    const cardNotify = [...el.querySelectorAll('.card-notification')].map(n => ({
+                      name: n.getAttribute('data-card-name') || '',
+                      image: n.getAttribute('data-card-image') || '',
+                      cardId: n.getAttribute('data-card-id') || '',
+                      rank: (n.getAttribute('data-card-rank') || n.dataset.rank || '').toUpperCase()
+                    }));
                     return {
                       id: String(id || ''),
                       unread: el.classList.contains('notifications__item--not-read'),
                       text: (el.innerText || '').trim().slice(0, 400),
                       href: String(link || ''),
+                      ranks,
+                      cardNotify,
                       idx: idx
                     };
                   });
@@ -1805,7 +2192,20 @@ class MangaBuffService:
 
         for it in items:
             text = (it.get("text") or "").strip()
-            n_cards, n_scroll, names = self._parse_card_notify_text(text)
+            n_cards, n_scroll, names, ranks = self._parse_card_notify_text(text)
+            for cn in it.get("cardNotify") or []:
+                nm = str((cn or {}).get("name") or "").strip()
+                rk = str((cn or {}).get("rank") or "").strip().upper()
+                if nm and nm not in names:
+                    names.append(nm)
+                if rk and rk not in ranks:
+                    ranks.append(rk)
+                if n_cards <= 0 and (nm or rk):
+                    n_cards = 1
+            for rk in it.get("ranks") or []:
+                rk = str(rk or "").strip().upper()
+                if rk and rk not in ranks:
+                    ranks.append(rk)
             if n_cards <= 0 and n_scroll <= 0:
                 continue
             key = (
@@ -1820,23 +2220,25 @@ class MangaBuffService:
             for n in names:
                 if n not in info.names:
                     info.names.append(n)
+            for r in ranks:
+                if r and r not in info.ranks:
+                    info.ranks.append(r)
             info.raw = text[:200]
             logger.info(
-                "MangaBuff notify-feed card +%s scroll +%s key=%s unread=%s text=%s",
+                "MangaBuff notify-feed card +%s scroll +%s ranks=%s key=%s text=%s",
                 n_cards,
                 n_scroll,
+                ranks[:3],
                 key,
-                it.get("unread"),
                 text[:120].replace("\n", " | "),
             )
 
         if info.cards or info.scrolls:
             if info.cards:
                 self.stats.cards_claimed += info.cards
+                line = info.cards_line(2)
                 self.stats.last_card_drop = (
-                    f"+{info.cards} · {', '.join(info.names[:2])}"
-                    if info.names
-                    else f"+{info.cards}"
+                    f"+{info.cards} · {line}" if line else f"+{info.cards}"
                 )
             if info.scrolls:
                 self.stats.scrolls_claimed += info.scrolls
@@ -1846,7 +2248,7 @@ class MangaBuffService:
                 page.url,
             )
             self._persist_stats()
-            await self._emit_card_drop(info)
+            await self._emit_card_drop(info, page)
         else:
             self._persist_stats()
         return info
@@ -1856,46 +2258,67 @@ class MangaBuffService:
         info = CardDropInfo(source="reader-toast")
         try:
             blobs = await page.evaluate(
-                """() => [...document.querySelectorAll('.reader__notification, .club-card-notify, .mb-toast-wrap .mb-toast')]
-                  .map(el => (el.innerText || el.innerHTML || '').trim().slice(0, 300))
-                  .filter(Boolean)
+                """() => [...document.querySelectorAll('.reader__notification, .club-card-notify, .mb-toast-wrap .mb-toast, .card-notification')]
+                  .map(el => ({
+                    text: (el.innerText || '').trim().slice(0, 300),
+                    html: (el.innerHTML || '').trim().slice(0, 500),
+                    rank: (el.getAttribute('data-card-rank') || el.dataset.rank || '').toUpperCase(),
+                    name: el.getAttribute('data-card-name') || ''
+                  }))
+                  .filter(x => x.text || x.name)
                   .slice(0, 6)"""
             )
         except Exception:  # noqa: BLE001
             blobs = []
         for raw in blobs or []:
-            # strip tags if html slipped in
-            text = re.sub(r"<[^>]+>", " ", raw)
-            text = re.sub(r"\s+", " ", text).strip()
-            n_cards, n_scroll, names = self._parse_card_notify_text(text)
-            if n_cards <= 0 and n_scroll <= 0:
+            if isinstance(raw, str):
+                text = re.sub(r"<[^>]+>", " ", raw)
+                text = re.sub(r"\s+", " ", text).strip()
+                rank_hint = ""
+                name_hint = ""
+            else:
+                text = re.sub(r"<[^>]+>", " ", str(raw.get("text") or raw.get("html") or ""))
+                text = re.sub(r"\s+", " ", text).strip()
+                rank_hint = str(raw.get("rank") or "").upper()
+                name_hint = str(raw.get("name") or "").strip()
+            n_cards, n_scroll, names, ranks = self._parse_card_notify_text(text)
+            if name_hint and name_hint not in names:
+                names.insert(0, name_hint)
+            if rank_hint and rank_hint not in ranks:
+                ranks.insert(0, rank_hint)
+            if n_cards <= 0 and n_scroll <= 0 and not (name_hint or rank_hint):
                 continue
-            key = f"toast:{hash(text) & 0xFFFFFFFF:x}"
+            if n_cards <= 0 and (name_hint or rank_hint):
+                n_cards = 1
+            key = f"toast:{hash(text or name_hint) & 0xFFFFFFFF:x}"
             if not self._remember_notification(key):
                 continue
             info.cards += n_cards
             info.scrolls += n_scroll
             info.names.extend(names)
-            info.raw = text[:200]
+            for r in ranks:
+                if r and r not in info.ranks:
+                    info.ranks.append(r)
+            info.raw = (text or name_hint)[:200]
         if info.cards or info.scrolls:
             if info.cards:
                 self.stats.cards_claimed += info.cards
+                line = info.cards_line(2)
                 self.stats.last_card_drop = (
-                    f"+{info.cards} · {', '.join(info.names[:2])}"
-                    if info.names
-                    else f"+{info.cards}"
+                    f"+{info.cards} · {line}" if line else f"+{info.cards}"
                 )
             if info.scrolls:
                 self.stats.scrolls_claimed += info.scrolls
             self.stats.touch(f"тост: карт +{info.cards}", page.url)
             self._persist_stats()
             logger.info(
-                "MangaBuff reader toast +%s scrolls +%s names=%s",
+                "MangaBuff reader toast +%s scrolls +%s ranks=%s names=%s",
                 info.cards,
                 info.scrolls,
+                info.ranks[:3],
                 info.names[:3],
             )
-            await self._emit_card_drop(info)
+            await self._emit_card_drop(info, page)
         return info
 
     # ------------------------------------------------------------------
@@ -2284,7 +2707,7 @@ class MangaBuffService:
                 await asyncio.sleep(wait_for)
             gift = await self._flush_history_pool(page)
             if gift and (gift.cards or gift.scrolls):
-                await self._emit_card_drop(gift)
+                await self._emit_card_drop(gift, page)
         return True
 
     async def _flush_history_pool(self, page: Page) -> Optional[CardDropInfo]:
@@ -2358,29 +2781,45 @@ class MangaBuffService:
 
         payload = data.get("data") if isinstance(data.get("data"), dict) else {}
         info = CardDropInfo(source="addHistory")
-        if payload.get("image") or payload.get("name"):
+        if payload.get("image") or payload.get("name") or payload.get("rank"):
             info.cards = 1
-            name = str(payload.get("name") or "").strip()
+            name = str(
+                payload.get("name") or payload.get("card_name") or ""
+            ).strip()
             if name:
                 info.names.append(name)
+            rank = str(payload.get("rank") or "").strip().upper()
+            if rank:
+                info.ranks.append(rank)
+            for key in ("insert_user_id", "user_card_id", "card_user_id", "id"):
+                raw_id = payload.get(key)
+                if raw_id and str(raw_id).isdigit():
+                    info.user_card_ids.append(int(raw_id))
+                    break
             info.raw = str(payload)[:200]
             self.stats.cards_claimed += 1
-            self.stats.last_card_drop = f"+1 · {name}" if name else "+1"
+            line = info.cards_line(1)
+            self.stats.last_card_drop = f"+1 · {line}" if line else "+1"
             self.stats.touch("карта из addHistory", page.url)
             self._persist_stats()
-            logger.info("MangaBuff card from addHistory: %s", name or payload.get("image"))
+            logger.info(
+                "MangaBuff card from addHistory: %s rank=%s",
+                name or payload.get("image"),
+                rank or "?",
+            )
 
         await self._tempo_pause(0.25, 0.6)
         try:
             toast = await self._harvest_reader_toast(page)
+            # toast уже шлёт notify сам — не возвращаем повторно
             if toast.cards and not info.cards:
-                return toast
+                return None
         except Exception:  # noqa: BLE001
             pass
         try:
             drop = await self._harvest_card_drops(page, source="addHistory-ui")
             if drop.cards and not info.cards:
-                return drop
+                return None
         except Exception:  # noqa: BLE001
             pass
         return info if info.cards else None

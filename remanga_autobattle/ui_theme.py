@@ -167,21 +167,24 @@ def cards_events_home(
     notify_cards: bool,
     last_drop: str,
     last_action: str,
+    auto_market: bool = False,
 ) -> str:
     return (
         f"<b>🃏 Карты · Эвенты</b>\n"
-        f"<i>дропы · сундуки · паки · дейлики</i>\n"
+        f"<i>дропы · сундуки · паки · площадка</i>\n"
         f"{hr()}\n"
         f"Автофарм: <code>{'● on' if events_on else '○ off'}</code>\n"
         f"Чтение: <code>{'● on' if read_on else '○ off'}</code>\n"
-        f"Уведомления карт: <code>{'●' if notify_cards else '○'}</code>\n\n"
+        f"Уведомления карт: <code>{'●' if notify_cards else '○'}</code>\n"
+        f"Авто-лоты: <code>{'●' if auto_market else '○'}</code>\n\n"
         f"🃏 Карт всего <b>{cards_total}</b> · сессия <b>{cards_session}</b>\n"
         f"📜 Свитки <b>{scrolls}</b>\n"
         f"📦 Сундуки <b>{chests}</b> · Паки <b>{packs}</b>\n"
         f"🎯 Эвенты <b>{events}</b> · 🎁 Награды <b>{rewards}</b>\n\n"
         f"Последний дроп: <i>{last_drop or '—'}</i>\n"
         f"📝 {last_action or '—'}\n\n"
-        f"<i>Карты за чтение — /notifications (до 10/сутки).\n"
+        f"<i>Дроп — с редкостью сразу.\n"
+        f"Лот: цена = 1 карта ранга выше (E→D→…→S→X).\n"
         f"Сундуки — /battle · паки — /cards/pack.</i>"
     )
 
@@ -216,8 +219,9 @@ def help_text() -> str:
         f"<b>{BRAND}</b>\n"
         f"{hr()}\n"
         f"<b>Фарм</b> — чтение тайтлов до 90%, главы через addHistory.\n"
-        f"<b>Карты · Эвенты</b> — сундуки, паки, дейлики, дропы.\n\n"
-        f"Карты — лента /notifications · до 10/сутки.\n"
+        f"<b>Карты · Эвенты</b> — сундуки, паки, дейлики, дропы, площадка.\n\n"
+        f"Карты — лента /notifications · редкость в уведомлении.\n"
+        f"Площадка — лот за 1 карту ранга выше.\n"
         f"Свитки — до 5/сутки (~1ч).\n"
         f"Ночь 01:00–05:00 МСК — пауза."
     )
