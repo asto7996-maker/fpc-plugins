@@ -75,9 +75,9 @@ class Config:
             self.selector_timeout_ms = settings.selector_timeout_ms
         if getattr(settings, "mangabuff_start_url", None):
             self.mangabuff_start_url = settings.mangabuff_start_url.strip()
-        if getattr(settings, "mangabuff_delay_min_sec", 0) >= 1:
+        if getattr(settings, "mangabuff_delay_min_sec", 0) >= 0.05:
             self.mangabuff_delay_min_sec = float(settings.mangabuff_delay_min_sec)
-        if getattr(settings, "mangabuff_delay_max_sec", 0) >= 1:
+        if getattr(settings, "mangabuff_delay_max_sec", 0) >= 0.05:
             self.mangabuff_delay_max_sec = float(settings.mangabuff_delay_max_sec)
 
 

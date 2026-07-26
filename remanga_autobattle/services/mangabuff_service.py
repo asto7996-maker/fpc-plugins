@@ -762,10 +762,32 @@ class MangaBuffService:
         steps_min: int = 8,
         steps_max: int = 12,
     ) -> None:
-        self.delay_min_sec = max(0.8, float(delay_min))
+        self.delay_min_sec = max(0.08, float(delay_min))
         self.delay_max_sec = max(self.delay_min_sec, float(delay_max))
-        self.steps_min = max(4, int(steps_min))
+        self.steps_min = max(3, int(steps_min))
         self.steps_max = max(self.steps_min, int(steps_max))
+
+    def _scroll_chunk_factor(self) -> float:
+        """Крупнее прыжок скролла → меньше шагов (особенно в турбо)."""
+        if self.delay_min_sec <= 0.2:
+            return random.uniform(2.2, 3.2)
+        if self.delay_min_sec <= 0.4:
+            return random.uniform(1.7, 2.5)
+        if self.delay_min_sec <= 0.8:
+            return random.uniform(1.2, 1.8)
+        if self.delay_min_sec <= 1.5:
+            return random.uniform(0.95, 1.35)
+        return random.uniform(0.70, 0.95)
+
+    def _chapter_gap_pause(self) -> Tuple[float, float]:
+        """Пауза между главами по темпу."""
+        if self.delay_min_sec <= 0.2:
+            return 0.25, 0.7
+        if self.delay_min_sec <= 0.5:
+            return 0.4, 1.1
+        if self.delay_min_sec <= 1.0:
+            return 0.8, 1.8
+        return 1.5, 4.0
 
     async def run_setup(self) -> None:
         await self.start(headless=False)
@@ -1306,7 +1328,7 @@ class MangaBuffService:
         return None
 
     async def _smooth_read_chapter(self, page: Page) -> int:
-        """Доскроллить главу почти до конца (не 7–12 шагов на огромной странице)."""
+        """Доскроллить главу до конца; темп зависит от пресета (турбо = крупные шаги)."""
         steps = 0
         chapter_url = page.url.split("?")[0]
         try:
@@ -1318,25 +1340,25 @@ class MangaBuffService:
             total_height, viewport = 4000, 900
 
         viewport = max(int(viewport), 600)
-        pages_approx = max(1, int(total_height / viewport))
-        # хватает шагов, чтобы реально дойти до низа (+ запас на lazy-load)
-        max_steps = min(
-            140,
-            max(self.steps_max, pages_approx + random.randint(2, 6)),
-        )
+        chunk_factor = self._scroll_chunk_factor()
+        avg_chunk = max(viewport * 0.8, viewport * chunk_factor)
+        pages_approx = max(1, int(total_height / avg_chunk))
+        # запас на lazy-load, но без сотен мелких шагов
+        max_steps = min(80, max(self.steps_max, pages_approx + random.randint(1, 3)))
         position = 0
         logger.info(
-            "MangaBuff scroll start height=%s viewport=%s max_steps=%s delay=%.1f-%.1f",
+            "MangaBuff scroll start height=%s viewport=%s max_steps=%s "
+            "chunk=%.1fx delay=%.2f-%.2f",
             total_height,
             viewport,
             max_steps,
+            chunk_factor,
             self.delay_min_sec,
             self.delay_max_sec,
         )
         while position + viewport < total_height - 60 and steps < max_steps:
             if self._stop_flag.is_set() or self._skip_title.is_set():
                 break
-            # если страницу утащили (награды/макеты) — вернуться
             if page.url.split("?")[0] != chapter_url and not re.search(
                 r"/manga/[^/]+/\d+/\d+", page.url
             ):
@@ -1348,16 +1370,16 @@ class MangaBuffService:
                 if not await self._safe_goto(page, chapter_url):
                     break
                 await self._dismiss_overlays(page)
-            chunk = int(viewport * random.uniform(0.70, 0.95))
+
+            factor = self._scroll_chunk_factor()
+            chunk = int(viewport * factor)
             target = min(position + chunk, int(total_height))
             await self._animate_scroll(page, position, target)
             position = target
             steps += 1
             self.stats.pages_scrolled += 1
 
-            lo = self.delay_min_sec
-            hi = self.delay_max_sec
-            delay = random.uniform(lo, hi) * random.uniform(0.92, 1.08)
+            delay = random.uniform(self.delay_min_sec, self.delay_max_sec)
             try:
                 await asyncio.wait_for(self._stop_flag.wait(), timeout=delay)
                 break
@@ -1369,20 +1391,26 @@ class MangaBuffService:
                     "() => document.body.scrollHeight || 4000"
                 )
                 if new_h > total_height:
-                    # lazy-load: даём подрасти, но не бесконечно
-                    total_height = min(new_h, total_height + viewport * 3)
-                    if steps > max_steps - 3 and new_h > position + viewport * 2:
-                        max_steps = min(140, max_steps + 4)
+                    total_height = min(new_h, total_height + int(viewport * factor * 2))
+                    if steps > max_steps - 2 and new_h > position + viewport:
+                        max_steps = min(80, max_steps + 3)
             except Exception:  # noqa: BLE001
                 pass
 
         try:
-            await page.evaluate(
-                "() => window.scrollTo({top: document.body.scrollHeight, behavior: 'smooth'})"
-            )
-            await self._human_pause(0.5, 1.0)
+            # мгновенный доскролл вниз в турбо, иначе smooth
+            if self.delay_min_sec <= 0.35:
+                await page.evaluate(
+                    "() => window.scrollTo(0, document.body.scrollHeight)"
+                )
+                await self._human_pause(0.15, 0.35)
+            else:
+                await page.evaluate(
+                    "() => window.scrollTo({top: document.body.scrollHeight, behavior: 'smooth'})"
+                )
+                await self._human_pause(0.35, 0.8)
             c, cards, _ = await asyncio.wait_for(
-                self._click_reward_buttons(page), timeout=10
+                self._click_reward_buttons(page), timeout=8
             )
             self.stats.rewards_claimed += c
             self.stats.cards_claimed += cards
@@ -1391,7 +1419,23 @@ class MangaBuffService:
         return steps
 
     async def _animate_scroll(self, page: Page, start: int, end: int) -> None:
-        frames = random.randint(6, 14)
+        # В турбо — почти без анимации кадров
+        if self.delay_min_sec <= 0.2:
+            frames, frame_sleep = 1, (0.0, 0.0)
+        elif self.delay_min_sec <= 0.4:
+            frames, frame_sleep = random.randint(2, 3), (0.01, 0.03)
+        elif self.delay_min_sec <= 0.9:
+            frames, frame_sleep = random.randint(3, 5), (0.02, 0.05)
+        else:
+            frames, frame_sleep = random.randint(6, 12), (0.04, 0.12)
+
+        if frames <= 1:
+            try:
+                await page.evaluate("(y) => window.scrollTo(0, y)", int(end))
+            except Exception:  # noqa: BLE001
+                pass
+            return
+
         for i in range(1, frames + 1):
             if self._stop_flag.is_set():
                 break
@@ -1400,7 +1444,7 @@ class MangaBuffService:
                 await page.evaluate("(y) => window.scrollTo(0, y)", y)
             except Exception:  # noqa: BLE001
                 break
-            await asyncio.sleep(random.uniform(0.04, 0.14))
+            await asyncio.sleep(random.uniform(*frame_sleep))
 
     async def _go_next_chapter(self, page: Page) -> bool:
         before = page.url.split("?")[0]
@@ -2194,7 +2238,8 @@ class MangaBuffService:
                 except Exception:  # noqa: BLE001
                     pass
 
-            await self._human_pause(1.5, 4.0)
+            gap_lo, gap_hi = self._chapter_gap_pause()
+            await self._human_pause(gap_lo, gap_hi)
             if chapters_this_title >= max_per_title:
                 break
             if not await self._go_next_chapter(page):
@@ -2215,11 +2260,7 @@ class MangaBuffService:
         return chapters_this_title
 
     def _in_night_break_window(self) -> bool:
-        now = datetime.now(MSK).time()
-        if NIGHT_BREAK_START <= NIGHT_BREAK_END:
-            return NIGHT_BREAK_START <= now < NIGHT_BREAK_END
-        # через полночь
-        return now >= NIGHT_BREAK_START or now < NIGHT_BREAK_END
+        return self._night_break_remaining() is not None
 
     async def farm_loop(self, on_progress=None) -> MangaBuffStats:
         """
