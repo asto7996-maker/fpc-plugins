@@ -1,0 +1,33 @@
+# Секреты
+.env
+.env.local
+
+# Настройки / статистика
+settings.json
+settings.json.tmp
+mangabuff_stats.json
+mangabuff_stats.json.tmp
+
+# Профиль браузера Playwright
+user_data_mangabuff/
+user_data_mangabuff/*
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+*.egg
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Логи и артефакты
+*.log
+screenshots/
+artifacts/
