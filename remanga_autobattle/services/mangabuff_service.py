@@ -1205,8 +1205,8 @@ class MangaBuffService:
     def _history_min_gap_for_tier(self) -> float:
         """Минимальный интервал между POST /addHistory (429 на слишком частых запросах)."""
         base = {
-            "turbo": 10.0,
-            "fast": 12.0,
+            "turbo": 8.0,
+            "fast": 11.0,
             "lively": 14.0,
             "normal": 16.0,
             "slow": 18.0,
@@ -1220,9 +1220,9 @@ class MangaBuffService:
         """Сколько ждать авто-отправку reader.js перед ручным flush."""
         tier = self._tempo_tier()
         if tier == "turbo":
-            return 1.5
+            return 0.8
         if tier == "fast":
-            return 3.0
+            return 2.0
         return 12.0
 
     def _scroll_plan(self, total_height: int, viewport: int) -> Tuple[int, int]:
@@ -3089,6 +3089,111 @@ class MangaBuffService:
             return True
         return False
 
+    async def _reader_global_chapter(self, page: Page) -> int:
+        """Глобальный номер следующей непрочитанной главы (current_chapter.current)."""
+        try:
+            n = await page.evaluate(
+                """() => {
+                  const ch = window.current_chapter;
+                  if (!ch) return 0;
+                  const cur = parseInt(ch.current, 10);
+                  return Number.isFinite(cur) ? cur : 0;
+                }"""
+            )
+            return max(0, int(n or 0))
+        except Exception:  # noqa: BLE001
+            return 0
+
+    async def _chapter_already_read_on_site(self, page: Page) -> bool:
+        """Глава уже была отправлена на сайт — повторное чтение не засчитывается."""
+        try:
+            return bool(
+                await page.evaluate(
+                    "(typeof read_status_send !== 'undefined') && !!read_status_send"
+                )
+            )
+        except Exception:  # noqa: BLE001
+            return False
+
+    async def _extract_next_chapter_href(self, page: Page) -> Optional[str]:
+        """Ссылка «След. глава» — сайт знает корректный том (тома могут быть 1→4)."""
+        try:
+            href = await page.evaluate(
+                """() => {
+                  for (const el of document.querySelectorAll('a[href*="/manga/"]')) {
+                    const t = (el.innerText || '').trim();
+                    if (/след\\.?\\s*глава/i.test(t)) {
+                      return el.href.split('?')[0];
+                    }
+                  }
+                  const ch = window.current_chapter;
+                  if (ch && ch.next_url) return String(ch.next_url).split('?')[0];
+                  if (ch && ch.next) return String(ch.next).split('?')[0];
+                  return '';
+                }"""
+            )
+            href = str(href or "").strip()
+            return href or None
+        except Exception:  # noqa: BLE001
+            return None
+
+    async def _validate_chapter_advance(
+        self, page: Page, before_url: str, before_global: int
+    ) -> bool:
+        """Проверить, что перешли на новую главу (глобальный номер вырос)."""
+        now = page.url.split("?")[0]
+        if now == before_url:
+            return False
+        try:
+            title = await page.title()
+            if "404" in title.lower():
+                return False
+        except Exception:  # noqa: BLE001
+            pass
+        tier = self._tempo_tier()
+        ctx_timeout = 3.0 if tier == "turbo" else (5.0 if tier == "fast" else 8.0)
+        if not await self._wait_for_chapter_context(page, timeout_sec=ctx_timeout):
+            return False
+        after_global = await self._reader_global_chapter(page)
+        if before_global > 0 and after_global > before_global:
+            return True
+        if before_global <= 0 and re.search(r"/manga/[^/]+/\d+/\d+", now):
+            return True
+        return False
+
+    async def _skip_to_unread_chapter(self, page: Page, max_hops: int = 10) -> bool:
+        """Пропустить уже прочитанные главы до первой непрочитанной."""
+        for _ in range(max(1, max_hops)):
+            if self._stop_flag.is_set():
+                return False
+            if not await self._wait_for_chapter_context(page, timeout_sec=5.0):
+                return False
+            if not await self._chapter_already_read_on_site(page):
+                return True
+            url = page.url.split("?")[0]
+            logger.info("MangaBuff hop over re-read %s", url)
+            if not await self._go_next_chapter(page):
+                return False
+        return not await self._chapter_already_read_on_site(page)
+
+    async def _title_has_reading_progress(self, page: Page) -> bool:
+        """На карточке тайтла есть прогресс — нельзя открывать /1/1."""
+        try:
+            return bool(
+                await page.evaluate(
+                    """() => {
+                      const text = (document.body && document.body.innerText) || '';
+                      const hasContinue = [...document.querySelectorAll('a')].some(
+                        a => /продолж/i.test((a.innerText || '').trim())
+                      );
+                      const hasProgress = /прочитан|из\\s+\\d+\\s*%|\\d+\\s*%\\s*прочитано/i.test(text);
+                      return hasContinue || hasProgress;
+                    }"""
+                )
+            )
+        except Exception:  # noqa: BLE001
+            return False
+
     async def _open_first_chapter(self, title_href: str) -> Optional[str]:
         assert self._page is not None
         page = self._page
@@ -3140,20 +3245,38 @@ class MangaBuffService:
                         got = await _ok_reader()
                         if got:
                             logger.info("MangaBuff open %s via title button %s", slug, got)
+                            if await self._skip_to_unread_chapter(page):
+                                return page.url.split("?")[0]
                             return got
                 except Exception:  # noqa: BLE001
                     pass
 
-        # Прямой URL первой главы — надёжный fallback
+        # Прямой URL первой главы — только если на тайтле нет прогресса
         if slug:
-            for candidate in (
-                f"https://mangabuff.ru/manga/{slug}/1/1",
-                f"https://mangabuff.ru/manga/{slug}/1/0",
-            ):
-                if await self._safe_goto(page, candidate):
-                    got = await _ok_reader()
-                    if got:
-                        return got
+            has_progress = False
+            try:
+                title_url = f"https://mangabuff.ru/manga/{slug}"
+                if await self._safe_goto(page, title_url):
+                    await self._dismiss_overlays(page)
+                    has_progress = await self._title_has_reading_progress(page)
+            except Exception:  # noqa: BLE001
+                has_progress = False
+            if not has_progress:
+                for candidate in (
+                    f"https://mangabuff.ru/manga/{slug}/1/1",
+                    f"https://mangabuff.ru/manga/{slug}/1/0",
+                ):
+                    if await self._safe_goto(page, candidate):
+                        got = await _ok_reader()
+                        if got:
+                            if await self._skip_to_unread_chapter(page):
+                                return page.url.split("?")[0]
+                            return got
+            else:
+                logger.info(
+                    "MangaBuff skip /1/1 fallback for %s — title has progress",
+                    slug,
+                )
 
         if not await self._safe_goto(page, title_href):
             return None
@@ -3542,11 +3665,11 @@ class MangaBuffService:
             if pool <= 0:
                 return 0
             tier = self._tempo_tier()
-            if attempt == 1:
-                self._history_gap_boost_until = max(
-                    self._history_gap_boost_until,
-                    time_mod.time() + (90.0 if tier == "turbo" else 120.0),
-                )
+            self._history_gap_boost_until = max(
+                self._history_gap_boost_until,
+                time_mod.time() + (90.0 if tier == "turbo" else 120.0),
+            )
+            self._last_history_post_at = time_mod.time()
             backoff = {
                 "turbo": 18.0,
                 "fast": 20.0,
@@ -3753,8 +3876,10 @@ class MangaBuffService:
                 break
             await asyncio.sleep(random.uniform(*frame_sleep))
 
-    async def _click_sequential_next(self, page: Page, before: str) -> bool:
-        """Клик «След. глава» только если href/URL строго следующая."""
+    async def _click_sequential_next(
+        self, page: Page, before: str, before_global: int = 0
+    ) -> bool:
+        """Клик «След. глава» — валидация по глобальному номеру, не vol+1."""
         tier = self._tempo_tier()
         vis_timeout = 250 if tier in ("turbo", "fast") else 700
         candidates = (
@@ -3773,14 +3898,6 @@ class MangaBuffService:
                 try:
                     if not await el.is_visible(timeout=vis_timeout):
                         continue
-                    href = (await el.get_attribute("href")) or ""
-                    # заранее отсечь прыжки по href
-                    if href:
-                        abs_href = href
-                        if href.startswith("/"):
-                            abs_href = "https://mangabuff.ru" + href
-                        if not self._is_sequential_next(before, abs_href):
-                            continue
                     await el.click(force=True)
                     gap_lo, gap_hi = self._chapter_gap_pause()
                     await self._human_pause(gap_lo, gap_hi)
@@ -3792,15 +3909,16 @@ class MangaBuffService:
                     except Exception:  # noqa: BLE001
                         pass
                     await self._dismiss_overlays(page)
-                    now = page.url.split("?")[0]
-                    if self._is_sequential_next(before, now):
-                        logger.info("MangaBuff next chapter via click %s", now)
+                    if await self._validate_chapter_advance(page, before, before_global):
+                        logger.info(
+                            "MangaBuff next chapter via click %s",
+                            page.url.split("?")[0],
+                        )
                         return True
                     logger.warning(
-                        "MangaBuff reject chapter jump %s → %s (href=%s)",
+                        "MangaBuff reject chapter jump %s → %s",
                         before,
-                        now,
-                        href[:80],
+                        page.url.split("?")[0],
                     )
                     await self._safe_goto(page, before)
                 except Exception:  # noqa: BLE001
@@ -3811,44 +3929,42 @@ class MangaBuffService:
         return False
 
     async def _go_next_chapter(self, page: Page) -> bool:
-        """Строго следующая глава по порядку — без перескоков."""
+        """Следующая глава — через ссылку сайта (тома могут быть несмежными)."""
         before = page.url.split("?")[0]
-        parsed = self._parse_chapter_url(before)
-        if not parsed:
+        if not self._parse_chapter_url(before):
             return False
-        slug, vol, ch = parsed
-        ordered = [
-            f"https://mangabuff.ru/manga/{slug}/{vol}/{ch + 1}",
-            f"https://mangabuff.ru/manga/{slug}/{vol + 1}/1",
-        ]
-        tier = self._tempo_tier()
+        before_global = await self._reader_global_chapter(page)
 
-        # turbo/fast: клик быстрее полного goto, если кнопка есть
-        if tier in ("turbo", "fast"):
-            if await self._click_sequential_next(page, before):
-                return True
+        nxt_href = await self._extract_next_chapter_href(page)
+        if nxt_href and nxt_href != before:
+            if await self._safe_goto(page, nxt_href):
+                if await self._validate_chapter_advance(page, before, before_global):
+                    logger.info(
+                        "MangaBuff next chapter via href %s",
+                        page.url.split("?")[0],
+                    )
+                    return True
+                await self._safe_goto(page, before)
 
-        # URL следующей главы
-        for nxt in ordered:
-            if not await self._safe_goto(page, nxt):
-                continue
-            title = ""
-            try:
-                title = await page.title()
-            except Exception:  # noqa: BLE001
-                pass
-            now = page.url.split("?")[0]
-            if "404" in title.lower() or now == before:
-                continue
-            if self._is_sequential_next(before, now):
-                logger.info("MangaBuff next chapter via URL %s", now)
-                return True
-            await self._safe_goto(page, before)
+        if await self._click_sequential_next(page, before, before_global):
+            return True
 
-        # медленные режимы / fallback: клик
-        if tier not in ("turbo", "fast"):
-            if await self._click_sequential_next(page, before):
-                return True
+        parsed = self._parse_chapter_url(before)
+        if parsed:
+            slug, vol, ch = parsed
+            for nxt in (
+                f"https://mangabuff.ru/manga/{slug}/{vol}/{ch + 1}",
+                f"https://mangabuff.ru/manga/{slug}/{vol + 1}/1",
+            ):
+                if not await self._safe_goto(page, nxt):
+                    continue
+                if await self._validate_chapter_advance(page, before, before_global):
+                    logger.info(
+                        "MangaBuff next chapter via URL %s",
+                        page.url.split("?")[0],
+                    )
+                    return True
+                await self._safe_goto(page, before)
         return False
 
     # ------------------------------------------------------------------
@@ -4458,12 +4574,16 @@ class MangaBuffService:
             stale = await self._history_pool_size(page)
             if stale > 0:
                 logger.warning(
-                    "MangaBuff clear stale history_pool=%s before %s", stale, slug
+                    "MangaBuff flush stale history_pool=%s before %s", stale, slug
                 )
-                await page.evaluate(
-                    "localStorage.setItem('history_pool', JSON.stringify([]))"
-                )
-                self.stats.chapters_pending = 0
+                flushed = await self._flush_history_pool_confirmed(page)
+                if flushed > 0:
+                    self.stats.chapters_read += flushed
+                    for _ in range(flushed):
+                        self.note_chapter_finished()
+                    self.stats.chapters_pending = await self._history_pool_size(page)
+                    self.stats.touch(f"зачтено сайтом +{flushed} (до тайтла)", page.url)
+                    self._persist_stats()
         except Exception:  # noqa: BLE001
             pass
         max_per_title = self._chapters_target_for_title(total_chapters)
@@ -4510,10 +4630,10 @@ class MangaBuffService:
 
             url = page.url.split("?")[0]
             if not re.search(r"/manga/[^/]+/\d+/\d+", url):
-                recover = last_chapter_url or (
-                    f"https://mangabuff.ru/manga/{slug}/1/"
-                    f"{max(1, chapters_this_title + 1)}"
-                )
+                recover = last_chapter_url
+                if not recover:
+                    logger.warning("MangaBuff not on chapter page: %s — stop", url)
+                    break
                 logger.warning(
                     "MangaBuff not on chapter page: %s — recover %s",
                     url,
@@ -4526,6 +4646,12 @@ class MangaBuffService:
                     break
 
             if url in self._read_urls:
+                if not await self._go_next_chapter_with_retry(page):
+                    break
+                continue
+
+            if await self._chapter_already_read_on_site(page):
+                logger.info("MangaBuff skip re-read %s", url)
                 if not await self._go_next_chapter_with_retry(page):
                     break
                 continue
@@ -4624,6 +4750,11 @@ class MangaBuffService:
                 elif pending > 0:
                     self.stats.touch(f"в очереди ({pending})", final_url)
                     self._persist_stats()
+                elif await self._chapter_already_read_on_site(page):
+                    logger.info(
+                        "MangaBuff chapter already on site (re-read): %s",
+                        final_url,
+                    )
                 else:
                     logger.warning(
                         "MangaBuff chapter not queued: %s", final_url
