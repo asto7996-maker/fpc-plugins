@@ -3218,6 +3218,10 @@ class MangaBuffService:
                 "() => window.scrollTo(0, document.body.scrollHeight)"
             )
             await self._tempo_pause(0.12, 0.35)
+        except Exception:  # noqa: BLE001
+            pass
+        await self._scroll_until_site_read(page)
+        try:
             reward_timeout = 3.0 if tier in ("turbo", "fast") else 8.0
             c, cards, scrolls, chests, packs, _ = await asyncio.wait_for(
                 self._click_reward_buttons(page), timeout=reward_timeout
@@ -3252,6 +3256,94 @@ class MangaBuffService:
             await asyncio.sleep(0.35)
         return False
 
+    async def _scroll_until_site_read(self, page: Page) -> bool:
+        """
+        Прокрутить главу так, чтобы reader.js выставил is_read=true (≥50% высоты).
+        Без этого addHistory() на сайте не срабатывает — только комментарии «живут».
+        """
+        tier = self._tempo_tier()
+        pause = 0.12 if tier == "turbo" else (0.22 if tier == "fast" else 0.45)
+        deadline = time_mod.time() + (35.0 if tier in ("turbo", "fast") else 55.0)
+        chapter_url = page.url.split("?")[0]
+
+        async def _fire_scroll(target_y: int) -> None:
+            await page.evaluate(
+                """(ty) => {
+                  window.scrollTo(0, ty);
+                  window.dispatchEvent(new Event('scroll'));
+                  if (window.jQuery) window.jQuery(window).trigger('scroll');
+                }""",
+                int(target_y),
+            )
+
+        while time_mod.time() < deadline and not self._stop_flag.is_set():
+            if page.url.split("?")[0] != chapter_url:
+                break
+            state = await page.evaluate(
+                """() => ({
+                  is_read: (typeof is_read !== 'undefined') ? !!is_read : false,
+                  y: window.scrollY || 0,
+                  h: document.body.scrollHeight || 0,
+                  vh: window.innerHeight || 900,
+                })"""
+            )
+            if state.get("is_read"):
+                return True
+            h = max(int(state.get("h") or 0), 1200)
+            vh = max(int(state.get("vh") or 0), 600)
+            y = int(state.get("y") or 0)
+            half = max(int((h - vh) * 0.52), vh)
+            step = max(int(vh * 0.45), 350) if y + vh < half else max(int(vh * 0.85), 500)
+            target = min(y + step, max(0, h - vh))
+            await _fire_scroll(target)
+            await asyncio.sleep(pause)
+
+        for _ in range(10):
+            if self._stop_flag.is_set():
+                break
+            state = await page.evaluate(
+                """() => ({
+                  is_read: (typeof is_read !== 'undefined') ? !!is_read : false,
+                  h: document.body.scrollHeight || 0,
+                  y: window.scrollY || 0,
+                  vh: window.innerHeight || 900,
+                })"""
+            )
+            if state.get("is_read"):
+                return True
+            h = int(state.get("h") or 0)
+            y = int(state.get("y") or 0)
+            vh = int(state.get("vh") or 0)
+            if y + vh >= h - 40:
+                break
+            await _fire_scroll(max(0, h - vh))
+            await asyncio.sleep(0.35 if tier in ("turbo", "fast") else 0.6)
+
+        ok = bool(
+            await page.evaluate(
+                "(typeof is_read !== 'undefined') ? !!is_read : false"
+            )
+        )
+        if not ok:
+            logger.warning(
+                "MangaBuff is_read still false after scroll: %s", chapter_url
+            )
+        return ok
+
+    async def _wait_for_native_history_flush(
+        self, page: Page, *, pool_before: int, timeout_sec: float = 12.0
+    ) -> int:
+        """Дождаться, пока reader.js сам отправит history_pool (jQuery $.post)."""
+        if pool_before <= 0:
+            return 0
+        deadline = time_mod.time() + max(2.0, float(timeout_sec))
+        while time_mod.time() < deadline:
+            pool = await self._history_pool_size(page)
+            if pool < pool_before:
+                return pool_before - pool
+            await asyncio.sleep(0.35)
+        return 0
+
     async def _history_pool_size(self, page: Page) -> int:
         try:
             n = await page.evaluate(
@@ -3267,7 +3359,7 @@ class MangaBuffService:
             return 0
 
     async def _queue_chapter_in_pool(self, page: Page) -> Optional[Dict[str, Any]]:
-        """Поставить текущую главу в history_pool (как reader.js)."""
+        """Поставить главу в history_pool через нативный reader.js addHistory()."""
         try:
             meta = await page.evaluate(
                 """() => {
@@ -3275,27 +3367,45 @@ class MangaBuffService:
                   if (!ch || !ch.id || !ch.chapter_id) {
                     return {ok: false, reason: 'no current_chapter', url: location.href};
                   }
-                  try { is_read = true; } catch (e) {}
-                  let items = [];
-                  try {
-                    items = JSON.parse(localStorage.getItem('history_pool') || '[]') || [];
-                  } catch (e) { items = []; }
-                  if (!Array.isArray(items)) items = [];
-                  const obj = {manga_id: ch.id, chapter_id: ch.chapter_id};
-                  if (!items.some(el => el && el.manga_id === obj.manga_id
-                      && el.chapter_id === obj.chapter_id)) {
-                    items.push(obj);
-                    localStorage.setItem('history_pool', JSON.stringify(items));
+                  if (typeof is_read === 'undefined' || !is_read) {
+                    return {
+                      ok: false,
+                      reason: 'not_read_yet',
+                      chapter: String(ch.chapter || ''),
+                      url: location.href
+                    };
                   }
-                  try { read_status_send = true; } catch (e) {}
+                  if (typeof read_status_send !== 'undefined' && read_status_send) {
+                    return {
+                      ok: false,
+                      reason: 'already_sent',
+                      chapter: String(ch.chapter || ''),
+                      url: location.href
+                    };
+                  }
+                  if (typeof addHistory !== 'function') {
+                    return {ok: false, reason: 'no addHistory', url: location.href};
+                  }
+                  let before = 0;
+                  try {
+                    before = JSON.parse(localStorage.getItem('history_pool') || '[]').length;
+                  } catch (e) { before = 0; }
+                  addHistory();
+                  let after = before;
+                  try {
+                    after = JSON.parse(localStorage.getItem('history_pool') || '[]').length;
+                  } catch (e) { after = before; }
                   return {
                     ok: true,
                     manga_id: ch.id,
                     chapter_id: ch.chapter_id,
                     chapter: String(ch.chapter || ''),
                     slug: String(ch.slug || ''),
-                    pool: items.length,
+                    pool: after,
+                    pool_before: before,
                     ccl: Number(window.ccl || 2),
+                    is_read: !!is_read,
+                    read_status_send: !!read_status_send,
                     url: location.href
                   };
                 }"""
@@ -3305,8 +3415,9 @@ class MangaBuffService:
             return None
         if not meta or not meta.get("ok"):
             logger.warning(
-                "MangaBuff chapter NOT queued: %s",
+                "MangaBuff chapter NOT queued: %s (%s)",
                 (meta or {}).get("reason") or "unknown",
+                (meta or {}).get("chapter") or (meta or {}).get("url") or "",
             )
             return None
         return meta
@@ -3355,21 +3466,39 @@ class MangaBuffService:
 
         Возвращает число глав, реально принятых сайтом (0 = только в очереди или ошибка).
         """
-        meta = await self._queue_chapter_in_pool(page)
+        meta: Optional[Dict[str, Any]] = None
+        for attempt in range(2):
+            meta = await self._queue_chapter_in_pool(page)
+            if meta:
+                break
+            if attempt == 0:
+                await self._scroll_until_site_read(page)
+                await asyncio.sleep(0.25)
         if not meta:
             self.stats.chapters_pending = await self._history_pool_size(page)
+            if force_flush:
+                return await self._flush_history_pool_confirmed(page)
             return 0
 
         pool = int(meta.get("pool") or 0)
         ccl = max(1, int(meta.get("ccl") or 2))
         self.stats.chapters_pending = pool
         logger.info(
-            "MangaBuff site-read queued manga=%s ch=%s pool=%s/%s",
+            "MangaBuff site-read queued manga=%s ch=%s pool=%s/%s native=1",
             meta.get("manga_id"),
             meta.get("chapter") or meta.get("chapter_id"),
             pool,
             ccl,
         )
+
+        if pool >= ccl:
+            native_flushed = await self._wait_for_native_history_flush(
+                page, pool_before=pool
+            )
+            if native_flushed > 0:
+                self._last_history_post_at = time_mod.time()
+                self.stats.chapters_pending = await self._history_pool_size(page)
+                return native_flushed
 
         if not force_flush and pool < ccl:
             return 0
@@ -3662,9 +3791,11 @@ class MangaBuffService:
                 await self._safe_goto(page, f"https://mangabuff.ru/manga/{slug}")
         return None
 
-    async def _maybe_comment(self, page: Page) -> bool:
-        """Каждые 5–15 глав: коммент на ТЕКУЩУЮ главу (без прыжков по тайтлу)."""
-        self._chapters_since_comment += 1
+    async def _maybe_comment(self, page: Page, confirmed: int = 0) -> bool:
+        """Каждые 5–15 засчитанных глав — коммент на текущую главу."""
+        if confirmed <= 0:
+            return False
+        self._chapters_since_comment += int(confirmed)
         if self._chapters_since_comment < self._next_comment_after:
             return False
 
@@ -4403,7 +4534,7 @@ class MangaBuffService:
                     pending,
                 )
 
-            await self._maybe_comment(page)
+                await self._maybe_comment(page, confirmed)
             if not re.search(r"/manga/[^/]+/\d+/\d+", page.url.split("?")[0]):
                 await self._safe_goto(page, final_url)
 
