@@ -959,6 +959,7 @@ class MangaBuffService:
         self._mb_user_id: str = ""
         self._last_history_post_at: float = 0.0
         self._history_min_gap_sec: float = 20.0
+        self._history_resume_anchor: Optional[int] = None
         self._migrate_stats_if_needed()
         # сброс ложных дропов («Тайтлы» из навбара) — портили статистику карт
         if "тайтл" in (self.stats.last_card_drop or "").lower():
@@ -3406,6 +3407,7 @@ class MangaBuffService:
                 logger.info(
                     "MangaBuff native flush cleared pool but progress=0 (re-read?)"
                 )
+                self._history_resume_anchor = None
                 return 0
             if progress > 0:
                 self._last_history_post_at = time_mod.time()
@@ -3563,11 +3565,22 @@ class MangaBuffService:
                 await asyncio.sleep(0.25)
         if not meta:
             self.stats.chapters_pending = await self._history_pool_size(page)
+            anchor = self._history_resume_anchor
+            if anchor is None:
+                anchor = before_resume
             if force_flush:
-                return await self._flush_history_pool_confirmed(
-                    page, before_resume=before_resume
+                confirmed = await self._flush_history_pool_confirmed(
+                    page, before_resume=anchor
                 )
+                if confirmed > 0:
+                    self._history_resume_anchor = None
+                return confirmed
             return 0
+
+        pool_before = int(meta.get("pool_before") or 0)
+        if pool_before <= 0 and self._history_resume_anchor is None:
+            self._history_resume_anchor = before_resume
+        anchor = self._history_resume_anchor if self._history_resume_anchor is not None else before_resume
 
         pool = int(meta.get("pool") or 0)
         ccl = max(1, int(meta.get("ccl") or 2))
@@ -3583,18 +3596,22 @@ class MangaBuffService:
 
         if pool >= ccl:
             native_flushed = await self._wait_for_native_history_flush(
-                page, pool_before=pool, before_resume=before_resume
+                page, pool_before=pool, before_resume=anchor
             )
             if native_flushed > 0:
+                self._history_resume_anchor = None
                 self.stats.chapters_pending = await self._history_pool_size(page)
                 return native_flushed
 
         if not force_flush and pool < ccl:
             return 0
 
-        return await self._flush_history_pool_confirmed(
-            page, before_resume=before_resume
+        confirmed = await self._flush_history_pool_confirmed(
+            page, before_resume=anchor
         )
+        if confirmed > 0:
+            self._history_resume_anchor = None
+        return confirmed
 
     async def _flush_history_pool(self, page: Page) -> Tuple[int, Optional[CardDropInfo]]:
         """POST /addHistory — сайт засчитывает главы и может выдать карту."""
@@ -4517,7 +4534,7 @@ class MangaBuffService:
                         ch_num,
                         resume,
                     )
-                    if resume - ch_num > 2:
+                    if resume - ch_num > 1:
                         jump = f"https://mangabuff.ru/manga/{slug_p}/1/{resume}"
                         if await self._safe_goto(page, jump):
                             await self._dismiss_overlays(page)
@@ -4590,10 +4607,14 @@ class MangaBuffService:
                     pending,
                     final_url,
                 )
-                backlog_resume = await self._reader_resume_chapter(page)
+                backlog_resume = self._history_resume_anchor
+                if backlog_resume is None:
+                    backlog_resume = await self._reader_resume_chapter(page)
                 confirmed = await self._flush_history_pool_confirmed(
                     page, before_resume=backlog_resume
                 )
+                if confirmed > 0:
+                    self._history_resume_anchor = None
                 pending = await self._history_pool_size(page)
                 self.stats.chapters_pending = pending
 
@@ -4892,10 +4913,14 @@ class MangaBuffService:
             pending = await self._history_pool_size(page)
             self.stats.chapters_pending = pending
             if confirmed <= 0 and pending >= 2:
-                backlog_resume = await self._reader_resume_chapter(page)
+                backlog_resume = self._history_resume_anchor
+                if backlog_resume is None:
+                    backlog_resume = await self._reader_resume_chapter(page)
                 confirmed = await self._flush_history_pool_confirmed(
                     page, before_resume=backlog_resume
                 )
+                if confirmed > 0:
+                    self._history_resume_anchor = None
             if confirmed <= 0:
                 if pending <= 0:
                     if not await self._go_next_chapter(page):
