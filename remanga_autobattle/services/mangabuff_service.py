@@ -5083,7 +5083,7 @@ class MangaBuffService:
             # ждём финал
             finished = False
             win = False
-            for _wait in range(40):
+            for _wait in range(50):
                 text = ""
                 try:
                     text = await page.evaluate(
@@ -5091,16 +5091,32 @@ class MangaBuffService:
                     )
                 except Exception:  # noqa: BLE001
                     pass
-                low = text.lower()
-                if re.search(r"победа|вы победили|победили", low):
-                    finished, win = True, True
+                low = (text or "").lower()
+                if re.search(
+                    r"победа|вы победили|победили|winner|you win|\+эссенц|\+алмаз",
+                    low,
+                ):
+                    # поражение тоже может содержать +эссенцию — уточним
+                    if re.search(r"поражение|проиграли|вы проиграли|you lose", low):
+                        finished, win = True, False
+                    else:
+                        finished, win = True, True
+                        if "поражен" in low:
+                            win = False
                     break
                 if re.search(r"поражение|проиграли|вы проиграли", low):
                     finished, win = True, False
                     break
-                if re.search(r"итог|результат боя|бой заверш", low):
+                if re.search(r"итог боя|результат боя|бой заверш|награда за бой", low):
                     finished = True
-                    win = "побед" in low
+                    win = bool(
+                        re.search(r"побед|выигрыш|win", low)
+                    ) and not re.search(r"поражен", low)
+                    break
+                # если ушли с fight URL — считаем завершённым
+                if "/battle/fight/" not in page.url and "/battle" in page.url:
+                    finished = True
+                    win = True  # optimistic if redirected home with rewards
                     break
                 try:
                     skip = page.locator(".battle-control__button--skip").first
@@ -5108,7 +5124,23 @@ class MangaBuffService:
                         await skip.click(force=True, timeout=1000)
                 except Exception:  # noqa: BLE001
                     pass
-                await asyncio.sleep(0.6)
+                await asyncio.sleep(0.5)
+
+            # если бой шёл долго без явного текста — засчитать участие
+            if not finished and "/battle/fight/" in page.url:
+                finished = True
+                # эвристика по HP
+                try:
+                    win = bool(
+                        await page.evaluate(
+                            """() => {
+                              const t = document.body.innerText || '';
+                              return /побед/i.test(t) && !/поражен/i.test(t);
+                            }"""
+                        )
+                    )
+                except Exception:  # noqa: BLE001
+                    win = False
 
             if win:
                 self.stats.battles_won += 1
