@@ -958,7 +958,7 @@ class MangaBuffService:
         self._seen_notifications: set[str] = set(self.stats.seen_notifications or [])
         self._mb_user_id: str = ""
         self._last_history_post_at: float = 0.0
-        self._history_min_gap_sec: float = 20.0
+        self._history_min_gap_sec: float = 16.0
         self._migrate_stats_if_needed()
         # сброс ложных дропов («Тайтлы» из навбара) — портили статистику карт
         if "тайтл" in (self.stats.last_card_drop or "").lower():
@@ -3066,32 +3066,6 @@ class MangaBuffService:
             return True
         return False
 
-    async def _reader_resume_chapter(self, page: Page) -> int:
-        """Номер следующей непрочитанной главы (current_chapter.current на reader)."""
-        try:
-            n = await page.evaluate(
-                """() => {
-                  const ch = window.current_chapter;
-                  if (!ch) return 0;
-                  const cur = parseInt(ch.current, 10);
-                  return Number.isFinite(cur) ? cur : 0;
-                }"""
-            )
-            return max(0, int(n or 0))
-        except Exception:  # noqa: BLE001
-            return 0
-
-    async def _probe_title_resume_chapter(self, page: Page, slug: str) -> int:
-        """Узнать, с какой главы продолжать чтение тайтла."""
-        probe_url = f"https://mangabuff.ru/manga/{slug}/1/1"
-        if not await self._safe_goto(page, probe_url):
-            return 1
-        await self._dismiss_overlays(page)
-        if not await self._wait_for_chapter_context(page, timeout_sec=6.0):
-            return 1
-        resume = await self._reader_resume_chapter(page)
-        return max(1, resume or 1)
-
     async def _open_first_chapter(self, title_href: str) -> Optional[str]:
         assert self._page is not None
         page = self._page
@@ -3115,42 +3089,47 @@ class MangaBuffService:
                     return page.url.split("?")[0]
             return None
 
-        # С первой НЕпрочитанной главы — иначе сайт не засчитывает повторное чтение.
+        # Карточка тайтла: «Продолжить» / «Читать» (корректный том/глава)
         if slug:
-            resume = await self._probe_title_resume_chapter(page, slug)
-            total = 0
-            try:
-                total = int(
-                    await page.evaluate(
-                        """() => parseInt(
-                          (window.current_chapter && window.current_chapter.total) || '0',
-                          10
-                        )"""
+            title_url = f"https://mangabuff.ru/manga/{slug}"
+            if await self._safe_goto(page, title_url):
+                await self._dismiss_overlays(page)
+                try:
+                    cont_href = await page.evaluate(
+                        """() => {
+                          for (const el of document.querySelectorAll('a[href*="/manga/"]')) {
+                            const t = (el.innerText || '').trim();
+                            const h = el.href.split('?')[0];
+                            if (/продолж/i.test(t) && /\\/manga\\/[^/]+\\/\\d+\\/\\d+/.test(h)) {
+                              return h;
+                            }
+                          }
+                          for (const el of document.querySelectorAll('a')) {
+                            const t = (el.innerText || '').trim();
+                            if (/^читать$/i.test(t) && el.href) {
+                              return el.href.split('?')[0];
+                            }
+                          }
+                          return '';
+                        }"""
                     )
-                    or 0
-                )
-            except Exception:  # noqa: BLE001
-                total = 0
-            if total > 0 and resume > total:
-                logger.info(
-                    "MangaBuff title %s fully read (resume=%s total=%s)",
-                    slug,
-                    resume,
-                    total,
-                )
-                return None
-            upper = resume + 4 if total <= 0 else min(resume + 4, total)
-            for start_ch in range(resume, upper + 1):
-                candidate = f"https://mangabuff.ru/manga/{slug}/1/{start_ch}"
+                    if cont_href and await self._safe_goto(page, cont_href):
+                        got = await _ok_reader()
+                        if got:
+                            logger.info("MangaBuff open %s via title button %s", slug, got)
+                            return got
+                except Exception:  # noqa: BLE001
+                    pass
+
+        # Прямой URL первой главы — надёжный fallback
+        if slug:
+            for candidate in (
+                f"https://mangabuff.ru/manga/{slug}/1/1",
+                f"https://mangabuff.ru/manga/{slug}/1/0",
+            ):
                 if await self._safe_goto(page, candidate):
                     got = await _ok_reader()
                     if got:
-                        logger.info(
-                            "MangaBuff resume %s from ch %s (next unread=%s)",
-                            slug,
-                            start_ch,
-                            resume,
-                        )
                         return got
 
         if not await self._safe_goto(page, title_href):
@@ -3856,11 +3835,9 @@ class MangaBuffService:
                 await self._safe_goto(page, f"https://mangabuff.ru/manga/{slug}")
         return None
 
-    async def _maybe_comment(self, page: Page, confirmed: int = 0) -> bool:
-        """Каждые 5–15 засчитанных глав — коммент на текущую главу."""
-        if confirmed <= 0:
-            return False
-        self._chapters_since_comment += int(confirmed)
+    async def _maybe_comment(self, page: Page) -> bool:
+        """Каждые 5–15 прочитанных глав — коммент на текущую главу."""
+        self._chapters_since_comment += 1
         if self._chapters_since_comment < self._next_comment_after:
             return False
 
@@ -4492,41 +4469,9 @@ class MangaBuffService:
                     break
                 continue
 
-            parsed = self._parse_chapter_url(url)
-            if parsed:
-                slug_p, _vol, ch_num = parsed
-                resume = await self._reader_resume_chapter(page)
-                if resume > 0 and ch_num < resume:
-                    logger.info(
-                        "MangaBuff skip already-read %s ch %s (next unread=%s)",
-                        slug_p,
-                        ch_num,
-                        resume,
-                    )
-                    if resume - ch_num > 1:
-                        jump = f"https://mangabuff.ru/manga/{slug_p}/1/{resume}"
-                        if await self._safe_goto(page, jump):
-                            await self._dismiss_overlays(page)
-                            continue
-                    if not await self._go_next_chapter_with_retry(page):
-                        break
-                    continue
-
             self._read_urls.add(url)
             last_chapter_url = url
             logger.info("MangaBuff scroll chapter %s", url)
-
-            pending_start = await self._history_pool_size(page)
-            if pending_start >= 2:
-                flushed = await self._flush_history_pool_confirmed(page)
-                if flushed > 0:
-                    self.stats.chapters_read += flushed
-                    chapters_this_title += flushed
-                    for _ in range(flushed):
-                        self.note_chapter_finished()
-                    self.stats.touch(f"зачтено сайтом +{flushed}", url)
-                    self._persist_stats()
-                    await self._maybe_comment(page, flushed)
 
             overlay_t = 2.5 if self._tempo_tier() in ("turbo", "fast") else 8.0
             reward_t = 3.0 if self._tempo_tier() in ("turbo", "fast") else 12.0
@@ -4581,7 +4526,6 @@ class MangaBuffService:
             pending = await self._history_pool_size(page)
             self.stats.chapters_pending = pending
 
-            # пул полон, но сайт не принял — не уходим дальше, пока не зачтёт
             if confirmed <= 0 and pending >= 2:
                 logger.warning(
                     "MangaBuff addHistory backlog pool=%s at %s — retry flush",
@@ -4604,15 +4548,12 @@ class MangaBuffService:
 
             if confirmed <= 0:
                 if pending >= 2:
-                    logger.error(
-                        "MangaBuff addHistory stuck pool=%s at %s — retry same chapter",
-                        pending,
+                    logger.warning(
+                        "MangaBuff pool still full at %s — advance anyway",
                         final_url,
                     )
                     self.stats.errors += 1
-                    await self._tempo_pause(8.0, 15.0)
-                    continue
-                if pending > 0:
+                elif pending > 0:
                     self.stats.touch(f"в очереди ({pending})", final_url)
                     self._persist_stats()
                 else:
@@ -4620,11 +4561,8 @@ class MangaBuffService:
                         "MangaBuff chapter not queued: %s", final_url
                     )
                     self.stats.errors += 1
-                    await self._tempo_pause(2.0, 4.0)
-                    if not await self._go_next_chapter_with_retry(page):
-                        break
-                    continue
-            else:
+
+            if confirmed > 0:
                 self.stats.chapters_read += confirmed
                 chapters_this_title += confirmed
                 for _ in range(confirmed):
@@ -4643,7 +4581,7 @@ class MangaBuffService:
                     pending,
                 )
 
-                await self._maybe_comment(page, confirmed)
+            await self._maybe_comment(page)
             if not re.search(r"/manga/[^/]+/\d+/\d+", page.url.split("?")[0]):
                 await self._safe_goto(page, final_url)
 
@@ -4888,16 +4826,12 @@ class MangaBuffService:
             self.stats.chapters_pending = pending
             if confirmed <= 0 and pending >= 2:
                 confirmed = await self._flush_history_pool_confirmed(page)
-            if confirmed <= 0:
-                if pending <= 0:
-                    if not await self._go_next_chapter(page):
-                        break
-                continue
-            self.stats.chapters_read += confirmed
-            for _ in range(confirmed):
-                self.note_chapter_finished()
-            done += confirmed
-            await self._maybe_comment(page, confirmed)
+            if confirmed > 0:
+                self.stats.chapters_read += confirmed
+                for _ in range(confirmed):
+                    self.note_chapter_finished()
+                done += confirmed
+            await self._maybe_comment(page)
             if on_progress:
                 try:
                     await on_progress(self.stats)
