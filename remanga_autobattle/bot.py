@@ -636,6 +636,9 @@ class App:
     async def _auto_list_dropped_cards(self, info: CardDropInfo) -> None:
         """Авто-выставление дропа на площадку."""
         await asyncio.sleep(10.0)
+        if self.mangabuff.stats.running:
+            logger.info("auto market deferred — chapter farm active")
+            return
         chat = self._notify_chat_id or self.config.telegram_admin_id
         try:
             if not self.mangabuff.is_started:
@@ -791,6 +794,7 @@ class App:
             return "ℹ️ Фарм уже запущен."
 
         async def _runner() -> None:
+            self.mangabuff.stats.running = True
             try:
                 if not self.mangabuff.is_started:
                     await self.mangabuff.start(headless=True)
@@ -817,6 +821,7 @@ class App:
                 self.scheduler.remove_job(JOB_MANGABUFF_READ)
 
         self.scheduler.start()
+        self.mangabuff.stats.running = True
         self._mb_task = asyncio.create_task(_runner(), name=JOB_MANGABUFF_READ)
         self._mb_session_started_at = datetime.now()
         self._mb_session_titles_base = int(self.mangabuff.stats.titles_visited or 0)
@@ -949,10 +954,11 @@ class App:
                 ok = await self.mangabuff.ensure_login()
                 logger.info("MangaBuff login on boot: %s", ok)
                 if ok and self._should_resume_mangabuff_farm():
-                    asyncio.create_task(self.start_mangabuff_read())
+                    # Сначала фарм — events/market не должны перехватить браузер
+                    await self.start_mangabuff_read()
                     logger.info("MangaBuff farm resumed")
                 if ok and load_settings().mangabuff_events_farm_enabled:
-                    # параллельно с чтением (общий lock), не elif
+                    # параллельно с чтением (idle while farm active), не elif
                     if not (self._events_task and not self._events_task.done()):
                         asyncio.create_task(self.start_events_farm(resume=True))
                         logger.info("MangaBuff events farm resumed")

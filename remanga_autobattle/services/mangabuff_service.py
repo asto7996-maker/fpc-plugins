@@ -1103,6 +1103,27 @@ class MangaBuffService:
         self._skip_title.set()
         self.stats.touch("пропуск тайтла запрошен")
 
+    def _chapter_farm_active(self) -> bool:
+        """Идёт основной фарм глав — маркет/эвенты не должны отбирать браузер."""
+        return bool(self.stats.running and not self._stop_flag.is_set())
+
+    async def _acquire_browser_lock(self, purpose: str, timeout: float = 120.0) -> bool:
+        """Взять lock с таймаутом и логом ожидания (для фарма глав)."""
+        deadline = asyncio.get_event_loop().time() + max(1.0, float(timeout))
+        warned = False
+        while not self._stop_flag.is_set():
+            try:
+                await asyncio.wait_for(self._lock.acquire(), timeout=3.0)
+                return True
+            except asyncio.TimeoutError:
+                if not warned:
+                    logger.warning("MangaBuff waiting for browser lock (%s)", purpose)
+                    warned = True
+                if asyncio.get_event_loop().time() >= deadline:
+                    logger.error("MangaBuff browser lock timeout (%s)", purpose)
+                    return False
+        return False
+
     def set_delay(
         self,
         delay_min: float,
@@ -1402,19 +1423,24 @@ class MangaBuffService:
                 await self._await_night_break_if_needed()
                 if self._events_stop.is_set() or self._stop_flag.is_set():
                     break
-                try:
-                    result = await self.farm_events_once(quick=True)
-                    if on_progress is not None:
-                        try:
-                            await on_progress(result)
-                        except Exception:  # noqa: BLE001
-                            pass
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning("events_loop: %s", exc)
-                    self.stats.errors += 1
+                # Пока идёт фарм глав — не трогаем браузер: эвенты между тайтлами
+                # уже собирает сам farm_loop.
+                if not self._chapter_farm_active():
+                    try:
+                        result = await self.farm_events_once(quick=True)
+                        if on_progress is not None:
+                            try:
+                                await on_progress(result)
+                            except Exception:  # noqa: BLE001
+                                pass
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("events_loop: %s", exc)
+                        self.stats.errors += 1
+                else:
+                    logger.debug("events_loop idle — chapter farm active")
                 # пока идёт чтение — реже (лок и так сериализует), иначе плотнее
                 tier = self._tempo_tier()
-                if self.stats.running:
+                if self._chapter_farm_active():
                     pause = 120.0 if tier in ("turbo", "fast") else 180.0
                 elif tier == "turbo":
                     pause = 28.0
@@ -2275,6 +2301,9 @@ class MangaBuffService:
         Цена: 1× ранг выше; для X (нет выше) — 2×X.
         При maintain=True также переключает цену раз в сутки (1×выше ↔ 2×та же).
         """
+        if self._chapter_farm_active():
+            logger.info("market list deferred — chapter farm active")
+            return MarketListResult(details=["отложено: идёт фарм глав"])
         if not self.is_started:
             await self.start(headless=True)
         try:
@@ -2296,6 +2325,9 @@ class MangaBuffService:
 
     async def maintain_market_lots(self) -> MarketListResult:
         """Фоновая поддержка: топ-10 лотов + суточная смена цены."""
+        if self._chapter_farm_active():
+            logger.info("market maintain deferred — chapter farm active")
+            return MarketListResult(details=["отложено: идёт фарм глав"])
         if not self.is_started:
             await self.start(headless=True)
         # не отбираем браузер у фарма надолго — лучше пропустить час
@@ -4292,7 +4324,15 @@ class MangaBuffService:
         assert self._page is not None
         page = self._page
 
-        if not await self.ensure_login():
+        if not await self._acquire_browser_lock("farm login", 90.0):
+            self.stats.running = False
+            self.stats.touch("браузер занят")
+            return self.stats
+        try:
+            ok = await self._ensure_login_unlocked()
+        finally:
+            self._lock.release()
+        if not ok:
             self.stats.running = False
             self.stats.touch("нет авторизации")
             return self.stats
@@ -4305,12 +4345,16 @@ class MangaBuffService:
 
             cycle += 1
             try:
-                # Лок на навигацию: параллельные «Награды/Макеты» больше
-                # не уводят вкладку во время чтения.
-                async with self._lock:
-                    # сначала каталог и чтение — эвенты не блокируют старт сессии
+                # Лок на навигацию: параллельные задачи не уводят вкладку.
+                if not await self._acquire_browser_lock(f"cycle {cycle} catalog", 90.0):
+                    self.stats.touch("ожидание браузера")
+                    await self._tempo_pause(3.0, 6.0)
+                    continue
+                try:
                     logger.info("MangaBuff farm cycle %s: fetch popular", cycle)
                     titles = await self.fetch_popular_titles(limit=24)
+                finally:
+                    self._lock.release()
 
                 if not titles:
                     self.stats.touch("каталог пуст — пауза")
@@ -4331,12 +4375,27 @@ class MangaBuffService:
 
                     slug = str(title.get("slug") or "")
                     logger.info("MangaBuff start title %s", slug or title.get("href"))
-                    async with self._lock:
+                    if not await self._acquire_browser_lock(f"read {slug}", 120.0):
+                        deferred.append(title)
+                        logger.warning(
+                            "MangaBuff title %s deferred — browser lock busy",
+                            slug,
+                        )
+                        await self._tempo_pause(2.0, 4.0)
+                        continue
+                    try:
                         chapters_this_title = await self._read_title_almost_end(
                             page,
                             title,
                             on_progress=on_progress,
                         )
+                        if chapters_this_title > 0:
+                            try:
+                                await self._farm_events_unlocked(quick=True)
+                            except Exception as exc:  # noqa: BLE001
+                                logger.warning("inter-title events: %s", exc)
+                    finally:
+                        self._lock.release()
                     if chapters_this_title <= 0:
                         # не скипаем навсегда — вернёмся в конце цикла
                         deferred.append(title)
@@ -4351,12 +4410,6 @@ class MangaBuffService:
                         slug,
                         chapters_this_title,
                     )
-                    # между тайтлами — быстрый сбор эвентов/сундуков/паков
-                    try:
-                        async with self._lock:
-                            await self._farm_events_unlocked(quick=True)
-                    except Exception as exc:  # noqa: BLE001
-                        logger.warning("inter-title events: %s", exc)
                     await self._tempo_pause(2.0, 6.0)
 
                 # повтор отложенных тайтлов в том же цикле
@@ -4368,12 +4421,20 @@ class MangaBuffService:
                         break
                     slug = str(title.get("slug") or "")
                     logger.info("MangaBuff retry deferred title %s", slug)
-                    async with self._lock:
+                    if not await self._acquire_browser_lock(f"retry {slug}", 120.0):
+                        logger.warning(
+                            "MangaBuff retry %s skipped — browser lock busy",
+                            slug,
+                        )
+                        continue
+                    try:
                         chapters_this_title = await self._read_title_almost_end(
                             page,
                             title,
                             on_progress=on_progress,
                         )
+                    finally:
+                        self._lock.release()
                     if chapters_this_title <= 0:
                         logger.error(
                             "MangaBuff title %s still unreadable — next cycle",
