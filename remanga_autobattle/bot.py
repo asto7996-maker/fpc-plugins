@@ -30,6 +30,7 @@ from scheduler import JOB_MANGABUFF_MARKET, JOB_MANGABUFF_READ, AppScheduler
 from services.mangabuff_service import CardDropInfo, MangaBuffService
 from settings_store import load_settings, update_settings
 from ui_theme import (
+    hr,
     BRAND,
     BRAND_LINE,
     DEFAULT_SPEED_KEY,
@@ -78,11 +79,11 @@ class AdminOnlyMiddleware(BaseMiddleware):
 def main_menu_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="▶️ Фарм"), KeyboardButton(text="⏹ Стоп")],
-            [KeyboardButton(text="📊 Статус"), KeyboardButton(text="⏭ Тайтл")],
-            [KeyboardButton(text="🃏 Карты · Эвенты"), KeyboardButton(text="✦ Пульс")],
-            [KeyboardButton(text="🎚 Темп"), KeyboardButton(text="🔔 Оповещения")],
-            [KeyboardButton(text="ℹ️ О боте")],
+            [KeyboardButton(text="▸ Фарм"), KeyboardButton(text="■ Стоп")],
+            [KeyboardButton(text="Статус"), KeyboardButton(text="Тайтл ›")],
+            [KeyboardButton(text="Карты · Бои"), KeyboardButton(text="Пульс")],
+            [KeyboardButton(text="Темп"), KeyboardButton(text="Оповещения")],
+            [KeyboardButton(text="О боте")],
         ],
         resize_keyboard=True,
         is_persistent=True,
@@ -91,14 +92,18 @@ def main_menu_keyboard() -> ReplyKeyboardMarkup:
 
 def cards_events_keyboard() -> ReplyKeyboardMarkup:
     s = load_settings()
-    notify = "🔔 Карты: вкл" if s.mangabuff_notify_cards else "🔕 Карты: выкл"
-    auto_m = "📤 Авто-лоты: вкл" if s.mangabuff_auto_market else "📤 Авто-лоты: выкл"
+    notify = "Алерты · вкл" if s.mangabuff_notify_cards else "Алерты · выкл"
+    auto_m = "Лоты · вкл" if s.mangabuff_auto_market else "Лоты · выкл"
+    auto_b = "Бои · вкл" if getattr(s, "mangabuff_auto_battle", True) else "Бои · выкл"
+    auto_t = "Обмены · вкл" if getattr(s, "mangabuff_auto_trade", True) else "Обмены · выкл"
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="▶️ Автофарм карт"), KeyboardButton(text="⏹ Стоп карт")],
-            [KeyboardButton(text="🎁 Собрать сейчас"), KeyboardButton(text="📊 Статус карт")],
-            [KeyboardButton(text="📤 На площадку"), KeyboardButton(text=auto_m)],
-            [KeyboardButton(text=notify), KeyboardButton(text="📡 Вехи")],
+            [KeyboardButton(text="▸ Автофарм карт"), KeyboardButton(text="■ Стоп карт")],
+            [KeyboardButton(text="Собрать"), KeyboardButton(text="Статус карт")],
+            [KeyboardButton(text="Бой сейчас"), KeyboardButton(text="Обмены сейчас")],
+            [KeyboardButton(text="На площадку"), KeyboardButton(text=auto_m)],
+            [KeyboardButton(text=auto_b), KeyboardButton(text=auto_t)],
+            [KeyboardButton(text=notify), KeyboardButton(text="Вехи")],
             [KeyboardButton(text="⌂ Домой")],
         ],
         resize_keyboard=True,
@@ -111,13 +116,13 @@ def mb_notify_keyboard() -> ReplyKeyboardMarkup:
         keyboard=[
             [
                 KeyboardButton(
-                    text=("✅" if s.mangabuff_notify_cards else "❌") + " Дроп карт"
+                    text=("●" if s.mangabuff_notify_cards else "○") + " Дроп карт"
                 ),
                 KeyboardButton(
-                    text=("✅" if s.mangabuff_notify_milestones else "❌") + " Вехи глав"
+                    text=("●" if s.mangabuff_notify_milestones else "○") + " Вехи глав"
                 ),
             ],
-            [KeyboardButton(text="📡 Интервал вех")],
+            [KeyboardButton(text="Интервал вех")],
             [KeyboardButton(text="⌂ Домой")],
         ],
         resize_keyboard=True,
@@ -127,20 +132,19 @@ def mb_notify_keyboard() -> ReplyKeyboardMarkup:
 def delay_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="⚡ Турбо"), KeyboardButton(text="🏃 Быстрый")],
-            [KeyboardButton(text="✨ Живой"), KeyboardButton(text="📖 Норма")],
-            [KeyboardButton(text="🐢 Неспешно"), KeyboardButton(text="🕯 Медленно")],
-            [KeyboardButton(text="🎛 Своя скорость")],
+            [KeyboardButton(text="Турбо"), KeyboardButton(text="Быстрый")],
+            [KeyboardButton(text="Живой"), KeyboardButton(text="Норма")],
+            [KeyboardButton(text="Неспешно"), KeyboardButton(text="Медленно")],
+            [KeyboardButton(text="Своя скорость")],
             [KeyboardButton(text="⌂ Домой")],
         ],
         resize_keyboard=True,
     )
 
 
-
 def cancel_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="❌ Отмена")]],
+        keyboard=[[KeyboardButton(text="Отмена")]],
         resize_keyboard=True,
     )
 
@@ -257,7 +261,7 @@ class App:
             await state.clear()
             await message.answer(self._dashboard_text(), reply_markup=main_menu_keyboard())
 
-        @self.dp.message(F.text.in_({"ℹ️ О боте", "ℹ️ Помощь", "Помощь"}))
+        @self.dp.message(F.text.in_({"ℹ️ О боте", "ℹ️ Помощь", "Помощь", "О боте"}))
         @self.dp.message(Command("help"))
         async def cmd_help(message: Message) -> None:
             await message.answer(help_text(), reply_markup=main_menu_keyboard())
@@ -287,7 +291,7 @@ class App:
 
         @self.dp.message(
             StateFilter(None),
-            F.text.in_({"▶️ Фарм", "▶️ Запустить фарм", "Запустить фарм"}),
+            F.text.in_({"▶️ Фарм", "▶️ Запустить фарм", "Запустить фарм", "▸ Фарм", "Фарм"}),
         )
         async def mb_start(message: Message) -> None:
             self._notify_chat_id = message.chat.id
@@ -296,7 +300,7 @@ class App:
 
         @self.dp.message(
             StateFilter(None),
-            F.text.in_({"⏹ Стоп", "⏹ Стоп фарм", "Остановить фарм"}),
+            F.text.in_({"⏹ Стоп", "⏹ Стоп фарм", "Остановить фарм", "■ Стоп", "Стоп"}),
         )
         async def mb_stop(message: Message) -> None:
             text = await self.stop_mangabuff_read()
@@ -304,7 +308,7 @@ class App:
 
         @self.dp.message(
             StateFilter(None),
-            F.text.in_({"⏭ Тайтл", "⏭ След. тайтл", "След. тайтл"}),
+            F.text.in_({"⏭ Тайтл", "⏭ След. тайтл", "След. тайтл", "Тайтл ›", "Тайтл"}),
         )
         async def mb_skip(message: Message) -> None:
             if not self.mangabuff.stats.running:
@@ -313,7 +317,7 @@ class App:
             self.mangabuff.request_skip_title()
             await message.answer("⏭ Следующий тайтл…", reply_markup=main_menu_keyboard())
 
-        @self.dp.message(StateFilter(None), F.text.in_({"📊 Статус", "📊 Статус MangaBuff"}))
+        @self.dp.message(StateFilter(None), F.text.in_({"📊 Статус", "📊 Статус MangaBuff", "Статус"}))
         async def mb_status(message: Message) -> None:
             await message.answer(self._mb_status_card(), reply_markup=main_menu_keyboard())
 
@@ -328,7 +332,7 @@ class App:
                 reply_markup=mb_notify_keyboard(),
             )
 
-        @self.dp.message(StateFilter(None), F.text.regexp(r"^[✅❌] Дроп карт$"))
+        @self.dp.message(StateFilter(None), F.text.regexp(r"^[✅❌●○] Дроп карт$"))
         async def mb_toggle_card_notify(message: Message) -> None:
             s = load_settings()
             on = not s.mangabuff_notify_cards
@@ -338,7 +342,7 @@ class App:
                 reply_markup=mb_notify_keyboard(),
             )
 
-        @self.dp.message(StateFilter(None), F.text.regexp(r"^[✅❌] Вехи глав$"))
+        @self.dp.message(StateFilter(None), F.text.regexp(r"^[✅❌●○] Вехи глав$"))
         async def mb_toggle_milestones(message: Message) -> None:
             s = load_settings()
             on = not s.mangabuff_notify_milestones
@@ -350,7 +354,7 @@ class App:
 
         @self.dp.message(
             StateFilter(None),
-            F.text.in_({"🎚 Темп", "🎚 Темп чтения"}),
+            F.text.in_({"🎚 Темп", "🎚 Темп чтения", "Темп"}),
         )
         async def mb_delay_menu(message: Message) -> None:
             s = load_settings()
@@ -363,31 +367,31 @@ class App:
                 reply_markup=delay_keyboard(),
             )
 
-        @self.dp.message(StateFilter(None), F.text == "⚡ Турбо")
+        @self.dp.message(StateFilter(None), F.text.in_({"⚡ Турбо", "Турбо"}))
         async def delay_turbo(message: Message) -> None:
             await self._apply_speed_preset(message, "turbo")
 
-        @self.dp.message(StateFilter(None), F.text == "🏃 Быстрый")
+        @self.dp.message(StateFilter(None), F.text.in_({"🏃 Быстрый", "Быстрый"}))
         async def delay_fast(message: Message) -> None:
             await self._apply_speed_preset(message, "fast")
 
-        @self.dp.message(StateFilter(None), F.text == "✨ Живой")
+        @self.dp.message(StateFilter(None), F.text.in_({"✨ Живой", "Живой"}))
         async def delay_lively(message: Message) -> None:
             await self._apply_speed_preset(message, "lively")
 
-        @self.dp.message(StateFilter(None), F.text == "📖 Норма")
+        @self.dp.message(StateFilter(None), F.text.in_({"📖 Норма", "Норма"}))
         async def delay_norm(message: Message) -> None:
             await self._apply_speed_preset(message, "normal")
 
-        @self.dp.message(StateFilter(None), F.text == "🐢 Неспешно")
+        @self.dp.message(StateFilter(None), F.text.in_({"🐢 Неспешно", "Неспешно"}))
         async def delay_slow(message: Message) -> None:
             await self._apply_speed_preset(message, "slow")
 
-        @self.dp.message(StateFilter(None), F.text == "🕯 Медленно")
+        @self.dp.message(StateFilter(None), F.text.in_({"🕯 Медленно", "Медленно"}))
         async def delay_crawl(message: Message) -> None:
             await self._apply_speed_preset(message, "crawl")
 
-        @self.dp.message(StateFilter(None), F.text == "🎛 Своя скорость")
+        @self.dp.message(StateFilter(None), F.text.in_({"🎛 Своя скорость", "Своя скорость"}))
         async def delay_custom_ask(message: Message, state: FSMContext) -> None:
             await state.set_state(SettingsStates.waiting_custom_speed)
             await message.answer(
@@ -418,7 +422,7 @@ class App:
 
         @self.dp.message(
             StateFilter(None),
-            F.text.in_({"🃏 Карты · Эвенты", "Карты · Эвенты", "Карты", "Эвенты"}),
+            F.text.in_({"🃏 Карты · Эвенты", "Карты · Эвенты", "Карты · Бои", "Карты", "Эвенты"}),
         )
         @self.dp.message(Command("cards"))
         async def open_cards_events(message: Message) -> None:
@@ -428,20 +432,20 @@ class App:
                 reply_markup=cards_events_keyboard(),
             )
 
-        @self.dp.message(StateFilter(None), F.text.in_({"▶️ Автофарм карт", "Автофарм карт"}))
+        @self.dp.message(StateFilter(None), F.text.in_({"▶️ Автофарм карт", "Автофарм карт", "▸ Автофарм карт"}))
         async def cards_start(message: Message) -> None:
             self._notify_chat_id = message.chat.id
             text = await self.start_events_farm()
             await message.answer(text, reply_markup=cards_events_keyboard())
 
-        @self.dp.message(StateFilter(None), F.text.in_({"⏹ Стоп карт", "Стоп карт"}))
+        @self.dp.message(StateFilter(None), F.text.in_({"⏹ Стоп карт", "Стоп карт", "■ Стоп карт"}))
         async def cards_stop(message: Message) -> None:
             text = await self.stop_events_farm()
             await message.answer(text, reply_markup=cards_events_keyboard())
 
         @self.dp.message(
             StateFilter(None),
-            F.text.in_({"🎁 Собрать сейчас", "🎁 Награды"}),
+            F.text.in_({"🎁 Собрать сейчас", "🎁 Награды", "Собрать"}),
         )
         async def cards_claim_now(message: Message) -> None:
             self._notify_chat_id = message.chat.id
@@ -464,16 +468,93 @@ class App:
 
         @self.dp.message(
             StateFilter(None),
-            F.text.regexp(r"^🔔 Карты: (вкл|выкл)$|^🔕 Карты: (вкл|выкл)$"),
+            F.text.regexp(
+                r"^(🔔 Карты: |🔕 Карты: |Алерты · )(вкл|выкл)$"
+            ),
         )
         async def cards_toggle_notify(message: Message) -> None:
             s = load_settings()
             on = not s.mangabuff_notify_cards
             update_settings(mangabuff_notify_cards=on)
             await message.answer(
-                f"🃏 Уведомления о картах: <b>{'вкл' if on else 'выкл'}</b>",
+                f"Алерты карт · <b>{'вкл' if on else 'выкл'}</b>",
                 reply_markup=cards_events_keyboard(),
             )
+
+        @self.dp.message(
+            StateFilter(None),
+            F.text.regexp(r"^(Бои · )(вкл|выкл)$"),
+        )
+        async def cards_toggle_battle(message: Message) -> None:
+            s = load_settings()
+            on = not bool(getattr(s, "mangabuff_auto_battle", True))
+            update_settings(mangabuff_auto_battle=on)
+            await message.answer(
+                f"Авто-бои · <b>{'вкл' if on else 'выкл'}</b>",
+                reply_markup=cards_events_keyboard(),
+            )
+
+        @self.dp.message(
+            StateFilter(None),
+            F.text.regexp(r"^(Обмены · )(вкл|выкл)$"),
+        )
+        async def cards_toggle_trade(message: Message) -> None:
+            s = load_settings()
+            on = not bool(getattr(s, "mangabuff_auto_trade", True))
+            update_settings(mangabuff_auto_trade=on)
+            await message.answer(
+                f"Авто-обмены · <b>{'вкл' if on else 'выкл'}</b>",
+                reply_markup=cards_events_keyboard(),
+            )
+
+        @self.dp.message(StateFilter(None), F.text.in_({"Бой сейчас"}))
+        async def cards_battle_now(message: Message) -> None:
+            self._notify_chat_id = message.chat.id
+            await message.answer("Ищу бои…", reply_markup=cards_events_keyboard())
+            try:
+                if not self.mangabuff.is_started:
+                    await self.mangabuff.start(headless=True)
+                async with self.mangabuff._lock:
+                    await self.mangabuff._ensure_login_unlocked()
+                    n = await self.mangabuff._run_card_battles(
+                        self.mangabuff._page, max_fights=3
+                    )
+                    aw = await self.mangabuff._run_card_awakening(
+                        self.mangabuff._page, max_cards=2
+                    )
+                await message.answer(
+                    f"Бои · побед <b>{n}</b> · пробуждение <b>{aw}</b>\n"
+                    f"Всего побед · <b>{self.mangabuff.stats.battles_won}</b>",
+                    reply_markup=cards_events_keyboard(),
+                )
+            except Exception as exc:  # noqa: BLE001
+                await message.answer(
+                    f"⚠️ <code>{exc}</code>",
+                    reply_markup=cards_events_keyboard(),
+                )
+
+        @self.dp.message(StateFilter(None), F.text.in_({"Обмены сейчас"}))
+        async def cards_trade_now(message: Message) -> None:
+            self._notify_chat_id = message.chat.id
+            await message.answer(
+                "Кидаю обмены A→S…", reply_markup=cards_events_keyboard()
+            )
+            try:
+                if not self.mangabuff.is_started:
+                    await self.mangabuff.start(headless=True)
+                sent = await self.mangabuff.run_card_trades(offers=6)
+                up = await self.mangabuff.run_card_upgrades(max_ops=2)
+                await message.answer(
+                    f"Обмены · отправлено <b>{sent}</b>\n"
+                    f"Улучшение · <b>{up}</b>\n"
+                    f"Всего обменов · <b>{self.mangabuff.stats.trades_sent}</b>",
+                    reply_markup=cards_events_keyboard(),
+                )
+            except Exception as exc:  # noqa: BLE001
+                await message.answer(
+                    f"⚠️ <code>{exc}</code>",
+                    reply_markup=cards_events_keyboard(),
+                )
 
         @self.dp.message(
             StateFilter(None),
@@ -505,7 +586,7 @@ class App:
 
         @self.dp.message(
             StateFilter(None),
-            F.text.regexp(r"^📤 Авто-лоты: (вкл|выкл)$"),
+            F.text.regexp(r"^(📤 Авто-лоты: |Лоты · )(вкл|выкл)$"),
         )
         async def cards_toggle_auto_market(message: Message) -> None:
             s = load_settings()
@@ -517,7 +598,7 @@ class App:
                 reply_markup=cards_events_keyboard(),
             )
 
-        @self.dp.message(StateFilter(None), F.text.in_({"📡 Вехи", "📡 Интервал вех"}))
+        @self.dp.message(StateFilter(None), F.text.in_({"📡 Вехи", "📡 Интервал вех", "Вехи", "Интервал вех"}))
         async def mb_milestones(message: Message, state: FSMContext) -> None:
             s = load_settings()
             flag = "вкл" if s.mangabuff_notify_milestones else "выкл"
@@ -568,6 +649,18 @@ class App:
                 live.chests_opened = max(live.chests_opened, disk.chests_opened)
                 live.packs_opened = max(live.packs_opened, disk.packs_opened)
                 live.events_actions = max(live.events_actions, disk.events_actions)
+                live.battles_won = max(
+                    int(getattr(live, "battles_won", 0) or 0),
+                    int(getattr(disk, "battles_won", 0) or 0),
+                )
+                live.battles_total = max(
+                    int(getattr(live, "battles_total", 0) or 0),
+                    int(getattr(disk, "battles_total", 0) or 0),
+                )
+                live.trades_sent = max(
+                    int(getattr(live, "trades_sent", 0) or 0),
+                    int(getattr(disk, "trades_sent", 0) or 0),
+                )
                 if disk.last_url:
                     live.last_url = disk.last_url
                 if disk.last_action:
@@ -598,6 +691,11 @@ class App:
             last_drop=st.last_card_drop or "",
             last_action=st.last_action or "",
             auto_market=bool(s.mangabuff_auto_market),
+            auto_battle=bool(getattr(s, "mangabuff_auto_battle", True)),
+            auto_trade=bool(getattr(s, "mangabuff_auto_trade", True)),
+            battles_won=int(getattr(st, "battles_won", 0) or 0),
+            battles_total=int(getattr(st, "battles_total", 0) or 0),
+            trades_sent=int(getattr(st, "trades_sent", 0) or 0),
         )
 
     async def _on_card_drop(self, info: CardDropInfo) -> None:
@@ -625,9 +723,9 @@ class App:
             try:
                 await self.bot.send_message(
                     chat,
-                    f"<b>🃏 +{info.cards} карт{scrolls}</b>{rarity_hint}"
+                    f"<b>Новая карта</b> · +{info.cards}{scrolls}{rarity_hint}"
                     f"{detail}{src}\n"
-                    f"Всего: <b>{self.mangabuff.stats.cards_claimed}</b>"
+                    f"Всего · <b>{self.mangabuff.stats.cards_claimed}</b>"
                     f" · сессия <b>{self.mangabuff.session_cards}</b>",
                 )
             except Exception as exc:  # noqa: BLE001
@@ -705,6 +803,8 @@ class App:
             sec_per_chapter=self._sec_per_chapter(),
             session_titles=self._session_titles(),
             chapters_pending=int(st.chapters_pending or 0),
+            battles_won=int(getattr(st, "battles_won", 0) or 0),
+            trades_sent=int(getattr(st, "trades_sent", 0) or 0),
         )
 
     async def _apply_speed_preset(self, message: Message, key: str) -> None:

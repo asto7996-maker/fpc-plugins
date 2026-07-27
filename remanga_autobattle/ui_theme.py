@@ -9,7 +9,7 @@ from typing import Dict, Optional
 
 
 BRAND = "MangaBuff Autopilot"
-BRAND_LINE = "чтение · карты · эвенты"
+BRAND_LINE = "чтение · карты · бои · обмены"
 
 
 @dataclass(frozen=True)
@@ -23,13 +23,32 @@ class SpeedPreset:
     blurb: str
 
 
+# blurb = реальная скорость с учётом addHistory (сайт лимитирует POST)
 SPEED_PRESETS: Dict[str, SpeedPreset] = {
-    "turbo": SpeedPreset("turbo", "Турбо", 0.02, 0.05, 1, 2, "~3–5 с/глава · ~700–1200 гл/ч"),
-    "fast": SpeedPreset("fast", "Быстрый", 0.08, 0.18, 3, 6, "~7–12 с/глава · ~300–500 гл/ч"),
-    "lively": SpeedPreset("lively", "Живой", 0.20, 0.45, 5, 8, "~12–20 с/глава · ~180–300 гл/ч"),
-    "normal": SpeedPreset("normal", "Норма", 0.50, 1.00, 7, 11, "~20–35 с/глава · ~100–180 гл/ч"),
-    "slow": SpeedPreset("slow", "Неспешно", 1.00, 2.00, 9, 14, "~35–60 с/глава · ~60–100 гл/ч"),
-    "crawl": SpeedPreset("crawl", "Медленно", 1.80, 3.50, 12, 18, "~60–100 с/глава · ~35–60 гл/ч"),
+    "turbo": SpeedPreset(
+        "turbo", "Турбо", 0.02, 0.05, 1, 1,
+        "~4–6 с/гл · пакет 4 · ~600–900 гл/ч",
+    ),
+    "fast": SpeedPreset(
+        "fast", "Быстрый", 0.08, 0.18, 2, 4,
+        "~7–10 с/гл · ~360–500 гл/ч",
+    ),
+    "lively": SpeedPreset(
+        "lively", "Живой", 0.20, 0.45, 4, 6,
+        "~12–18 с/гл · ~200–300 гл/ч",
+    ),
+    "normal": SpeedPreset(
+        "normal", "Норма", 0.50, 1.00, 6, 9,
+        "~20–30 с/гл · ~120–180 гл/ч",
+    ),
+    "slow": SpeedPreset(
+        "slow", "Неспешно", 1.00, 2.00, 8, 12,
+        "~35–55 с/гл · ~65–100 гл/ч",
+    ),
+    "crawl": SpeedPreset(
+        "crawl", "Медленно", 1.80, 3.50, 10, 16,
+        "~60–90 с/гл · ~40–60 гл/ч",
+    ),
 }
 
 DEFAULT_SPEED_KEY = "lively"
@@ -50,7 +69,7 @@ def progress_bar(value: int, maximum: int = 10, width: int = 10) -> str:
 
 
 def hr() -> str:
-    return "────────────────────"
+    return "────────────────────────"
 
 
 def welcome_text(
@@ -64,15 +83,17 @@ def welcome_text(
     m = "● online" if mb_on else "○ idle"
     e = "● on" if events_on else "○ off"
     total_line = (
-        f"📚 Всего: <b>{chapters_total}</b>\n" if chapters_total > 0 else ""
+        f"Всего зачтено · <b>{chapters_total}</b>\n" if chapters_total > 0 else ""
     )
     return (
         f"<b>{BRAND}</b>\n"
         f"<i>{BRAND_LINE}</i>\n"
         f"{hr()}\n"
-        f"Чтение: <code>{m}</code> · Карты: <code>{e}</code>\n"
-        f"🎚 {speed_label}\n"
-        f"📖 Сессия: <b>{chapters}</b> гл · 🃏 <b>{cards_session}</b>\n"
+        f"Чтение  <code>{m}</code>\n"
+        f"Карты   <code>{e}</code>\n"
+        f"Темп    <b>{speed_label}</b>\n"
+        f"{hr()}\n"
+        f"Сессия  <b>{chapters}</b> гл · <b>{cards_session}</b> карт\n"
         f"{total_line}"
     )
 
@@ -81,19 +102,21 @@ def speed_menu_text(dmin: float, dmax: float, preset_key: str = "") -> str:
     preset = SPEED_PRESETS.get(preset_key) or preset_by_delays(dmin, dmax)
     cur = preset.title if preset else f"Своя {dmin:.2f}–{dmax:.2f}с"
     lines = [
-        "<b>🎚 Темп чтения</b>",
+        "<b>Темп чтения</b>",
         hr(),
-        f"Сейчас: <b>{cur}</b>",
-        f"Пауза шага: <code>{dmin:.2f}–{dmax:.2f}</code> сек",
+        f"Сейчас · <b>{cur}</b>",
+        f"Шаг скролла · <code>{dmin:.2f}–{dmax:.2f}с</code>",
         "",
-        "В описании — время целой главы (скролл + переход).",
+        "<i>В описании — реальная скорость главы</i>",
+        "<i>(скролл + addHistory на сайте).</i>",
         "",
     ]
     for p in SPEED_PRESETS.values():
-        mark = "›" if preset and preset.key == p.key else "·"
+        mark = "▸" if preset and preset.key == p.key else "·"
         lines.append(
-            f"{mark} <b>{p.title}</b>  шаг <code>{p.delay_min:.2f}–{p.delay_max:.2f}с</code>"
-            f" · {p.steps_min}–{p.steps_max} шаг.\n"
+            f"{mark} <b>{p.title}</b>\n"
+            f"   <code>{p.delay_min:.2f}–{p.delay_max:.2f}с</code>"
+            f" · {p.steps_min}–{p.steps_max} шаг\n"
             f"   <i>{p.blurb}</i>"
         )
     lines += ["", "Своя скорость — кнопка ниже."]
@@ -119,44 +142,47 @@ def mangabuff_home(
     sec_per_chapter: float = 0.0,
     session_titles: int = 0,
     chapters_pending: int = 0,
+    battles_won: int = 0,
+    trades_sent: int = 0,
 ) -> str:
-    state = "● фарм идёт" if running else "○ пауза"
+    state = "● фарм" if running else "○ пауза"
     bar = progress_bar(chapters, 10)
     if sec_per_chapter > 0:
-        pace = f"~{sec_per_chapter:.1f} с/гл"
+        pace = f"{sec_per_chapter:.1f} с/гл"
     elif cph > 0:
-        pace = f"~{3600.0 / cph:.1f} с/гл"
+        pace = f"{3600.0 / cph:.1f} с/гл"
     else:
         pace = "замер…"
     total = chapters_total if chapters_total > 0 else chapters
-    pending_line = (
-        f" · ⏳ <b>{chapters_pending}</b> в очереди"
+    pending = (
+        f"\nОчередь  <b>{chapters_pending}</b> гл"
         if chapters_pending > 0
         else ""
     )
-    titles_line = (
-        f"🏷 Тайтлы    <b>{session_titles}</b> за сессию · всего <b>{titles}</b>\n"
-        if session_titles > 0
-        else f"🏷 Тайтлы    <b>{titles}</b>\n"
+    titles_bit = (
+        f"{session_titles} / {titles}" if session_titles > 0 else str(titles)
     )
     return (
-        f"<b>📚 MangaBuff</b>\n"
-        f"<i>авточтение · награды · ивенты</i>\n"
+        f"<b>MangaBuff · статус</b>\n"
         f"{hr()}\n"
-        f"Статус: <code>{state}</code>\n"
-        f"Пресет: <b>{preset_title}</b>\n"
-        f"Пауза шага: <code>{dmin:.2f}–{dmax:.2f}с</code>\n"
-        f"Факт: <b>{cph:.0f}</b> гл/час · {pace}\n"
-        f"Сессия: <code>{bar}</code>  {chapters} гл.\n\n"
-        f"📖 За сессию <b>{chapters}</b> <i>(зачтено сайтом)</i>{pending_line}\n"
-        f"📚 Всего     <b>{total}</b>\n"
-        f"📄 Скроллы   <b>{pages}</b>\n"
-        f"{titles_line}"
-        f"🎁 Награды   <b>{rewards}</b> · 🃏 <b>{cards}</b>\n"
-        f"💬 Комменты  <b>{comments}</b>\n\n"
-        f"🌙 Ночь: <code>{night or 'выкл до 01:00 МСК'}</code>\n"
-        f"📝 {last_action or '—'}\n"
-        f"🔗 <code>{(last_url or '—')[:100]}</code>"
+        f"Состояние  <code>{state}</code>\n"
+        f"Пресет     <b>{preset_title}</b>\n"
+        f"Шаг        <code>{dmin:.2f}–{dmax:.2f}с</code>\n"
+        f"Темп       <b>{cph:.0f}</b> гл/ч · {pace}\n"
+        f"{hr()}\n"
+        f"<code>{bar}</code>  {chapters}\n"
+        f"Сессия     <b>{chapters}</b> <i>зачтено сайтом</i>{pending}\n"
+        f"Всего      <b>{total}</b>\n"
+        f"Тайтлы     <b>{titles_bit}</b>\n"
+        f"Скроллы    <b>{pages}</b>\n"
+        f"{hr()}\n"
+        f"Карты      <b>{cards}</b> · награды <b>{rewards}</b>\n"
+        f"Комменты   <b>{comments}</b>\n"
+        f"Бои        <b>{battles_won}</b> побед · обмены <b>{trades_sent}</b>\n"
+        f"{hr()}\n"
+        f"Ночь  <code>{night or 'выкл до 01:00 МСК'}</code>\n"
+        f"{last_action or '—'}\n"
+        f"<code>{(last_url or '—')[:90]}</code>"
     )
 
 
@@ -174,24 +200,34 @@ def cards_events_home(
     last_drop: str,
     last_action: str,
     auto_market: bool = False,
+    auto_battle: bool = False,
+    auto_trade: bool = False,
+    battles_won: int = 0,
+    battles_total: int = 0,
+    trades_sent: int = 0,
 ) -> str:
     return (
-        f"<b>🃏 Карты · Эвенты</b>\n"
-        f"<i>дропы · сундуки · паки · площадка</i>\n"
+        f"<b>Карты · бои · обмены</b>\n"
         f"{hr()}\n"
-        f"Автофарм: <code>{'● on' if events_on else '○ off'}</code>\n"
-        f"Чтение: <code>{'● on' if read_on else '○ off'}</code>\n"
-        f"Уведомления карт: <code>{'●' if notify_cards else '○'}</code>\n"
-        f"Авто-лоты: <code>{'●' if auto_market else '○'}</code>\n\n"
-        f"🃏 Карт всего <b>{cards_total}</b> · сессия <b>{cards_session}</b>\n"
-        f"📜 Свитки <b>{scrolls}</b>\n"
-        f"📦 Сундуки <b>{chests}</b> · Паки <b>{packs}</b>\n"
-        f"🎯 Эвенты <b>{events}</b> · 🎁 Награды <b>{rewards}</b>\n\n"
-        f"Последний дроп: <i>{last_drop or '—'}</i>\n"
-        f"📝 {last_action or '—'}\n\n"
-        f"<i>Дроп — с редкостью · на площадку только топ-10 дорогих.\n"
-        f"Лот: 1× ранг выше (X → 2×X); раз в сутки ↔ 2× та же.\n"
-        f"Сундуки — /battle · паки — /cards/pack.</i>"
+        f"Автофарм   <code>{'●' if events_on else '○'}</code>\n"
+        f"Чтение     <code>{'●' if read_on else '○'}</code>\n"
+        f"Бои        <code>{'●' if auto_battle else '○'}</code>\n"
+        f"Обмены     <code>{'●' if auto_trade else '○'}</code>\n"
+        f"Лоты       <code>{'●' if auto_market else '○'}</code>\n"
+        f"Алерты     <code>{'●' if notify_cards else '○'}</code>\n"
+        f"{hr()}\n"
+        f"Карты      <b>{cards_total}</b> · сессия <b>{cards_session}</b>\n"
+        f"Свитки     <b>{scrolls}</b>\n"
+        f"Сундуки    <b>{chests}</b> · паки <b>{packs}</b>\n"
+        f"Эвенты     <b>{events}</b> · награды <b>{rewards}</b>\n"
+        f"Бои        <b>{battles_won}</b> / {battles_total}\n"
+        f"Обмены     <b>{trades_sent}</b> отправлено\n"
+        f"{hr()}\n"
+        f"Дроп · <i>{last_drop or '—'}</i>\n"
+        f"{last_action or '—'}\n\n"
+        f"<i>Бои — пробуждение, поиск, итоги.\n"
+        f"Обмен — A → просим S у разных игроков.\n"
+        f"Улучшение / заточка — авто в цикле карт.</i>"
     )
 
 
@@ -206,16 +242,17 @@ def pulse_text(
     events_on: bool = False,
     cards_session: int = 0,
 ) -> str:
-    pace = f" · ~{sec_per_chapter:.1f} с/гл" if sec_per_chapter > 0 else ""
-    total = f" / всего {chapters_total}" if chapters_total > 0 else ""
+    pace = f" · {sec_per_chapter:.1f} с/гл" if sec_per_chapter > 0 else ""
+    total = f" / {chapters_total}" if chapters_total > 0 else ""
     return (
-        f"<b>✦ Пульс</b>\n"
+        f"<b>Пульс</b>\n"
         f"{hr()}\n"
-        f"📚 Чтение      {'●' if mb_on else '○'}\n"
-        f"🃏 Карты/эвент {'●' if events_on else '○'}\n\n"
-        f"📖 {chapters} гл{total} · {cph:.0f}/ч{pace}\n"
-        f"🃏 Карт за сессию: <b>{cards_session}</b>\n"
-        f"🎚 {speed}\n\n"
+        f"Чтение     {'●' if mb_on else '○'}\n"
+        f"Карты      {'●' if events_on else '○'}\n"
+        f"{hr()}\n"
+        f"<b>{chapters}</b> гл{total} · <b>{cph:.0f}</b>/ч{pace}\n"
+        f"Карты сессии · <b>{cards_session}</b>\n"
+        f"Темп · {speed}\n\n"
         f"<i>{last_mb or 'ожидание'}</i>"
     )
 
@@ -224,10 +261,11 @@ def help_text() -> str:
     return (
         f"<b>{BRAND}</b>\n"
         f"{hr()}\n"
-        f"<b>Фарм</b> — чтение тайтлов до 90%, главы через addHistory.\n"
-        f"<b>Карты · Эвенты</b> — сундуки, паки, дейлики, дропы, площадка.\n\n"
-        f"Карты — лента /notifications · редкость в уведомлении.\n"
-        f"Площадка — топ-10 самых дорогих; 1× выше / X→2×X; сутки ↔ 2× та же.\n"
-        f"Свитки — до 5/сутки (~1ч).\n"
+        f"<b>Фарм</b> — чтение до ~90%, зачёт через addHistory.\n"
+        f"<b>Карты</b> — сундуки, паки, дропы, площадка.\n"
+        f"<b>Бои</b> — пробуждение, поиск боя, победы, дейлики.\n"
+        f"<b>Обмены</b> — предложения A→S разным игрокам.\n"
+        f"<b>Улучшение</b> — прокачка и заточка дублей.\n\n"
+        f"Статистика глав — только то, что принял сайт.\n"
         f"Ночь 01:00–05:00 МСК — пауза."
     )

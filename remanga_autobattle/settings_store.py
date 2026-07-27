@@ -32,9 +32,11 @@ class RuntimeSettings:
     mangabuff_notify_milestones: bool = True
     mangabuff_notify_cards: bool = True
     mangabuff_auto_market: bool = True
+    mangabuff_auto_battle: bool = True
+    mangabuff_auto_trade: bool = True
     mangabuff_farm_enabled: bool = False
     mangabuff_events_farm_enabled: bool = False
-    mangabuff_stats_site_only: bool = False
+    mangabuff_stats_site_only: bool = True
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)

@@ -69,6 +69,7 @@ EVENT_FARM_URLS = (
     "https://mangabuff.ru/cards",
     "https://mangabuff.ru/cards/pack",
     "https://mangabuff.ru/cards?scroll_enable=1",
+    "https://mangabuff.ru/trades",
     "https://mangabuff.ru/decks",
     "https://mangabuff.ru/products",
     "https://mangabuff.ru/transactions",
@@ -750,6 +751,12 @@ class MangaBuffStats:
     commented_chapters: List[str] = field(default_factory=list)
     # Уже обработанные уведомления сайта (id/hash) — без повторных TG-алертов
     seen_notifications: List[str] = field(default_factory=list)
+    # chapter_id уже зачтённых глав — против завышения счётчика
+    credited_chapter_ids: List[str] = field(default_factory=list)
+    battles_won: int = 0
+    battles_total: int = 0
+    trades_sent: int = 0
+    cards_upgraded: int = 0
 
     def touch(self, action: str, url: str = "") -> None:
         self.last_action = action
@@ -776,6 +783,11 @@ class MangaBuffStats:
             cleaned["seen_notifications"] = []
         else:
             cleaned["seen_notifications"] = [str(x) for x in seen if x][-800:]
+        credited = cleaned.get("credited_chapter_ids")
+        if not isinstance(credited, list):
+            cleaned["credited_chapter_ids"] = []
+        else:
+            cleaned["credited_chapter_ids"] = [str(x) for x in credited if x][-8000:]
         return cls(**cleaned)
 
     def to_telegram(self, delay_range: Tuple[float, float] = (5.0, 15.0)) -> str:
@@ -956,9 +968,13 @@ class MangaBuffService:
         # колбэк: async (CardDropInfo) -> None — уведомление о картах
         self.on_card_drop = None
         self._seen_notifications: set[str] = set(self.stats.seen_notifications or [])
+        self._credited_chapter_ids: set[str] = set(
+            self.stats.credited_chapter_ids or []
+        )
         self._mb_user_id: str = ""
         self._last_history_post_at: float = 0.0
         self._history_gap_boost_until: float = 0.0
+        self._turbo_flush_at: int = 4
         self._migrate_stats_if_needed()
         # сброс ложных дропов («Тайтлы» из навбара) — портили статистику карт
         if "тайтл" in (self.stats.last_card_drop or "").lower():
@@ -1205,7 +1221,7 @@ class MangaBuffService:
     def _history_min_gap_for_tier(self) -> float:
         """Минимальный интервал между POST /addHistory (429 на слишком частых запросах)."""
         base = {
-            "turbo": 8.0,
+            "turbo": 7.0,
             "fast": 9.0,
             "lively": 14.0,
             "normal": 16.0,
@@ -1213,7 +1229,7 @@ class MangaBuffService:
             "crawl": 20.0,
         }[self._tempo_tier()]
         if time_mod.time() < self._history_gap_boost_until:
-            base += 8.0
+            base += 5.0
         return base
 
     def _native_flush_timeout(self) -> float:
@@ -1222,8 +1238,13 @@ class MangaBuffService:
         if tier == "turbo":
             return 0.0
         if tier == "fast":
-            return 1.0
-        return 12.0
+            return 0.8
+        if tier == "lively":
+            return 3.0
+        return 8.0
+
+    def _turbo_pool_flush_at(self) -> int:
+        return max(2, int(self._turbo_flush_at or 4))
 
     def _scroll_plan(self, total_height: int, viewport: int) -> Tuple[int, int]:
         """
@@ -1556,7 +1577,7 @@ class MangaBuffService:
             result.packs += packs
             result.details.extend(details)
             self.stats.rewards_claimed += c
-            self.stats.cards_claimed += cards
+            # cards только через _emit_card_drop (анти-дубли)
             self.stats.scrolls_claimed += scrolls
             self.stats.chests_opened += chests
             self.stats.packs_opened += packs
@@ -1570,11 +1591,21 @@ class MangaBuffService:
                     f"дроп: +{drop.cards} карт / +{drop.scrolls} свитков"
                 )
 
-            if "/battle" in url:
+            if "/battle" in url and "/awakening" not in url and "/reroll" not in url:
                 ev = await self._farm_battle_events(page)
                 result.events += len(ev)
                 result.details.extend(ev)
                 self.stats.events_actions += len(ev)
+                try:
+                    from settings_store import load_settings as _ls
+
+                    if _ls().mangabuff_auto_battle:
+                        battled = await self._run_card_battles(page, max_fights=3)
+                        if battled:
+                            result.details.append(f"бои: {battled}")
+                            result.events += battled
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("auto battles: %s", exc)
                 # ещё раз сундук после дейликов
                 c2, cards2, sc2, ch2, pk2, d2 = await self._click_reward_buttons(page)
                 result.claimed += c2
@@ -1584,10 +1615,36 @@ class MangaBuffService:
                 result.packs += pk2
                 result.details.extend(d2)
                 self.stats.rewards_claimed += c2
-                self.stats.cards_claimed += cards2
                 self.stats.scrolls_claimed += sc2
                 self.stats.chests_opened += ch2
                 self.stats.packs_opened += pk2
+            elif "/battle/awakening" in url:
+                try:
+                    from settings_store import load_settings as _ls
+
+                    if _ls().mangabuff_auto_battle:
+                        n = await self._run_card_awakening(page, max_cards=2)
+                        if n:
+                            result.details.append(f"пробуждение: {n}")
+                            result.events += n
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("awakening: %s", exc)
+            elif "/trades" in url:
+                try:
+                    from settings_store import load_settings as _ls
+
+                    s = _ls()
+                    if s.mangabuff_auto_trade:
+                        sent = await self._run_card_trades_unlocked(offers=4)
+                        if sent:
+                            result.details.append(f"обмены: {sent}")
+                            result.events += sent
+                    up = await self._run_card_upgrades_unlocked(max_ops=2)
+                    if up:
+                        result.details.append(f"улучшение: {up}")
+                        result.events += up
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("trades/upgrade: %s", exc)
 
         gained = max(0, int(self.stats.cards_claimed or 0) - before_cards)
         if gained > 0 and not result.cards:
@@ -1860,7 +1917,6 @@ class MangaBuffService:
                 except Exception:  # noqa: BLE001
                     continue
             if info.cards:
-                self.stats.cards_claimed += info.cards
                 line = info.cards_line(2)
                 self.stats.last_card_drop = (
                     f"+{info.cards} · {line}" if line else f"+{info.cards}"
@@ -1872,7 +1928,6 @@ class MangaBuffService:
                 + (f" свит +{info.scrolls}" if info.scrolls else ""),
                 page.url,
             )
-            self._persist_stats()
             logger.info(
                 "MangaBuff card drop +%s scrolls +%s from %s ranks=%s names=%s",
                 info.cards,
@@ -1894,12 +1949,18 @@ class MangaBuffService:
                 await self._enrich_card_drop_rarity(page, info)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("enrich card rarity: %s", exc)
+        fp = self._card_drop_fingerprint(info)
+        if info.cards and not self._remember_notification(f"cd:{fp}"):
+            logger.info("MangaBuff skip duplicate card notify %s", fp)
+            return
+        if info.cards:
+            self.stats.cards_claimed += max(0, int(info.cards))
             if info.ranks:
                 line = info.cards_line(3)
                 self.stats.last_card_drop = (
                     f"+{info.cards} · {line}" if line else f"+{info.cards}"
                 )
-                self._persist_stats()
+            self._persist_stats()
         cb = self.on_card_drop
         if cb is None:
             return
@@ -1936,6 +1997,30 @@ class MangaBuffService:
         self._seen_notifications = set(recent)
         self.stats.seen_notifications = recent
         return True
+
+    def _card_drop_fingerprint(self, info: "CardDropInfo") -> str:
+        if info.user_card_ids:
+            ids = ",".join(str(x) for x in sorted(set(info.user_card_ids)))
+            return f"uid:{ids}"
+        ranks = ",".join(info.ranks[:3])
+        names = "|".join(info.names[:2])
+        minute = int(time_mod.time() // 60)
+        return f"rn:{ranks}|n:{names}|c:{info.cards}|m:{minute}"
+
+    def _credit_chapter_ids(self, chapter_ids: List[str]) -> int:
+        """Засчитать только новые chapter_id. Возвращает число новых."""
+        fresh = 0
+        for cid in chapter_ids:
+            cid = str(cid or "").strip()
+            if not cid or cid in self._credited_chapter_ids:
+                continue
+            self._credited_chapter_ids.add(cid)
+            fresh += 1
+        if fresh:
+            recent = list(self._credited_chapter_ids)[-8000:]
+            self._credited_chapter_ids = set(recent)
+            self.stats.credited_chapter_ids = recent
+        return fresh
 
     def _parse_ranks_from_text(self, text: str) -> List[str]:
         ranks: List[str] = []
@@ -2856,12 +2941,6 @@ class MangaBuffService:
             )
 
         if info.cards or info.scrolls:
-            if info.cards:
-                self.stats.cards_claimed += info.cards
-                line = info.cards_line(2)
-                self.stats.last_card_drop = (
-                    f"+{info.cards} · {line}" if line else f"+{info.cards}"
-                )
             if info.scrolls:
                 self.stats.scrolls_claimed += info.scrolls
             self.stats.touch(
@@ -2869,7 +2948,6 @@ class MangaBuffService:
                 + (f" свит +{info.scrolls}" if info.scrolls else ""),
                 page.url,
             )
-            self._persist_stats()
             await self._emit_card_drop(info, page)
         else:
             self._persist_stats()
@@ -2923,16 +3001,9 @@ class MangaBuffService:
                     info.ranks.append(r)
             info.raw = (text or name_hint)[:200]
         if info.cards or info.scrolls:
-            if info.cards:
-                self.stats.cards_claimed += info.cards
-                line = info.cards_line(2)
-                self.stats.last_card_drop = (
-                    f"+{info.cards} · {line}" if line else f"+{info.cards}"
-                )
             if info.scrolls:
                 self.stats.scrolls_claimed += info.scrolls
             self.stats.touch(f"тост: карт +{info.cards}", page.url)
-            self._persist_stats()
             logger.info(
                 "MangaBuff reader toast +%s scrolls +%s ranks=%s names=%s",
                 info.cards,
@@ -3683,10 +3754,10 @@ class MangaBuffService:
             tier = self._tempo_tier()
             self._history_gap_boost_until = max(
                 self._history_gap_boost_until,
-                time_mod.time() + (90.0 if tier == "turbo" else 120.0),
+                time_mod.time() + (40.0 if tier == "turbo" else 90.0),
             )
             backoff = {
-                "turbo": 14.0,
+                "turbo": 12.0,
                 "fast": 16.0,
                 "lively": 22.0,
             }.get(tier, 8.0 + (attempt - 1) * 6.0)
@@ -3734,6 +3805,8 @@ class MangaBuffService:
         )
 
         flush_at = ccl
+        if tier == "turbo":
+            flush_at = self._turbo_pool_flush_at()
         if tier == "turbo" and not force_flush:
             return 0
         if pool >= flush_at:
@@ -3744,8 +3817,9 @@ class MangaBuffService:
                     timeout_sec=self._native_flush_timeout(),
                 )
                 if native_flushed > 0:
+                    # native flush без chapter_id — не завышаем; 0 до ручного учёта
                     self.stats.chapters_pending = await self._history_pool_size(page)
-                    return native_flushed
+                    return 0
             if tier in ("turbo", "fast"):
                 return await self._flush_history_pool_confirmed(page)
 
@@ -3793,6 +3867,7 @@ class MangaBuffService:
                     posted: true,
                     status: resp.status,
                     count: items.length,
+                    chapter_ids: items.map(it => String(it.chapter_id || '')),
                     data: json,
                     cleared: resp.status >= 200 && resp.status < 300
                   };
@@ -3808,6 +3883,9 @@ class MangaBuffService:
         status = int(data.get("status") or 0)
         count = int(data.get("count") or 0)
         cleared = bool(data.get("cleared"))
+        chapter_ids = [
+            str(x) for x in (data.get("chapter_ids") or []) if x
+        ]
         logger.info(
             "MangaBuff addHistory status=%s chapters=%s cleared=%s data=%s",
             status,
@@ -3823,6 +3901,14 @@ class MangaBuffService:
             return 0, None
 
         self._last_history_post_at = time_mod.time()
+        # только новые chapter_id — иначе TG/статы завышаются на re-read
+        fresh = self._credit_chapter_ids(chapter_ids) if chapter_ids else count
+        if fresh <= 0:
+            logger.info(
+                "MangaBuff addHistory ok but 0 new chapters (already credited)"
+            )
+            return 0, None
+        count = fresh
         payload = data.get("data") if isinstance(data.get("data"), dict) else {}
         info = CardDropInfo(source="addHistory")
         if payload.get("image") or payload.get("name") or payload.get("rank"):
@@ -3841,32 +3927,32 @@ class MangaBuffService:
                     info.user_card_ids.append(int(raw_id))
                     break
             info.raw = str(payload)[:200]
-            self.stats.cards_claimed += 1
-            line = info.cards_line(1)
-            self.stats.last_card_drop = f"+1 · {line}" if line else "+1"
             self.stats.touch("карта из addHistory", page.url)
-            self._persist_stats()
             logger.info(
                 "MangaBuff card from addHistory: %s rank=%s",
                 name or payload.get("image"),
                 rank or "?",
             )
 
+        # turbo: не дублируем toast/UI harvest — карта уже из JSON
+        if info.cards:
+            await self._emit_card_drop(info, page)
+            return count, None
         if self._tempo_tier() != "turbo":
             await self._tempo_pause(0.25, 0.6)
             try:
                 toast = await self._harvest_reader_toast(page)
-                if toast.cards and not info.cards:
+                if toast.cards:
                     return count, None
             except Exception:  # noqa: BLE001
                 pass
             try:
                 drop = await self._harvest_card_drops(page, source="addHistory-ui")
-                if drop.cards and not info.cards:
+                if drop.cards:
                     return count, None
             except Exception:  # noqa: BLE001
                 pass
-        return count, (info if info.cards else None)
+        return count, None
 
     async def _animate_scroll(self, page: Page, start: int, end: int) -> None:
         tier = self._tempo_tier()
@@ -4744,13 +4830,20 @@ class MangaBuffService:
             self.stats.chapters_pending = pending
             turbo_moved_next = False
 
-            if tier == "turbo" and pending >= 2 and confirmed <= 0:
+            if tier == "turbo" and pending >= self._turbo_pool_flush_at() and confirmed <= 0:
                 turbo_moved_next = await self._go_next_chapter_with_retry(page)
                 confirmed = await self._flush_history_pool_confirmed(page)
                 pending = await self._history_pool_size(page)
                 self.stats.chapters_pending = pending
-            elif tier == "turbo" and pending == 1 and confirmed <= 0:
+            elif tier == "turbo" and pending >= 1 and confirmed <= 0:
+                # продолжаем читать пока копится пакет / идёт gap
                 turbo_moved_next = await self._go_next_chapter_with_retry(page)
+                gap = self._history_min_gap_for_tier()
+                ready = (time_mod.time() - self._last_history_post_at) >= gap
+                if pending >= 2 and ready:
+                    confirmed = await self._flush_history_pool_confirmed(page)
+                    pending = await self._history_pool_size(page)
+                    self.stats.chapters_pending = pending
             elif confirmed <= 0 and pending >= 2:
                 logger.warning(
                     "MangaBuff addHistory backlog pool=%s at %s — retry flush",
@@ -4868,6 +4961,494 @@ class MangaBuffService:
 
     def _in_night_break_window(self) -> bool:
         return self._night_break_remaining() is not None
+
+    async def _csrf_token(self, page: Page) -> str:
+        try:
+            return str(
+                await page.evaluate(
+                    """() => {
+                      const m = document.querySelector('meta[name="csrf-token"]');
+                      return m ? (m.getAttribute('content') || '') : '';
+                    }"""
+                )
+                or ""
+            )
+        except Exception:  # noqa: BLE001
+            return ""
+
+    async def _post_json(
+        self, page: Page, url: str, payload: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        csrf = await self._csrf_token(page)
+        try:
+            data = await page.evaluate(
+                """async ({url, payload, csrf}) => {
+                  const body = new URLSearchParams();
+                  const append = (k, v) => {
+                    if (Array.isArray(v)) {
+                      v.forEach((it, i) => {
+                        if (it && typeof it === 'object') {
+                          Object.entries(it).forEach(([kk, vv]) => body.append(k+'['+i+']['+kk+']', String(vv)));
+                        } else {
+                          body.append(k+'[]', String(it));
+                        }
+                      });
+                    } else if (v != null) body.append(k, String(v));
+                  };
+                  Object.entries(payload || {}).forEach(([k,v]) => append(k, v));
+                  const resp = await fetch(url, {
+                    method: 'POST',
+                    headers: {
+                      'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+                      'X-CSRF-TOKEN': csrf || '',
+                      'X-Requested-With': 'XMLHttpRequest'
+                    },
+                    body: body.toString(),
+                    credentials: 'same-origin'
+                  });
+                  let json = null;
+                  const raw = await resp.text();
+                  try { json = JSON.parse(raw); } catch (e) { json = {raw: raw.slice(0,400)}; }
+                  return {status: resp.status, json};
+                }""",
+                {"url": url, "payload": payload, "csrf": csrf},
+            )
+            return data if isinstance(data, dict) else {}
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("post %s: %s", url, exc)
+            return {"status": 0, "json": {"error": str(exc)}}
+
+    async def _run_card_battles(self, page: Page, max_fights: int = 3) -> int:
+        """Найти бой → дождаться итогов → забрать дейлики."""
+        done = 0
+        if not await self._safe_goto(page, "https://mangabuff.ru/battle"):
+            return 0
+        await self._dismiss_overlays(page)
+        for _ in range(max(1, max_fights)):
+            if self._stop_flag.is_set() or self._events_stop.is_set():
+                break
+            # забрать дейлик-награды
+            for text in ("Забрать", "Получить", "Забрать награду"):
+                loc = page.get_by_role("button", name=re.compile(re.escape(text), re.I))
+                try:
+                    n = await loc.count()
+                except Exception:  # noqa: BLE001
+                    n = 0
+                for i in range(min(n, 4)):
+                    try:
+                        btn = loc.nth(i)
+                        if await btn.is_visible(timeout=300):
+                            await btn.click(force=True, timeout=1500)
+                            await asyncio.sleep(0.4)
+                    except Exception:  # noqa: BLE001
+                        pass
+
+            start = page.locator("[data-battle-start]").first
+            try:
+                if not await start.count() or not await start.is_visible(timeout=800):
+                    break
+                await start.click(force=True, timeout=3000)
+            except Exception:  # noqa: BLE001
+                # fallback POST
+                resp = await self._post_json(page, "/battle/fight/start", {})
+                fight_id = (resp.get("json") or {}).get("fight_id") or (
+                    resp.get("json") or {}
+                ).get("id")
+                if fight_id:
+                    await self._safe_goto(
+                        page, f"https://mangabuff.ru/battle/fight/{fight_id}"
+                    )
+                else:
+                    break
+
+            # ждём страницу боя
+            deadline = time_mod.time() + 25.0
+            while time_mod.time() < deadline:
+                if "/battle/fight/" in page.url:
+                    break
+                await asyncio.sleep(0.4)
+            if "/battle/fight/" not in page.url:
+                logger.info("MangaBuff battle: no fight page")
+                break
+
+            self.stats.battles_total += 1
+            # пропуск анимации
+            try:
+                skip = page.locator(".battle-control__button--skip").first
+                if await skip.count() and await skip.is_visible(timeout=1500):
+                    await skip.click(force=True, timeout=2000)
+            except Exception:  # noqa: BLE001
+                pass
+
+            # ждём финал
+            finished = False
+            win = False
+            for _wait in range(40):
+                text = ""
+                try:
+                    text = await page.evaluate(
+                        "() => (document.body && document.body.innerText) || ''"
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+                low = text.lower()
+                if re.search(r"победа|вы победили|победили", low):
+                    finished, win = True, True
+                    break
+                if re.search(r"поражение|проиграли|вы проиграли", low):
+                    finished, win = True, False
+                    break
+                if re.search(r"итог|результат боя|бой заверш", low):
+                    finished = True
+                    win = "побед" in low
+                    break
+                try:
+                    skip = page.locator(".battle-control__button--skip").first
+                    if await skip.count() and await skip.is_visible(timeout=200):
+                        await skip.click(force=True, timeout=1000)
+                except Exception:  # noqa: BLE001
+                    pass
+                await asyncio.sleep(0.6)
+
+            if win:
+                self.stats.battles_won += 1
+                done += 1
+                self.stats.touch("победа в карточном бою", page.url)
+            elif finished:
+                self.stats.touch("бой завершён", page.url)
+            self._persist_stats()
+            await self._safe_goto(page, "https://mangabuff.ru/battle")
+            await asyncio.sleep(0.8)
+        return done
+
+    async def _run_card_awakening(self, page: Page, max_cards: int = 2) -> int:
+        """Пробудить до max_cards карт (если есть энергия)."""
+        if not await self._safe_goto(page, "https://mangabuff.ru/battle/awakening"):
+            return 0
+        await self._dismiss_overlays(page)
+        awakened = 0
+        for _ in range(max(1, max_cards)):
+            if self._stop_flag.is_set():
+                break
+            energy = await page.evaluate(
+                """() => {
+                  const el = document.querySelector('[data-awakening-energy]');
+                  const t = el ? (el.innerText || '') : '';
+                  const m = t.match(/(\\d+)/);
+                  return m ? parseInt(m[1], 10) : 0;
+                }"""
+            )
+            if int(energy or 0) <= 0:
+                break
+            # клик по первой карте в инвентаре
+            clicked = await page.evaluate(
+                """() => {
+                  const card = document.querySelector(
+                    '.card-inventory-container--battle-awakening [data-id], '
+                    + '.card-inventory-container .card-item, '
+                    + '.card-filter-form ~ * [data-id]'
+                  );
+                  if (!card) return false;
+                  card.click();
+                  return true;
+                }"""
+            )
+            if not clicked:
+                # попробовать любой кликабельный элемент инвентаря
+                loc = page.locator(
+                    ".card-inventory-container--battle-awakening img, "
+                    ".card-inventory-container [data-id]"
+                )
+                try:
+                    if await loc.count():
+                        await loc.first.click(force=True, timeout=2000)
+                        clicked = True
+                except Exception:  # noqa: BLE001
+                    clicked = False
+            if not clicked:
+                break
+            await asyncio.sleep(0.4)
+            submit = page.locator("[data-awakening-submit]").first
+            try:
+                if await submit.count() and await submit.is_visible(timeout=800):
+                    await submit.click(force=True, timeout=2500)
+                    awakened += 1
+                    self.stats.cards_upgraded += 1
+                    self.stats.touch("пробуждение карты", page.url)
+                    await asyncio.sleep(1.2)
+                    await self._harvest_card_drops(page, source="awakening")
+            except Exception:  # noqa: BLE001
+                break
+        if awakened:
+            self._persist_stats()
+        return awakened
+
+    async def _inventory_cards_by_rank(
+        self, page: Page, rank: str, limit: int = 8
+    ) -> List[Dict[str, Any]]:
+        """Карты своего инвентаря нужного ранга через cards-filter."""
+        await self._refresh_user_id(page)
+        uid = self._mb_user_id
+        if not uid:
+            return []
+        csrf = await self._csrf_token(page)
+        try:
+            data = await page.evaluate(
+                """async ({uid, rank, limit, csrf}) => {
+                  const body = new URLSearchParams();
+                  body.append('page', '1');
+                  body.append('per_page', String(limit));
+                  body.append('rank', rank || '');
+                  const resp = await fetch('/cards-filter/' + uid, {
+                    method: 'POST',
+                    headers: {
+                      'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+                      'X-CSRF-TOKEN': csrf || '',
+                      'X-Requested-With': 'XMLHttpRequest'
+                    },
+                    body: body.toString(),
+                    credentials: 'same-origin'
+                  });
+                  const raw = await resp.text();
+                  let json = null;
+                  try { json = JSON.parse(raw); } catch (e) { return {status: resp.status, raw: raw.slice(0,300)}; }
+                  return {status: resp.status, json};
+                }""",
+                {"uid": uid, "rank": rank, "limit": limit, "csrf": csrf},
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("inventory filter: %s", exc)
+            return []
+        items: List[Dict[str, Any]] = []
+        payload = (data or {}).get("json") if isinstance(data, dict) else None
+        if isinstance(payload, dict):
+            raw_items = (
+                payload.get("cards")
+                or payload.get("data")
+                or payload.get("items")
+                or []
+            )
+            if isinstance(raw_items, dict):
+                raw_items = list(raw_items.values())
+            for it in raw_items or []:
+                if not isinstance(it, dict):
+                    continue
+                cid = (
+                    it.get("id")
+                    or it.get("card_user_id")
+                    or it.get("user_card_id")
+                    or (it.get("card") or {}).get("id")
+                )
+                if not cid:
+                    continue
+                items.append(
+                    {
+                        "id": int(cid) if str(cid).isdigit() else cid,
+                        "rank": str(
+                            it.get("rank")
+                            or (it.get("card") or {}).get("rank")
+                            or rank
+                        ).upper(),
+                        "name": str(
+                            it.get("name")
+                            or (it.get("card") or {}).get("name")
+                            or ""
+                        ),
+                        "available": bool(
+                            it.get("available_for_trade", True)
+                        ),
+                    }
+                )
+        return items[:limit]
+
+    async def _pick_trade_targets(self, page: Page, limit: int = 8) -> List[str]:
+        """ID пользователей для обмена (рейтинг / колоды)."""
+        ids: List[str] = []
+        for url in (
+            "https://mangabuff.ru/users",
+            "https://mangabuff.ru/rating",
+            "https://mangabuff.ru/decks",
+        ):
+            if len(ids) >= limit:
+                break
+            if not await self._safe_goto(page, url):
+                continue
+            found = await page.evaluate(
+                """() => [...document.querySelectorAll("a[href*='/users/']")]
+                  .map(a => (a.href.match(/\\/users\\/(\\d+)/) || [])[1])
+                  .filter(Boolean)"""
+            )
+            for uid in found or []:
+                uid = str(uid)
+                if uid and uid != self._mb_user_id and uid not in ids:
+                    ids.append(uid)
+                if len(ids) >= limit:
+                    break
+        return ids
+
+    async def run_card_trades(self, offers: int = 6) -> int:
+        """Кинуть обмены: отдаём A, просим S у разных игроков."""
+        async with self._lock:
+            return await self._run_card_trades_unlocked(offers=offers)
+
+    async def _run_card_trades_unlocked(self, offers: int = 6) -> int:
+        assert self._page is not None
+        page = self._page
+        await self._ensure_login_unlocked()
+        await self._refresh_user_id(page)
+        my_a = await self._inventory_cards_by_rank(page, "A", limit=12)
+        my_a = [c for c in my_a if c.get("available")]
+        if not my_a:
+            # fallback: G/B тоже можно кидать
+            for rank in ("G", "B", "C"):
+                my_a = await self._inventory_cards_by_rank(page, rank, limit=12)
+                my_a = [c for c in my_a if c.get("available")]
+                if my_a:
+                    break
+        if not my_a:
+            logger.info("MangaBuff trades: no offer cards")
+            return 0
+        targets = await self._pick_trade_targets(page, limit=max(offers, 6))
+        sent = 0
+        for i, receiver_id in enumerate(targets[:offers]):
+            if self._stop_flag.is_set():
+                break
+            offer = my_a[i % len(my_a)]
+            # страница трейда пользователя
+            trade_url = f"https://mangabuff.ru/trades/create/{receiver_id}"
+            ok = await self._safe_goto(page, trade_url)
+            if not ok or "404" in (await page.title()).lower():
+                # альтернатива: профиль → кнопка обмена
+                await self._safe_goto(page, f"https://mangabuff.ru/users/{receiver_id}")
+                href = await page.evaluate(
+                    """() => {
+                      const a = [...document.querySelectorAll('a')].find(x => /обмен/i.test(x.innerText||'') || /\\/trades\\//.test(x.href||''));
+                      return a ? a.href : '';
+                    }"""
+                )
+                if href:
+                    await self._safe_goto(page, href)
+                else:
+                    continue
+            # их S-карты на странице обмена
+            their_s = await page.evaluate(
+                """() => {
+                  const nodes = [...document.querySelectorAll(
+                    '.trade__inventory-item[data-id], [data-id][data-rank], .trade__inventory-item'
+                  )];
+                  const out = [];
+                  for (const el of nodes) {
+                    const id = el.getAttribute('data-id');
+                    const rank = (el.getAttribute('data-rank') || '').toUpperCase();
+                    const side = el.getAttribute('data-type') || el.getAttribute('data-side') || '';
+                    const cls = el.className || '';
+                    if (!id) continue;
+                    if (rank === 'S' || /\\bS\\b/.test(el.innerText||'')) {
+                      if (/receiver|their|other|opponent/i.test(side+cls) || !/creator|mine|my/i.test(side+cls)) {
+                        out.push(id);
+                      }
+                    }
+                  }
+                  return [...new Set(out)].slice(0, 3);
+                }"""
+            )
+            receiver_card_ids = [str(x) for x in (their_s or [])][:1]
+            # если не нашли S — всё равно шлём запрос с пустым receiver (сайт может отклонить)
+            resp = await self._post_json(
+                page,
+                "/trades/create",
+                {
+                    "receiver_id": receiver_id,
+                    "creator_card_ids": [str(offer["id"])],
+                    "receiver_card_ids": receiver_card_ids or [],
+                },
+            )
+            status = int(resp.get("status") or 0)
+            js = resp.get("json") if isinstance(resp.get("json"), dict) else {}
+            if status in (200, 201) or (js and js.get("trade")):
+                sent += 1
+                self.stats.trades_sent += 1
+                self.stats.touch(
+                    f"обмен A→S → user {receiver_id}",
+                    page.url,
+                )
+                logger.info(
+                    "MangaBuff trade sent to %s offer=%s want=%s",
+                    receiver_id,
+                    offer.get("id"),
+                    receiver_card_ids,
+                )
+            else:
+                logger.info(
+                    "MangaBuff trade fail user=%s status=%s json=%s",
+                    receiver_id,
+                    status,
+                    str(js)[:160],
+                )
+            await asyncio.sleep(0.8)
+        if sent:
+            self._persist_stats()
+        return sent
+
+    async def run_card_upgrades(self, max_ops: int = 3) -> int:
+        """Улучшение карт на /trades (вкладки улучшение)."""
+        async with self._lock:
+            return await self._run_card_upgrades_unlocked(max_ops=max_ops)
+
+    async def _run_card_upgrades_unlocked(self, max_ops: int = 3) -> int:
+        assert self._page is not None
+        page = self._page
+        await self._ensure_login_unlocked()
+        done = 0
+        # страницы улучшения / заточки
+        for url in (
+            "https://mangabuff.ru/trades",
+            "https://mangabuff.ru/cards/upgrade",
+            "https://mangabuff.ru/cards/level-up",
+        ):
+            if done >= max_ops:
+                break
+            if not await self._safe_goto(page, url):
+                continue
+            # клик по вкладке Улучшение если есть
+            try:
+                tab = page.get_by_text(re.compile(r"^Улучшение$", re.I))
+                if await tab.count():
+                    await tab.first.click(timeout=1500)
+                    await asyncio.sleep(0.8)
+            except Exception:  # noqa: BLE001
+                pass
+            # выбрать 2–3 карты и нажать улучшить
+            selected = await page.evaluate(
+                """() => {
+                  const items = [...document.querySelectorAll(
+                    '.card-upgrade__inventory [data-id], .card-inventory-container [data-id], [data-id]'
+                  )].slice(0, 8);
+                  const ids = [];
+                  for (const el of items) {
+                    const id = el.getAttribute('data-id');
+                    if (!id) continue;
+                    el.click();
+                    ids.push(id);
+                    if (ids.length >= 3) break;
+                  }
+                  return ids;
+                }"""
+            )
+            if not selected:
+                continue
+            resp = await self._post_json(
+                page, "/cards/upgrade", {"card_ids": list(selected)[:3]}
+            )
+            if int(resp.get("status") or 0) in (200, 201):
+                done += 1
+                self.stats.cards_upgraded += 1
+                self.stats.touch("улучшение карт", page.url)
+                await self._harvest_card_drops(page, source="upgrade")
+            await asyncio.sleep(0.6)
+        if done:
+            self._persist_stats()
+        return done
 
     async def farm_loop(self, on_progress=None) -> MangaBuffStats:
         """
