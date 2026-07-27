@@ -1205,7 +1205,7 @@ class MangaBuffService:
     def _history_min_gap_for_tier(self) -> float:
         """Минимальный интервал между POST /addHistory (429 на слишком частых запросах)."""
         base = {
-            "turbo": 5.0,
+            "turbo": 6.5,
             "fast": 9.0,
             "lively": 14.0,
             "normal": 16.0,
@@ -3734,10 +3734,10 @@ class MangaBuffService:
             ccl,
         )
 
-        flush_at = 1 if tier == "turbo" else ccl
+        flush_at = ccl
+        if tier == "turbo" and not force_flush:
+            return 0
         if pool >= flush_at:
-            if tier == "turbo" and not force_flush:
-                return 0
             if self._native_flush_timeout() > 0:
                 native_flushed = await self._wait_for_native_history_flush(
                     page,
@@ -4745,12 +4745,14 @@ class MangaBuffService:
             self.stats.chapters_pending = pending
             turbo_moved_next = False
 
-            if tier == "turbo" and pending >= 1 and confirmed <= 0:
+            if tier == "turbo" and pending >= 2 and confirmed <= 0:
                 turbo_moved_next = await self._go_next_chapter_with_retry(page)
                 confirmed = await self._flush_history_pool_confirmed(page)
                 pending = await self._history_pool_size(page)
                 self.stats.chapters_pending = pending
-            elif confirmed <= 0 and pending >= (1 if tier == "turbo" else 2):
+            elif tier == "turbo" and pending == 1 and confirmed <= 0:
+                turbo_moved_next = await self._go_next_chapter_with_retry(page)
+            elif confirmed <= 0 and pending >= 2:
                 logger.warning(
                     "MangaBuff addHistory backlog pool=%s at %s — retry flush",
                     pending,
@@ -4771,7 +4773,7 @@ class MangaBuffService:
                     pass
 
             if confirmed <= 0:
-                if pending >= (1 if tier == "turbo" else 2):
+                if pending >= 2:
                     logger.warning(
                         "MangaBuff pool still full at %s — advance anyway",
                         final_url,

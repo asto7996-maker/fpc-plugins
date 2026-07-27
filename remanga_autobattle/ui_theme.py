@@ -24,7 +24,7 @@ class SpeedPreset:
 
 
 SPEED_PRESETS: Dict[str, SpeedPreset] = {
-    "turbo": SpeedPreset("turbo", "Турбо", 0.02, 0.05, 1, 2, "~2–4 с/глава · ~900–1800 гл/ч"),
+    "turbo": SpeedPreset("turbo", "Турбо", 0.02, 0.05, 1, 2, "~3–5 с/глава · ~700–1200 гл/ч"),
     "fast": SpeedPreset("fast", "Быстрый", 0.08, 0.18, 3, 6, "~7–12 с/глава · ~300–500 гл/ч"),
     "lively": SpeedPreset("lively", "Живой", 0.20, 0.45, 5, 8, "~12–20 с/глава · ~180–300 гл/ч"),
     "normal": SpeedPreset("normal", "Норма", 0.50, 1.00, 7, 11, "~20–35 с/глава · ~100–180 гл/ч"),
