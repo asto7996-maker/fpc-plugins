@@ -1202,6 +1202,26 @@ class MangaBuffService:
             return
         await self._human_pause(max(0.01, lo), hi)
 
+    def _history_min_gap_for_tier(self) -> float:
+        """Минимальный интервал между POST /addHistory (429 на слишком частых запросах)."""
+        return {
+            "turbo": 3.5,
+            "fast": 7.0,
+            "lively": 11.0,
+            "normal": 16.0,
+            "slow": 18.0,
+            "crawl": 20.0,
+        }[self._tempo_tier()]
+
+    def _native_flush_timeout(self) -> float:
+        """Сколько ждать авто-отправку reader.js перед ручным flush."""
+        tier = self._tempo_tier()
+        if tier == "turbo":
+            return 1.5
+        if tier == "fast":
+            return 3.0
+        return 12.0
+
     def _scroll_plan(self, total_height: int, viewport: int) -> Tuple[int, int]:
         """
         Жёсткий план: steps из пресета, chunk подогнан под высоту главы.
@@ -1215,8 +1235,8 @@ class MangaBuffService:
         tier = self._tempo_tier()
         # в турбо/быстром — ещё крупнее прыжки
         if tier == "turbo":
-            chunk = max(chunk, int(viewport * random.uniform(6.0, 10.0)))
-            target_steps = min(target_steps, self.steps_max)
+            chunk = max(chunk, int(viewport * random.uniform(8.0, 14.0)))
+            target_steps = min(target_steps, max(1, self.steps_max - 1))
         elif tier == "fast":
             chunk = max(chunk, int(viewport * random.uniform(3.5, 5.5)))
         return target_steps, chunk
@@ -1224,8 +1244,8 @@ class MangaBuffService:
     def _chapter_gap_pause(self) -> Tuple[float, float]:
         """Пауза между главами по темпу."""
         return {
-            "turbo": (0.05, 0.18),
-            "fast": (0.12, 0.35),
+            "turbo": (0.02, 0.08),
+            "fast": (0.08, 0.22),
             "lively": (0.30, 0.70),
             "normal": (0.70, 1.50),
             "slow": (1.20, 2.80),
@@ -3249,12 +3269,12 @@ class MangaBuffService:
             await page.evaluate(
                 "() => window.scrollTo(0, document.body.scrollHeight)"
             )
-            await self._tempo_pause(0.12, 0.35)
+            await self._tempo_pause(0.04, 0.12)
         except Exception:  # noqa: BLE001
             pass
         await self._scroll_until_site_read(page)
         try:
-            reward_timeout = 3.0 if tier in ("turbo", "fast") else 8.0
+            reward_timeout = 1.2 if tier == "turbo" else (2.0 if tier == "fast" else 8.0)
             c, cards, scrolls, chests, packs, _ = await asyncio.wait_for(
                 self._click_reward_buttons(page), timeout=reward_timeout
             )
@@ -3271,6 +3291,12 @@ class MangaBuffService:
 
     async def _wait_for_chapter_context(self, page: Page, timeout_sec: float = 8.0) -> bool:
         """Дождаться window.current_chapter — без него addHistory не сработает."""
+        tier = self._tempo_tier()
+        if tier == "turbo":
+            timeout_sec = min(timeout_sec, 3.0)
+        elif tier == "fast":
+            timeout_sec = min(timeout_sec, 5.0)
+        poll = 0.12 if tier in ("turbo", "fast") else 0.35
         deadline = time_mod.time() + max(1.0, float(timeout_sec))
         while time_mod.time() < deadline:
             if self._stop_flag.is_set():
@@ -3285,7 +3311,7 @@ class MangaBuffService:
                     return True
             except Exception:  # noqa: BLE001
                 pass
-            await asyncio.sleep(0.35)
+            await asyncio.sleep(poll)
         return False
 
     async def _scroll_until_site_read(self, page: Page) -> bool:
@@ -3294,8 +3320,10 @@ class MangaBuffService:
         Без этого addHistory() на сайте не срабатывает — только комментарии «живут».
         """
         tier = self._tempo_tier()
-        pause = 0.12 if tier == "turbo" else (0.22 if tier == "fast" else 0.45)
-        deadline = time_mod.time() + (35.0 if tier in ("turbo", "fast") else 55.0)
+        pause = 0.05 if tier == "turbo" else (0.15 if tier == "fast" else 0.45)
+        deadline = time_mod.time() + (
+            10.0 if tier == "turbo" else (18.0 if tier == "fast" else 55.0)
+        )
         chapter_url = page.url.split("?")[0]
 
         async def _fire_scroll(target_y: int) -> None:
@@ -3307,6 +3335,20 @@ class MangaBuffService:
                 }""",
                 int(target_y),
             )
+
+        # turbo: сразу прыгнуть на ≥52% — reader.js засчитывает is_read
+        if tier == "turbo":
+            await page.evaluate(
+                """() => {
+                  const h = document.body.scrollHeight || 4000;
+                  const vh = window.innerHeight || 900;
+                  const ty = Math.max(0, Math.floor((h - vh) * 0.52));
+                  window.scrollTo(0, ty);
+                  window.dispatchEvent(new Event('scroll'));
+                  if (window.jQuery) window.jQuery(window).trigger('scroll');
+                }"""
+            )
+            await asyncio.sleep(0.06)
 
         while time_mod.time() < deadline and not self._stop_flag.is_set():
             if page.url.split("?")[0] != chapter_url:
@@ -3325,7 +3367,7 @@ class MangaBuffService:
             vh = max(int(state.get("vh") or 0), 600)
             y = int(state.get("y") or 0)
             half = max(int((h - vh) * 0.52), vh)
-            step = max(int(vh * 0.45), 350) if y + vh < half else max(int(vh * 0.85), 500)
+            step = max(int(vh * 0.55), 400) if y + vh < half else max(int(vh * 0.9), 500)
             target = min(y + step, max(0, h - vh))
             await _fire_scroll(target)
             await asyncio.sleep(pause)
@@ -3349,7 +3391,7 @@ class MangaBuffService:
             if y + vh >= h - 40:
                 break
             await _fire_scroll(max(0, h - vh))
-            await asyncio.sleep(0.35 if tier in ("turbo", "fast") else 0.6)
+            await asyncio.sleep(0.08 if tier == "turbo" else (0.2 if tier == "fast" else 0.6))
 
         ok = bool(
             await page.evaluate(
@@ -3372,14 +3414,16 @@ class MangaBuffService:
         """Дождаться, пока reader.js отправит history_pool (jQuery $.post)."""
         if pool_before <= 0:
             return 0
-        deadline = time_mod.time() + max(2.0, float(timeout_sec))
+        tier = self._tempo_tier()
+        poll = 0.12 if tier in ("turbo", "fast") else 0.35
+        deadline = time_mod.time() + max(1.0, float(timeout_sec))
         while time_mod.time() < deadline:
             pool = await self._history_pool_size(page)
             if pool < pool_before:
                 flushed = pool_before - pool
                 self._last_history_post_at = time_mod.time()
                 return flushed
-            await asyncio.sleep(0.35)
+            await asyncio.sleep(poll)
         return 0
 
     async def _history_pool_size(self, page: Page) -> int:
@@ -3468,7 +3512,7 @@ class MangaBuffService:
             if self._stop_flag.is_set():
                 return 0
             now = time_mod.time()
-            gap = self._history_min_gap_sec
+            gap = self._history_min_gap_for_tier()
             if (now - self._last_history_post_at) < gap:
                 wait_for = max(0.2, gap - (now - self._last_history_post_at))
                 logger.info(
@@ -3538,11 +3582,15 @@ class MangaBuffService:
 
         if pool >= ccl:
             native_flushed = await self._wait_for_native_history_flush(
-                page, pool_before=pool
+                page,
+                pool_before=pool,
+                timeout_sec=self._native_flush_timeout(),
             )
             if native_flushed > 0:
                 self.stats.chapters_pending = await self._history_pool_size(page)
                 return native_flushed
+            if self._tempo_tier() in ("turbo", "fast"):
+                return await self._flush_history_pool_confirmed(page)
 
         if not force_flush and pool < ccl:
             return 0
@@ -4473,23 +4521,30 @@ class MangaBuffService:
             last_chapter_url = url
             logger.info("MangaBuff scroll chapter %s", url)
 
-            overlay_t = 2.5 if self._tempo_tier() in ("turbo", "fast") else 8.0
-            reward_t = 3.0 if self._tempo_tier() in ("turbo", "fast") else 12.0
-            try:
-                await asyncio.wait_for(self._dismiss_overlays(page), timeout=overlay_t)
-            except Exception:  # noqa: BLE001
-                pass
-            try:
-                c, cards, scrolls, chests, packs, _ = await asyncio.wait_for(
-                    self._click_reward_buttons(page), timeout=reward_t
-                )
-                self.stats.rewards_claimed += c
-                self.stats.cards_claimed += cards
-                self.stats.scrolls_claimed += scrolls
-                self.stats.chests_opened += chests
-                self.stats.packs_opened += packs
-            except Exception:  # noqa: BLE001
-                pass
+            tier = self._tempo_tier()
+            if tier not in ("turbo", "fast"):
+                overlay_t = 8.0
+                reward_t = 12.0
+                try:
+                    await asyncio.wait_for(self._dismiss_overlays(page), timeout=overlay_t)
+                except Exception:  # noqa: BLE001
+                    pass
+                try:
+                    c, cards, scrolls, chests, packs, _ = await asyncio.wait_for(
+                        self._click_reward_buttons(page), timeout=reward_t
+                    )
+                    self.stats.rewards_claimed += c
+                    self.stats.cards_claimed += cards
+                    self.stats.scrolls_claimed += scrolls
+                    self.stats.chests_opened += chests
+                    self.stats.packs_opened += packs
+                except Exception:  # noqa: BLE001
+                    pass
+            else:
+                try:
+                    await asyncio.wait_for(self._dismiss_overlays(page), timeout=0.8)
+                except Exception:  # noqa: BLE001
+                    pass
 
             steps = await self._smooth_read_chapter(page)
             final_url = page.url.split("?")[0]
