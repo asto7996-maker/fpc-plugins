@@ -95,6 +95,8 @@ _CARD_NOTIFY_RE = re.compile(
 # Индекс больше = карта дороже / реже.
 CARD_RANK_LADDER = ("E", "D", "C", "B", "G", "P", "A", "S", "X")
 MARKET_LOTS_PATH = BASE_DIR / "market_lots.json"
+TRADE_RECEIVERS_PATH = BASE_DIR / "trade_receivers.json"
+TRADE_CANDIDATES_PATH = BASE_DIR / "trade_candidates.json"
 # Лимит сайта: одновременно не больше 10 лотов — берём самые дорогие.
 MARKET_LOT_LIMIT = 10
 # Режим цены: higher = 1× ранг выше (для X — 2×X); same2 = 2× тот же ранг.
@@ -975,6 +977,10 @@ class MangaBuffService:
         self._last_history_post_at: float = 0.0
         self._history_gap_boost_until: float = 0.0
         self._turbo_flush_at: int = 4
+        # Уже кидали обмен этим user_id — строго 1 на человека
+        self._trade_receivers: set[str] = self._load_trade_receivers()
+        # Кандидаты из чата/комментов глав (накопительный пул)
+        self._trade_candidates: List[str] = self._load_trade_candidates()
         self._migrate_stats_if_needed()
         # сброс ложных дропов («Тайтлы» из навбара) — портили статистику карт
         if "тайтл" in (self.stats.last_card_drop or "").lower():
@@ -1635,7 +1641,7 @@ class MangaBuffService:
 
                     s = _ls()
                     if s.mangabuff_auto_trade:
-                        sent = await self._run_card_trades_unlocked(offers=4)
+                        sent = await self._run_card_trades_unlocked(offers=40)
                         if sent:
                             result.details.append(f"обмены: {sent}")
                             result.events += sent
@@ -2097,6 +2103,91 @@ class MangaBuffService:
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning("market_lots save: %s", exc)
+
+    def _load_trade_receivers(self) -> set[str]:
+        try:
+            if not TRADE_RECEIVERS_PATH.exists():
+                return set()
+            raw = json.loads(TRADE_RECEIVERS_PATH.read_text(encoding="utf-8"))
+            ids = raw.get("receivers") if isinstance(raw, dict) else raw
+            if not isinstance(ids, list):
+                return set()
+            return {str(x) for x in ids if x}
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("trade_receivers load: %s", exc)
+            return set()
+
+    def _save_trade_receivers(self) -> None:
+        try:
+            ids = sorted(self._trade_receivers)[-8000:]
+            self._trade_receivers = set(ids)
+            tmp = TRADE_RECEIVERS_PATH.with_suffix(".json.tmp")
+            tmp.write_text(
+                json.dumps({"receivers": ids}, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            tmp.replace(TRADE_RECEIVERS_PATH)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("trade_receivers save: %s", exc)
+
+    def _mark_trade_receiver(self, user_id: str) -> None:
+        uid = str(user_id or "").strip()
+        if not uid or uid in self._trade_receivers:
+            return
+        self._trade_receivers.add(uid)
+        self._save_trade_receivers()
+
+    def _load_trade_candidates(self) -> List[str]:
+        try:
+            if not TRADE_CANDIDATES_PATH.exists():
+                return []
+            raw = json.loads(TRADE_CANDIDATES_PATH.read_text(encoding="utf-8"))
+            ids = raw.get("candidates") if isinstance(raw, dict) else raw
+            if not isinstance(ids, list):
+                return []
+            out: List[str] = []
+            seen: set[str] = set()
+            for x in ids:
+                uid = str(x or "").strip()
+                if not uid or uid in seen:
+                    continue
+                seen.add(uid)
+                out.append(uid)
+            return out[-4000:]
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("trade_candidates load: %s", exc)
+            return []
+
+    def _save_trade_candidates(self) -> None:
+        try:
+            ids = list(self._trade_candidates)[-4000:]
+            self._trade_candidates = ids
+            tmp = TRADE_CANDIDATES_PATH.with_suffix(".json.tmp")
+            tmp.write_text(
+                json.dumps({"candidates": ids}, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            tmp.replace(TRADE_CANDIDATES_PATH)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("trade_candidates save: %s", exc)
+
+    def _remember_trade_candidates(self, user_ids: Sequence[str]) -> int:
+        """Добавить user_id из чата/комментов в пул кандидатов на обмен."""
+        added = 0
+        me = str(self._mb_user_id or "")
+        known = set(self._trade_candidates)
+        for raw in user_ids or []:
+            uid = str(raw or "").strip()
+            if not uid or not uid.isdigit():
+                continue
+            if uid == me or uid in known or uid in self._trade_receivers:
+                continue
+            self._trade_candidates.append(uid)
+            known.add(uid)
+            added += 1
+        if added:
+            self._save_trade_candidates()
+        return added
 
     async def _fetch_inventory_cards(
         self,
@@ -4210,11 +4301,17 @@ class MangaBuffService:
             pass
 
         try:
-            return await page.locator(".comments__send-form textarea").first.is_visible(
+            ok = await page.locator(".comments__send-form textarea").first.is_visible(
                 timeout=2000
             )
         except Exception:  # noqa: BLE001
-            return False
+            ok = False
+        if ok:
+            try:
+                await self._harvest_comment_authors(page)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("comment authors harvest: %s", exc)
+        return ok
 
     async def _collect_comment_samples(self, page: Page) -> List[str]:
         samples: List[str] = []
@@ -5293,133 +5390,376 @@ class MangaBuffService:
                 )
         return items[:limit]
 
-    async def _pick_trade_targets(self, page: Page, limit: int = 8) -> List[str]:
-        """ID пользователей для обмена (рейтинг / колоды)."""
-        ids: List[str] = []
-        for url in (
-            "https://mangabuff.ru/users",
-            "https://mangabuff.ru/rating",
-            "https://mangabuff.ru/decks",
-        ):
-            if len(ids) >= limit:
+    async def _extract_user_ids_from_page(self, page: Page) -> List[str]:
+        """Собрать user_id со ссылок /users/<id> на текущей странице."""
+        try:
+            found = await page.evaluate(
+                """() => {
+                  const out = [];
+                  const seen = new Set();
+                  for (const a of document.querySelectorAll("a[href*='/users/']")) {
+                    const m = (a.href || '').match(/\\/users\\/(\\d+)/);
+                    if (!m) continue;
+                    const id = m[1];
+                    if (seen.has(id)) continue;
+                    seen.add(id);
+                    out.push(id);
+                  }
+                  return out;
+                }"""
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("extract user ids: %s", exc)
+            return []
+        me = str(self._mb_user_id or "")
+        out: List[str] = []
+        for uid in found or []:
+            uid = str(uid)
+            if uid and uid != me and uid not in out:
+                out.append(uid)
+        return out
+
+    async def _harvest_comment_authors(self, page: Page) -> int:
+        """Запомнить авторов комментариев текущей главы как кандидатов на обмен."""
+        ids = await self._extract_user_ids_from_page(page)
+        added = self._remember_trade_candidates(ids)
+        if added:
+            logger.info("MangaBuff trade candidates +%s from comments", added)
+        return added
+
+    async def _collect_chat_trade_targets(self, page: Page, limit: int = 40) -> List[str]:
+        """Люди из чата арены — основной источник обменов."""
+        if not await self._safe_goto(page, "https://mangabuff.ru/chat"):
+            return []
+        await asyncio.sleep(1.2)
+        # немного прокрутим чат — подтянуть свежие сообщения
+        try:
+            await page.evaluate(
+                """() => {
+                  const box = document.querySelector('.chat-arena, .chat-arena__wrapper, .chat-arena-box')
+                    || document.scrollingElement;
+                  if (box) box.scrollTop = box.scrollHeight;
+                }"""
+            )
+            await asyncio.sleep(0.6)
+        except Exception:  # noqa: BLE001
+            pass
+        ids = await self._extract_user_ids_from_page(page)
+        self._remember_trade_candidates(ids)
+        return ids[: max(1, int(limit))]
+
+    async def _collect_comment_trade_targets(
+        self, page: Page, limit: int = 40
+    ) -> List[str]:
+        """Авторы комментов глав: текущая глава + недавние URL чтения."""
+        urls: List[str] = []
+        cur = (page.url or "").split("?")[0]
+        if re.search(r"/manga/[^/]+/\d+/\d+", cur):
+            urls.append(cur)
+        last = (self.stats.last_url or "").split("?")[0]
+        if last and re.search(r"/manga/[^/]+/\d+/\d+", last) and last not in urls:
+            urls.append(last)
+        # запасные популярные главы, если своих нет
+        if len(urls) < 2:
+            for extra in (
+                "https://mangabuff.ru/manga/svinarnik/1/5",
+                "https://mangabuff.ru/manga/top",
+            ):
+                if extra not in urls:
+                    urls.append(extra)
+        collected: List[str] = []
+        for url in urls:
+            if len(collected) >= limit:
                 break
+            if url.endswith("/top") or url.rstrip("/").endswith("/manga"):
+                if not await self._safe_goto(page, url):
+                    continue
+                href = await page.evaluate(
+                    """() => {
+                      const a = [...document.querySelectorAll("a[href*='/manga/']")]
+                        .map(x => x.href)
+                        .find(h => /\\/manga\\/[^/]+\\/\\d+\\/\\d+/.test(h));
+                      return a || '';
+                    }"""
+                )
+                if not href:
+                    continue
+                url = href
             if not await self._safe_goto(page, url):
                 continue
-            found = await page.evaluate(
-                """() => [...document.querySelectorAll("a[href*='/users/']")]
-                  .map(a => (a.href.match(/\\/users\\/(\\d+)/) || [])[1])
-                  .filter(Boolean)"""
-            )
-            for uid in found or []:
-                uid = str(uid)
-                if uid and uid != self._mb_user_id and uid not in ids:
-                    ids.append(uid)
-                if len(ids) >= limit:
+            await asyncio.sleep(0.5)
+            try:
+                await self._open_comments_panel(page)
+            except Exception:  # noqa: BLE001
+                pass
+            ids = await self._extract_user_ids_from_page(page)
+            self._remember_trade_candidates(ids)
+            for uid in ids:
+                if uid not in collected:
+                    collected.append(uid)
+                if len(collected) >= limit:
                     break
-        return ids
+        return collected[:limit]
 
-    async def run_card_trades(self, offers: int = 6) -> int:
-        """Кинуть обмены: отдаём A, просим S у разных игроков."""
+    async def _pick_trade_targets(self, page: Page, limit: int = 40) -> List[str]:
+        """Только чат + авторы комментов глав; без повторов (1 обмен / человек)."""
+        await self._refresh_user_id(page)
+        me = str(self._mb_user_id or "")
+        want = max(1, int(limit))
+        ordered: List[str] = []
+        seen: set[str] = set()
+
+        def _push(uids: Sequence[str]) -> None:
+            for raw in uids:
+                uid = str(raw or "").strip()
+                if not uid or not uid.isdigit():
+                    continue
+                if uid == me or uid in self._trade_receivers or uid in seen:
+                    continue
+                seen.add(uid)
+                ordered.append(uid)
+
+        # сначала свежий чат
+        _push(await self._collect_chat_trade_targets(page, limit=want * 2))
+        # затем комменты глав
+        if len(ordered) < want:
+            _push(await self._collect_comment_trade_targets(page, limit=want * 2))
+        # накопительный пул
+        if len(ordered) < want:
+            _push(list(self._trade_candidates))
+        logger.info(
+            "MangaBuff trade targets: %s (chat/comments, skip already=%s)",
+            len(ordered[:want]),
+            len(self._trade_receivers),
+        )
+        return ordered[:want]
+
+    def _card_tradable(self, row: Dict[str, Any]) -> bool:
+        if not isinstance(row, dict):
+            return False
+        cid = row.get("id")
+        if not cid:
+            return False
+        if int(row.get("is_lock") or 0):
+            return False
+        if int(row.get("in_trade") or 0):
+            return False
+        if int(row.get("is_not_tradable") or 0):
+            return False
+        if int(row.get("is_block_trade") or 0):
+            return False
+        if row.get("available_for_trade") is False:
+            return False
+        return True
+
+    async def _tradable_inventory_cards(self, page: Page) -> List[Dict[str, Any]]:
+        """Все свои карты, которые можно кинуть в обмен — от малой редкости к большой."""
+        rows = await self._fetch_all_inventory_cards(page, per_page=70)
+        out = [r for r in rows if self._card_tradable(r)]
+        out.sort(key=lambda r: rank_value(str(r.get("rank") or "")))
+        return out
+
+    async def _fetch_receiver_trade_card(
+        self, page: Page, receiver_id: str, prefer_min_rank: str = ""
+    ) -> Optional[Dict[str, Any]]:
+        """Любая доступная карта партнёра (нужна сайту в receiver_card_ids)."""
+        prefer = (prefer_min_rank or "").strip().upper()
+        prefer_v = rank_value(prefer) if prefer else -1
+        try:
+            data = await page.evaluate(
+                """async ({uid}) => {
+                  const csrf = (document.querySelector('meta[name="csrf-token"]')
+                    || {}).content || '';
+                  const body = new URLSearchParams();
+                  body.set('page', '1');
+                  body.set('per_page', '70');
+                  body.set('search', '');
+                  body.set('rank', '');
+                  const resp = await fetch('/cards-filter/' + uid, {
+                    method: 'POST',
+                    headers: {
+                      'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+                      'X-CSRF-TOKEN': csrf,
+                      'X-Requested-With': 'XMLHttpRequest'
+                    },
+                    body: body.toString(),
+                    credentials: 'same-origin'
+                  });
+                  if (!resp.ok) return {ok:false, status: resp.status, data:[]};
+                  let json = null;
+                  try { json = await resp.json(); } catch (e) { return {ok:false, data:[]}; }
+                  return {ok:true, data: (json && json.data) ? json.data : []};
+                }""",
+                {"uid": str(receiver_id)},
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("receiver cards %s: %s", receiver_id, exc)
+            return None
+        rows = (data or {}).get("data") or []
+        tradable = [r for r in rows if isinstance(r, dict) and self._card_tradable(r)]
+        if not tradable:
+            return None
+        if prefer_v >= 0:
+            better = [
+                r
+                for r in tradable
+                if rank_value(str(r.get("rank") or "")) >= prefer_v
+            ]
+            if better:
+                better.sort(
+                    key=lambda r: rank_value(str(r.get("rank") or "")),
+                    reverse=True,
+                )
+                return better[0]
+        tradable.sort(
+            key=lambda r: rank_value(str(r.get("rank") or "")), reverse=True
+        )
+        return tradable[0]
+
+    async def run_card_trades(self, offers: int = 40) -> int:
+        """Кинуть обмены людям из чата/комментов: 1 человек = 1 обмен, все свои карты."""
         async with self._lock:
             return await self._run_card_trades_unlocked(offers=offers)
 
-    async def _run_card_trades_unlocked(self, offers: int = 6) -> int:
+    async def _run_card_trades_unlocked(self, offers: int = 40) -> int:
         assert self._page is not None
         page = self._page
         await self._ensure_login_unlocked()
         await self._refresh_user_id(page)
-        my_a = await self._inventory_cards_by_rank(page, "A", limit=12)
-        my_a = [c for c in my_a if c.get("available")]
-        if not my_a:
-            # fallback: G/B тоже можно кидать
-            for rank in ("G", "B", "C"):
-                my_a = await self._inventory_cards_by_rank(page, rank, limit=12)
-                my_a = [c for c in my_a if c.get("available")]
-                if my_a:
-                    break
-        if not my_a:
-            logger.info("MangaBuff trades: no offer cards")
+        if not await self._safe_goto(page, "https://mangabuff.ru/trades"):
+            logger.warning("MangaBuff trades: cannot open /trades")
             return 0
-        targets = await self._pick_trade_targets(page, limit=max(offers, 6))
+        my_cards = await self._tradable_inventory_cards(page)
+        if not my_cards:
+            logger.info("MangaBuff trades: no tradable cards in inventory")
+            return 0
+        want = max(1, min(int(offers or 40), len(my_cards)))
+        targets = await self._pick_trade_targets(page, limit=want)
+        if not targets:
+            logger.info("MangaBuff trades: no chat/comment targets")
+            return 0
+        # CSRF актуален с /trades
+        if not await self._safe_goto(page, "https://mangabuff.ru/trades"):
+            return 0
         sent = 0
-        for i, receiver_id in enumerate(targets[:offers]):
-            if self._stop_flag.is_set():
+        used_card_ids: set[str] = set()
+        card_idx = 0
+        rate_wait = 3.5
+        for receiver_id in targets:
+            if self._stop_flag.is_set() or sent >= want:
                 break
-            offer = my_a[i % len(my_a)]
-            # страница трейда пользователя
-            trade_url = f"https://mangabuff.ru/trades/create/{receiver_id}"
-            ok = await self._safe_goto(page, trade_url)
-            if not ok or "404" in (await page.title()).lower():
-                # альтернатива: профиль → кнопка обмена
-                await self._safe_goto(page, f"https://mangabuff.ru/users/{receiver_id}")
-                href = await page.evaluate(
-                    """() => {
-                      const a = [...document.querySelectorAll('a')].find(x => /обмен/i.test(x.innerText||'') || /\\/trades\\//.test(x.href||''));
-                      return a ? a.href : '';
-                    }"""
-                )
-                if href:
-                    await self._safe_goto(page, href)
-                else:
-                    continue
-            # их S-карты на странице обмена
-            their_s = await page.evaluate(
-                """() => {
-                  const nodes = [...document.querySelectorAll(
-                    '.trade__inventory-item[data-id], [data-id][data-rank], .trade__inventory-item'
-                  )];
-                  const out = [];
-                  for (const el of nodes) {
-                    const id = el.getAttribute('data-id');
-                    const rank = (el.getAttribute('data-rank') || '').toUpperCase();
-                    const side = el.getAttribute('data-type') || el.getAttribute('data-side') || '';
-                    const cls = el.className || '';
-                    if (!id) continue;
-                    if (rank === 'S' || /\\bS\\b/.test(el.innerText||'')) {
-                      if (/receiver|their|other|opponent/i.test(side+cls) || !/creator|mine|my/i.test(side+cls)) {
-                        out.push(id);
-                      }
-                    }
-                  }
-                  return [...new Set(out)].slice(0, 3);
-                }"""
+            # следующая свободная карта (от малой к большой)
+            offer = None
+            while card_idx < len(my_cards):
+                cand = my_cards[card_idx]
+                card_idx += 1
+                cid = str(cand.get("id") or "")
+                if cid and cid not in used_card_ids:
+                    offer = cand
+                    break
+            if not offer:
+                logger.info("MangaBuff trades: cards exhausted after %s", sent)
+                break
+            their = await self._fetch_receiver_trade_card(
+                page,
+                receiver_id,
+                prefer_min_rank=str(offer.get("rank") or ""),
             )
-            receiver_card_ids = [str(x) for x in (their_s or [])][:1]
-            # если не нашли S — всё равно шлём запрос с пустым receiver (сайт может отклонить)
+            if not their:
+                logger.info(
+                    "MangaBuff trade skip user=%s: no their cards", receiver_id
+                )
+                # человека не помечаем — попробуем позже, когда появятся карты
+                continue
             resp = await self._post_json(
                 page,
                 "/trades/create",
                 {
-                    "receiver_id": receiver_id,
+                    "receiver_id": str(receiver_id),
                     "creator_card_ids": [str(offer["id"])],
-                    "receiver_card_ids": receiver_card_ids or [],
+                    "receiver_card_ids": [str(their["id"])],
                 },
             )
             status = int(resp.get("status") or 0)
             js = resp.get("json") if isinstance(resp.get("json"), dict) else {}
+            # rate-limit: пауза и один ретрай
+            if status == 429:
+                wait_s = min(45.0, rate_wait * 3)
+                logger.info(
+                    "MangaBuff trade 429 → sleep %.1fs then retry user=%s",
+                    wait_s,
+                    receiver_id,
+                )
+                await asyncio.sleep(wait_s)
+                rate_wait = min(12.0, rate_wait + 1.5)
+                resp = await self._post_json(
+                    page,
+                    "/trades/create",
+                    {
+                        "receiver_id": str(receiver_id),
+                        "creator_card_ids": [str(offer["id"])],
+                        "receiver_card_ids": [str(their["id"])],
+                    },
+                )
+                status = int(resp.get("status") or 0)
+                js = resp.get("json") if isinstance(resp.get("json"), dict) else {}
             if status in (200, 201) or (js and js.get("trade")):
                 sent += 1
+                used_card_ids.add(str(offer["id"]))
+                self._mark_trade_receiver(receiver_id)
                 self.stats.trades_sent += 1
+                offer_rank = str(offer.get("rank") or "?")
+                want_rank = str(their.get("rank") or "?")
                 self.stats.touch(
-                    f"обмен A→S → user {receiver_id}",
+                    f"обмен {offer_rank}→{want_rank} · user {receiver_id}",
                     page.url,
                 )
                 logger.info(
-                    "MangaBuff trade sent to %s offer=%s want=%s",
+                    "MangaBuff trade sent to %s offer=%s[%s] want=%s[%s]",
                     receiver_id,
                     offer.get("id"),
-                    receiver_card_ids,
+                    offer_rank,
+                    their.get("id"),
+                    want_rank,
                 )
+                rate_wait = max(2.0, rate_wait * 0.9)
             else:
+                # при фейле карту можно попробовать с другим человеком
                 logger.info(
                     "MangaBuff trade fail user=%s status=%s json=%s",
                     receiver_id,
                     status,
-                    str(js)[:160],
+                    str(js)[:200],
                 )
-            await asyncio.sleep(0.8)
+                msg = ""
+                if isinstance(js, dict):
+                    msg = str(js.get("message") or "")
+                    errs = js.get("errors")
+                    if isinstance(errs, dict):
+                        msg += " " + " ".join(
+                            str(v) for v in errs.values()
+                        )
+                msg_l = msg.lower()
+                # навсегда: запретил обмены / уже есть pending
+                if status in (409, 422) and (
+                    "запретил" in msg_l
+                    or "already" in msg_l
+                    or "pending" in msg_l
+                    or "уже есть" in msg_l
+                    or "уже отправ" in msg_l
+                ):
+                    self._mark_trade_receiver(receiver_id)
+                if status == 429:
+                    await asyncio.sleep(min(60.0, rate_wait * 4))
+            await asyncio.sleep(rate_wait)
         if sent:
             self._persist_stats()
+        logger.info(
+            "MangaBuff trades done: sent=%s / want=%s cards_left≈%s",
+            sent,
+            want,
+            max(0, len(my_cards) - len(used_card_ids)),
+        )
         return sent
 
     async def run_card_upgrades(self, max_ops: int = 3) -> int:

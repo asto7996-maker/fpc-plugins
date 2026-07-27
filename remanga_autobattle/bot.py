@@ -537,17 +537,20 @@ class App:
         async def cards_trade_now(message: Message) -> None:
             self._notify_chat_id = message.chat.id
             await message.answer(
-                "Кидаю обмены A→S…", reply_markup=cards_events_keyboard()
+                "Кидаю обмены людям из чата/комментов…\n"
+                "<i>1 человек = 1 обмен · все карты инвентаря</i>",
+                reply_markup=cards_events_keyboard(),
             )
             try:
                 if not self.mangabuff.is_started:
                     await self.mangabuff.start(headless=True)
-                sent = await self.mangabuff.run_card_trades(offers=6)
+                sent = await self.mangabuff.run_card_trades(offers=50)
                 up = await self.mangabuff.run_card_upgrades(max_ops=2)
                 await message.answer(
                     f"Обмены · отправлено <b>{sent}</b>\n"
                     f"Улучшение · <b>{up}</b>\n"
-                    f"Всего обменов · <b>{self.mangabuff.stats.trades_sent}</b>",
+                    f"Всего обменов · <b>{self.mangabuff.stats.trades_sent}</b>\n"
+                    f"Уже кидали · <b>{len(getattr(self.mangabuff, '_trade_receivers', []) or [])}</b>",
                     reply_markup=cards_events_keyboard(),
                 )
             except Exception as exc:  # noqa: BLE001
