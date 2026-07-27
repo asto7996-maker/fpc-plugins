@@ -17,11 +17,30 @@ DEFAULT_USER = Path(__file__).resolve().parent / "user_data_mangabuff"
 async def profile_snapshot(page) -> dict:
     """Extract reading-related stats from profile and daily pages."""
     out: dict = {}
-    for url, key in [
-        ("https://mangabuff.ru/user", "user"),
-        ("https://mangabuff.ru/user/history", "history"),
-        ("https://mangabuff.ru/", "home"),
-    ]:
+    user_id = ""
+    try:
+        await page.goto("https://mangabuff.ru/", wait_until="domcontentloaded", timeout=60000)
+        await page.wait_for_timeout(1500)
+        user_id = str(
+            await page.evaluate(
+                "() => (window.user_id != null ? String(window.user_id) : '')"
+            )
+            or ""
+        ).strip()
+        out["user_id"] = user_id
+    except Exception as exc:
+        out["user_id_error"] = str(exc)
+
+    urls = [("https://mangabuff.ru/", "home")]
+    if user_id.isdigit():
+        urls.extend(
+            [
+                (f"https://mangabuff.ru/users/{user_id}", "profile"),
+                (f"https://mangabuff.ru/users/{user_id}/history", "history"),
+            ]
+        )
+
+    for url, key in urls:
         try:
             await page.goto(url, wait_until="domcontentloaded", timeout=60000)
             await page.wait_for_timeout(2000)
@@ -32,16 +51,18 @@ async def profile_snapshot(page) -> dict:
                   const chapterMentions = text.match(/(\\d+)\\s*глав[аыи]?/gi) || [];
                   const readMentions = text.match(/прочитан[оа]?\\s*[:\\-]?\\s*(\\d+)/gi) || [];
                   const questMentions = text.match(/задани[ея][^\\d]*(\\d+)/gi) || [];
+                  const dailyMentions = text.match(/сегодня[^\\d]*(\\d+)/gi) || [];
                   const links = [...document.querySelectorAll('a[href*="/manga/"]')]
                     .slice(0, 5)
                     .map(a => ({t: (a.innerText||'').trim().slice(0,40), h: a.href.split('?')[0]}));
                   return {
                     url: location.href,
                     title: document.title.slice(0, 80),
-                    textSample: text.slice(0, 2000),
+                    textSample: text.slice(0, 2500),
                     chapterMentions: chapterMentions.slice(0, 8),
                     readMentions: readMentions.slice(0, 8),
                     questMentions: questMentions.slice(0, 8),
+                    dailyMentions: dailyMentions.slice(0, 8),
                     nums: nums.slice(0, 30),
                     links,
                   };
@@ -56,15 +77,24 @@ async def profile_snapshot(page) -> dict:
 def _diff_profiles(before: dict, after: dict) -> dict:
     """Compare text samples and chapter mentions between snapshots."""
     changes: dict = {}
+    skip_keys = {"user_id"}
     for key in set(before) | set(after):
-        b = before.get(key) or {}
-        a = after.get(key) or {}
+        if key in skip_keys:
+            continue
+        b = before.get(key)
+        a = after.get(key)
+        if not isinstance(b, dict) or not isinstance(a, dict):
+            if b != a:
+                changes[key] = {"before": b, "after": a}
+            continue
         if b.get("textSample") != a.get("textSample"):
             changes[key] = {
                 "chapterMentions_before": b.get("chapterMentions"),
                 "chapterMentions_after": a.get("chapterMentions"),
                 "readMentions_before": b.get("readMentions"),
                 "readMentions_after": a.get("readMentions"),
+                "text_before_tail": str(b.get("textSample") or "")[-400:],
+                "text_after_tail": str(a.get("textSample") or "")[-400:],
             }
     return changes
 
@@ -112,9 +142,12 @@ async def read_one_chapter(page, url: str, gap_sec: float = 8.0) -> dict:
               const items = JSON.parse(localStorage.getItem('history_pool') || '[]');
               const body = new URLSearchParams();
               items.forEach((it,i)=>{body.append('items['+i+'][manga_id]',String(it.manga_id));body.append('items['+i+'][chapter_id]',String(it.chapter_id));});
-              const csrf = document.querySelector('meta[name=csrf-token]').content;
+              const csrfEl = document.querySelector('meta[name=csrf-token]');
+              const csrf = csrfEl ? csrfEl.getAttribute('content') : '';
               const resp = await fetch('/addHistory?r=702',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded; charset=UTF-8','X-CSRF-TOKEN':csrf,'X-Requested-With':'XMLHttpRequest'},body:body.toString(),credentials:'same-origin'});
-              let json=null; try{json=await resp.json();}catch(e){json=await resp.text();}
+              const raw = await resp.text();
+              let json = null;
+              try { json = JSON.parse(raw); } catch (e) { json = {raw: raw.slice(0, 500)}; }
               if (resp.status>=200 && resp.status<300) localStorage.setItem('history_pool','[]');
               return {status: resp.status, json, count: items.length};
             }"""
