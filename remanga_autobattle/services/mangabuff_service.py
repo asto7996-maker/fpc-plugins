@@ -3194,6 +3194,41 @@ class MangaBuffService:
         except Exception:  # noqa: BLE001
             return False
 
+    async def _find_continue_href(self, page: Page, slug: str = "") -> Optional[str]:
+        """Ссылка «Продолжить» / «Читать» на карточке тайтла."""
+        try:
+            href = await page.evaluate(
+                """(slug) => {
+                  const chapterRe = /\\/manga\\/[^/]+\\/\\d+\\/\\d+/;
+                  const slugRe = slug ? new RegExp('/manga/' + slug + '/\\\\d+/\\\\d+') : chapterRe;
+                  const candidates = [];
+                  for (const el of document.querySelectorAll('a[href*="/manga/"]')) {
+                    const t = (el.innerText || el.getAttribute('title') || '').trim();
+                    const h = el.href.split('?')[0];
+                    if (!slugRe.test(h)) continue;
+                    if (/продолж/i.test(t)) candidates.push(h);
+                    if (/^читать$/i.test(t)) candidates.push(h);
+                  }
+                  if (candidates.length) return candidates[0];
+                  for (const el of document.querySelectorAll('a, button')) {
+                    const t = (el.innerText || '').trim();
+                    if (!/продолж/i.test(t)) continue;
+                    const href = el.href || el.getAttribute('href') || '';
+                    if (href && slugRe.test(href)) return href.split('?')[0];
+                    const parent = el.closest('a[href*="/manga/"]');
+                    if (parent && slugRe.test(parent.href)) {
+                      return parent.href.split('?')[0];
+                    }
+                  }
+                  return '';
+                }""",
+                slug,
+            )
+            href = str(href or "").strip()
+            return href or None
+        except Exception:  # noqa: BLE001
+            return None
+
     async def _open_first_chapter(self, title_href: str) -> Optional[str]:
         assert self._page is not None
         page = self._page
@@ -3223,24 +3258,7 @@ class MangaBuffService:
             if await self._safe_goto(page, title_url):
                 await self._dismiss_overlays(page)
                 try:
-                    cont_href = await page.evaluate(
-                        """() => {
-                          for (const el of document.querySelectorAll('a[href*="/manga/"]')) {
-                            const t = (el.innerText || '').trim();
-                            const h = el.href.split('?')[0];
-                            if (/продолж/i.test(t) && /\\/manga\\/[^/]+\\/\\d+\\/\\d+/.test(h)) {
-                              return h;
-                            }
-                          }
-                          for (const el of document.querySelectorAll('a')) {
-                            const t = (el.innerText || '').trim();
-                            if (/^читать$/i.test(t) && el.href) {
-                              return el.href.split('?')[0];
-                            }
-                          }
-                          return '';
-                        }"""
-                    )
+                    cont_href = await self._find_continue_href(page, slug)
                     if cont_href and await self._safe_goto(page, cont_href):
                         got = await _ok_reader()
                         if got:
@@ -3251,32 +3269,24 @@ class MangaBuffService:
                 except Exception:  # noqa: BLE001
                     pass
 
-        # Прямой URL первой главы — только если на тайтле нет прогресса
+        # Fallback: открыть 1-ю главу и перейти к первой непрочитанной
         if slug:
-            has_progress = False
-            try:
-                title_url = f"https://mangabuff.ru/manga/{slug}"
-                if await self._safe_goto(page, title_url):
-                    await self._dismiss_overlays(page)
-                    has_progress = await self._title_has_reading_progress(page)
-            except Exception:  # noqa: BLE001
-                has_progress = False
-            if not has_progress:
-                for candidate in (
-                    f"https://mangabuff.ru/manga/{slug}/1/1",
-                    f"https://mangabuff.ru/manga/{slug}/1/0",
-                ):
-                    if await self._safe_goto(page, candidate):
-                        got = await _ok_reader()
-                        if got:
-                            if await self._skip_to_unread_chapter(page):
-                                return page.url.split("?")[0]
-                            return got
-            else:
-                logger.info(
-                    "MangaBuff skip /1/1 fallback for %s — title has progress",
-                    slug,
-                )
+            for candidate in (
+                f"https://mangabuff.ru/manga/{slug}/1/1",
+                f"https://mangabuff.ru/manga/{slug}/1/0",
+            ):
+                if await self._safe_goto(page, candidate):
+                    got = await _ok_reader()
+                    if got:
+                        if await self._skip_to_unread_chapter(page):
+                            logger.info(
+                                "MangaBuff open %s from %s → unread %s",
+                                slug,
+                                candidate,
+                                page.url.split("?")[0],
+                            )
+                            return page.url.split("?")[0]
+                        return got
 
         if not await self._safe_goto(page, title_href):
             return None
@@ -3315,7 +3325,9 @@ class MangaBuffService:
                     if chn >= 1:
                         await self._safe_goto(page, h)
                         await self._dismiss_overlays(page)
-                        return page.url
+                        if await self._skip_to_unread_chapter(page):
+                            return page.url.split("?")[0]
+                        return page.url.split("?")[0]
         except Exception as exc:  # noqa: BLE001
             logger.warning("open first chapter: %s", exc)
         return None
