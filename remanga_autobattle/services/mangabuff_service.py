@@ -1205,7 +1205,7 @@ class MangaBuffService:
     def _history_min_gap_for_tier(self) -> float:
         """Минимальный интервал между POST /addHistory (429 на слишком частых запросах)."""
         base = {
-            "turbo": 6.5,
+            "turbo": 8.0,
             "fast": 9.0,
             "lively": 14.0,
             "normal": 16.0,
@@ -1213,7 +1213,7 @@ class MangaBuffService:
             "crawl": 20.0,
         }[self._tempo_tier()]
         if time_mod.time() < self._history_gap_boost_until:
-            base += 4.0
+            base += 8.0
         return base
 
     def _native_flush_timeout(self) -> float:
@@ -3683,11 +3683,10 @@ class MangaBuffService:
             tier = self._tempo_tier()
             self._history_gap_boost_until = max(
                 self._history_gap_boost_until,
-                time_mod.time() + (45.0 if tier == "turbo" else 120.0),
+                time_mod.time() + (90.0 if tier == "turbo" else 120.0),
             )
-            self._last_history_post_at = time_mod.time()
             backoff = {
-                "turbo": 10.0,
+                "turbo": 14.0,
                 "fast": 16.0,
                 "lively": 22.0,
             }.get(tier, 8.0 + (attempt - 1) * 6.0)
