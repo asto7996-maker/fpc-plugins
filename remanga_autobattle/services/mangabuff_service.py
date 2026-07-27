@@ -4459,6 +4459,19 @@ class MangaBuffService:
 
         logger.info("MangaBuff open title %s", slug)
         total_chapters = await self._estimate_title_chapters(slug)
+        try:
+            stale = await self._history_pool_size(page)
+            if stale > 0:
+                logger.warning(
+                    "MangaBuff clear stale history_pool=%s before %s", stale, slug
+                )
+                await page.evaluate(
+                    "localStorage.setItem('history_pool', JSON.stringify([]))"
+                )
+                self._history_resume_anchor = None
+                self.stats.chapters_pending = 0
+        except Exception:  # noqa: BLE001
+            pass
         max_per_title = self._chapters_target_for_title(total_chapters)
         pct = (
             (100.0 * max_per_title / total_chapters) if total_chapters > 0 else 90.0
@@ -4546,6 +4559,24 @@ class MangaBuffService:
             self._read_urls.add(url)
             last_chapter_url = url
             logger.info("MangaBuff scroll chapter %s", url)
+
+            pending_start = await self._history_pool_size(page)
+            if pending_start >= 2:
+                anchor = self._history_resume_anchor
+                if anchor is None:
+                    anchor = await self._reader_resume_chapter(page)
+                flushed = await self._flush_history_pool_confirmed(
+                    page, before_resume=anchor
+                )
+                if flushed > 0:
+                    self._history_resume_anchor = None
+                    self.stats.chapters_read += flushed
+                    chapters_this_title += flushed
+                    for _ in range(flushed):
+                        self.note_chapter_finished()
+                    self.stats.touch(f"зачтено сайтом +{flushed}", url)
+                    self._persist_stats()
+                    await self._maybe_comment(page, flushed)
 
             overlay_t = 2.5 if self._tempo_tier() in ("turbo", "fast") else 8.0
             reward_t = 3.0 if self._tempo_tier() in ("turbo", "fast") else 12.0
