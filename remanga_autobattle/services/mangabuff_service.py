@@ -3409,9 +3409,6 @@ class MangaBuffService:
                 )
                 self._history_resume_anchor = None
                 return 0
-            if progress > 0:
-                self._last_history_post_at = time_mod.time()
-                return progress
             await asyncio.sleep(0.35)
         return 0
 
@@ -3518,10 +3515,12 @@ class MangaBuffService:
                     await self._wait_for_chapter_context(page, timeout_sec=5.0)
                 except Exception:  # noqa: BLE001
                     pass
+            pool_before_flush = await self._history_pool_size(page)
             count, gift = await self._flush_history_pool(page)
+            pool_after = await self._history_pool_size(page)
             after_resume = await self._reader_resume_chapter(page)
             progress = max(0, after_resume - before_resume)
-            if progress > 0:
+            if progress > 0 and pool_after < pool_before_flush:
                 if gift and (gift.cards or gift.scrolls):
                     await self._emit_card_drop(gift, page)
                 self.stats.chapters_pending = await self._history_pool_size(page)
