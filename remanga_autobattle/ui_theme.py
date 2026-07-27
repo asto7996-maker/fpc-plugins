@@ -118,6 +118,7 @@ def mangabuff_home(
     chapters_total: int = 0,
     sec_per_chapter: float = 0.0,
     session_titles: int = 0,
+    chapters_pending: int = 0,
 ) -> str:
     state = "● фарм идёт" if running else "○ пауза"
     bar = progress_bar(chapters, 10)
@@ -128,6 +129,11 @@ def mangabuff_home(
     else:
         pace = "замер…"
     total = chapters_total if chapters_total > 0 else chapters
+    pending_line = (
+        f" · ⏳ <b>{chapters_pending}</b> в очереди"
+        if chapters_pending > 0
+        else ""
+    )
     titles_line = (
         f"🏷 Тайтлы    <b>{session_titles}</b> за сессию · всего <b>{titles}</b>\n"
         if session_titles > 0
@@ -142,7 +148,7 @@ def mangabuff_home(
         f"Пауза шага: <code>{dmin:.2f}–{dmax:.2f}с</code>\n"
         f"Факт: <b>{cph:.0f}</b> гл/час · {pace}\n"
         f"Сессия: <code>{bar}</code>  {chapters} гл.\n\n"
-        f"📖 За сессию <b>{chapters}</b> <i>(зачтено сайтом)</i>\n"
+        f"📖 За сессию <b>{chapters}</b> <i>(зачтено сайтом)</i>{pending_line}\n"
         f"📚 Всего     <b>{total}</b>\n"
         f"📄 Скроллы   <b>{pages}</b>\n"
         f"{titles_line}"

@@ -555,6 +555,10 @@ class App:
             live = self.mangabuff.stats
             if disk.chapters_read > live.chapters_read:
                 live.chapters_read = disk.chapters_read
+                live.chapters_pending = max(
+                    int(live.chapters_pending or 0),
+                    int(disk.chapters_pending or 0),
+                )
                 live.pages_scrolled = max(live.pages_scrolled, disk.pages_scrolled)
                 live.rewards_claimed = max(live.rewards_claimed, disk.rewards_claimed)
                 live.cards_claimed = max(live.cards_claimed, disk.cards_claimed)
@@ -700,6 +704,7 @@ class App:
             chapters_total=st.chapters_read,
             sec_per_chapter=self._sec_per_chapter(),
             session_titles=self._session_titles(),
+            chapters_pending=int(st.chapters_pending or 0),
         )
 
     async def _apply_speed_preset(self, message: Message, key: str) -> None:

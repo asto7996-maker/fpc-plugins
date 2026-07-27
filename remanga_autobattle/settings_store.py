@@ -34,6 +34,7 @@ class RuntimeSettings:
     mangabuff_auto_market: bool = True
     mangabuff_farm_enabled: bool = False
     mangabuff_events_farm_enabled: bool = False
+    mangabuff_stats_site_only: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)

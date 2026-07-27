@@ -739,6 +739,7 @@ class MangaBuffStats:
     packs_opened: int = 0
     scrolls_claimed: int = 0
     errors: int = 0
+    chapters_pending: int = 0
     last_url: str = ""
     last_action: str = ""
     last_at: str = ""
@@ -957,6 +958,8 @@ class MangaBuffService:
         self._seen_notifications: set[str] = set(self.stats.seen_notifications or [])
         self._mb_user_id: str = ""
         self._last_history_post_at: float = 0.0
+        self._history_min_gap_sec: float = 16.0
+        self._migrate_stats_if_needed()
         # сброс ложных дропов («Тайтлы» из навбара) — портили статистику карт
         if "тайтл" in (self.stats.last_card_drop or "").lower():
             logger.warning(
@@ -968,6 +971,27 @@ class MangaBuffService:
             self.stats.last_card_drop = ""
             self._session_cards_base = 0
             self._persist_stats()
+
+    def _migrate_stats_if_needed(self) -> None:
+        """Сброс завышенного счётчика глав (старая логика считала скролл, не addHistory)."""
+        try:
+            from settings_store import load_settings, update_settings
+
+            s = load_settings()
+            if s.mangabuff_stats_site_only:
+                return
+            logger.warning(
+                "MangaBuff reset chapter counters (old inflated stats: %s)",
+                self.stats.chapters_read,
+            )
+            self.stats.chapters_read = 0
+            self.stats.chapters_pending = 0
+            self._session_chapters_base = 0
+            self._chapter_ts.clear()
+            self._persist_stats()
+            update_settings(mangabuff_stats_site_only=True)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("stats migration: %s", exc)
 
     def mark_farm_session_start(self) -> None:
         """Зафиксировать начало сессии: главы «за сессию» считаются отсюда."""
@@ -3209,13 +3233,41 @@ class MangaBuffService:
             pass
         return steps
 
-    async def _register_chapter_read(self, page: Page, *, force_flush: bool = False) -> bool:
-        """
-        Засчитать главу на сайте через history_pool + POST /addHistory.
+    async def _wait_for_chapter_context(self, page: Page, timeout_sec: float = 8.0) -> bool:
+        """Дождаться window.current_chapter — без него addHistory не сработает."""
+        deadline = time_mod.time() + max(1.0, float(timeout_sec))
+        while time_mod.time() < deadline:
+            if self._stop_flag.is_set():
+                return False
+            try:
+                ok = await page.evaluate(
+                    """() => !!(window.current_chapter
+                      && window.current_chapter.id
+                      && window.current_chapter.chapter_id)"""
+                )
+                if ok:
+                    return True
+            except Exception:  # noqa: BLE001
+                pass
+            await asyncio.sleep(0.35)
+        return False
 
-        reader.js: скролл >50% (is_read) и пакетная отправка при pool>=ccl (обычно 2).
-        Не спамим /addHistory каждый раз — иначе 429 и главы не засчитываются.
-        """
+    async def _history_pool_size(self, page: Page) -> int:
+        try:
+            n = await page.evaluate(
+                """() => {
+                  try {
+                    const items = JSON.parse(localStorage.getItem('history_pool') || '[]');
+                    return Array.isArray(items) ? items.length : 0;
+                  } catch (e) { return 0; }
+                }"""
+            )
+            return max(0, int(n or 0))
+        except Exception:  # noqa: BLE001
+            return 0
+
+    async def _queue_chapter_in_pool(self, page: Page) -> Optional[Dict[str, Any]]:
+        """Поставить текущую главу в history_pool (как reader.js)."""
         try:
             meta = await page.evaluate(
                 """() => {
@@ -3249,18 +3301,68 @@ class MangaBuffService:
                 }"""
             )
         except Exception as exc:  # noqa: BLE001
-            logger.warning("register chapter read evaluate: %s", exc)
-            return False
-
+            logger.warning("queue chapter pool: %s", exc)
+            return None
         if not meta or not meta.get("ok"):
             logger.warning(
-                "MangaBuff chapter NOT counted on site: %s",
+                "MangaBuff chapter NOT queued: %s",
                 (meta or {}).get("reason") or "unknown",
             )
-            return False
+            return None
+        return meta
+
+    async def _flush_history_pool_confirmed(
+        self, page: Page, *, max_retries: int = 5
+    ) -> int:
+        """POST /addHistory с паузой и повторами. Возвращает число зачтённых глав."""
+        for attempt in range(1, max_retries + 1):
+            if self._stop_flag.is_set():
+                return 0
+            now = time_mod.time()
+            gap = self._history_min_gap_sec
+            if (now - self._last_history_post_at) < gap:
+                wait_for = max(0.2, gap - (now - self._last_history_post_at))
+                logger.info(
+                    "MangaBuff addHistory throttle %.1fs (attempt %s/%s)",
+                    wait_for,
+                    attempt,
+                    max_retries,
+                )
+                await asyncio.sleep(wait_for)
+            count, gift = await self._flush_history_pool(page)
+            if count > 0:
+                if gift and (gift.cards or gift.scrolls):
+                    await self._emit_card_drop(gift, page)
+                self.stats.chapters_pending = await self._history_pool_size(page)
+                return count
+            pool = await self._history_pool_size(page)
+            if pool <= 0:
+                return 0
+            backoff = 8.0 + (attempt - 1) * 6.0
+            logger.warning(
+                "MangaBuff addHistory retry in %.0fs (pool=%s, attempt %s/%s)",
+                backoff,
+                pool,
+                attempt,
+                max_retries,
+            )
+            await asyncio.sleep(backoff)
+        return 0
+
+    async def _register_chapter_read(self, page: Page, *, force_flush: bool = False) -> int:
+        """
+        Засчитать главу на сайте через history_pool + POST /addHistory.
+
+        Возвращает число глав, реально принятых сайтом (0 = только в очереди или ошибка).
+        """
+        meta = await self._queue_chapter_in_pool(page)
+        if not meta:
+            self.stats.chapters_pending = await self._history_pool_size(page)
+            return 0
 
         pool = int(meta.get("pool") or 0)
         ccl = max(1, int(meta.get("ccl") or 2))
+        self.stats.chapters_pending = pool
         logger.info(
             "MangaBuff site-read queued manga=%s ch=%s pool=%s/%s",
             meta.get("manga_id"),
@@ -3269,23 +3371,12 @@ class MangaBuffService:
             ccl,
         )
 
-        # flush пакетом как сайт (ccl). Между POST ≥16с — иначе 429.
-        min_gap = 16.0
-        now = time_mod.time()
-        due = (now - self._last_history_post_at) >= min_gap
-        if pool >= ccl or force_flush:
-            if not due:
-                wait_for = max(0.2, min_gap - (now - self._last_history_post_at))
-                logger.info(
-                    "MangaBuff addHistory throttle %.1fs (pool=%s)", wait_for, pool
-                )
-                await asyncio.sleep(wait_for)
-            gift = await self._flush_history_pool(page)
-            if gift and (gift.cards or gift.scrolls):
-                await self._emit_card_drop(gift, page)
-        return True
+        if not force_flush and pool < ccl:
+            return 0
 
-    async def _flush_history_pool(self, page: Page) -> Optional[CardDropInfo]:
+        return await self._flush_history_pool_confirmed(page)
+
+    async def _flush_history_pool(self, page: Page) -> Tuple[int, Optional[CardDropInfo]]:
         """POST /addHistory — сайт засчитывает главы и может выдать карту."""
         try:
             data = await page.evaluate(
@@ -3331,29 +3422,29 @@ class MangaBuffService:
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning("flush history_pool: %s", exc)
-            return None
+            return 0, None
 
         if not data or not data.get("posted"):
-            return None
+            return 0, None
 
         status = int(data.get("status") or 0)
-        self._last_history_post_at = time_mod.time()
+        count = int(data.get("count") or 0)
+        cleared = bool(data.get("cleared"))
         logger.info(
             "MangaBuff addHistory status=%s chapters=%s cleared=%s data=%s",
             status,
-            data.get("count"),
-            data.get("cleared"),
+            count,
+            cleared,
             (
                 list((data.get("data") or {}).keys())[:8]
                 if isinstance(data.get("data"), dict)
                 else data.get("data")
             ),
         )
-        if status == 429 or status >= 400:
-            # после 429 — длиннее пауза, пул сохранён
-            await asyncio.sleep(12.0)
-            return None
+        if not cleared or status == 429 or status >= 400:
+            return 0, None
 
+        self._last_history_post_at = time_mod.time()
         payload = data.get("data") if isinstance(data.get("data"), dict) else {}
         info = CardDropInfo(source="addHistory")
         if payload.get("image") or payload.get("name") or payload.get("rank"):
@@ -3386,18 +3477,17 @@ class MangaBuffService:
         await self._tempo_pause(0.25, 0.6)
         try:
             toast = await self._harvest_reader_toast(page)
-            # toast уже шлёт notify сам — не возвращаем повторно
             if toast.cards and not info.cards:
-                return None
+                return count, None
         except Exception:  # noqa: BLE001
             pass
         try:
             drop = await self._harvest_card_drops(page, source="addHistory-ui")
             if drop.cards and not info.cards:
-                return None
+                return count, None
         except Exception:  # noqa: BLE001
             pass
-        return info if info.cards else None
+        return count, (info if info.cards else None)
 
     async def _animate_scroll(self, page: Page, start: int, end: int) -> None:
         tier = self._tempo_tier()
@@ -4227,11 +4317,40 @@ class MangaBuffService:
                 continue
 
             # критично: засчитать главу на сайте (иначе турбо уходит до addHistory)
-            site_ok = False
+            if not await self._wait_for_chapter_context(page):
+                logger.warning(
+                    "MangaBuff no reader context, reload: %s", final_url
+                )
+                if not await self._safe_goto(page, final_url):
+                    break
+                if not await self._wait_for_chapter_context(page, timeout_sec=6.0):
+                    logger.warning(
+                        "MangaBuff skip chapter (no current_chapter): %s",
+                        final_url,
+                    )
+                    if not await self._go_next_chapter_with_retry(page):
+                        break
+                    continue
+
+            confirmed = 0
             try:
-                site_ok = await self._register_chapter_read(page, force_flush=False)
+                confirmed = await self._register_chapter_read(page, force_flush=False)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("register chapter read: %s", exc)
+
+            pending = await self._history_pool_size(page)
+            self.stats.chapters_pending = pending
+
+            # пул полон, но сайт не принял — не уходим дальше, пока не зачтёт
+            if confirmed <= 0 and pending >= 2:
+                logger.warning(
+                    "MangaBuff addHistory backlog pool=%s at %s — retry flush",
+                    pending,
+                    final_url,
+                )
+                confirmed = await self._flush_history_pool_confirmed(page)
+                pending = await self._history_pool_size(page)
+                self.stats.chapters_pending = pending
 
             # тосты/модалки после flush (без ухода с главы)
             try:
@@ -4243,30 +4362,46 @@ class MangaBuffService:
             except Exception:  # noqa: BLE001
                 pass
 
-            # в локальную статистику — только если сайт принял / очередь записана
-            if not site_ok:
-                logger.warning(
-                    "MangaBuff skip local chapter++ (site not counted): %s",
+            if confirmed <= 0:
+                if pending >= 2:
+                    logger.error(
+                        "MangaBuff addHistory stuck pool=%s at %s — retry same chapter",
+                        pending,
+                        final_url,
+                    )
+                    self.stats.errors += 1
+                    await self._tempo_pause(8.0, 15.0)
+                    continue
+                if pending > 0:
+                    self.stats.touch(f"в очереди ({pending})", final_url)
+                    self._persist_stats()
+                else:
+                    logger.warning(
+                        "MangaBuff chapter not queued: %s", final_url
+                    )
+                    self.stats.errors += 1
+                    await self._tempo_pause(2.0, 4.0)
+                    if not await self._go_next_chapter_with_retry(page):
+                        break
+                    continue
+            else:
+                self.stats.chapters_read += confirmed
+                chapters_this_title += confirmed
+                for _ in range(confirmed):
+                    self.note_chapter_finished()
+                last_chapter_url = final_url
+                self.stats.touch(f"зачтено сайтом +{confirmed}", final_url)
+                self._persist_stats()
+                logger.info(
+                    "MangaBuff chapter done steps=%s session=%s total=%s "
+                    "url=%s site=+%s pending=%s",
+                    steps,
+                    self.session_chapters,
+                    self.stats.chapters_read,
                     final_url,
+                    confirmed,
+                    pending,
                 )
-                # всё равно пробуем следующую, но не врём в счётчике
-                if not await self._go_next_chapter_with_retry(page):
-                    break
-                continue
-
-            self.stats.chapters_read += 1
-            chapters_this_title += 1
-            self.note_chapter_finished()
-            last_chapter_url = final_url
-            self.stats.touch("глава прочитана", final_url)
-            self._persist_stats()
-            logger.info(
-                "MangaBuff chapter done steps=%s session=%s total=%s url=%s site=ok",
-                steps,
-                self.session_chapters,
-                self.stats.chapters_read,
-                final_url,
-            )
 
             await self._maybe_comment(page)
             if not re.search(r"/manga/[^/]+/\d+/\d+", page.url.split("?")[0]):
@@ -4293,7 +4428,15 @@ class MangaBuffService:
 
         # добить остаток history_pool перед уходом с тайтла
         try:
-            await self._flush_history_pool(page)
+            tail = await self._register_chapter_read(page, force_flush=True)
+            if tail > 0:
+                self.stats.chapters_read += tail
+                chapters_this_title += tail
+                for _ in range(tail):
+                    self.note_chapter_finished()
+                self.stats.chapters_pending = await self._history_pool_size(page)
+                self.stats.touch(f"зачтено сайтом +{tail} (хвост)", page.url)
+                self._persist_stats()
         except Exception:  # noqa: BLE001
             pass
         logger.info(
@@ -4496,14 +4639,24 @@ class MangaBuffService:
             await self._await_night_break_if_needed()
             await self._dismiss_overlays(page)
             await self._smooth_read_chapter(page)
-            site_ok = await self._register_chapter_read(page, force_flush=False)
-            if not site_ok:
+            if not await self._wait_for_chapter_context(page):
                 if not await self._go_next_chapter(page):
                     break
                 continue
-            self.stats.chapters_read += 1
-            self.note_chapter_finished()
-            done += 1
+            confirmed = await self._register_chapter_read(page, force_flush=False)
+            pending = await self._history_pool_size(page)
+            self.stats.chapters_pending = pending
+            if confirmed <= 0 and pending >= 2:
+                confirmed = await self._flush_history_pool_confirmed(page)
+            if confirmed <= 0:
+                if pending <= 0:
+                    if not await self._go_next_chapter(page):
+                        break
+                continue
+            self.stats.chapters_read += confirmed
+            for _ in range(confirmed):
+                self.note_chapter_finished()
+            done += confirmed
             await self._maybe_comment(page)
             if on_progress:
                 try:
