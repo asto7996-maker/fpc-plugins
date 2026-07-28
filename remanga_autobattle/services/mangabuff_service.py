@@ -1050,7 +1050,7 @@ class MangaBuffService:
         self._mb_user_id: str = ""
         self._last_history_post_at: float = 0.0
         self._history_gap_boost_until: float = 0.0
-        self._turbo_flush_at: int = 4
+        self._turbo_flush_at: int = 2  # макс. фарм: flush раньше (было 4)
         # chapter_id в history_pool, ещё не зачтённые через наш flush
         self._pending_credit_ids: List[str] = []
         # Уже кидали обмен этим user_id — строго 1 на человека
@@ -1392,6 +1392,13 @@ class MangaBuffService:
     # ------------------------------------------------------------------
 
     def _night_break_remaining(self) -> Optional[timedelta]:
+        try:
+            from settings_store import load_settings as _ls
+
+            if not bool(getattr(_ls(), "mangabuff_night_break", False)):
+                return None
+        except Exception:  # noqa: BLE001
+            return None
         now = datetime.now(MSK)
         t = now.time()
         if NIGHT_BREAK_START <= t < NIGHT_BREAK_END:
@@ -1613,11 +1620,11 @@ class MangaBuffService:
                 # пока идёт чтение — реже (лок и так сериализует), иначе плотнее
                 tier = self._tempo_tier()
                 if self._chapter_farm_active():
-                    pause = 120.0 if tier in ("turbo", "fast") else 180.0
+                    pause = 45.0 if tier in ("turbo", "fast") else 90.0
                 elif tier == "turbo":
-                    pause = 28.0
+                    pause = 12.0
                 elif tier == "fast":
-                    pause = 40.0
+                    pause = 20.0
                 else:
                     pause = float(interval_sec)
                 end = asyncio.get_event_loop().time() + pause
@@ -1704,7 +1711,7 @@ class MangaBuffService:
                     from settings_store import load_settings as _ls
 
                     if _ls().mangabuff_auto_battle:
-                        battled = await self._run_card_battles(page, max_fights=3)
+                        battled = await self._run_card_battles(page, max_fights=10)
                         if battled:
                             result.details.append(f"бои: {battled}")
                             result.events += battled
@@ -1727,7 +1734,7 @@ class MangaBuffService:
                     from settings_store import load_settings as _ls
 
                     if _ls().mangabuff_auto_battle:
-                        n = await self._run_card_awakening(page, max_cards=2)
+                        n = await self._run_card_awakening(page, max_cards=6)
                         if n:
                             result.details.append(f"пробуждение: {n}")
                             result.events += n
@@ -1739,11 +1746,11 @@ class MangaBuffService:
 
                     s = _ls()
                     if s.mangabuff_auto_trade:
-                        sent = await self._run_card_trades_unlocked(offers=40)
+                        sent = await self._run_card_trades_unlocked(offers=80)
                         if sent:
                             result.details.append(f"обмены: {sent}")
                             result.events += sent
-                    up = await self._run_card_upgrades_unlocked(max_ops=2)
+                    up = await self._run_card_upgrades_unlocked(max_ops=5)
                     if up:
                         result.details.append(f"улучшение: {up}")
                         result.events += up

@@ -51,7 +51,7 @@ SPEED_PRESETS: Dict[str, SpeedPreset] = {
     ),
 }
 
-DEFAULT_SPEED_KEY = "lively"
+DEFAULT_SPEED_KEY = "turbo"
 
 
 def preset_by_delays(dmin: float, dmax: float) -> Optional[SpeedPreset]:

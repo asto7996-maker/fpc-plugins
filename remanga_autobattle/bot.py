@@ -564,10 +564,10 @@ class App:
                 async with self.mangabuff._lock:
                     await self.mangabuff._ensure_login_unlocked()
                     n = await self.mangabuff._run_card_battles(
-                        self.mangabuff._page, max_fights=3
+                        self.mangabuff._page, max_fights=10
                     )
                     aw = await self.mangabuff._run_card_awakening(
-                        self.mangabuff._page, max_cards=2
+                        self.mangabuff._page, max_cards=6
                     )
                 await message.answer(
                     f"Бои · побед <b>{n}</b> · пробуждение <b>{aw}</b>\n"
@@ -592,8 +592,8 @@ class App:
             try:
                 if not self.mangabuff.is_started:
                     await self.mangabuff.start(headless=True)
-                sent = await self.mangabuff.run_card_trades(offers=50)
-                up = await self.mangabuff.run_card_upgrades(max_ops=2)
+                sent = await self.mangabuff.run_card_trades(offers=80)
+                up = await self.mangabuff.run_card_upgrades(max_ops=5)
                 await message.answer(
                     f"Обмены · отправлено <b>{sent}</b>\n"
                     f"Улучшение · <b>{up}</b>\n"
@@ -909,7 +909,7 @@ class App:
             try:
                 if not self.mangabuff.is_started:
                     await self.mangabuff.start(headless=True)
-                await self.mangabuff.events_loop(interval_sec=75.0)
+                await self.mangabuff.events_loop(interval_sec=45.0)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001
@@ -1093,34 +1093,43 @@ class App:
         logger.info("Старт MangaBuff Autopilot (admin=%s)", self.config.telegram_admin_id or "pending")
         await self._setup_bot_profile()
 
+        # Максимальный фарм: турбо + все авто + без ночного стопа
+        preset = SPEED_PRESETS["turbo"]
+        update_settings(
+            mangabuff_delay_min_sec=preset.delay_min,
+            mangabuff_delay_max_sec=preset.delay_max,
+            mangabuff_speed_preset=preset.key,
+            mangabuff_auto_market=True,
+            mangabuff_auto_battle=True,
+            mangabuff_auto_trade=True,
+            mangabuff_auto_quiz=True,
+            mangabuff_night_break=False,
+            mangabuff_notify_milestones=False,
+            mangabuff_farm_enabled=True,
+            mangabuff_events_farm_enabled=True,
+        )
+        self._apply_speed_from_settings()
         s = load_settings()
-        if (
-            abs(s.mangabuff_delay_min_sec - 5.0) < 0.01
-            and abs(s.mangabuff_delay_max_sec - 15.0) < 0.01
-        ) or not s.mangabuff_speed_preset:
-            preset = SPEED_PRESETS[DEFAULT_SPEED_KEY]
-            update_settings(
-                mangabuff_delay_min_sec=preset.delay_min,
-                mangabuff_delay_max_sec=preset.delay_max,
-                mangabuff_speed_preset=preset.key,
-            )
-            self._apply_speed_from_settings()
-            s = load_settings()
+        logger.info(
+            "max-farm boot: tier=%s delay=%.2f-%.2f autos=market/battle/trade/quiz night_break=%s",
+            s.mangabuff_speed_preset,
+            s.mangabuff_delay_min_sec,
+            s.mangabuff_delay_max_sec,
+            getattr(s, "mangabuff_night_break", False),
+        )
 
         try:
             if self.config.mangabuff_email:
                 await self.mangabuff.start(headless=True)
                 ok = await self.mangabuff.ensure_login()
                 logger.info("MangaBuff login on boot: %s", ok)
-                if ok and self._should_resume_mangabuff_farm():
+                if ok:
                     # Сначала фарм — events/market не должны перехватить браузер
                     await self.start_mangabuff_read()
-                    logger.info("MangaBuff farm resumed")
-                if ok and load_settings().mangabuff_events_farm_enabled:
-                    # параллельно с чтением (idle while farm active), не elif
+                    logger.info("MangaBuff farm resumed (max)")
                     if not (self._events_task and not self._events_task.done()):
                         asyncio.create_task(self.start_events_farm(resume=True))
-                        logger.info("MangaBuff events farm resumed")
+                        logger.info("MangaBuff events farm resumed (max)")
         except Exception as exc:  # noqa: BLE001
             logger.warning("MangaBuff browser: %s", exc)
 

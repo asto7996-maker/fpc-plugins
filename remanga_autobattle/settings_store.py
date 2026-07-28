@@ -24,12 +24,12 @@ class RuntimeSettings:
     setup_completed: bool = False
 
     mangabuff_start_url: str = "https://mangabuff.ru/"
-    mangabuff_delay_min_sec: float = 0.20
-    mangabuff_delay_max_sec: float = 0.45
+    mangabuff_delay_min_sec: float = 0.02
+    mangabuff_delay_max_sec: float = 0.05
     mangabuff_setup_done: bool = False
-    mangabuff_speed_preset: str = "lively"
-    mangabuff_milestone_every: int = 10
-    mangabuff_notify_milestones: bool = True
+    mangabuff_speed_preset: str = "turbo"
+    mangabuff_milestone_every: int = 25
+    mangabuff_notify_milestones: bool = False
     mangabuff_notify_cards: bool = True
     mangabuff_auto_market: bool = True
     mangabuff_auto_battle: bool = True
@@ -38,6 +38,8 @@ class RuntimeSettings:
     mangabuff_farm_enabled: bool = False
     mangabuff_events_farm_enabled: bool = False
     mangabuff_stats_site_only: bool = True
+    # Ночной стоп 01–05 МСК; для макс. фарма держим выкл.
+    mangabuff_night_break: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
