@@ -91,12 +91,30 @@ _CARD_NOTIFY_RE = re.compile(
     re.I,
 )
 
-# Лестница редкости MangaBuff (как getNextRank на сайте) + X выше S.
-# Индекс больше = карта дороже / реже.
-CARD_RANK_LADDER = ("E", "D", "C", "B", "G", "P", "A", "S", "X")
+# Лестница редкости MangaBuff (низ → верх). Индекс больше = дороже.
+# Как на сайте: K L Q V N H E D C B G P A S X
+CARD_RANK_LADDER = (
+    "K",
+    "L",
+    "Q",
+    "V",
+    "N",
+    "H",
+    "E",
+    "D",
+    "C",
+    "B",
+    "G",
+    "P",
+    "A",
+    "S",
+    "X",
+)
 MARKET_LOTS_PATH = BASE_DIR / "market_lots.json"
 TRADE_RECEIVERS_PATH = BASE_DIR / "trade_receivers.json"
 TRADE_CANDIDATES_PATH = BASE_DIR / "trade_candidates.json"
+# Сколько S нужно отдать за 1 X (выгодный апгрейд).
+TRADE_S_FOR_X = 2
 # Лимит сайта: одновременно не больше 10 лотов — берём самые дорогие.
 MARKET_LOT_LIMIT = 10
 # Режим цены: higher = 1× ранг выше (для X — 2×X); same2 = 2× тот же ранг.
@@ -124,7 +142,7 @@ def card_value_key(row: Dict[str, Any]) -> Tuple[int, int, int, int]:
 
 
 def next_higher_rank(rank: str) -> Optional[str]:
-    """Следующий ранг выше (цена лота: 1 карта этого ранга)."""
+    """Следующий ранг выше по лестнице сайта."""
     r = (rank or "").strip().upper()
     if r not in CARD_RANK_LADDER:
         return None
@@ -132,6 +150,32 @@ def next_higher_rank(rank: str) -> Optional[str]:
     if i >= len(CARD_RANK_LADDER) - 1:
         return None
     return CARD_RANK_LADDER[i + 1]
+
+
+def prev_lower_rank(rank: str) -> Optional[str]:
+    """Предыдущий (более слабый) ранг."""
+    r = (rank or "").strip().upper()
+    if r not in CARD_RANK_LADDER:
+        return None
+    i = CARD_RANK_LADDER.index(r)
+    if i <= 0:
+        return None
+    return CARD_RANK_LADDER[i - 1]
+
+
+def trade_card_value(rank: str, *, has_shadow: int = 0) -> float:
+    """Ценность карты для оценки выгодности обмена (экспонента по рангу)."""
+    v = rank_value(rank)
+    if v < 0:
+        return 0.0
+    return (2.0**v) * (1.12 if int(has_shadow or 0) else 1.0)
+
+
+def trade_bundle_value(cards: Sequence[Dict[str, Any]]) -> float:
+    return sum(
+        trade_card_value(str(c.get("rank") or ""), has_shadow=int(c.get("has_shadow") or 0))
+        for c in cards or []
+    )
 
 
 def format_rank_label(rank: str) -> str:
@@ -5795,7 +5839,7 @@ class MangaBuffService:
         )
         return ordered[:want]
 
-    def _card_tradable(self, row: Dict[str, Any]) -> bool:
+    def _card_tradable(self, row: Dict[str, Any], *, allow_in_trade: bool = False) -> bool:
         if not isinstance(row, dict):
             return False
         cid = row.get("id")
@@ -5803,7 +5847,7 @@ class MangaBuffService:
             return False
         if int(row.get("is_lock") or 0):
             return False
-        if int(row.get("in_trade") or 0):
+        if not allow_in_trade and int(row.get("in_trade") or 0):
             return False
         if int(row.get("is_not_tradable") or 0):
             return False
@@ -5814,28 +5858,123 @@ class MangaBuffService:
         return True
 
     async def _tradable_inventory_cards(self, page: Page) -> List[Dict[str, Any]]:
-        """Все свои карты, которые можно кинуть в обмен — от малой редкости к большой."""
+        """Свои карты для обмена: без X, от малой редкости к большой."""
         rows = await self._fetch_all_inventory_cards(page, per_page=70)
-        out = [r for r in rows if self._card_tradable(r)]
+        out = []
+        for r in rows:
+            if not self._card_tradable(r):
+                continue
+            if str(r.get("rank") or "").upper() == "X":
+                continue  # X никогда не отдаём
+            out.append(r)
         out.sort(key=lambda r: rank_value(str(r.get("rank") or "")))
         return out
 
-    async def _fetch_receiver_trade_card(
-        self, page: Page, receiver_id: str, prefer_min_rank: str = ""
-    ) -> Optional[Dict[str, Any]]:
-        """Любая доступная карта партнёра (нужна сайту в receiver_card_ids)."""
-        prefer = (prefer_min_rank or "").strip().upper()
-        prefer_v = rank_value(prefer) if prefer else -1
+    def _build_profitable_offer_units(
+        self, my_cards: Sequence[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """
+        Единицы выгодных офферов:
+        - 1×R → 1×(R+1) для R < S
+        - 2×S → 1×X
+        X не отдаём.
+        """
+        by_rank: Dict[str, List[Dict[str, Any]]] = {}
+        for c in my_cards:
+            r = str(c.get("rank") or "").upper()
+            if not r or r == "X":
+                continue
+            by_rank.setdefault(r, []).append(c)
+        units: List[Dict[str, Any]] = []
+        # сначала пары S → X
+        s_list = list(by_rank.get("S") or [])
+        while len(s_list) >= TRADE_S_FOR_X:
+            pair = [s_list.pop(0) for _ in range(TRADE_S_FOR_X)]
+            units.append(
+                {
+                    "kind": "2s_x",
+                    "offer_cards": pair,
+                    "want_rank": "X",
+                    "want_count": 1,
+                }
+            )
+        # одиночные ранги ниже S: ровно +1
+        for r in CARD_RANK_LADDER:
+            if r in ("S", "X"):
+                continue
+            want = next_higher_rank(r)
+            if not want:
+                continue
+            for card in by_rank.get(r) or []:
+                units.append(
+                    {
+                        "kind": "plus1",
+                        "offer_cards": [card],
+                        "want_rank": want,
+                        "want_count": 1,
+                    }
+                )
+        return units
+
+    def _is_incoming_trade_profitable(
+        self,
+        give_cards: Sequence[Dict[str, Any]],
+        get_cards: Sequence[Dict[str, Any]],
+    ) -> bool:
+        """True только если входящий обмен выгоден нам."""
+        give = [c for c in give_cards if isinstance(c, dict)]
+        get = [c for c in get_cards if isinstance(c, dict)]
+        if not give or not get:
+            return False
+        # никогда не отдаём X
+        if any(str(c.get("rank") or "").upper() == "X" for c in give):
+            return False
+        give_ranks = [str(c.get("rank") or "").upper() for c in give]
+        get_ranks = [str(c.get("rank") or "").upper() for c in get]
+
+        # идеальный паттерн: 2S → 1X
+        if (
+            len(give) == TRADE_S_FOR_X
+            and all(r == "S" for r in give_ranks)
+            and len(get) == 1
+            and get_ranks[0] == "X"
+        ):
+            return True
+        # идеальный паттерн: 1×R → 1×(R+1), но S только через 2S→X
+        if len(give) == 1 and len(get) == 1:
+            if give_ranks[0] == "S":
+                return False
+            want = next_higher_rank(give_ranks[0])
+            if want and get_ranks[0] == want:
+                return True
+        # общий случай: только явная выгода (≥ +1 ранг по ценности)
+        gv = trade_bundle_value(give)
+        rv = trade_bundle_value(get)
+        if gv <= 0:
+            return False
+        # минимум ~+15% и строго дороже по сумме рангов
+        return rv > gv and rv >= gv * 1.15
+
+    async def _fetch_user_cards_by_rank(
+        self,
+        page: Page,
+        user_id: str,
+        rank: str,
+        *,
+        limit: int = 40,
+    ) -> List[Dict[str, Any]]:
+        """Карты пользователя конкретного ранга через cards-filter."""
+        rank_u = (rank or "").strip().upper()
         try:
             data = await page.evaluate(
-                """async ({uid}) => {
+                """async ({uid, rank, limit}) => {
                   const csrf = (document.querySelector('meta[name="csrf-token"]')
                     || {}).content || '';
                   const body = new URLSearchParams();
                   body.set('page', '1');
-                  body.set('per_page', '70');
+                  body.set('per_page', String(limit || 40));
                   body.set('search', '');
-                  body.set('rank', '');
+                  body.set('rank', (rank || '').toLowerCase());
                   const resp = await fetch('/cards-filter/' + uid, {
                     method: 'POST',
                     headers: {
@@ -5846,39 +5985,399 @@ class MangaBuffService:
                     body: body.toString(),
                     credentials: 'same-origin'
                   });
-                  if (!resp.ok) return {ok:false, status: resp.status, data:[]};
+                  if (!resp.ok) return {ok:false, data:[]};
                   let json = null;
                   try { json = await resp.json(); } catch (e) { return {ok:false, data:[]}; }
                   return {ok:true, data: (json && json.data) ? json.data : []};
                 }""",
-                {"uid": str(receiver_id)},
+                {
+                    "uid": str(user_id),
+                    "rank": rank_u,
+                    "limit": int(limit),
+                },
             )
         except Exception as exc:  # noqa: BLE001
-            logger.debug("receiver cards %s: %s", receiver_id, exc)
-            return None
+            logger.debug("user cards by rank %s/%s: %s", user_id, rank_u, exc)
+            return []
         rows = (data or {}).get("data") or []
-        tradable = [r for r in rows if isinstance(r, dict) and self._card_tradable(r)]
-        if not tradable:
-            return None
-        if prefer_v >= 0:
-            better = [
-                r
-                for r in tradable
-                if rank_value(str(r.get("rank") or "")) >= prefer_v
-            ]
-            if better:
-                better.sort(
-                    key=lambda r: rank_value(str(r.get("rank") or "")),
-                    reverse=True,
-                )
-                return better[0]
-        tradable.sort(
-            key=lambda r: rank_value(str(r.get("rank") or "")), reverse=True
+        out = []
+        for r in rows:
+            if not isinstance(r, dict) or not self._card_tradable(r):
+                continue
+            if str(r.get("rank") or "").upper() != rank_u:
+                continue
+            out.append(r)
+        return out
+
+    async def _fetch_receiver_want_cards(
+        self,
+        page: Page,
+        receiver_id: str,
+        want_rank: str,
+        want_count: int = 1,
+    ) -> List[Dict[str, Any]]:
+        """Ровно нужный ранг у партнёра (не выше и не ниже)."""
+        rows = await self._fetch_user_cards_by_rank(
+            page, receiver_id, want_rank, limit=max(40, want_count * 10)
         )
-        return tradable[0]
+        if not rows:
+            return []
+        # чуть хуже копии сначала — легче примут
+        rows.sort(
+            key=lambda r: (
+                -int(r.get("has_shadow") or 0),
+                int(r.get("copy_number") or 10**9),
+            )
+        )
+        return rows[: max(1, int(want_count))]
+
+    async def _rank_map_for_user(
+        self, page: Page, user_id: str
+    ) -> Dict[str, str]:
+        """card_id → rank для пользователя (кэш на один проход)."""
+        try:
+            data = await page.evaluate(
+                """async ({uid}) => {
+                  const csrf = (document.querySelector('meta[name="csrf-token"]')
+                    || {}).content || '';
+                  const all = [];
+                  let pageNo = 1, last = 1;
+                  while (pageNo <= last && pageNo <= 30) {
+                    const body = new URLSearchParams();
+                    body.set('page', String(pageNo));
+                    body.set('per_page', '70');
+                    body.set('search', '');
+                    body.set('rank', '');
+                    const resp = await fetch('/cards-filter/' + uid, {
+                      method: 'POST',
+                      headers: {
+                        'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+                        'X-CSRF-TOKEN': csrf,
+                        'X-Requested-With': 'XMLHttpRequest'
+                      },
+                      body: body.toString(),
+                      credentials: 'same-origin'
+                    });
+                    if (!resp.ok) break;
+                    let json = null;
+                    try { json = await resp.json(); } catch (e) { break; }
+                    const rows = (json && json.data) ? json.data : [];
+                    all.push(...rows);
+                    last = (json && json.last_page) ? Number(json.last_page) : pageNo;
+                    if (!rows.length) break;
+                    pageNo += 1;
+                  }
+                  return all;
+                }""",
+                {"uid": str(user_id)},
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("rank map %s: %s", user_id, exc)
+            return {}
+        out: Dict[str, str] = {}
+        for r in data or []:
+            if not isinstance(r, dict):
+                continue
+            cid = str(r.get("card_id") or "").strip()
+            rank = str(r.get("rank") or "").upper().strip()
+            if cid and rank:
+                out[cid] = rank
+        return out
+
+    async def _parse_trade_page_cards(
+        self, page: Page
+    ) -> Dict[str, Any]:
+        """Разобрать страницу /trades/<id>: стороны и card_id."""
+        try:
+            raw = await page.evaluate(
+                """() => {
+                  const tradeId = (document.querySelector('.trade')||{}).getAttribute('data-id') || '';
+                  const creatorA = document.querySelector('a.trade__header-name');
+                  const creatorHref = creatorA ? (creatorA.href||'') : '';
+                  const m = creatorHref.match(/\\/users\\/(\\d+)/);
+                  const creatorId = m ? m[1] : '';
+                  function side(sel){
+                    const box = document.querySelector(sel);
+                    if (!box) return [];
+                    return [...box.querySelectorAll('a.trade__main-item')].map(a => {
+                      const href = a.href || '';
+                      const cm = href.match(/\\/cards\\/(\\d+)/);
+                      const lock = a.querySelector('.lock-card-btn');
+                      return {
+                        card_id: cm ? cm[1] : '',
+                        user_card_id: lock ? (lock.getAttribute('data-id')||'') : '',
+                        href
+                      };
+                    });
+                  }
+                  const text = document.body.innerText || '';
+                  const pending = /отменить обмен|принять|отклонить/i.test(text)
+                    && !/обмен отклонен|обмен принят|обмен заверш/i.test(text);
+                  const canAccept = !!document.querySelector('.trade__accepted-btn');
+                  const canReject = !!document.querySelector('.trade__rejected-btn');
+                  const canCancel = !!document.querySelector('.trade__cancel-btn');
+                  // партнёр (не creator): ссылка в шапке справа / любой /users/ кроме creator
+                  let partnerId = '';
+                  const names = [...document.querySelectorAll(
+                    'a.trade__header-name, .trade__header a[href*="/users/"]'
+                  )];
+                  for (const a of names) {
+                    const pm = (a.href||'').match(/\\/users\\/(\\d+)/);
+                    if (!pm) continue;
+                    if (creatorId && pm[1] === creatorId) continue;
+                    partnerId = pm[1];
+                    break;
+                  }
+                  if (!partnerId) {
+                    for (const a of document.querySelectorAll('a[href*="/users/"]')) {
+                      const pm = (a.href||'').match(/\\/users\\/(\\d+)/);
+                      if (!pm) continue;
+                      if (creatorId && pm[1] === creatorId) continue;
+                      partnerId = pm[1];
+                      break;
+                    }
+                  }
+                  return {
+                    trade_id: tradeId,
+                    creator_id: creatorId,
+                    partner_id: partnerId,
+                    creator_cards: side('.trade__main-items--creator'),
+                    receiver_cards: side('.trade__main-items--receiver'),
+                    pending,
+                    can_accept: canAccept,
+                    can_reject: canReject,
+                    can_cancel: canCancel,
+                    text: text.slice(0, 500)
+                  };
+                }"""
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("parse trade page: %s", exc)
+            return {}
+        return raw if isinstance(raw, dict) else {}
+
+    async def _enrich_trade_side_ranks(
+        self,
+        page: Page,
+        cards: Sequence[Dict[str, Any]],
+        owner_id: str,
+        rank_cache: Dict[str, Dict[str, str]],
+    ) -> List[Dict[str, Any]]:
+        owner = str(owner_id or "")
+        if owner and owner not in rank_cache:
+            rank_cache[owner] = await self._rank_map_for_user(page, owner)
+        m = rank_cache.get(owner) or {}
+        out: List[Dict[str, Any]] = []
+        for c in cards or []:
+            cid = str(c.get("card_id") or "").strip()
+            rank = m.get(cid) or ""
+            out.append(
+                {
+                    "card_id": cid,
+                    "id": c.get("user_card_id") or cid,
+                    "rank": rank,
+                }
+            )
+        return out
+
+    async def _cleanup_unprofitable_outgoing(self, page: Page) -> int:
+        """Отменить свои исходящие, которые не соответствуют выгодным правилам."""
+        if not await self._safe_goto(page, "https://mangabuff.ru/trades/offers"):
+            return 0
+        await asyncio.sleep(0.5)
+        hrefs = await page.evaluate(
+            """() => [...document.querySelectorAll('a.trade__list-item[href*="/trades/"]')]
+              .map(a => a.href.split('?')[0])
+              .filter(h => /\\/trades\\/\\d+$/.test(h))
+              .slice(0, 40)"""
+        )
+        me = str(self._mb_user_id or "")
+        rank_cache: Dict[str, Dict[str, str]] = {}
+        cancelled = 0
+        for href in hrefs or []:
+            if self._stop_flag.is_set():
+                break
+            if not await self._safe_goto(page, href):
+                continue
+            await asyncio.sleep(0.3)
+            info = await self._parse_trade_page_cards(page)
+            tid = str(info.get("trade_id") or "").strip()
+            creator_id = str(info.get("creator_id") or "").strip()
+            if not tid or creator_id != me or not info.get("can_cancel"):
+                continue
+            # исходящий: отдаём creator, просим у партнёра (receiver)
+            partner = str(info.get("partner_id") or "").strip()
+            if not partner:
+                partner = await page.evaluate(
+                    """() => {
+                      const me = String(window.user_id||'');
+                      const links = [...document.querySelectorAll('a[href*="/users/"]')];
+                      for (const a of links) {
+                        const m = (a.href||'').match(/\\/users\\/(\\d+)/);
+                        if (!m) continue;
+                        if (m[1] === me) continue;
+                        return m[1];
+                      }
+                      return '';
+                    }"""
+                )
+            give = await self._enrich_trade_side_ranks(
+                page, info.get("creator_cards") or [], me, rank_cache
+            )
+            get = await self._enrich_trade_side_ranks(
+                page,
+                info.get("receiver_cards") or [],
+                str(partner or ""),
+                rank_cache,
+            )
+            # для исходящего «выгодно» = наш офферный паттерн
+            status = self._is_outgoing_offer_profitable(give, get)
+            if status is not False:
+                continue
+            resp = await self._post_json(page, f"/trades/{tid}/cancel", {})
+            if int(resp.get("status") or 0) in (200, 201):
+                cancelled += 1
+                logger.info(
+                    "MangaBuff cancel bad outgoing #%s give=%s get=%s",
+                    tid,
+                    [c.get("rank") for c in give],
+                    [c.get("rank") for c in get],
+                )
+            await asyncio.sleep(0.45)
+        if cancelled:
+            logger.info("MangaBuff cleaned outgoing: %s", cancelled)
+        return cancelled
+
+    def _is_outgoing_offer_profitable(
+        self,
+        give_cards: Sequence[Dict[str, Any]],
+        get_cards: Sequence[Dict[str, Any]],
+    ) -> Optional[bool]:
+        """
+        Исходящий оффер: True=выгодный, False=мусор, None=ранги не ясны (не трогаем).
+        Правила: только +1 ранг или 2S→1X, без отдачи X.
+        """
+        give = [c for c in give_cards if isinstance(c, dict)]
+        get = [c for c in get_cards if isinstance(c, dict)]
+        if not give or not get:
+            return False
+        if any(str(c.get("rank") or "").upper() == "X" for c in give):
+            return False
+        if any(not str(c.get("rank") or "").strip() for c in give + get):
+            return None
+        give_ranks = [str(c.get("rank") or "").upper() for c in give]
+        get_ranks = [str(c.get("rank") or "").upper() for c in get]
+        if (
+            len(give) == TRADE_S_FOR_X
+            and all(r == "S" for r in give_ranks)
+            and len(get) == 1
+            and get_ranks[0] == "X"
+        ):
+            return True
+        if len(give) == 1 and len(get) == 1:
+            if give_ranks[0] == "S":
+                return False  # S только парой 2S→1X
+            want = next_higher_rank(give_ranks[0])
+            return bool(want and get_ranks[0] == want)
+        return False
+
+    async def _cancel_all_outgoing_trades(self, page: Page) -> None:
+        """Устарело: точечная чистка через _cleanup_unprofitable_outgoing."""
+        await self._cleanup_unprofitable_outgoing(page)
+
+    async def _process_incoming_trades_unlocked(self, page: Page) -> Dict[str, int]:
+        """Принять выгодные входящие, отклонить остальные."""
+        stats = {"accepted": 0, "rejected": 0, "seen": 0}
+        if not await self._safe_goto(page, "https://mangabuff.ru/trades"):
+            return stats
+        await asyncio.sleep(0.6)
+        hrefs = await page.evaluate(
+            """() => [...document.querySelectorAll('a.trade__list-item[href*=\"/trades/\"]')]
+              .map(a => a.href.split('?')[0])
+              .filter(h => /\\/trades\\/\\d+$/.test(h))
+              .slice(0, 30)"""
+        )
+        # на вкладке предложений могут быть только входящие; если пусто — ок
+        if not hrefs:
+            # иногда список в основном контейнере без класса list-item
+            hrefs = await page.evaluate(
+                """() => {
+                  const t = document.body.innerText || '';
+                  if (/предложений нет/i.test(t)) return [];
+                  return [...document.querySelectorAll('a[href*=\"/trades/\"]')]
+                    .map(a => a.href.split('?')[0])
+                    .filter(h => /\\/trades\\/\\d+$/.test(h))
+                    .slice(0, 30);
+                }"""
+            )
+        me = str(self._mb_user_id or "")
+        rank_cache: Dict[str, Dict[str, str]] = {}
+        for href in hrefs or []:
+            if self._stop_flag.is_set():
+                break
+            if not await self._safe_goto(page, href):
+                continue
+            await asyncio.sleep(0.35)
+            info = await self._parse_trade_page_cards(page)
+            tid = str(info.get("trade_id") or "").strip()
+            creator_id = str(info.get("creator_id") or "").strip()
+            if not tid or not creator_id:
+                continue
+            # исходящие нам тут не нужны
+            if creator_id == me:
+                continue
+            if not info.get("can_accept") and not info.get("can_reject"):
+                continue
+            stats["seen"] += 1
+            give_raw = info.get("receiver_cards") or []  # мы receiver → отдаём receiver side
+            get_raw = info.get("creator_cards") or []  # получаем то, что даёт creator
+            give = await self._enrich_trade_side_ranks(
+                page, give_raw, me, rank_cache
+            )
+            get = await self._enrich_trade_side_ranks(
+                page, get_raw, creator_id, rank_cache
+            )
+            # если ранги не резолвнулись — отклоняем (не рискуем)
+            if any(not c.get("rank") for c in list(give) + list(get)):
+                profitable = False
+            else:
+                profitable = self._is_incoming_trade_profitable(give, get)
+            endpoint = "accept" if profitable else "reject"
+            resp = await self._post_json(page, f"/trades/{tid}/{endpoint}", {})
+            status = int(resp.get("status") or 0)
+            ok = status in (200, 201)
+            if ok and profitable:
+                stats["accepted"] += 1
+                self.stats.touch(f"обмен принят #{tid}", page.url)
+                logger.info(
+                    "MangaBuff incoming ACCEPT #%s give=%s get=%s",
+                    tid,
+                    [c.get("rank") for c in give],
+                    [c.get("rank") for c in get],
+                )
+            elif ok:
+                stats["rejected"] += 1
+                self.stats.touch(f"обмен отклонён #{tid}", page.url)
+                logger.info(
+                    "MangaBuff incoming REJECT #%s give=%s get=%s",
+                    tid,
+                    [c.get("rank") for c in give],
+                    [c.get("rank") for c in get],
+                )
+            else:
+                logger.info(
+                    "MangaBuff incoming %s fail #%s status=%s",
+                    endpoint,
+                    tid,
+                    status,
+                )
+            await asyncio.sleep(0.7)
+        if stats["accepted"] or stats["rejected"]:
+            self._persist_stats()
+        return stats
 
     async def run_card_trades(self, offers: int = 40) -> int:
-        """Кинуть обмены людям из чата/комментов: 1 человек = 1 обмен, все свои карты."""
+        """Автофарм выгодных обменов: чат/комменты, 1 обмен/человек."""
         async with self._lock:
             return await self._run_card_trades_unlocked(offers=offers)
 
@@ -5890,60 +6389,102 @@ class MangaBuffService:
         if not await self._safe_goto(page, "https://mangabuff.ru/trades"):
             logger.warning("MangaBuff trades: cannot open /trades")
             return 0
-        my_cards = await self._tradable_inventory_cards(page)
-        if not my_cards:
-            logger.info("MangaBuff trades: no tradable cards in inventory")
+
+        # 1) входящие: принять выгодные / отклонить остальное
+        try:
+            incoming = await self._process_incoming_trades_unlocked(page)
+            if incoming.get("seen"):
+                logger.info(
+                    "MangaBuff incoming trades: seen=%s accepted=%s rejected=%s",
+                    incoming.get("seen"),
+                    incoming.get("accepted"),
+                    incoming.get("rejected"),
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("incoming trades: %s", exc)
+
+        # 2) точечно отменить только невыгодные исходящие (не трогаем хорошие pending)
+        try:
+            await self._cleanup_unprofitable_outgoing(page)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("cleanup outgoing: %s", exc)
+
+        if not await self._safe_goto(page, "https://mangabuff.ru/trades"):
             return 0
-        want = max(1, min(int(offers or 40), len(my_cards)))
-        targets = await self._pick_trade_targets(page, limit=want)
+        my_cards = await self._tradable_inventory_cards(page)
+        units = self._build_profitable_offer_units(my_cards)
+        if not units:
+            # карты заняты старыми pending — сброс исходящих и повтор
+            try:
+                await self._safe_goto(
+                    page, "https://mangabuff.ru/trades/rejectAll?type_trade=sender"
+                )
+                await asyncio.sleep(1.4)
+                logger.info("MangaBuff trades: reset outgoing (no free cards)")
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("reset outgoing: %s", exc)
+            if not await self._safe_goto(page, "https://mangabuff.ru/trades"):
+                return 0
+            my_cards = await self._tradable_inventory_cards(page)
+            units = self._build_profitable_offer_units(my_cards)
+        if not units:
+            logger.info("MangaBuff trades: no profitable offer units")
+            return 0
+        want = max(1, min(int(offers or 40), len(units)))
+        targets = await self._pick_trade_targets(page, limit=max(want * 2, want))
         if not targets:
             logger.info("MangaBuff trades: no chat/comment targets")
             return 0
-        # CSRF актуален с /trades
         if not await self._safe_goto(page, "https://mangabuff.ru/trades"):
             return 0
+
         sent = 0
         used_card_ids: set[str] = set()
-        card_idx = 0
+        used_unit_idx: set[int] = set()
         rate_wait = 3.5
         for receiver_id in targets:
             if self._stop_flag.is_set() or sent >= want:
                 break
-            # следующая свободная карта (от малой к большой)
-            offer = None
-            while card_idx < len(my_cards):
-                cand = my_cards[card_idx]
-                card_idx += 1
-                cid = str(cand.get("id") or "")
-                if cid and cid not in used_card_ids:
-                    offer = cand
-                    break
-            if not offer:
-                logger.info("MangaBuff trades: cards exhausted after %s", sent)
-                break
-            their = await self._fetch_receiver_trade_card(
-                page,
-                receiver_id,
-                prefer_min_rank=str(offer.get("rank") or ""),
-            )
-            if not their:
-                logger.info(
-                    "MangaBuff trade skip user=%s: no their cards", receiver_id
+            unit = None
+            unit_i = -1
+            their: List[Dict[str, Any]] = []
+            # подбираем оффер, который партнёр реально может закрыть
+            for i, cand in enumerate(units):
+                if i in used_unit_idx:
+                    continue
+                ids = [str(c.get("id") or "") for c in cand["offer_cards"]]
+                if any(not cid or cid in used_card_ids for cid in ids):
+                    continue
+                want_rank = str(cand["want_rank"])
+                want_count = int(cand.get("want_count") or 1)
+                cand_their = await self._fetch_receiver_want_cards(
+                    page, receiver_id, want_rank, want_count=want_count
                 )
-                # человека не помечаем — попробуем позже, когда появятся карты
+                if len(cand_their) < want_count:
+                    continue
+                unit = cand
+                unit_i = i
+                their = cand_their
+                break
+            if not unit:
+                logger.info(
+                    "MangaBuff trade skip user=%s: no matching want rank",
+                    receiver_id,
+                )
                 continue
-            resp = await self._post_json(
-                page,
-                "/trades/create",
-                {
-                    "receiver_id": str(receiver_id),
-                    "creator_card_ids": [str(offer["id"])],
-                    "receiver_card_ids": [str(their["id"])],
-                },
-            )
+
+            want_rank = str(unit["want_rank"])
+            want_count = int(unit.get("want_count") or 1)
+            creator_ids = [str(c["id"]) for c in unit["offer_cards"]]
+            receiver_ids = [str(c["id"]) for c in their[:want_count]]
+            payload = {
+                "receiver_id": str(receiver_id),
+                "creator_card_ids": creator_ids,
+                "receiver_card_ids": receiver_ids,
+            }
+            resp = await self._post_json(page, "/trades/create", payload)
             status = int(resp.get("status") or 0)
             js = resp.get("json") if isinstance(resp.get("json"), dict) else {}
-            # rate-limit: пауза и один ретрай
             if status == 429:
                 wait_s = min(45.0, rate_wait * 3)
                 logger.info(
@@ -5953,39 +6494,35 @@ class MangaBuffService:
                 )
                 await asyncio.sleep(wait_s)
                 rate_wait = min(12.0, rate_wait + 1.5)
-                resp = await self._post_json(
-                    page,
-                    "/trades/create",
-                    {
-                        "receiver_id": str(receiver_id),
-                        "creator_card_ids": [str(offer["id"])],
-                        "receiver_card_ids": [str(their["id"])],
-                    },
-                )
+                resp = await self._post_json(page, "/trades/create", payload)
                 status = int(resp.get("status") or 0)
                 js = resp.get("json") if isinstance(resp.get("json"), dict) else {}
+
             if status in (200, 201) or (js and js.get("trade")):
                 sent += 1
-                used_card_ids.add(str(offer["id"]))
+                used_unit_idx.add(unit_i)
+                for i in creator_ids:
+                    used_card_ids.add(i)
                 self._mark_trade_receiver(receiver_id)
                 self.stats.trades_sent += 1
-                offer_rank = str(offer.get("rank") or "?")
-                want_rank = str(their.get("rank") or "?")
+                offer_ranks = [
+                    str(c.get("rank") or "?") for c in unit["offer_cards"]
+                ]
                 self.stats.touch(
-                    f"обмен {offer_rank}→{want_rank} · user {receiver_id}",
+                    f"обмен {','.join(offer_ranks)}→{want_rank} · user {receiver_id}",
                     page.url,
                 )
                 logger.info(
-                    "MangaBuff trade sent to %s offer=%s[%s] want=%s[%s]",
+                    "MangaBuff trade sent to %s kind=%s offer=%s[%s] want=%s[%s]",
                     receiver_id,
-                    offer.get("id"),
-                    offer_rank,
-                    their.get("id"),
+                    unit.get("kind"),
+                    creator_ids,
+                    offer_ranks,
+                    receiver_ids,
                     want_rank,
                 )
                 rate_wait = max(2.0, rate_wait * 0.9)
             else:
-                # при фейле карту можно попробовать с другим человеком
                 logger.info(
                     "MangaBuff trade fail user=%s status=%s json=%s",
                     receiver_id,
@@ -5997,11 +6534,8 @@ class MangaBuffService:
                     msg = str(js.get("message") or "")
                     errs = js.get("errors")
                     if isinstance(errs, dict):
-                        msg += " " + " ".join(
-                            str(v) for v in errs.values()
-                        )
+                        msg += " " + " ".join(str(v) for v in errs.values())
                 msg_l = msg.lower()
-                # навсегда: запретил обмены / уже есть pending
                 if status in (409, 422) and (
                     "запретил" in msg_l
                     or "already" in msg_l
@@ -6013,13 +6547,14 @@ class MangaBuffService:
                 if status == 429:
                     await asyncio.sleep(min(60.0, rate_wait * 4))
             await asyncio.sleep(rate_wait)
+
         if sent:
             self._persist_stats()
         logger.info(
-            "MangaBuff trades done: sent=%s / want=%s cards_left≈%s",
+            "MangaBuff trades done: sent=%s / want=%s units_free≈%s",
             sent,
             want,
-            max(0, len(my_cards) - len(used_card_ids)),
+            max(0, len(units) - len(used_unit_idx)),
         )
         return sent
 

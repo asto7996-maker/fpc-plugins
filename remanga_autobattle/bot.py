@@ -537,8 +537,9 @@ class App:
         async def cards_trade_now(message: Message) -> None:
             self._notify_chat_id = message.chat.id
             await message.answer(
-                "Кидаю обмены людям из чата/комментов…\n"
-                "<i>1 человек = 1 обмен · все карты инвентаря</i>",
+                "Фарм обменов…\n"
+                "<i>только выгодные: R→R+1 · 2S→1X · без отдачи X\n"
+                "входящие невыгодные — автоотклонение · 1 обмен/человек</i>",
                 reply_markup=cards_events_keyboard(),
             )
             try:
