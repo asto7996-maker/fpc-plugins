@@ -202,17 +202,21 @@ def cards_events_home(
     auto_market: bool = False,
     auto_battle: bool = False,
     auto_trade: bool = False,
+    auto_quiz: bool = False,
     battles_won: int = 0,
     battles_total: int = 0,
     trades_sent: int = 0,
+    quiz_correct: int = 0,
+    quiz_best: int = 0,
 ) -> str:
     return (
-        f"<b>Карты · бои · обмены</b>\n"
+        f"<b>Карты · бои · обмены · викторина</b>\n"
         f"{hr()}\n"
         f"Автофарм   <code>{'●' if events_on else '○'}</code>\n"
         f"Чтение     <code>{'●' if read_on else '○'}</code>\n"
         f"Бои        <code>{'●' if auto_battle else '○'}</code>\n"
         f"Обмены     <code>{'●' if auto_trade else '○'}</code>\n"
+        f"Викторина  <code>{'●' if auto_quiz else '○'}</code>\n"
         f"Лоты       <code>{'●' if auto_market else '○'}</code>\n"
         f"Алерты     <code>{'●' if notify_cards else '○'}</code>\n"
         f"{hr()}\n"
@@ -222,11 +226,13 @@ def cards_events_home(
         f"Эвенты     <b>{events}</b> · награды <b>{rewards}</b>\n"
         f"Бои        <b>{battles_won}</b> / {battles_total}\n"
         f"Обмены     <b>{trades_sent}</b> отправлено\n"
+        f"Викторина  <b>{quiz_correct}</b> верных · рекорд серии <b>{quiz_best}</b>\n"
         f"{hr()}\n"
         f"Дроп · <i>{last_drop or '—'}</i>\n"
         f"{last_action or '—'}\n\n"
         f"<i>Бои — пробуждение, поиск, итоги.\n"
-        f"Обмен — A → просим S у разных игроков.\n"
+        f"Обмен — выгодные R→R+1 / 2S→X.\n"
+        f"Викторина — автоответы, цель 1 место в рейтинге.\n"
         f"Улучшение / заточка — авто в цикле карт.</i>"
     )
 
@@ -264,7 +270,8 @@ def help_text() -> str:
         f"<b>Фарм</b> — чтение до ~90%, зачёт через addHistory.\n"
         f"<b>Карты</b> — сундуки, паки, дропы, площадка.\n"
         f"<b>Бои</b> — пробуждение, поиск боя, победы, дейлики.\n"
-        f"<b>Обмены</b> — предложения A→S разным игрокам.\n"
+        f"<b>Обмены</b> — выгодные предложения R→R+1 / 2S→X.\n"
+        f"<b>Викторина</b> — автоответы (API + кэш), серия к 1 месту.\n"
         f"<b>Улучшение</b> — прокачка и заточка дублей.\n\n"
         f"Статистика глав — только то, что принял сайт.\n"
         f"Ночь 01:00–05:00 МСК — пауза."

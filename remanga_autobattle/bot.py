@@ -96,11 +96,13 @@ def cards_events_keyboard() -> ReplyKeyboardMarkup:
     auto_m = "Лоты · вкл" if s.mangabuff_auto_market else "Лоты · выкл"
     auto_b = "Бои · вкл" if getattr(s, "mangabuff_auto_battle", True) else "Бои · выкл"
     auto_t = "Обмены · вкл" if getattr(s, "mangabuff_auto_trade", True) else "Обмены · выкл"
+    auto_q = "Викторина · вкл" if getattr(s, "mangabuff_auto_quiz", True) else "Викторина · выкл"
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="▸ Автофарм карт"), KeyboardButton(text="■ Стоп карт")],
             [KeyboardButton(text="Собрать"), KeyboardButton(text="Статус карт")],
             [KeyboardButton(text="Бой сейчас"), KeyboardButton(text="Обмены сейчас")],
+            [KeyboardButton(text="Викторина сейчас"), KeyboardButton(text=auto_q)],
             [KeyboardButton(text="На площадку"), KeyboardButton(text=auto_m)],
             [KeyboardButton(text=auto_b), KeyboardButton(text=auto_t)],
             [KeyboardButton(text=notify), KeyboardButton(text="Вехи")],
@@ -507,6 +509,47 @@ class App:
                 reply_markup=cards_events_keyboard(),
             )
 
+        @self.dp.message(
+            StateFilter(None),
+            F.text.regexp(r"^(Викторина · )(вкл|выкл)$"),
+        )
+        async def cards_toggle_quiz(message: Message) -> None:
+            s = load_settings()
+            on = not bool(getattr(s, "mangabuff_auto_quiz", True))
+            update_settings(mangabuff_auto_quiz=on)
+            await message.answer(
+                f"Авто-викторина · <b>{'вкл' if on else 'выкл'}</b>\n"
+                "<i>правильные ответы из API + кэш + комменты + веб · цель — 1 место</i>",
+                reply_markup=cards_events_keyboard(),
+            )
+
+        @self.dp.message(StateFilter(None), F.text.in_({"Викторина сейчас"}))
+        async def cards_quiz_now(message: Message) -> None:
+            self._notify_chat_id = message.chat.id
+            await message.answer(
+                "Фарм викторины…\n"
+                "<i>отвечаю правильно, коплю серию к рекорду топа</i>",
+                reply_markup=cards_events_keyboard(),
+            )
+            try:
+                if not self.mangabuff.is_started:
+                    await self.mangabuff.start(headless=True)
+                stats = await self.mangabuff.run_quiz_farm(max_answers=120)
+                await message.answer(
+                    f"Викторина · верно <b>{stats.get('correct', 0)}</b> / "
+                    f"{stats.get('answered', 0)}\n"
+                    f"Серия сейчас · <b>{self.mangabuff.stats.quiz_last_streak}</b>\n"
+                    f"Лучшая серия · <b>{self.mangabuff.stats.quiz_best_streak}</b>\n"
+                    f"Всего верных · <b>{self.mangabuff.stats.quiz_correct}</b>\n"
+                    f"Наград ×10 · <b>{stats.get('milestones', 0)}</b>",
+                    reply_markup=cards_events_keyboard(),
+                )
+            except Exception as exc:  # noqa: BLE001
+                await message.answer(
+                    f"⚠️ <code>{exc}</code>",
+                    reply_markup=cards_events_keyboard(),
+                )
+
         @self.dp.message(StateFilter(None), F.text.in_({"Бой сейчас"}))
         async def cards_battle_now(message: Message) -> None:
             self._notify_chat_id = message.chat.id
@@ -697,9 +740,12 @@ class App:
             auto_market=bool(s.mangabuff_auto_market),
             auto_battle=bool(getattr(s, "mangabuff_auto_battle", True)),
             auto_trade=bool(getattr(s, "mangabuff_auto_trade", True)),
+            auto_quiz=bool(getattr(s, "mangabuff_auto_quiz", True)),
             battles_won=int(getattr(st, "battles_won", 0) or 0),
             battles_total=int(getattr(st, "battles_total", 0) or 0),
             trades_sent=int(getattr(st, "trades_sent", 0) or 0),
+            quiz_correct=int(getattr(st, "quiz_correct", 0) or 0),
+            quiz_best=int(getattr(st, "quiz_best_streak", 0) or 0),
         )
 
     async def _on_card_drop(self, info: CardDropInfo) -> None:

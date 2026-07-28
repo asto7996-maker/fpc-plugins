@@ -113,6 +113,10 @@ CARD_RANK_LADDER = (
 MARKET_LOTS_PATH = BASE_DIR / "market_lots.json"
 TRADE_RECEIVERS_PATH = BASE_DIR / "trade_receivers.json"
 TRADE_CANDIDATES_PATH = BASE_DIR / "trade_candidates.json"
+QUIZ_CACHE_PATH = BASE_DIR / "quiz_answers.json"
+# Пауза между ответами викторины (иначе 429 Too Many Attempts).
+QUIZ_ANSWER_DELAY_SEC = 2.15
+QUIZ_RETRY_ON_429_SEC = 8.0
 # Сколько S нужно отдать за 1 X (выгодный апгрейд).
 TRADE_S_FOR_X = 2
 # Лимит сайта: одновременно не больше 10 лотов — берём самые дорогие.
@@ -811,6 +815,10 @@ class MangaBuffStats:
     battles_total: int = 0
     trades_sent: int = 0
     cards_upgraded: int = 0
+    quiz_correct: int = 0
+    quiz_best_streak: int = 0
+    quiz_last_streak: int = 0
+    quiz_rounds: int = 0
 
     def touch(self, action: str, url: str = "") -> None:
         self.last_action = action
@@ -1045,6 +1053,8 @@ class MangaBuffService:
         self._trade_receivers: set[str] = self._load_trade_receivers()
         # Кандидаты из чата/комментов глав (накопительный пул)
         self._trade_candidates: List[str] = self._load_trade_candidates()
+        # Кэш викторины: question_id / текст → правильный ответ
+        self._quiz_cache: Dict[str, str] = self._load_quiz_cache()
         self._migrate_stats_if_needed()
         # сброс ложных дропов («Тайтлы» из навбара) — портили статистику карт
         if "тайтл" in (self.stats.last_card_drop or "").lower():
@@ -1736,6 +1746,30 @@ class MangaBuffService:
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("trades/upgrade: %s", exc)
 
+        # Викторина — отдельный автофарм (стремимся к рекорду / 1 месту)
+        try:
+            from settings_store import load_settings as _ls
+
+            if _ls().mangabuff_auto_quiz:
+                if self._chapter_farm_active():
+                    quiz_max = 8  # не тормозить чтение глав
+                elif quick:
+                    quiz_max = 50
+                else:
+                    quiz_max = 100
+                quiz_stats = await self._run_quiz_farm_unlocked(max_answers=quiz_max)
+                quiz_n = int(
+                    (quiz_stats or {}).get("correct")
+                    or (quiz_stats or {}).get("answered")
+                    or 0
+                )
+                if quiz_n:
+                    result.details.append(f"викторина: +{quiz_n}")
+                    result.events += quiz_n
+                    self.stats.events_actions += quiz_n
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("auto quiz: %s", exc)
+
         gained = max(0, int(self.stats.cards_claimed or 0) - before_cards)
         if gained > 0 and not result.cards:
             result.cards = gained
@@ -2269,6 +2303,229 @@ class MangaBuffService:
             tmp.replace(TRADE_CANDIDATES_PATH)
         except Exception as exc:  # noqa: BLE001
             logger.warning("trade_candidates save: %s", exc)
+
+    def _load_quiz_cache(self) -> Dict[str, str]:
+        try:
+            if not QUIZ_CACHE_PATH.exists():
+                return {}
+            raw = json.loads(QUIZ_CACHE_PATH.read_text(encoding="utf-8"))
+            answers = raw.get("answers") if isinstance(raw, dict) else raw
+            if not isinstance(answers, dict):
+                return {}
+            out: Dict[str, str] = {}
+            for k, v in answers.items():
+                key = str(k or "").strip()
+                val = str(v or "").strip()
+                if key and val:
+                    out[key] = val
+            return out
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("quiz_cache load: %s", exc)
+            return {}
+
+    def _save_quiz_cache(self) -> None:
+        try:
+            # ограничим размер кэша
+            items = list(self._quiz_cache.items())[-4000:]
+            self._quiz_cache = dict(items)
+            tmp = QUIZ_CACHE_PATH.with_suffix(".json.tmp")
+            tmp.write_text(
+                json.dumps({"answers": self._quiz_cache}, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            tmp.replace(QUIZ_CACHE_PATH)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("quiz_cache save: %s", exc)
+
+    def _remember_quiz_answer(
+        self,
+        *,
+        question_id: Any = None,
+        question_text: str = "",
+        answer: str = "",
+    ) -> None:
+        ans = str(answer or "").strip()
+        if not ans:
+            return
+        changed = False
+        qid = str(question_id or "").strip()
+        if qid and self._quiz_cache.get(f"id:{qid}") != ans:
+            self._quiz_cache[f"id:{qid}"] = ans
+            changed = True
+        qnorm = re.sub(r"\s+", " ", (question_text or "").strip().lower())
+        if qnorm and self._quiz_cache.get(f"q:{qnorm}") != ans:
+            self._quiz_cache[f"q:{qnorm}"] = ans
+            changed = True
+        if changed:
+            self._save_quiz_cache()
+
+    def _quiz_cache_lookup(
+        self, *, question_id: Any = None, question_text: str = ""
+    ) -> str:
+        qid = str(question_id or "").strip()
+        if qid:
+            hit = self._quiz_cache.get(f"id:{qid}") or ""
+            if hit:
+                return hit
+        qnorm = re.sub(r"\s+", " ", (question_text or "").strip().lower())
+        if qnorm:
+            return self._quiz_cache.get(f"q:{qnorm}") or ""
+        return ""
+
+    @staticmethod
+    def _normalize_quiz_choice(text: str) -> str:
+        t = (text or "").strip().lower().replace("ё", "е")
+        t = re.sub(r"[«»\"'`]", "", t)
+        t = re.sub(r"\s+", " ", t)
+        return t
+
+    def _pick_quiz_answer_from_options(
+        self, preferred: str, answers: Sequence[str]
+    ) -> str:
+        """Сопоставить правильный текст с одним из вариантов ответа."""
+        pref = (preferred or "").strip()
+        opts = [str(a).strip() for a in (answers or []) if str(a).strip()]
+        if not pref:
+            return opts[0] if opts else ""
+        if pref in opts:
+            return pref
+        pref_n = self._normalize_quiz_choice(pref)
+        for o in opts:
+            if self._normalize_quiz_choice(o) == pref_n:
+                return o
+        for o in opts:
+            on = self._normalize_quiz_choice(o)
+            if pref_n in on or on in pref_n:
+                return o
+        return pref
+
+    async def _scrape_quiz_comment_hints(self, page: Page) -> Dict[str, str]:
+        """Подсказки из комментариев под викториной: вопрос → частый ответ."""
+        try:
+            rows = await page.evaluate(
+                """() => {
+                  const out = [];
+                  const blocks = [...document.querySelectorAll(
+                    '.comments__item, .comment, [class*="comment"]'
+                  )];
+                  for (const b of blocks.slice(0, 80)) {
+                    const t = (b.innerText || '').trim();
+                    if (!t || t.length < 8) continue;
+                    out.push(t.slice(0, 500));
+                  }
+                  if (!out.length) {
+                    const zone = document.querySelector(
+                      '.comments, #comments, [class*="Comments"]'
+                    );
+                    if (zone) out.push((zone.innerText || '').slice(0, 4000));
+                  }
+                  return out;
+                }"""
+            )
+        except Exception:  # noqa: BLE001
+            return {}
+        hints: Dict[str, str] = {}
+        skip_tokens = (
+            "ответить",
+            "минут",
+            "час",
+            "рейтинг",
+            "нов",
+            "популяр",
+            "отправить",
+        )
+        for block in rows or []:
+            parts = [p.strip() for p in re.split(r"\n+", str(block)) if p.strip()]
+            if len(parts) < 3:
+                continue
+            q = parts[0]
+            for cand in reversed(parts[1:]):
+                cl = cand.lower()
+                if any(x in cl for x in skip_tokens):
+                    continue
+                if len(cand) > 90:
+                    continue
+                qn = re.sub(r"\s+", " ", q.lower())
+                if qn and cand:
+                    hints[qn] = cand
+                break
+        return hints
+
+    async def _web_guess_quiz_answer(
+        self, page: Page, question: str, answers: Sequence[str]
+    ) -> str:
+        """Грубая подсказка через DuckDuckGo HTML, если API не дал correct_text."""
+        opts = [str(a).strip() for a in answers if str(a).strip()]
+        q = (question or "").strip()
+        if not q or not opts:
+            return ""
+        try:
+            from urllib.parse import quote
+
+            query = f"{q} {' OR '.join(opts[:4])}"
+            url = "https://html.duckduckgo.com/html/?q=" + quote(query)
+            resp = await page.context.request.get(url, timeout=8000)
+            body = (await resp.text())[:12000].lower()
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("quiz web guess: %s", exc)
+            return ""
+        best = ""
+        best_score = 0
+        for o in opts:
+            on = self._normalize_quiz_choice(o)
+            if not on:
+                continue
+            score = body.count(on)
+            # частичные токены
+            for tok in on.split():
+                if len(tok) >= 4:
+                    score += body.count(tok) * 0.25
+            if score > best_score:
+                best_score = score
+                best = o
+        return best if best_score > 0 else ""
+
+    async def _resolve_quiz_answer(
+        self,
+        page: Page,
+        question: Dict[str, Any],
+        *,
+        comment_hints: Optional[Dict[str, str]] = None,
+    ) -> str:
+        """
+        Выбор ответа всеми доступными источниками:
+        1) correct_text из API сайта (главный)
+        2) локальный кэш
+        3) комментарии под викториной
+        4) веб-поиск по вариантам
+        """
+        answers = [
+            str(a).strip()
+            for a in (question.get("answers") or [])
+            if str(a).strip()
+        ]
+        qtext = str(question.get("question") or "").strip()
+        qid = question.get("id")
+        api_correct = str(question.get("correct_text") or "").strip()
+        if api_correct:
+            picked = self._pick_quiz_answer_from_options(api_correct, answers)
+            self._remember_quiz_answer(
+                question_id=qid, question_text=qtext, answer=picked
+            )
+            return picked
+
+        cached = self._quiz_cache_lookup(question_id=qid, question_text=qtext)
+        if cached:
+            return self._pick_quiz_answer_from_options(cached, answers)
+
+        qn = re.sub(r"\s+", " ", qtext.lower())
+        if comment_hints and qn in comment_hints:
+            return self._pick_quiz_answer_from_options(comment_hints[qn], answers)
+
+        web = await self._web_guess_quiz_answer(page, qtext, answers)
+        if web:
+            return self._pick_quiz_answer_from_options(web, answers)
+        return answers[0] if answers else ""
 
     def _remember_trade_candidates(self, user_ids: Sequence[str]) -> int:
         """Добавить user_id из чата/комментов в пул кандидатов на обмен."""
@@ -6412,6 +6669,148 @@ class MangaBuffService:
             await asyncio.sleep(0.7)
         if stats["accepted"] or stats["rejected"]:
             self._persist_stats()
+        return stats
+
+    async def run_quiz_farm(self, max_answers: int = 100) -> Dict[str, int]:
+        """Автофарм викторины MangaBuff (публичный API отдаёт correct_text)."""
+        async with self._lock:
+            return await self._run_quiz_farm_unlocked(max_answers=max_answers)
+
+    async def _run_quiz_farm_unlocked(self, max_answers: int = 100) -> Dict[str, int]:
+        """
+        Бесконечная серия правильных ответов до лимита.
+        Источники ответа: API correct_text → кэш → комменты → веб.
+        """
+        assert self._page is not None
+        page = self._page
+        await self._ensure_login_unlocked()
+        stats = {
+            "answered": 0,
+            "correct": 0,
+            "milestones": 0,
+            "restarts": 0,
+            "best": int(self.stats.quiz_best_streak or 0),
+        }
+        want = max(1, min(int(max_answers or 100), 500))
+        if not await self._safe_goto(page, "https://mangabuff.ru/quiz"):
+            logger.warning("MangaBuff quiz: cannot open /quiz")
+            return stats
+        await asyncio.sleep(0.6)
+        comment_hints = await self._scrape_quiz_comment_hints(page)
+
+        start = await self._post_json(page, "/quiz/start", {})
+        body = start.get("json") if isinstance(start.get("json"), dict) else {}
+        question = body.get("question") if isinstance(body, dict) else None
+        if not isinstance(question, dict):
+            # возможно уже идёт серия — попробуем ответить из DOM / перезапуск
+            logger.info(
+                "MangaBuff quiz start: status=%s body=%s",
+                start.get("status"),
+                str(body)[:200],
+            )
+            # иногда start без вопроса, если rate-limit
+            if int(start.get("status") or 0) == 429:
+                await asyncio.sleep(QUIZ_RETRY_ON_429_SEC)
+                start = await self._post_json(page, "/quiz/start", {})
+                body = start.get("json") if isinstance(start.get("json"), dict) else {}
+                question = body.get("question") if isinstance(body, dict) else None
+            if not isinstance(question, dict):
+                return stats
+
+        delay = QUIZ_ANSWER_DELAY_SEC
+        streak = int(body.get("correct_count") or 0) if isinstance(body, dict) else 0
+
+        while stats["answered"] < want:
+            if self._stop_flag.is_set() or self._events_stop.is_set():
+                break
+            if not isinstance(question, dict):
+                break
+            answer = await self._resolve_quiz_answer(
+                page, question, comment_hints=comment_hints
+            )
+            if not answer:
+                logger.warning("MangaBuff quiz: empty answer for q=%s", question.get("id"))
+                break
+            await asyncio.sleep(delay)
+            resp = await self._post_json(page, "/quiz/answer", {"answer": answer})
+            status = int(resp.get("status") or 0)
+            js = resp.get("json") if isinstance(resp.get("json"), dict) else {}
+            if status == 429:
+                logger.info("MangaBuff quiz 429 → sleep %.1fs", QUIZ_RETRY_ON_429_SEC)
+                await asyncio.sleep(QUIZ_RETRY_ON_429_SEC)
+                delay = min(4.5, delay + 0.4)
+                continue
+
+            stats["answered"] += 1
+            st = str(js.get("status") or "").lower()
+            msg = str(js.get("message") or "")
+            correct_count = int(js.get("correct_count") or 0)
+
+            if st in ("success", "milestone") or "верно" in msg.lower():
+                stats["correct"] += 1
+                self.stats.quiz_correct += 1
+                streak = correct_count or (streak + 1)
+                self.stats.quiz_last_streak = streak
+                if streak > int(self.stats.quiz_best_streak or 0):
+                    self.stats.quiz_best_streak = streak
+                    stats["best"] = streak
+                if st == "milestone" or "награду" in msg.lower():
+                    stats["milestones"] += 1
+                    self.stats.quiz_rounds += 1
+                self._remember_quiz_answer(
+                    question_id=question.get("id"),
+                    question_text=str(question.get("question") or ""),
+                    answer=answer,
+                )
+                self.stats.touch(
+                    f"викторина · серия {streak} · {answer[:40]}",
+                    page.url,
+                )
+                logger.info(
+                    "MangaBuff quiz OK streak=%s q=%s a=%s",
+                    streak,
+                    question.get("id"),
+                    answer[:60],
+                )
+                delay = max(QUIZ_ANSWER_DELAY_SEC, delay * 0.95)
+                question = js.get("question") if isinstance(js.get("question"), dict) else None
+                if not question:
+                    # серия оборвалась без нового вопроса — стартуем снова
+                    stats["restarts"] += 1
+                    await asyncio.sleep(delay)
+                    start = await self._post_json(page, "/quiz/start", {})
+                    body = start.get("json") if isinstance(start.get("json"), dict) else {}
+                    question = (
+                        body.get("question") if isinstance(body, dict) else None
+                    )
+                continue
+
+            # неверный / restart
+            stats["restarts"] += 1
+            logger.info(
+                "MangaBuff quiz FAIL status=%s msg=%s answer=%s",
+                st,
+                msg[:120],
+                answer[:60],
+            )
+            streak = 0
+            self.stats.quiz_last_streak = 0
+            await asyncio.sleep(delay)
+            start = await self._post_json(page, "/quiz/start", {})
+            body = start.get("json") if isinstance(start.get("json"), dict) else {}
+            question = body.get("question") if isinstance(body, dict) else None
+            if int(start.get("status") or 0) == 429:
+                await asyncio.sleep(QUIZ_RETRY_ON_429_SEC)
+
+        if stats["correct"] or stats["answered"]:
+            self._persist_stats()
+        logger.info(
+            "MangaBuff quiz done: correct=%s answered=%s best=%s milestones=%s",
+            stats["correct"],
+            stats["answered"],
+            stats["best"],
+            stats["milestones"],
+        )
         return stats
 
     async def run_card_trades(self, offers: int = 40) -> int:

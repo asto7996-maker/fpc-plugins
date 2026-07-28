@@ -34,6 +34,7 @@ class RuntimeSettings:
     mangabuff_auto_market: bool = True
     mangabuff_auto_battle: bool = True
     mangabuff_auto_trade: bool = True
+    mangabuff_auto_quiz: bool = True
     mangabuff_farm_enabled: bool = False
     mangabuff_events_farm_enabled: bool = False
     mangabuff_stats_site_only: bool = True
