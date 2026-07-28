@@ -527,21 +527,25 @@ class App:
         async def cards_quiz_now(message: Message) -> None:
             self._notify_chat_id = message.chat.id
             await message.answer(
-                "Фарм викторины…\n"
-                "<i>отвечаю правильно, коплю серию к рекорду топа</i>",
+                "Фарм викторины до <b>555</b>…\n"
+                "<i>идеальные ответы → на 555 специально ошибка, чтобы зафиксировать рекорд</i>",
                 reply_markup=cards_events_keyboard(),
             )
             try:
                 if not self.mangabuff.is_started:
                     await self.mangabuff.start(headless=True)
-                stats = await self.mangabuff.run_quiz_farm(max_answers=120)
+                stats = await self.mangabuff.run_quiz_farm()
+                locked = "да" if stats.get("locked") else (
+                    "уже был" if stats.get("skipped") else "нет"
+                )
                 await message.answer(
                     f"Викторина · верно <b>{stats.get('correct', 0)}</b> / "
                     f"{stats.get('answered', 0)}\n"
-                    f"Серия сейчас · <b>{self.mangabuff.stats.quiz_last_streak}</b>\n"
-                    f"Лучшая серия · <b>{self.mangabuff.stats.quiz_best_streak}</b>\n"
-                    f"Всего верных · <b>{self.mangabuff.stats.quiz_correct}</b>\n"
-                    f"Наград ×10 · <b>{stats.get('milestones', 0)}</b>",
+                    f"Серия · <b>{self.mangabuff.stats.quiz_last_streak}</b> "
+                    f"(цель {stats.get('target', 555)})\n"
+                    f"Рекорд · <b>{self.mangabuff.stats.quiz_best_streak}</b>\n"
+                    f"Фиксация 555 · <b>{locked}</b>\n"
+                    f"Всего верных · <b>{self.mangabuff.stats.quiz_correct}</b>",
                     reply_markup=cards_events_keyboard(),
                 )
             except Exception as exc:  # noqa: BLE001

@@ -115,8 +115,10 @@ TRADE_RECEIVERS_PATH = BASE_DIR / "trade_receivers.json"
 TRADE_CANDIDATES_PATH = BASE_DIR / "trade_candidates.json"
 QUIZ_CACHE_PATH = BASE_DIR / "quiz_answers.json"
 # Пауза между ответами викторины (иначе 429 Too Many Attempts).
-QUIZ_ANSWER_DELAY_SEC = 2.15
+QUIZ_ANSWER_DELAY_SEC = 2.05
 QUIZ_RETRY_ON_429_SEC = 8.0
+# Красивый рекорд: идеально до 555, затем специально ошибаемся.
+QUIZ_TARGET_STREAK = 555
 # Сколько S нужно отдать за 1 X (выгодный апгрейд).
 TRADE_S_FOR_X = 2
 # Лимит сайта: одновременно не больше 10 лотов — берём самые дорогие.
@@ -819,6 +821,8 @@ class MangaBuffStats:
     quiz_best_streak: int = 0
     quiz_last_streak: int = 0
     quiz_rounds: int = 0
+    # True после намеренного промаха на цели 555 — больше не фармим викторину
+    quiz_target_locked: bool = False
 
     def touch(self, action: str, url: str = "") -> None:
         self.last_action = action
@@ -1746,27 +1750,24 @@ class MangaBuffService:
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("trades/upgrade: %s", exc)
 
-        # Викторина — отдельный автофарм (стремимся к рекорду / 1 месту)
+        # Викторина — идеально до 555, затем намеренный промах (красивый рекорд)
         try:
             from settings_store import load_settings as _ls
 
-            if _ls().mangabuff_auto_quiz:
+            if _ls().mangabuff_auto_quiz and not self._quiz_target_reached():
+                # во время чтения глав не трогаем — серия должна идти одним заходом
                 if self._chapter_farm_active():
-                    quiz_max = 8  # не тормозить чтение глав
-                elif quick:
-                    quiz_max = 50
+                    logger.debug("MangaBuff quiz deferred: chapter farm active")
                 else:
-                    quiz_max = 100
-                quiz_stats = await self._run_quiz_farm_unlocked(max_answers=quiz_max)
-                quiz_n = int(
-                    (quiz_stats or {}).get("correct")
-                    or (quiz_stats or {}).get("answered")
-                    or 0
-                )
-                if quiz_n:
-                    result.details.append(f"викторина: +{quiz_n}")
-                    result.events += quiz_n
-                    self.stats.events_actions += quiz_n
+                    quiz_stats = await self._run_quiz_farm_unlocked()
+                    quiz_n = int((quiz_stats or {}).get("correct") or 0)
+                    if quiz_n or (quiz_stats or {}).get("locked"):
+                        detail = f"викторина: +{quiz_n}"
+                        if (quiz_stats or {}).get("locked"):
+                            detail += f" · рекорд {QUIZ_TARGET_STREAK}✓"
+                        result.details.append(detail)
+                        result.events += max(1, quiz_n)
+                        self.stats.events_actions += max(1, quiz_n)
         except Exception as exc:  # noqa: BLE001
             logger.warning("auto quiz: %s", exc)
 
@@ -6760,27 +6761,86 @@ class MangaBuffService:
             self._persist_stats()
         return stats
 
-    async def run_quiz_farm(self, max_answers: int = 100) -> Dict[str, int]:
-        """Автофарм викторины MangaBuff (публичный API отдаёт correct_text)."""
-        async with self._lock:
-            return await self._run_quiz_farm_unlocked(max_answers=max_answers)
+    def _pick_wrong_quiz_answer(self, question: Dict[str, Any]) -> str:
+        """Любой вариант, кроме правильного — чтобы зафиксировать серию."""
+        answers = [
+            str(a).strip()
+            for a in (question.get("answers") or [])
+            if str(a).strip()
+        ]
+        correct = self._pick_quiz_answer_from_options(
+            str(question.get("correct_text") or "").strip(), answers
+        )
+        corr_n = self._normalize_quiz_choice(correct)
+        for a in answers:
+            if self._normalize_quiz_choice(a) != corr_n:
+                return a
+        # fallback: заведомо неверный текст
+        return f"__wrong_{int(time_mod.time())}__"
 
-    async def _run_quiz_farm_unlocked(self, max_answers: int = 100) -> Dict[str, int]:
+    def _quiz_target_reached(self) -> bool:
+        """Рекорд 555 уже зафиксирован — викторину не трогаем."""
+        if bool(getattr(self.stats, "quiz_target_locked", False)):
+            return True
+        return int(self.stats.quiz_best_streak or 0) >= QUIZ_TARGET_STREAK
+
+    async def run_quiz_farm(
+        self,
+        max_answers: Optional[int] = None,
+        *,
+        target_streak: Optional[int] = None,
+    ) -> Dict[str, int]:
+        """Автофарм викторины до красивого рекорда (по умолчанию 555)."""
+        async with self._lock:
+            return await self._run_quiz_farm_unlocked(
+                max_answers=max_answers, target_streak=target_streak
+            )
+
+    async def _run_quiz_farm_unlocked(
+        self,
+        max_answers: Optional[int] = None,
+        *,
+        target_streak: Optional[int] = None,
+    ) -> Dict[str, int]:
         """
-        Бесконечная серия правильных ответов до лимита.
-        Источники ответа: API correct_text → кэш → комменты → веб.
+        Идеальная серия до target (555): только верные ответы.
+        На отметке target специально ошибаемся, чтобы сохранить красивое число.
         """
         assert self._page is not None
         page = self._page
         await self._ensure_login_unlocked()
+        target = int(target_streak or QUIZ_TARGET_STREAK)
+        if target < 1:
+            target = QUIZ_TARGET_STREAK
         stats = {
             "answered": 0,
             "correct": 0,
             "milestones": 0,
             "restarts": 0,
             "best": int(self.stats.quiz_best_streak or 0),
+            "target": target,
+            "locked": 0,
+            "skipped": 0,
         }
-        want = max(1, min(int(max_answers or 100), 500))
+        # уже зафиксировали красивый рекорд
+        if bool(self.stats.quiz_target_locked) or int(
+            self.stats.quiz_best_streak or 0
+        ) >= target:
+            stats["skipped"] = 1
+            stats["best"] = int(self.stats.quiz_best_streak or 0)
+            logger.info(
+                "MangaBuff quiz skip: already locked/best=%s target=%s",
+                self.stats.quiz_best_streak,
+                target,
+            )
+            return stats
+
+        # запас на 429-ретраи; по умолчанию хватает до цели + промах
+        if max_answers is None:
+            want = target + 80
+        else:
+            want = max(1, min(int(max_answers), target + 200))
+
         if not await self._safe_goto(page, "https://mangabuff.ru/quiz"):
             logger.warning("MangaBuff quiz: cannot open /quiz")
             return stats
@@ -6791,13 +6851,11 @@ class MangaBuffService:
         body = start.get("json") if isinstance(start.get("json"), dict) else {}
         question = body.get("question") if isinstance(body, dict) else None
         if not isinstance(question, dict):
-            # возможно уже идёт серия — попробуем ответить из DOM / перезапуск
             logger.info(
                 "MangaBuff quiz start: status=%s body=%s",
                 start.get("status"),
                 str(body)[:200],
             )
-            # иногда start без вопроса, если rate-limit
             if int(start.get("status") or 0) == 429:
                 await asyncio.sleep(QUIZ_RETRY_ON_429_SEC)
                 start = await self._post_json(page, "/quiz/start", {})
@@ -6808,18 +6866,33 @@ class MangaBuffService:
 
         delay = QUIZ_ANSWER_DELAY_SEC
         streak = int(body.get("correct_count") or 0) if isinstance(body, dict) else 0
+        self.stats.quiz_last_streak = streak
 
         while stats["answered"] < want:
             if self._stop_flag.is_set() or self._events_stop.is_set():
                 break
             if not isinstance(question, dict):
                 break
-            answer = await self._resolve_quiz_answer(
-                page, question, comment_hints=comment_hints
-            )
+
+            # Достигли 555 верных → следующий ответ специально неверный
+            intentional_wrong = streak >= target
+            if intentional_wrong:
+                answer = self._pick_wrong_quiz_answer(question)
+                logger.info(
+                    "MangaBuff quiz LOCK at %s → intentional wrong a=%s",
+                    streak,
+                    answer[:60],
+                )
+            else:
+                answer = await self._resolve_quiz_answer(
+                    page, question, comment_hints=comment_hints
+                )
             if not answer:
-                logger.warning("MangaBuff quiz: empty answer for q=%s", question.get("id"))
+                logger.warning(
+                    "MangaBuff quiz: empty answer for q=%s", question.get("id")
+                )
                 break
+
             await asyncio.sleep(delay)
             resp = await self._post_json(page, "/quiz/answer", {"answer": answer})
             status = int(resp.get("status") or 0)
@@ -6827,13 +6900,35 @@ class MangaBuffService:
             if status == 429:
                 logger.info("MangaBuff quiz 429 → sleep %.1fs", QUIZ_RETRY_ON_429_SEC)
                 await asyncio.sleep(QUIZ_RETRY_ON_429_SEC)
-                delay = min(4.5, delay + 0.4)
+                delay = min(4.5, delay + 0.35)
                 continue
 
             stats["answered"] += 1
             st = str(js.get("status") or "").lower()
             msg = str(js.get("message") or "")
             correct_count = int(js.get("correct_count") or 0)
+
+            if intentional_wrong:
+                # ожидание: restart / неверный ответ, рекорд сайта = target
+                stats["locked"] = 1
+                self.stats.quiz_target_locked = True
+                # фиксируем красивое число как лучшую серию
+                if target > int(self.stats.quiz_best_streak or 0):
+                    self.stats.quiz_best_streak = target
+                stats["best"] = int(self.stats.quiz_best_streak or 0)
+                self.stats.quiz_last_streak = target
+                self.stats.touch(
+                    f"викторина · рекорд {target} зафиксирован",
+                    page.url,
+                )
+                logger.info(
+                    "MangaBuff quiz TARGET LOCKED %s status=%s msg=%s",
+                    target,
+                    st,
+                    msg[:160],
+                )
+                self._persist_stats()
+                break
 
             if st in ("success", "milestone") or "верно" in msg.lower():
                 stats["correct"] += 1
@@ -6852,38 +6947,63 @@ class MangaBuffService:
                     answer=answer,
                 )
                 self.stats.touch(
-                    f"викторина · серия {streak} · {answer[:40]}",
+                    f"викторина · серия {streak}/{target}",
                     page.url,
                 )
                 logger.info(
-                    "MangaBuff quiz OK streak=%s q=%s a=%s",
+                    "MangaBuff quiz OK streak=%s/%s q=%s a=%s",
                     streak,
+                    target,
                     question.get("id"),
                     answer[:60],
                 )
-                delay = max(QUIZ_ANSWER_DELAY_SEC, delay * 0.95)
-                question = js.get("question") if isinstance(js.get("question"), dict) else None
+                # периодически сохраняем прогресс длинной серии
+                if streak % 25 == 0:
+                    self._persist_stats()
+                delay = max(QUIZ_ANSWER_DELAY_SEC, delay * 0.97)
+                question = (
+                    js.get("question") if isinstance(js.get("question"), dict) else None
+                )
                 if not question:
-                    # серия оборвалась без нового вопроса — стартуем снова
+                    # не должны терять серию — пробуем продолжить через start
                     stats["restarts"] += 1
                     await asyncio.sleep(delay)
                     start = await self._post_json(page, "/quiz/start", {})
-                    body = start.get("json") if isinstance(start.get("json"), dict) else {}
+                    body = (
+                        start.get("json")
+                        if isinstance(start.get("json"), dict)
+                        else {}
+                    )
+                    # если start сбросил серию — это плохо; логируем
+                    new_streak = (
+                        int(body.get("correct_count") or 0)
+                        if isinstance(body, dict)
+                        else 0
+                    )
+                    if new_streak and new_streak < streak:
+                        logger.warning(
+                            "MangaBuff quiz start reset streak %s→%s",
+                            streak,
+                            new_streak,
+                        )
+                        streak = new_streak
                     question = (
                         body.get("question") if isinstance(body, dict) else None
                     )
                 continue
 
-            # неверный / restart
+            # неожиданный промах — серия сброшена, начинаем заново к цели
             stats["restarts"] += 1
-            logger.info(
-                "MangaBuff quiz FAIL status=%s msg=%s answer=%s",
+            logger.warning(
+                "MangaBuff quiz UNEXPECTED FAIL streak_was=%s status=%s msg=%s a=%s",
+                streak,
                 st,
                 msg[:120],
                 answer[:60],
             )
             streak = 0
             self.stats.quiz_last_streak = 0
+            self._persist_stats()
             await asyncio.sleep(delay)
             start = await self._post_json(page, "/quiz/start", {})
             body = start.get("json") if isinstance(start.get("json"), dict) else {}
@@ -6891,14 +7011,15 @@ class MangaBuffService:
             if int(start.get("status") or 0) == 429:
                 await asyncio.sleep(QUIZ_RETRY_ON_429_SEC)
 
-        if stats["correct"] or stats["answered"]:
+        if stats["correct"] or stats["answered"] or stats["locked"]:
             self._persist_stats()
         logger.info(
-            "MangaBuff quiz done: correct=%s answered=%s best=%s milestones=%s",
+            "MangaBuff quiz done: correct=%s answered=%s best=%s locked=%s target=%s",
             stats["correct"],
             stats["answered"],
             stats["best"],
-            stats["milestones"],
+            stats["locked"],
+            target,
         )
         return stats
 
