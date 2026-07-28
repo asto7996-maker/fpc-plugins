@@ -177,13 +177,19 @@ def _parse_lot_price_text(text: str) -> Tuple[int, str]:
 NIGHT_BREAK_START = time(1, 0)
 NIGHT_BREAK_END = time(5, 0)
 
-# Комментарии каждые 5–15 глав (на текущую главу, без прыжков)
+# Комментарии: на турбо редко (не тормозить), на медленных — чаще
 COMMENT_EVERY_MIN = 5
 COMMENT_EVERY_MAX = 15
+COMMENT_EVERY_TURBO_MIN = 45
+COMMENT_EVERY_TURBO_MAX = 80
+COMMENT_EVERY_FAST_MIN = 20
+COMMENT_EVERY_FAST_MAX = 35
 # Читать ровно до 90% тайтла
 TITLE_READ_RATIO = 0.90
 # Запасной потолок, если число глав неизвестно (идём пока есть «след. глава»)
 TITLE_READ_HARD_CAP = 5000
+# Сколько уже-прочитанных глав перепрыгнуть при старте тайтла
+SKIP_REREAD_MAX_HOPS = 500
 COMMENT_WORDS_MIN = 5
 COMMENT_WORDS_MAX = 20
 # 65% — благодарности, 35% — похожие на чужие
@@ -755,6 +761,8 @@ class MangaBuffStats:
     seen_notifications: List[str] = field(default_factory=list)
     # chapter_id уже зачтённых глав — против завышения счётчика
     credited_chapter_ids: List[str] = field(default_factory=list)
+    # slug → последний URL главы (быстрый resume без hop с 1/1)
+    resume_by_slug: Dict[str, str] = field(default_factory=dict)
     battles_won: int = 0
     battles_total: int = 0
     trades_sent: int = 0
@@ -790,6 +798,15 @@ class MangaBuffStats:
             cleaned["credited_chapter_ids"] = []
         else:
             cleaned["credited_chapter_ids"] = [str(x) for x in credited if x][-8000:]
+        resume = cleaned.get("resume_by_slug")
+        if not isinstance(resume, dict):
+            cleaned["resume_by_slug"] = {}
+        else:
+            cleaned["resume_by_slug"] = {
+                str(k): str(v)
+                for k, v in resume.items()
+                if k and v and re.search(r"/manga/[^/]+/\d+/\d+", str(v))
+            }
         return cls(**cleaned)
 
     def to_telegram(self, delay_range: Tuple[float, float] = (5.0, 15.0)) -> str:
@@ -950,7 +967,8 @@ class MangaBuffService:
         self._stop_flag = asyncio.Event()
         self.stats = self._load_stats()
         self._chapters_since_comment = 0
-        self._next_comment_after = random.randint(COMMENT_EVERY_MIN, COMMENT_EVERY_MAX)
+        cmin, cmax = self._comment_interval_for_tier()
+        self._next_comment_after = random.randint(cmin, cmax)
         self._read_urls: set[str] = set()
         self._skip_title = asyncio.Event()
         self.steps_min = 8
@@ -977,6 +995,8 @@ class MangaBuffService:
         self._last_history_post_at: float = 0.0
         self._history_gap_boost_until: float = 0.0
         self._turbo_flush_at: int = 4
+        # chapter_id в history_pool, ещё не зачтённые через наш flush
+        self._pending_credit_ids: List[str] = []
         # Уже кидали обмен этим user_id — строго 1 на человека
         self._trade_receivers: set[str] = self._load_trade_receivers()
         # Кандидаты из чата/комментов глав (накопительный пул)
@@ -1181,6 +1201,11 @@ class MangaBuffService:
         self.delay_max_sec = max(self.delay_min_sec, float(delay_max))
         self.steps_min = max(1, int(steps_min))
         self.steps_max = max(self.steps_min, int(steps_max))
+        cmin, cmax = self._comment_interval_for_tier()
+        self._next_comment_after = max(
+            self._chapters_since_comment + 1,
+            random.randint(cmin, cmax),
+        )
         logger.info(
             "MangaBuff tempo set delay=%.2f-%.2f steps=%s-%s tier=%s",
             self.delay_min_sec,
@@ -1225,17 +1250,18 @@ class MangaBuffService:
         await self._human_pause(max(0.01, lo), hi)
 
     def _history_min_gap_for_tier(self) -> float:
-        """Минимальный интервал между POST /addHistory (429 на слишком частых запросах)."""
+        """Минимальный интервал между POST /addHistory (сайт жёстко режет 429)."""
+        # Подобрано по живым замерам: <10с на турбо → частые 429 и простой.
         base = {
-            "turbo": 7.0,
-            "fast": 9.0,
+            "turbo": 10.0,
+            "fast": 12.0,
             "lively": 14.0,
             "normal": 16.0,
             "slow": 18.0,
-            "crawl": 20.0,
+            "crawl": 22.0,
         }[self._tempo_tier()]
         if time_mod.time() < self._history_gap_boost_until:
-            base += 5.0
+            base += 6.0
         return base
 
     def _native_flush_timeout(self) -> float:
@@ -1244,13 +1270,21 @@ class MangaBuffService:
         if tier == "turbo":
             return 0.0
         if tier == "fast":
-            return 0.8
+            return 0.35
         if tier == "lively":
-            return 3.0
-        return 8.0
+            return 2.0
+        return 6.0
 
     def _turbo_pool_flush_at(self) -> int:
         return max(2, int(self._turbo_flush_at or 4))
+
+    def _comment_interval_for_tier(self) -> Tuple[int, int]:
+        tier = self._tempo_tier()
+        if tier == "turbo":
+            return COMMENT_EVERY_TURBO_MIN, COMMENT_EVERY_TURBO_MAX
+        if tier == "fast":
+            return COMMENT_EVERY_FAST_MIN, COMMENT_EVERY_FAST_MAX
+        return COMMENT_EVERY_MIN, COMMENT_EVERY_MAX
 
     def _scroll_plan(self, total_height: int, viewport: int) -> Tuple[int, int]:
         """
@@ -1339,33 +1373,39 @@ class MangaBuffService:
             pass
 
     async def _dismiss_overlays(self, page: Page) -> None:
-        selectors = (
-            ".close-adult-modal-btn",
-            ".update-toast__close",
-            ".tg-prompt__close",
-            ".modal__close",
-            "button.close-adult-modal-btn",
-            "button:has-text('Подтвердить')",
-            "button:has-text('Мне 18')",
-            "button:has-text('Мне есть 18')",
-            "button:has-text('Понятно')",
-            "button:has-text('Закрыть')",
-            "button:has-text('Продолжить')",
-            "button:has-text('Смотреть')",
-            "button:has-text('Да, мне есть')",
-            "a:has-text('Продолжить')",
-        )
-        for sel in selectors:
-            try:
-                loc = page.locator(sel)
-                n = await loc.count()
-                for i in range(min(n, 3)):
-                    btn = loc.nth(i)
-                    if await btn.is_visible(timeout=600):
-                        await btn.click(force=True, timeout=1500)
-                        await self._human_pause(0.2, 0.6)
-            except Exception:  # noqa: BLE001
-                continue
+        """Быстро закрыть 18+/тосты. Без долгих timeout=1500 на click (ломают turbo)."""
+        try:
+            await page.evaluate(
+                """() => {
+                  const texts = /подтвердить|мне\\s*18|понятно|закрыть|продолжить|смотреть|есть\\s*18/i;
+                  const nodes = [
+                    ...document.querySelectorAll(
+                      '.close-adult-modal-btn, .update-toast__close, .tg-prompt__close, .modal__close, button, a'
+                    )
+                  ];
+                  for (const el of nodes) {
+                    const t = (el.innerText || el.textContent || '').trim();
+                    const cls = el.className || '';
+                    if (
+                      /close-adult|modal__close|toast__close|tg-prompt__close/i.test(cls)
+                      || texts.test(t)
+                    ) {
+                      try { el.click(); } catch (e) {}
+                    }
+                  }
+                  const adult = document.querySelector('.adult-modal, .modal--adult, [class*="adult"]');
+                  if (adult) adult.style.display = 'none';
+                }"""
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        # запасной короткий клик только по adult-кнопке
+        try:
+            loc = page.locator(".close-adult-modal-btn").first
+            if await loc.count() and await loc.is_visible(timeout=200):
+                await loc.click(force=True, timeout=400, no_wait_after=True)
+        except Exception:  # noqa: BLE001
+            pass
 
     async def _safe_goto(self, page: Page, url: str) -> bool:
         try:
@@ -2026,7 +2066,22 @@ class MangaBuffService:
             recent = list(self._credited_chapter_ids)[-8000:]
             self._credited_chapter_ids = set(recent)
             self.stats.credited_chapter_ids = recent
+            try:
+                self._persist_stats()
+            except Exception:  # noqa: BLE001
+                pass
         return fresh
+
+    def _remember_resume_url(self, url: str) -> None:
+        parsed = self._parse_chapter_url(url)
+        if not parsed:
+            return
+        slug, _vol, _ch = parsed
+        clean = url.split("?")[0]
+        self.stats.resume_by_slug[slug] = clean
+        if len(self.stats.resume_by_slug) > 400:
+            items = list(self.stats.resume_by_slug.items())[-300:]
+            self.stats.resume_by_slug = dict(items)
 
     def _parse_ranks_from_text(self, text: str) -> List[str]:
         ranks: List[str] = []
@@ -3266,16 +3321,38 @@ class MangaBuffService:
         except Exception:  # noqa: BLE001
             return 0
 
-    async def _chapter_already_read_on_site(self, page: Page) -> bool:
-        """Глава уже была отправлена на сайт — повторное чтение не засчитывается."""
+    async def _current_chapter_id(self, page: Page) -> str:
         try:
-            return bool(
-                await page.evaluate(
-                    "(typeof read_status_send !== 'undefined') && !!read_status_send"
-                )
+            cid = await page.evaluate(
+                """() => {
+                  const ch = window.current_chapter;
+                  return ch && ch.chapter_id ? String(ch.chapter_id) : '';
+                }"""
+            )
+            return str(cid or "").strip()
+        except Exception:  # noqa: BLE001
+            return ""
+
+    async def _chapter_already_read_on_site(self, page: Page) -> bool:
+        """Глава уже зачтена (сессия/история) — повтор не даёт прогресса."""
+        try:
+            flags = await page.evaluate(
+                """() => ({
+                  sent: (typeof read_status_send !== 'undefined') && !!read_status_send,
+                  cid: (window.current_chapter && window.current_chapter.chapter_id)
+                    ? String(window.current_chapter.chapter_id) : ''
+                })"""
             )
         except Exception:  # noqa: BLE001
             return False
+        if not isinstance(flags, dict):
+            return False
+        if flags.get("sent"):
+            return True
+        cid = str(flags.get("cid") or "").strip()
+        if cid and cid in self._credited_chapter_ids:
+            return True
+        return False
 
     async def _extract_next_chapter_href(self, page: Page) -> Optional[str]:
         """Ссылка «След. глава» — сайт знает корректный том (тома могут быть 1→4)."""
@@ -3313,7 +3390,7 @@ class MangaBuffService:
         except Exception:  # noqa: BLE001
             pass
         tier = self._tempo_tier()
-        ctx_timeout = 3.0 if tier == "turbo" else (5.0 if tier == "fast" else 8.0)
+        ctx_timeout = 2.5 if tier == "turbo" else (4.0 if tier == "fast" else 8.0)
         if not await self._wait_for_chapter_context(page, timeout_sec=ctx_timeout):
             return False
         after_global = await self._reader_global_chapter(page)
@@ -3323,20 +3400,93 @@ class MangaBuffService:
             return True
         return False
 
-    async def _skip_to_unread_chapter(self, page: Page, max_hops: int = 10) -> bool:
-        """Пропустить уже прочитанные главы до первой непрочитанной."""
-        for _ in range(max(1, max_hops)):
+    async def _skip_to_unread_chapter(
+        self, page: Page, max_hops: int = SKIP_REREAD_MAX_HOPS
+    ) -> bool:
+        """Пропустить уже прочитанные главы до первой непрочитанной (быстрые hop)."""
+        hops = 0
+        for _ in range(max(1, int(max_hops))):
             if self._stop_flag.is_set():
                 return False
-            if not await self._wait_for_chapter_context(page, timeout_sec=5.0):
-                return False
+            tier = self._tempo_tier()
+            ctx_t = 1.8 if tier == "turbo" else 4.0
+            if not await self._wait_for_chapter_context(page, timeout_sec=ctx_t):
+                # контекст не поднялся — всё равно пробуем next
+                if not await self._hop_next_unread_fast(page):
+                    return False
+                hops += 1
+                continue
             if not await self._chapter_already_read_on_site(page):
+                if hops:
+                    logger.info(
+                        "MangaBuff resume unread after %s hops → %s",
+                        hops,
+                        page.url.split("?")[0],
+                    )
                 return True
             url = page.url.split("?")[0]
-            logger.info("MangaBuff hop over re-read %s", url)
-            if not await self._go_next_chapter(page):
+            hops += 1
+            if hops <= 2 or hops % 50 == 0:
+                logger.info("MangaBuff hop over re-read #%s %s", hops, url)
+            # каждые 10 уже-прочитанных — прыжок +10, иначе вечность на длинных тайтлах
+            if hops % 10 == 0:
+                if await self._hop_ahead_guess(page, stride=10):
+                    continue
+            if not await self._hop_next_unread_fast(page):
                 return False
-        return not await self._chapter_already_read_on_site(page)
+        still = await self._chapter_already_read_on_site(page)
+        if still:
+            logger.warning(
+                "MangaBuff unread not found after %s hops at %s",
+                max_hops,
+                page.url.split("?")[0],
+            )
+            return False
+        return True
+
+    async def _hop_next_unread_fast(self, page: Page) -> bool:
+        """Быстрый переход на след. главу без тяжёлых пауз (для skip re-read)."""
+        before = page.url.split("?")[0]
+        href = await self._extract_next_chapter_href(page)
+        if not href or href == before:
+            return await self._go_next_chapter(page)
+        try:
+            tier = self._tempo_tier()
+            wait_until = "commit" if tier == "turbo" else "domcontentloaded"
+            await page.goto(
+                href,
+                wait_until=wait_until,
+                timeout=12000 if tier == "turbo" else 25000,
+            )
+            try:
+                await self._dismiss_overlays(page)
+            except Exception:  # noqa: BLE001
+                pass
+            now = page.url.split("?")[0]
+            return bool(now and now != before and re.search(r"/manga/[^/]+/\d+/\d+", now))
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("fast hop failed: %s", exc)
+            return await self._go_next_chapter(page)
+
+    async def _hop_ahead_guess(self, page: Page, stride: int = 10) -> bool:
+        """Прыжок вперёд на N глав по URL (ускорение skip длинных хвостов)."""
+        parsed = self._parse_chapter_url(page.url.split("?")[0])
+        if not parsed:
+            return False
+        slug, vol, ch = parsed
+        for delta in (stride, max(2, stride // 2), 2):
+            guess = f"https://mangabuff.ru/manga/{slug}/{vol}/{ch + delta}"
+            if not await self._safe_goto(page, guess):
+                continue
+            try:
+                title = await page.title()
+                if "404" in title.lower():
+                    continue
+            except Exception:  # noqa: BLE001
+                continue
+            if await self._wait_for_chapter_context(page, timeout_sec=2.0):
+                return True
+        return False
 
     async def _title_has_reading_progress(self, page: Page) -> bool:
         """На карточке тайтла есть прогресс — нельзя открывать /1/1."""
@@ -3416,6 +3566,16 @@ class MangaBuffService:
 
         # Карточка тайтла: «Продолжить» / «Читать» (корректный том/глава)
         if slug:
+            # быстрый resume с прошлого захода
+            resume = (self.stats.resume_by_slug or {}).get(slug) or ""
+            if resume and await self._safe_goto(page, resume):
+                got = await _ok_reader()
+                if got:
+                    logger.info("MangaBuff open %s via resume %s", slug, got)
+                    if await self._skip_to_unread_chapter(page):
+                        cur = page.url.split("?")[0]
+                        self._remember_resume_url(cur)
+                        return cur
             title_url = f"https://mangabuff.ru/manga/{slug}"
             if await self._safe_goto(page, title_url):
                 await self._dismiss_overlays(page)
@@ -3426,8 +3586,14 @@ class MangaBuffService:
                         if got:
                             logger.info("MangaBuff open %s via title button %s", slug, got)
                             if await self._skip_to_unread_chapter(page):
-                                return page.url.split("?")[0]
-                            return got
+                                cur = page.url.split("?")[0]
+                                self._remember_resume_url(cur)
+                                return cur
+                            logger.warning(
+                                "MangaBuff %s: no unread after continue — skip title",
+                                slug,
+                            )
+                            return None
                 except Exception:  # noqa: BLE001
                     pass
 
@@ -3448,7 +3614,12 @@ class MangaBuffService:
                                 page.url.split("?")[0],
                             )
                             return page.url.split("?")[0]
-                        return got
+                        logger.warning(
+                            "MangaBuff %s: no unread from %s — skip title",
+                            slug,
+                            candidate,
+                        )
+                        return None
 
         if not await self._safe_goto(page, title_href):
             return None
@@ -3747,6 +3918,15 @@ class MangaBuffService:
     async def _queue_chapter_in_pool(self, page: Page) -> Optional[Dict[str, Any]]:
         """Поставить главу в history_pool через нативный reader.js addHistory()."""
         try:
+            # не даём reader.js самому слать пакеты — иначе теряем chapter_id в статистике
+            await page.evaluate(
+                """() => {
+                  try { window.ccl = 50; } catch (e) {}
+                }"""
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        try:
             meta = await page.evaluate(
                 """() => {
                   const ch = window.current_chapter;
@@ -3773,13 +3953,20 @@ class MangaBuffService:
                     return {ok: false, reason: 'no addHistory', url: location.href};
                   }
                   let before = 0;
+                  let beforeIds = [];
                   try {
-                    before = JSON.parse(localStorage.getItem('history_pool') || '[]').length;
+                    const arr = JSON.parse(localStorage.getItem('history_pool') || '[]') || [];
+                    before = arr.length;
+                    beforeIds = arr.map(it => String(it.chapter_id || ''));
                   } catch (e) { before = 0; }
+                  try { window.ccl = 50; } catch (e) {}
                   addHistory();
                   let after = before;
+                  let afterIds = beforeIds;
                   try {
-                    after = JSON.parse(localStorage.getItem('history_pool') || '[]').length;
+                    const arr2 = JSON.parse(localStorage.getItem('history_pool') || '[]') || [];
+                    after = arr2.length;
+                    afterIds = arr2.map(it => String(it.chapter_id || ''));
                   } catch (e) { after = before; }
                   return {
                     ok: true,
@@ -3789,6 +3976,8 @@ class MangaBuffService:
                     slug: String(ch.slug || ''),
                     pool: after,
                     pool_before: before,
+                    before_ids: beforeIds,
+                    after_ids: afterIds,
                     ccl: Number(window.ccl || 2),
                     is_read: !!is_read,
                     read_status_send: !!read_status_send,
@@ -3806,33 +3995,65 @@ class MangaBuffService:
                 (meta or {}).get("chapter") or (meta or {}).get("url") or "",
             )
             return None
+        # если native flush ужал пул — засчитать исчезнувшие id
+        before_ids = [str(x) for x in (meta.get("before_ids") or []) if x]
+        after_ids = [str(x) for x in (meta.get("after_ids") or []) if x]
+        cid = str(meta.get("chapter_id") or "").strip()
+        if cid and cid not in self._pending_credit_ids:
+            self._pending_credit_ids.append(cid)
+        disappeared = [x for x in before_ids if x and x not in after_ids]
+        if disappeared:
+            n = self._credit_chapter_ids(disappeared)
+            if n > 0:
+                self._last_history_post_at = time_mod.time()
+                logger.info(
+                    "MangaBuff native flush credited +%s ids=%s",
+                    n,
+                    disappeared[:6],
+                )
+                meta["native_credited"] = n
+            self._pending_credit_ids = [
+                x for x in self._pending_credit_ids if x in after_ids or x == cid
+            ]
         return meta
 
     async def _flush_history_pool_confirmed(
-        self, page: Page, *, max_retries: int = 5
+        self, page: Page, *, max_retries: int = 2, force: bool = False
     ) -> int:
-        """POST /addHistory с паузой и повторами. Возвращает число зачтённых глав."""
+        """POST /addHistory с паузой. На 429 не блокируем фарм на минуты — уходим и повторим позже."""
         for attempt in range(1, max_retries + 1):
             if self._stop_flag.is_set():
+                return 0
+            pool0 = await self._history_pool_size(page)
+            if pool0 <= 0:
                 return 0
             now = time_mod.time()
             gap = self._history_min_gap_for_tier()
             if (now - self._last_history_post_at) < gap:
-                wait_for = max(0.2, gap - (now - self._last_history_post_at))
+                wait_for = max(0.15, gap - (now - self._last_history_post_at))
+                flush_need = self._turbo_pool_flush_at()
+                # turbo: откладываем только пока пакет не полный; полный — ждём gap и шлём
+                if (
+                    not force
+                    and self._tempo_tier() == "turbo"
+                    and wait_for > 2.5
+                    and attempt == 1
+                    and pool0 < flush_need
+                ):
+                    logger.info(
+                        "MangaBuff addHistory defer %.1fs (pool=%s)",
+                        wait_for,
+                        pool0,
+                    )
+                    return 0
                 logger.info(
-                    "MangaBuff addHistory throttle %.1fs (attempt %s/%s)",
+                    "MangaBuff addHistory throttle %.1fs (attempt %s/%s pool=%s)",
                     wait_for,
                     attempt,
                     max_retries,
+                    pool0,
                 )
                 await asyncio.sleep(wait_for)
-            if attempt > 1:
-                try:
-                    await page.reload(wait_until="domcontentloaded", timeout=45000)
-                    await self._dismiss_overlays(page)
-                    await self._wait_for_chapter_context(page, timeout_sec=5.0)
-                except Exception:  # noqa: BLE001
-                    pass
             count, gift = await self._flush_history_pool(page)
             if count > 0:
                 if gift and (gift.cards or gift.scrolls):
@@ -3841,17 +4062,19 @@ class MangaBuffService:
                 return count
             pool = await self._history_pool_size(page)
             if pool <= 0:
+                # пул очищен (200 + already credited) — не ошибка
                 return 0
             tier = self._tempo_tier()
             self._history_gap_boost_until = max(
                 self._history_gap_boost_until,
-                time_mod.time() + (40.0 if tier == "turbo" else 90.0),
+                time_mod.time() + (55.0 if tier == "turbo" else 90.0),
             )
-            backoff = {
-                "turbo": 12.0,
-                "fast": 16.0,
-                "lively": 22.0,
-            }.get(tier, 8.0 + (attempt - 1) * 6.0)
+            if attempt >= max_retries:
+                logger.warning(
+                    "MangaBuff addHistory defer after 429/fail (pool=%s)", pool
+                )
+                return 0
+            backoff = 8.0 if tier == "turbo" else 12.0
             logger.warning(
                 "MangaBuff addHistory retry in %.0fs (pool=%s, attempt %s/%s)",
                 backoff,
@@ -3887,6 +4110,10 @@ class MangaBuffService:
         pool = int(meta.get("pool") or 0)
         ccl = max(1, int(meta.get("ccl") or 2))
         self.stats.chapters_pending = pool
+        native_credited = int(meta.get("native_credited") or 0)
+        if native_credited > 0:
+            # reader.js сам отправил часть пула — уже учли chapter_id
+            return native_credited
         logger.info(
             "MangaBuff site-read queued manga=%s ch=%s pool=%s/%s native=1",
             meta.get("manga_id"),
@@ -3900,8 +4127,8 @@ class MangaBuffService:
             flush_at = self._turbo_pool_flush_at()
         if tier == "turbo" and not force_flush:
             return 0
-        if pool >= flush_at:
-            if self._native_flush_timeout() > 0:
+        if pool >= flush_at or force_flush:
+            if self._native_flush_timeout() > 0 and not force_flush:
                 native_flushed = await self._wait_for_native_history_flush(
                     page,
                     pool_before=pool,
@@ -3911,13 +4138,15 @@ class MangaBuffService:
                     # native flush без chapter_id — не завышаем; 0 до ручного учёта
                     self.stats.chapters_pending = await self._history_pool_size(page)
                     return 0
-            if tier in ("turbo", "fast"):
-                return await self._flush_history_pool_confirmed(page)
+            if tier in ("turbo", "fast") or force_flush:
+                return await self._flush_history_pool_confirmed(
+                    page, force=force_flush
+                )
 
         if not force_flush and pool < flush_at:
             return 0
 
-        return await self._flush_history_pool_confirmed(page)
+        return await self._flush_history_pool_confirmed(page, force=force_flush)
 
     async def _flush_history_pool(self, page: Page) -> Tuple[int, Optional[CardDropInfo]]:
         """POST /addHistory — сайт засчитывает главы и может выдать карту."""
@@ -3994,6 +4223,11 @@ class MangaBuffService:
         self._last_history_post_at = time_mod.time()
         # только новые chapter_id — иначе TG/статы завышаются на re-read
         fresh = self._credit_chapter_ids(chapter_ids) if chapter_ids else count
+        if chapter_ids:
+            done = set(str(x) for x in chapter_ids if x)
+            self._pending_credit_ids = [
+                x for x in self._pending_credit_ids if x not in done
+            ]
         if fresh <= 0:
             logger.info(
                 "MangaBuff addHistory ok but 0 new chapters (already credited)"
@@ -4213,7 +4447,7 @@ class MangaBuffService:
         return None
 
     async def _maybe_comment(self, page: Page) -> bool:
-        """Каждые 5–15 прочитанных глав — коммент на текущую главу."""
+        """Редкие комменты; на турбо почти не мешают чтению."""
         self._chapters_since_comment += 1
         if self._chapters_since_comment < self._next_comment_after:
             return False
@@ -4222,13 +4456,19 @@ class MangaBuffService:
         parsed = self._parse_chapter_url(current_url)
         if not parsed:
             logger.info("MangaBuff comment skip: not on chapter url %s", current_url)
-            self._next_comment_after = self._chapters_since_comment + random.randint(1, 3)
+            cmin, cmax = self._comment_interval_for_tier()
+            self._next_comment_after = self._chapters_since_comment + random.randint(
+                1, max(2, cmin // 4)
+            )
             return False
 
         slug, vol, cur_ch = parsed
         key = self._chapter_comment_key(slug, vol, cur_ch)
         if key in self._commented_chapters:
-            self._next_comment_after = self._chapters_since_comment + random.randint(1, 3)
+            cmin, cmax = self._comment_interval_for_tier()
+            self._next_comment_after = self._chapters_since_comment + random.randint(
+                1, max(2, cmin // 4)
+            )
             return False
 
         logger.info(
@@ -4245,9 +4485,8 @@ class MangaBuffService:
             if ok:
                 self._mark_chapter_commented(slug, vol, cur_ch)
                 self._chapters_since_comment = 0
-                self._next_comment_after = random.randint(
-                    COMMENT_EVERY_MIN, COMMENT_EVERY_MAX
-                )
+                cmin, cmax = self._comment_interval_for_tier()
+                self._next_comment_after = random.randint(cmin, cmax)
                 self._persist_stats()
                 logger.info("MangaBuff comment locked to chapter %s", key)
             else:
@@ -4396,12 +4635,13 @@ class MangaBuffService:
             self.stats.comments_posted += 1
             self.stats.touch(f"коммент: {text[:50]}", page.url)
             voice = self._voice_for_slug(slug).get("key", "?")
+            cmin, cmax = self._comment_interval_for_tier()
             logger.info(
                 "MangaBuff comment posted on %s voice=%s (next in %s–%s): %s",
                 page.url,
                 voice,
-                COMMENT_EVERY_MIN,
-                COMMENT_EVERY_MAX,
+                cmin,
+                cmax,
                 text,
             )
             return True
@@ -4856,14 +5096,27 @@ class MangaBuffService:
                     break
                 continue
 
-            if await self._chapter_already_read_on_site(page):
-                logger.info("MangaBuff skip re-read %s", url)
+            # важно: дождаться контекста, иначе skip по credited id не сработает
+            if not await self._wait_for_chapter_context(
+                page,
+                timeout_sec=2.5 if self._tempo_tier() == "turbo" else 5.0,
+            ):
+                logger.warning("MangaBuff no context at %s — try next", url)
                 if not await self._go_next_chapter_with_retry(page):
                     break
                 continue
 
+            if await self._chapter_already_read_on_site(page):
+                logger.info("MangaBuff skip re-read %s", url)
+                self._read_urls.add(url)
+                if not await self._hop_next_unread_fast(page):
+                    if not await self._go_next_chapter_with_retry(page):
+                        break
+                continue
+
             self._read_urls.add(url)
             last_chapter_url = url
+            self._remember_resume_url(url)
             logger.info("MangaBuff scroll chapter %s", url)
 
             tier = self._tempo_tier()
@@ -4926,22 +5179,24 @@ class MangaBuffService:
             pending = await self._history_pool_size(page)
             self.stats.chapters_pending = pending
             turbo_moved_next = False
+            gap_ready = (
+                time_mod.time() - self._last_history_post_at
+            ) >= self._history_min_gap_for_tier()
 
             if tier == "turbo" and pending >= self._turbo_pool_flush_at() and confirmed <= 0:
                 turbo_moved_next = await self._go_next_chapter_with_retry(page)
-                confirmed = await self._flush_history_pool_confirmed(page)
-                pending = await self._history_pool_size(page)
-                self.stats.chapters_pending = pending
-            elif tier == "turbo" and pending >= 1 and confirmed <= 0:
-                # продолжаем читать пока копится пакет / идёт gap
-                turbo_moved_next = await self._go_next_chapter_with_retry(page)
-                gap = self._history_min_gap_for_tier()
-                ready = (time_mod.time() - self._last_history_post_at) >= gap
-                if pending >= 2 and ready:
+                if gap_ready or pending >= self._turbo_pool_flush_at() + 1:
                     confirmed = await self._flush_history_pool_confirmed(page)
                     pending = await self._history_pool_size(page)
                     self.stats.chapters_pending = pending
-            elif confirmed <= 0 and pending >= 2:
+            elif tier == "turbo" and pending >= 1 and confirmed <= 0:
+                # продолжаем читать пока копится пакет / идёт gap
+                turbo_moved_next = await self._go_next_chapter_with_retry(page)
+                if pending >= 2 and gap_ready:
+                    confirmed = await self._flush_history_pool_confirmed(page)
+                    pending = await self._history_pool_size(page)
+                    self.stats.chapters_pending = pending
+            elif confirmed <= 0 and pending >= 2 and gap_ready:
                 logger.warning(
                     "MangaBuff addHistory backlog pool=%s at %s — retry flush",
                     pending,
@@ -4963,11 +5218,9 @@ class MangaBuffService:
 
             if confirmed <= 0:
                 if pending >= 2:
-                    logger.warning(
-                        "MangaBuff pool still full at %s — advance anyway",
-                        final_url,
-                    )
-                    self.stats.errors += 1
+                    # пакет копится / ждём gap — это норма для турбо
+                    self.stats.touch(f"в очереди ({pending})", final_url)
+                    self._persist_stats()
                 elif pending > 0:
                     self.stats.touch(f"в очереди ({pending})", final_url)
                     self._persist_stats()
@@ -4977,10 +5230,18 @@ class MangaBuffService:
                         final_url,
                     )
                 else:
-                    logger.warning(
-                        "MangaBuff chapter not queued: %s", final_url
-                    )
-                    self.stats.errors += 1
+                    cid = await self._current_chapter_id(page)
+                    if cid and cid in self._credited_chapter_ids:
+                        logger.info(
+                            "MangaBuff chapter already credited: %s id=%s",
+                            final_url,
+                            cid,
+                        )
+                    else:
+                        logger.warning(
+                            "MangaBuff chapter not queued: %s", final_url
+                        )
+                        self.stats.errors += 1
 
             if confirmed > 0:
                 self.stats.chapters_read += confirmed
