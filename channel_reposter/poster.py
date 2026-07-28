@@ -118,6 +118,8 @@ class ChannelPoster:
         self.db = db
         # ID медиагрупп, уже обработанных в текущем цикле (чтобы не дублировать)
         self._seen_grouped: set[str] = set()
+        # Флаг отмены массового rewrite
+        self._rewrite_cancel = False
 
     # ------------------------------------------------------------------
     # Публичный API
@@ -471,7 +473,7 @@ class ChannelPoster:
         Аккаунт должен быть админом канала с правом редактирования сообщений.
 
         Returns:
-            {"updated": int, "skipped": int, "errors": int, "scanned": int}
+            {"updated": int, "skipped": int, "errors": int, "scanned": int, "cancelled": bool}
         """
         chat = _chat_ref(channel)
         text = (
@@ -482,11 +484,13 @@ class ChannelPoster:
         if not text.strip():
             raise ValueError("Шаблон описания пуст — сначала задайте текст через «✏️ Текст описания»")
 
+        self._rewrite_cancel = False
         updated = 0
         skipped = 0
         errors = 0
         scanned = 0
         seen_groups: set[str] = set()
+        cancelled = False
 
         logger.info(
             "Rewrite captions: channel=%s max_posts=%s",
@@ -495,6 +499,11 @@ class ChannelPoster:
         )
 
         async for msg in self.client.get_chat_history(chat):
+            if self._rewrite_cancel:
+                cancelled = True
+                logger.info("Rewrite cancelled by user")
+                break
+
             if max_posts is not None and updated >= max_posts:
                 break
 
@@ -524,18 +533,27 @@ class ChannelPoster:
             try:
                 await self._edit_message_description(chat, edit_msg, text)
                 updated += 1
-                delay = random.uniform(
-                    max(0.4, config.POST_DELAY_MIN / 4),
-                    max(1.0, config.POST_DELAY_MAX / 3),
-                )
+                # Медленнее — меньше FloodWait, бот остаётся живым
+                delay = random.uniform(3.0, 5.5)
                 await asyncio.sleep(delay)
             except FloodWait as e:
                 wait = int(e.value) + 1
                 logger.warning("FloodWait при edit %s сек", wait)
-                await asyncio.sleep(wait)
+                # Режем слишком длинные ожидания кусками, чтобы можно было отменить
+                left = wait
+                while left > 0:
+                    if self._rewrite_cancel:
+                        cancelled = True
+                        break
+                    step = min(left, 5)
+                    await asyncio.sleep(step)
+                    left -= step
+                if cancelled:
+                    break
                 try:
                     await self._edit_message_description(chat, edit_msg, text)
                     updated += 1
+                    await asyncio.sleep(random.uniform(3.0, 5.5))
                 except Exception as e2:
                     if _is_not_modified(e2):
                         skipped += 1
@@ -558,9 +576,14 @@ class ChannelPoster:
             "skipped": skipped,
             "errors": errors,
             "scanned": scanned,
+            "cancelled": cancelled,
         }
         logger.info("Rewrite done: %s", result)
         return result
+
+    def cancel_rewrite(self) -> None:
+        """Остановить текущий массовый rewrite."""
+        self._rewrite_cancel = True
 
     async def _edit_message_description(
         self, chat: str | int, msg: Message, text: str

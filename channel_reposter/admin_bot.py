@@ -11,6 +11,7 @@ admin_bot.py — админ-панель aiogram 3.x + мастер входа �
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Awaitable, Callable, Optional
 
@@ -56,6 +57,7 @@ _poster = None
 _trigger_cycle: Optional[Callable] = None
 _auth = None
 _on_userbot_ready: Optional[Callable[[], Awaitable[None]]] = None
+_rewrite_task: Optional[asyncio.Task] = None
 
 
 def set_dependencies(
@@ -981,6 +983,7 @@ async def _prompt_rewrite(message: Message, state: FSMContext) -> None:
 
 
 async def _run_rewrite(answer, channel: str, limit: int | None) -> None:
+    global _rewrite_task
     if _auth is None or not _auth.is_ready:
         await answer("⚠️ Нужен юзербот: /login")
         return
@@ -989,32 +992,57 @@ async def _run_rewrite(answer, channel: str, limit: int | None) -> None:
         await answer("❌ Массовое редактирование доступно только в режиме USERBOT")
         return
 
-    limit_label = str(limit) if limit is not None else "все"
-    await answer(
-        f"⏳ Обновляю описания в <code>{channel}</code> "
-        f"(лимит: <b>{limit_label}</b>)…\nЭто может занять время.",
-        parse_mode="HTML",
-    )
-    try:
-        result = await poster.rewrite_captions_in_channel(channel, max_posts=limit)
-    except ValueError as e:
-        await answer(f"❌ {e}")
-        return
-    except Exception as e:
-        logger.exception("rewrite")
-        await answer(f"❌ Ошибка: {e}")
+    if _rewrite_task is not None and not _rewrite_task.done():
+        await answer(
+            "⚠️ Уже идёт обновление описаний.\n"
+            "Дождитесь окончания или отправьте /cancel_rewrite",
+            parse_mode="HTML",
+        )
         return
 
+    limit_label = str(limit) if limit is not None else "все"
     await answer(
-        "✅ Готово.\n"
-        f"Канал: <code>{channel}</code>\n"
-        f"Просмотрено: <b>{result.get('scanned', 0)}</b>\n"
-        f"Обновлено: <b>{result.get('updated', 0)}</b>\n"
-        f"Пропущено: <b>{result.get('skipped', 0)}</b>\n"
-        f"Ошибок: <b>{result.get('errors', 0)}</b>",
-        reply_markup=main_menu_kb(_require_db().get_settings().is_running),
+        f"⏳ Запустил обновление в <code>{channel}</code> "
+        f"(лимит: <b>{limit_label}</b>) в фоне.\n"
+        "Бот продолжает отвечать. Отмена: /cancel_rewrite\n"
+        "Между правками пауза 3–5 сек — чтобы не словить FloodWait.",
         parse_mode="HTML",
     )
+
+    async def _job() -> None:
+        try:
+            result = await poster.rewrite_captions_in_channel(channel, max_posts=limit)
+            status = "⏹ Отменено" if result.get("cancelled") else "✅ Готово"
+            await answer(
+                f"{status}.\n"
+                f"Канал: <code>{channel}</code>\n"
+                f"Просмотрено: <b>{result.get('scanned', 0)}</b>\n"
+                f"Обновлено: <b>{result.get('updated', 0)}</b>\n"
+                f"Пропущено: <b>{result.get('skipped', 0)}</b>\n"
+                f"Ошибок: <b>{result.get('errors', 0)}</b>",
+                reply_markup=main_menu_kb(_require_db().get_settings().is_running),
+                parse_mode="HTML",
+            )
+        except ValueError as e:
+            await answer(f"❌ {e}")
+        except Exception as e:
+            logger.exception("rewrite")
+            await answer(f"❌ Ошибка: {e}")
+
+    _rewrite_task = asyncio.create_task(_job(), name="rewrite-captions")
+
+
+@router.message(Command("cancel_rewrite", "stop_rewrite"))
+async def cmd_cancel_rewrite(message: Message) -> None:
+    if await _deny_if_not_admin(message.from_user.id if message.from_user else None, message.answer):
+        return
+    poster = _poster
+    if poster is not None and hasattr(poster, "cancel_rewrite"):
+        poster.cancel_rewrite()
+    if _rewrite_task is not None and not _rewrite_task.done():
+        await message.answer("⏹ Останавливаю обновление описаний…")
+    else:
+        await message.answer("Сейчас массовое обновление не запущено.")
 
 
 def setup_dispatcher(dp: Dispatcher) -> None:
