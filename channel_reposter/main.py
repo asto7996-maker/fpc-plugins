@@ -151,7 +151,8 @@ async def main() -> None:
     logger.info("Онлайн: https://t.me/%s  →  /start  или  /login", me.username)
 
     try:
-        await dp.start_polling(bot)
+        # drop_pending_updates — не застревать на старых callback'ах после рестарта
+        await dp.start_polling(bot, drop_pending_updates=True)
     finally:
         scheduler_task.cancel()
         try:

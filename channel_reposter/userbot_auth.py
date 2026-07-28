@@ -121,6 +121,7 @@ class UserbotAuth:
             api_id=creds.api_id,
             api_hash=creds.api_hash,
             workdir=str(self.workdir),
+            no_updates=True,
         )
         try:
             # В Pyrogram 2.x connect() возвращает bool: авторизована ли сессия
@@ -143,6 +144,7 @@ class UserbotAuth:
             api_id=creds.api_id,
             api_hash=creds.api_hash,
             workdir=str(self.workdir),
+            no_updates=True,
         )
         try:
             await self.client.start()
@@ -180,6 +182,7 @@ class UserbotAuth:
             api_id=creds.api_id,
             api_hash=creds.api_hash,
             workdir=str(self.workdir),
+            no_updates=True,
         )
         await self.client.connect()
 
@@ -245,6 +248,7 @@ class UserbotAuth:
             api_id=creds.api_id,
             api_hash=creds.api_hash,
             workdir=str(self.workdir),
+            no_updates=True,
         )
         await self.client.start()
         me = await self.client.get_me()
