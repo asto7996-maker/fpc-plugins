@@ -6835,11 +6835,11 @@ class MangaBuffService:
             )
             return stats
 
-        # запас на 429-ретраи; по умолчанию хватает до цели + промах
+        # запас на 429 и редкие сбросы серии; цель одна непрерывная достройка
         if max_answers is None:
-            want = target + 80
+            want = max(target * 2 + 50, target + 200)
         else:
-            want = max(1, min(int(max_answers), target + 200))
+            want = max(1, min(int(max_answers), target * 3 + 100))
 
         if not await self._safe_goto(page, "https://mangabuff.ru/quiz"):
             logger.warning("MangaBuff quiz: cannot open /quiz")
