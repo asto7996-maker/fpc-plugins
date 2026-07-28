@@ -2265,10 +2265,97 @@ class MangaBuffService:
 
     def _mark_trade_receiver(self, user_id: str) -> None:
         uid = str(user_id or "").strip()
-        if not uid or uid in self._trade_receivers:
+        if not uid or not uid.isdigit() or uid in self._trade_receivers:
             return
         self._trade_receivers.add(uid)
         self._save_trade_receivers()
+
+    def _already_traded_with(self, user_id: str) -> bool:
+        uid = str(user_id or "").strip()
+        return bool(uid) and uid in self._trade_receivers
+
+    async def _sync_trade_receivers_from_site(self, page: Page) -> int:
+        """
+        Подтянуть в чёрный список всех, кому уже кидали обмен:
+        вкладки «Отправленные» + «История обмена».
+        """
+        await self._refresh_user_id(page)
+        me = str(self._mb_user_id or "")
+        before = len(self._trade_receivers)
+        found: set[str] = set()
+
+        # История: user links прямо в списке
+        if await self._safe_goto(page, "https://mangabuff.ru/trades/history"):
+            await asyncio.sleep(0.5)
+            hist = await page.evaluate(
+                """() => [...document.querySelectorAll('a[href*="/users/"]')]
+                  .map(a => ((a.href||'').match(/\\/users\\/(\\d+)/)||[])[1])
+                  .filter(Boolean)"""
+            )
+            for uid in hist or []:
+                u = str(uid or "").strip()
+                if u and u.isdigit() and u != me:
+                    found.add(u)
+
+        # Отправленные pending: партнёр на странице обмена
+        if await self._safe_goto(page, "https://mangabuff.ru/trades/offers"):
+            await asyncio.sleep(0.5)
+            hrefs = await page.evaluate(
+                """() => [...document.querySelectorAll('a.trade__list-item[href*="/trades/"], a[href*="/trades/"]')]
+                  .map(a => (a.href||'').split('?')[0])
+                  .filter(h => /\\/trades\\/\\d+$/.test(h))
+                  .slice(0, 60)"""
+            )
+            for href in hrefs or []:
+                if self._stop_flag.is_set():
+                    break
+                if not await self._safe_goto(page, href):
+                    continue
+                await asyncio.sleep(0.25)
+                partner = await page.evaluate(
+                    """(me) => {
+                      const avatars = [...document.querySelectorAll(
+                        'a.trade__main-avatar[href*="/users/"], a.trade__header-name[href*="/users/"]'
+                      )];
+                      for (const a of avatars) {
+                        const m = (a.href||'').match(/\\/users\\/(\\d+)/);
+                        if (!m) continue;
+                        if (String(m[1]) === String(me||'')) continue;
+                        return m[1];
+                      }
+                      for (const a of document.querySelectorAll('a[href*="/users/"]')) {
+                        const m = (a.href||'').match(/\\/users\\/(\\d+)/);
+                        if (!m) continue;
+                        if (String(m[1]) === String(me||'')) continue;
+                        return m[1];
+                      }
+                      return '';
+                    }""",
+                    me,
+                )
+                u = str(partner or "").strip()
+                if u and u.isdigit() and u != me:
+                    found.add(u)
+
+        added = 0
+        for uid in found:
+            if uid not in self._trade_receivers:
+                self._trade_receivers.add(uid)
+                added += 1
+        if added:
+            self._save_trade_receivers()
+            logger.info(
+                "MangaBuff trade receivers synced from site: +%s (total=%s)",
+                added,
+                len(self._trade_receivers),
+            )
+        elif found:
+            logger.info(
+                "MangaBuff trade receivers sync: already known (%s site, %s local)",
+                len(found),
+                len(self._trade_receivers),
+            )
+        return len(self._trade_receivers) - before
 
     def _load_trade_candidates(self) -> List[str]:
         try:
@@ -6104,6 +6191,8 @@ class MangaBuffService:
     async def _pick_trade_targets(self, page: Page, limit: int = 40) -> List[str]:
         """Только чат + авторы комментов глав; без повторов (1 обмен / человек)."""
         await self._refresh_user_id(page)
+        # подхватить диск + сайт, чтобы не кинуть повторно после рестарта
+        self._trade_receivers |= self._load_trade_receivers()
         me = str(self._mb_user_id or "")
         want = max(1, int(limit))
         ordered: List[str] = []
@@ -6114,7 +6203,7 @@ class MangaBuffService:
                 uid = str(raw or "").strip()
                 if not uid or not uid.isdigit():
                     continue
-                if uid == me or uid in self._trade_receivers or uid in seen:
+                if uid == me or self._already_traded_with(uid) or uid in seen:
                     continue
                 seen.add(uid)
                 ordered.append(uid)
@@ -6887,7 +6976,12 @@ class MangaBuffService:
             logger.info("MangaBuff trades: no profitable offer units")
             return 0
         want = max(1, min(int(offers or 40), len(units)))
-        targets = await self._pick_trade_targets(page, limit=max(want * 2, want))
+        # сначала синхронизировать «уже кидали» с сайтом
+        try:
+            await self._sync_trade_receivers_from_site(page)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("trade receivers sync: %s", exc)
+        targets = await self._pick_trade_targets(page, limit=max(want * 3, want))
         if not targets:
             logger.info("MangaBuff trades: no chat/comment targets")
             return 0
@@ -6901,6 +6995,13 @@ class MangaBuffService:
         for receiver_id in targets:
             if self._stop_flag.is_set() or sent >= want:
                 break
+            # жёсткий запрет повторов — даже если список устарел mid-loop
+            if self._already_traded_with(receiver_id):
+                logger.info(
+                    "MangaBuff trade skip user=%s: already traded before",
+                    receiver_id,
+                )
+                continue
             unit = None
             unit_i = -1
             their: List[Dict[str, Any]] = []
@@ -6933,6 +7034,9 @@ class MangaBuffService:
             want_count = int(unit.get("want_count") or 1)
             creator_ids = [str(c["id"]) for c in unit["offer_cards"]]
             receiver_ids = [str(c["id"]) for c in their[:want_count]]
+            # ещё раз перед create
+            if self._already_traded_with(receiver_id):
+                continue
             payload = {
                 "receiver_id": str(receiver_id),
                 "creator_card_ids": creator_ids,
@@ -6992,12 +7096,19 @@ class MangaBuffService:
                     if isinstance(errs, dict):
                         msg += " " + " ".join(str(v) for v in errs.values())
                 msg_l = msg.lower()
-                if status in (409, 422) and (
-                    "запретил" in msg_l
-                    or "already" in msg_l
-                    or "pending" in msg_l
-                    or "уже есть" in msg_l
-                    or "уже отправ" in msg_l
+                # любой намёк, что с этим человеком уже есть связь — в чёрный список
+                if status in (409, 422) or any(
+                    x in msg_l
+                    for x in (
+                        "запретил",
+                        "already",
+                        "pending",
+                        "уже есть",
+                        "уже отправ",
+                        "ожидает",
+                        "нельзя",
+                        "повтор",
+                    )
                 ):
                     self._mark_trade_receiver(receiver_id)
                 if status == 429:
