@@ -1,10 +1,11 @@
 """
 main.py — точка входа Channel Reposter.
 
-Запускает параллельно:
-  1) Pyrogram Client (юзербот) — чтение/копирование постов;
-  2) aiogram Bot — админ-панель управления;
-  3) фоновый планировщик циклов публикации по интервалу из SQLite.
+Режимы:
+  • Bot API (по умолчанию, если нет API_ID/API_HASH) — достаточно BOT_TOKEN;
+    бот должен быть админом обоих каналов.
+  • Userbot (Pyrogram) — если заданы API_ID + API_HASH; при первом запуске
+    нужна интерактивная авторизация по телефону.
 """
 
 from __future__ import annotations
@@ -13,21 +14,17 @@ import asyncio
 import logging
 import sys
 from pathlib import Path
+from typing import Any, Protocol
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.fsm.storage.memory import MemoryStorage
-from pyrogram import Client
 
 import admin_bot
 import config
 from database import Database
-from poster import ChannelPoster
-
-# ---------------------------------------------------------------------------
-# Логирование
-# ---------------------------------------------------------------------------
+from poster_botapi import ChannelPosterBotAPI
 
 logging.basicConfig(
     level=logging.INFO,
@@ -37,12 +34,15 @@ logging.basicConfig(
 )
 logger = logging.getLogger("main")
 
-# Глобальная блокировка, чтобы не запускать два цикла одновременно
 _cycle_lock = asyncio.Lock()
 
 
-async def run_cycle_safe(poster: ChannelPoster) -> int:
-    """Выполнить цикл публикации с защитой от параллельного запуска."""
+class PosterLike(Protocol):
+    async def run_cycle(self) -> int: ...
+    async def apply_start_link(self, link: str) -> Any: ...
+
+
+async def run_cycle_safe(poster: PosterLike) -> int:
     if _cycle_lock.locked():
         logger.warning("Цикл уже выполняется — пропуск")
         return 0
@@ -50,22 +50,12 @@ async def run_cycle_safe(poster: ChannelPoster) -> int:
         return await poster.run_cycle()
 
 
-async def scheduler_loop(poster: ChannelPoster, db: Database) -> None:
-    """
-    Фоновый планировщик.
-
-    Каждые N часов (из настроек) запускает цикл, если автопостинг включён.
-    Интервал можно менять на лету через админ-панель — он читается перед сном.
-    """
+async def scheduler_loop(poster: PosterLike, db: Database) -> None:
     logger.info("Планировщик запущен")
-    # Небольшая пауза после старта, чтобы сессия успела подняться
     await asyncio.sleep(5)
 
     while True:
         settings = db.get_settings()
-        interval_hours = max(settings.interval_hours, 0.05)  # минимум ~3 минуты
-        interval_sec = interval_hours * 3600
-
         if settings.is_running:
             try:
                 count = await run_cycle_safe(poster)
@@ -75,15 +65,17 @@ async def scheduler_loop(poster: ChannelPoster, db: Database) -> None:
         else:
             logger.debug("Планировщик: автопостинг на паузе")
 
-        # Перечитываем интервал на случай изменения настроек
         settings = db.get_settings()
         interval_sec = max(settings.interval_hours, 0.05) * 3600
-        logger.info("Следующий цикл через %.1f ч. (%.0f сек.)", settings.interval_hours, interval_sec)
+        logger.info(
+            "Следующий цикл через %.1f ч. (%.0f сек.)",
+            settings.interval_hours,
+            interval_sec,
+        )
         await asyncio.sleep(interval_sec)
 
 
 async def main() -> None:
-    # --- База ---
     db = Database(config.DATABASE_PATH)
     db.ensure_defaults(
         caption=(
@@ -93,28 +85,59 @@ async def main() -> None:
         ),
         interval_hours=config.DEFAULT_INTERVAL_HOURS,
         posts_per_cycle=config.DEFAULT_POSTS_PER_CYCLE,
-        source_channel=config.SOURCE_CHANNEL,
-        target_channel=config.TARGET_CHANNEL,
+        source_channel=config.SOURCE_CHANNEL or "",
+        target_channel=config.TARGET_CHANNEL or "",
     )
     logger.info("SQLite: %s", config.DATABASE_PATH)
 
-    # --- Pyrogram юзербот ---
-    # workdir — каталог проекта, чтобы .session лежал рядом
-    workdir = str(Path(__file__).resolve().parent)
-    userbot = Client(
-        name=config.SESSION_NAME,
-        api_id=config.API_ID,
-        api_hash=config.API_HASH,
-        workdir=workdir,
-    )
-
-    poster = ChannelPoster(client=userbot, db=db)
-
-    # --- aiogram админ-бот ---
     bot = Bot(
         token=config.BOT_TOKEN,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
+    me = await bot.get_me()
+    logger.info("Бот: @%s (id=%s)", me.username, me.id)
+
+    userbot = None
+    poster: PosterLike
+
+    if config.userbot_enabled():
+        from pyrogram import Client
+        from poster import ChannelPoster
+
+        workdir = str(Path(__file__).resolve().parent)
+        userbot = Client(
+            name=config.SESSION_NAME,
+            api_id=config.API_ID,
+            api_hash=config.API_HASH,
+            workdir=workdir,
+        )
+        poster = ChannelPoster(client=userbot, db=db)
+        await userbot.start()
+        ube = await userbot.get_me()
+        logger.info(
+            "Режим USERBOT: %s (id=%s)",
+            ube.username or ube.first_name,
+            ube.id,
+        )
+        for label, chat in (
+            ("источник", db.get_settings().source_channel or config.SOURCE_CHANNEL),
+            ("назначение", db.get_settings().target_channel or config.TARGET_CHANNEL),
+        ):
+            if not chat:
+                continue
+            try:
+                info = await userbot.get_chat(chat)
+                logger.info("Канал-%s: %s (id=%s)", label, info.title, info.id)
+            except Exception as e:
+                logger.warning("Канал-%s (%s) недоступен: %s", label, chat, e)
+    else:
+        poster = ChannelPosterBotAPI(bot=bot, db=db)
+        logger.info(
+            "Режим BOT API (без юзербота). "
+            "Добавьте бота админом в оба канала. "
+            "Для альбомов «как есть» задайте API_ID/API_HASH и USERBOT_MODE=1."
+        )
+
     dp = Dispatcher(storage=MemoryStorage())
     admin_bot.set_dependencies(
         db=db,
@@ -123,35 +146,9 @@ async def main() -> None:
     )
     admin_bot.setup_dispatcher(dp)
 
-    # --- Запуск ---
-    await userbot.start()
-    me = await userbot.get_me()
-    logger.info(
-        "Юзербот авторизован как %s (id=%s)",
-        me.username or me.first_name,
-        me.id,
-    )
-
-    # Проверка доступа к каналам (мягкая — только предупреждение)
-    for label, chat in (
-        ("источник", db.get_settings().source_channel or config.SOURCE_CHANNEL),
-        ("назначение", db.get_settings().target_channel or config.TARGET_CHANNEL),
-    ):
-        try:
-            info = await userbot.get_chat(chat)
-            logger.info("Канал-%s: %s (id=%s)", label, info.title, info.id)
-        except Exception as e:
-            logger.warning(
-                "Не удалось получить канал-%s (%s): %s. "
-                "Убедитесь, что аккаунт состоит в канале / является админом назначения.",
-                label,
-                chat,
-                e,
-            )
-
     scheduler_task = asyncio.create_task(scheduler_loop(poster, db), name="scheduler")
+    logger.info("Админ-панель онлайн. Напишите боту /start — https://t.me/%s", me.username)
 
-    logger.info("Админ-бот запущен. Напишите боту /start")
     try:
         await dp.start_polling(bot)
     finally:
@@ -160,7 +157,8 @@ async def main() -> None:
             await scheduler_task
         except asyncio.CancelledError:
             pass
-        await userbot.stop()
+        if userbot is not None:
+            await userbot.stop()
         await bot.session.close()
         logger.info("Остановка завершена")
 

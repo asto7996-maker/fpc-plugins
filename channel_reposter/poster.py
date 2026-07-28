@@ -114,15 +114,9 @@ class ChannelPoster:
         Сам указанный пост НЕ публикуется — начнём со следующего (id+1).
         """
         chat_ref, message_id = parse_post_link(link)
-        settings = self.db.get_settings()
 
-        # Если в ссылке указан публичный username — обновим source_channel
-        if isinstance(chat_ref, str):
-            self.db.set_source_channel(chat_ref)
-        elif settings.source_channel:
-            # Для приватных каналов оставляем SOURCE_CHANNEL из настроек/env
-            pass
-
+        # Обновляем источник из ссылки (username или числовой ID приватного канала)
+        self.db.set_source_channel(str(chat_ref))
         self.db.set_start_link(link)
         self.db.set_progress_id(message_id)
         logger.info(

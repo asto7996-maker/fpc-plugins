@@ -28,7 +28,6 @@ from aiogram.types import (
 import config
 from database import Database
 from links import parse_post_link
-from poster import ChannelPoster
 
 logger = logging.getLogger(__name__)
 
@@ -44,17 +43,19 @@ class AdminStates(StatesGroup):
     waiting_interval = State()
     waiting_limit = State()
     waiting_link = State()
+    waiting_source = State()
+    waiting_target = State()
 
 
 # Зависимости внедряются из main.py через set_dependencies()
 _db: Optional[Database] = None
-_poster: Optional[ChannelPoster] = None
+_poster = None
 _trigger_cycle: Optional[Callable] = None
 
 
 def set_dependencies(
     db: Database,
-    poster: ChannelPoster,
+    poster,
     trigger_cycle: Optional[Callable] = None,
 ) -> None:
     """Привязать Database / Poster к хендлерам админки."""
@@ -70,7 +71,7 @@ def _require_db() -> Database:
     return _db
 
 
-def _require_poster() -> ChannelPoster:
+def _require_poster():
     if _poster is None:
         raise RuntimeError("Poster не инициализирован")
     return _poster
@@ -115,6 +116,14 @@ def main_menu_kb(is_running: bool) -> InlineKeyboardMarkup:
             [
                 InlineKeyboardButton(
                     text="🔗 Стартовая ссылка", callback_data="admin:link"
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="📥 Источник", callback_data="admin:source"
+                ),
+                InlineKeyboardButton(
+                    text="📤 Назначение", callback_data="admin:target"
                 ),
             ],
             [
@@ -337,6 +346,44 @@ async def cmd_run_now(message: Message) -> None:
     await _do_run_now(message.answer)
 
 
+@router.message(Command("set_source"))
+async def cmd_set_source(message: Message, state: FSMContext, command: CommandObject) -> None:
+    if await _deny_if_not_admin(message.from_user.id if message.from_user else None, message.answer):
+        return
+    if command.args and command.args.strip():
+        _require_db().set_source_channel(command.args.strip())
+        await message.answer(
+            f"✅ Источник: <code>{command.args.strip()}</code>",
+            parse_mode="HTML",
+        )
+        return
+    await state.set_state(AdminStates.waiting_source)
+    await message.answer(
+        "📥 Пришлите канал-источник: <code>@username</code> или <code>-100...</code>",
+        reply_markup=cancel_kb(),
+        parse_mode="HTML",
+    )
+
+
+@router.message(Command("set_target"))
+async def cmd_set_target(message: Message, state: FSMContext, command: CommandObject) -> None:
+    if await _deny_if_not_admin(message.from_user.id if message.from_user else None, message.answer):
+        return
+    if command.args and command.args.strip():
+        _require_db().set_target_channel(command.args.strip())
+        await message.answer(
+            f"✅ Назначение: <code>{command.args.strip()}</code>",
+            parse_mode="HTML",
+        )
+        return
+    await state.set_state(AdminStates.waiting_target)
+    await message.answer(
+        "📤 Пришлите канал-назначение: <code>@username</code> или <code>-100...</code>",
+        reply_markup=cancel_kb(),
+        parse_mode="HTML",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Callback-кнопки меню
 # ---------------------------------------------------------------------------
@@ -440,6 +487,32 @@ async def cb_link(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
 
 
+@router.callback_query(F.data == "admin:source")
+async def cb_source(callback: CallbackQuery, state: FSMContext) -> None:
+    if await _deny_if_not_admin(callback.from_user.id, callback.answer):
+        return
+    await state.set_state(AdminStates.waiting_source)
+    await callback.message.answer(  # type: ignore[union-attr]
+        "📥 Пришлите канал-источник (@username или -100...):",
+        reply_markup=cancel_kb(),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin:target")
+async def cb_target(callback: CallbackQuery, state: FSMContext) -> None:
+    if await _deny_if_not_admin(callback.from_user.id, callback.answer):
+        return
+    await state.set_state(AdminStates.waiting_target)
+    await callback.message.answer(  # type: ignore[union-attr]
+        "📤 Пришлите канал-назначение (@username или -100...):",
+        reply_markup=cancel_kb(),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
 @router.callback_query(F.data == "admin:run_now")
 async def cb_run_now(callback: CallbackQuery) -> None:
     if await _deny_if_not_admin(callback.from_user.id, callback.answer):
@@ -526,6 +599,40 @@ async def on_link(message: Message, state: FSMContext) -> None:
     link = (message.text or "").strip()
     await state.clear()
     await _apply_link(message, link)
+
+
+@router.message(AdminStates.waiting_source)
+async def on_source(message: Message, state: FSMContext) -> None:
+    if await _deny_if_not_admin(message.from_user.id if message.from_user else None, message.answer):
+        return
+    value = (message.text or "").strip()
+    if not value:
+        await message.answer("❌ Пустое значение")
+        return
+    _require_db().set_source_channel(value)
+    await state.clear()
+    await message.answer(
+        f"✅ Источник: <code>{value}</code>",
+        reply_markup=main_menu_kb(_require_db().get_settings().is_running),
+        parse_mode="HTML",
+    )
+
+
+@router.message(AdminStates.waiting_target)
+async def on_target(message: Message, state: FSMContext) -> None:
+    if await _deny_if_not_admin(message.from_user.id if message.from_user else None, message.answer):
+        return
+    value = (message.text or "").strip()
+    if not value:
+        await message.answer("❌ Пустое значение")
+        return
+    _require_db().set_target_channel(value)
+    await state.clear()
+    await message.answer(
+        f"✅ Назначение: <code>{value}</code>",
+        reply_markup=main_menu_kb(_require_db().get_settings().is_running),
+        parse_mode="HTML",
+    )
 
 
 # ---------------------------------------------------------------------------

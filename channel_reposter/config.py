@@ -1,8 +1,9 @@
 """
 config.py — загрузка настроек из переменных окружения (.env).
 
-Все чувствительные данные (токены, api_hash) хранятся только в .env,
-а не в коде. Скопируйте .env.example → .env и заполните значения.
+Обязателен только BOT_TOKEN.
+API_ID / API_HASH нужны лишь для режима юзербота (Pyrogram).
+Без них бот работает через Bot API (нужны права админа в обоих каналах).
 """
 
 from __future__ import annotations
@@ -12,13 +13,11 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-# Загружаем .env из каталога проекта (рядом с этим файлом)
 _BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(_BASE_DIR / ".env")
 
 
 def _require(name: str) -> str:
-    """Вернуть обязательную переменную окружения или выбросить понятную ошибку."""
     value = os.getenv(name, "").strip()
     if not value:
         raise RuntimeError(
@@ -28,8 +27,11 @@ def _require(name: str) -> str:
     return value
 
 
+def _optional(name: str, default: str = "") -> str:
+    return os.getenv(name, default).strip()
+
+
 def _parse_int_list(raw: str) -> list[int]:
-    """Разобрать список целых через запятую: '1, 2, 3' → [1, 2, 3]."""
     result: list[int] = []
     for part in raw.split(","):
         part = part.strip()
@@ -38,34 +40,45 @@ def _parse_int_list(raw: str) -> list[int]:
     return result
 
 
-# --- Telegram Bot (админ-панель, aiogram) ---
+# --- Telegram Bot (админ-панель + Bot API poster) ---
 BOT_TOKEN: str = _require("BOT_TOKEN")
 
-# --- Telegram Client API (юзербот, Pyrogram) ---
-API_ID: int = int(_require("API_ID"))
-API_HASH: str = _require("API_HASH")
-SESSION_NAME: str = os.getenv("SESSION_NAME", "reposter_userbot").strip()
+# --- Telegram Client API (опционально, для юзербота Pyrogram) ---
+_API_ID_RAW = _optional("API_ID")
+API_ID: int | None = int(_API_ID_RAW) if _API_ID_RAW and _API_ID_RAW.isdigit() else None
+API_HASH: str = _optional("API_HASH")
+SESSION_NAME: str = _optional("SESSION_NAME", "reposter_userbot") or "reposter_userbot"
+# 1 = принудительно юзербот; 0 = Bot API; auto = юзербот если есть API_ID+HASH+сессия
+USERBOT_MODE: str = (_optional("USERBOT_MODE", "auto") or "auto").lower()
 
-# --- Каналы ---
-# Могут быть @username или числовой ID (-100xxxxxxxxxx)
-SOURCE_CHANNEL: str = _require("SOURCE_CHANNEL")
-TARGET_CHANNEL: str = _require("TARGET_CHANNEL")
+# --- Каналы (можно задать позже через админку) ---
+SOURCE_CHANNEL: str = _optional("SOURCE_CHANNEL")
+TARGET_CHANNEL: str = _optional("TARGET_CHANNEL")
 
-# --- Админы ---
-ADMIN_IDS: list[int] = _parse_int_list(os.getenv("ADMIN_IDS", ""))
+# --- Админы (пустой список = доступен всем, удобно при первом запуске) ---
+ADMIN_IDS: list[int] = _parse_int_list(_optional("ADMIN_IDS"))
 
 # --- Пути ---
 DATABASE_PATH: Path = Path(
-    os.getenv("DATABASE_PATH", str(_BASE_DIR / "data" / "reposter.db"))
+    _optional("DATABASE_PATH", str(_BASE_DIR / "data" / "reposter.db"))
+    or str(_BASE_DIR / "data" / "reposter.db")
 )
 if not DATABASE_PATH.is_absolute():
     DATABASE_PATH = _BASE_DIR / DATABASE_PATH
 
-# --- Дефолты планировщика (переопределяются в SQLite через админку) ---
-DEFAULT_INTERVAL_HOURS: float = float(os.getenv("DEFAULT_INTERVAL_HOURS", "6"))
-DEFAULT_POSTS_PER_CYCLE: int = int(os.getenv("DEFAULT_POSTS_PER_CYCLE", "5"))
-POST_DELAY_MIN: float = float(os.getenv("POST_DELAY_MIN", "3"))
-POST_DELAY_MAX: float = float(os.getenv("POST_DELAY_MAX", "5"))
+DEFAULT_INTERVAL_HOURS: float = float(_optional("DEFAULT_INTERVAL_HOURS", "6") or "6")
+DEFAULT_POSTS_PER_CYCLE: int = int(_optional("DEFAULT_POSTS_PER_CYCLE", "5") or "5")
+POST_DELAY_MIN: float = float(_optional("POST_DELAY_MIN", "3") or "3")
+POST_DELAY_MAX: float = float(_optional("POST_DELAY_MAX", "5") or "5")
 
-# Режим разметки подписи постов (HTML сохраняет bold/italic/ссылки)
 PARSE_MODE: str = "html"
+
+
+def userbot_enabled() -> bool:
+    """Нужно ли поднимать Pyrogram-юзербот."""
+    if USERBOT_MODE in {"0", "false", "no", "botapi"}:
+        return False
+    if USERBOT_MODE in {"1", "true", "yes", "userbot"}:
+        return bool(API_ID and API_HASH)
+    # auto
+    return bool(API_ID and API_HASH)
