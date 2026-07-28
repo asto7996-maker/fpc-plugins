@@ -452,3 +452,164 @@ class ChannelPoster:
                 error=str(e),
             )
             return "skip"
+
+    # ------------------------------------------------------------------
+    # Массовая замена описаний в канале
+    # ------------------------------------------------------------------
+
+    async def rewrite_captions_in_channel(
+        self,
+        channel: str | int,
+        *,
+        caption: Optional[str] = None,
+        max_posts: Optional[int] = None,
+    ) -> dict:
+        """
+        Пройти посты в канале и заменить текст/подпись на текущий шаблон.
+
+        Для альбомов правится только одно сообщение (с подписью / первое).
+        Аккаунт должен быть админом канала с правом редактирования сообщений.
+
+        Returns:
+            {"updated": int, "skipped": int, "errors": int, "scanned": int}
+        """
+        chat = _chat_ref(channel)
+        text = (
+            caption
+            if caption is not None
+            else (self.db.get_settings().caption_template or "")
+        )
+        if not text.strip():
+            raise ValueError("Шаблон описания пуст — сначала задайте текст через «✏️ Текст описания»")
+
+        updated = 0
+        skipped = 0
+        errors = 0
+        scanned = 0
+        seen_groups: set[str] = set()
+
+        logger.info(
+            "Rewrite captions: channel=%s max_posts=%s",
+            chat,
+            max_posts if max_posts is not None else "all",
+        )
+
+        async for msg in self.client.get_chat_history(chat):
+            if max_posts is not None and updated >= max_posts:
+                break
+
+            scanned += 1
+
+            # Служебные сообщения канала
+            if getattr(msg, "service", None):
+                skipped += 1
+                continue
+
+            edit_msg = msg
+            if msg.media_group_id:
+                gid = str(msg.media_group_id)
+                if gid in seen_groups:
+                    skipped += 1
+                    continue
+                seen_groups.add(gid)
+                try:
+                    album = await self.client.get_media_group(chat, msg.id)
+                    album = sorted(album, key=lambda m: m.id)
+                    edit_msg = next((m for m in album if m.caption), album[0])
+                except (RPCError, ValueError) as e:
+                    logger.warning("Альбом %s недоступен: %s", gid, e)
+                    errors += 1
+                    continue
+
+            try:
+                await self._edit_message_description(chat, edit_msg, text)
+                updated += 1
+                delay = random.uniform(
+                    max(0.4, config.POST_DELAY_MIN / 4),
+                    max(1.0, config.POST_DELAY_MAX / 3),
+                )
+                await asyncio.sleep(delay)
+            except FloodWait as e:
+                wait = int(e.value) + 1
+                logger.warning("FloodWait при edit %s сек", wait)
+                await asyncio.sleep(wait)
+                try:
+                    await self._edit_message_description(chat, edit_msg, text)
+                    updated += 1
+                except Exception as e2:
+                    if _is_not_modified(e2):
+                        skipped += 1
+                    elif isinstance(e2, ValueError):
+                        skipped += 1
+                    else:
+                        errors += 1
+                        logger.warning("Edit fail id=%s: %s", edit_msg.id, e2)
+            except ValueError:
+                skipped += 1
+            except RPCError as e:
+                if _is_not_modified(e):
+                    skipped += 1
+                else:
+                    errors += 1
+                    logger.warning("Edit fail id=%s: %s", edit_msg.id, e)
+
+        result = {
+            "updated": updated,
+            "skipped": skipped,
+            "errors": errors,
+            "scanned": scanned,
+        }
+        logger.info("Rewrite done: %s", result)
+        return result
+
+    async def _edit_message_description(
+        self, chat: str | int, msg: Message, text: str
+    ) -> None:
+        """Заменить caption у медиа или text у текстового поста (HTML)."""
+        if _is_media_message(msg):
+            try:
+                await self.client.edit_message_caption(
+                    chat_id=chat,
+                    message_id=msg.id,
+                    caption=text,
+                    parse_mode=enums.ParseMode.HTML,
+                )
+            except RPCError as e:
+                if "parse" in str(e).lower():
+                    await self.client.edit_message_caption(
+                        chat_id=chat,
+                        message_id=msg.id,
+                        caption=text,
+                    )
+                else:
+                    raise
+            return
+
+        if msg.text is not None:
+            try:
+                await self.client.edit_message_text(
+                    chat_id=chat,
+                    message_id=msg.id,
+                    text=text,
+                    parse_mode=enums.ParseMode.HTML,
+                    disable_web_page_preview=False,
+                )
+            except RPCError as e:
+                if "parse" in str(e).lower():
+                    await self.client.edit_message_text(
+                        chat_id=chat,
+                        message_id=msg.id,
+                        text=text,
+                        disable_web_page_preview=False,
+                    )
+                else:
+                    raise
+            return
+
+        raise ValueError("nothing to edit")
+
+
+
+def _is_not_modified(err: BaseException) -> bool:
+    text = str(err).upper()
+    return "MESSAGE_NOT_MODIFIED" in text or "not modified" in text.lower()

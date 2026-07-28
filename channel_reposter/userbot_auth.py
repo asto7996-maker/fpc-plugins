@@ -123,8 +123,8 @@ class UserbotAuth:
             workdir=str(self.workdir),
         )
         try:
-            await probe.connect()
-            authorized = await probe.is_user_authorized()
+            # В Pyrogram 2.x connect() возвращает bool: авторизована ли сессия
+            authorized = await probe.connect()
             await probe.disconnect()
         except Exception:
             logger.exception("Не удалось проверить сессию")

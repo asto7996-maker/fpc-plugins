@@ -41,6 +41,8 @@ class AdminStates(StatesGroup):
     waiting_link = State()
     waiting_source = State()
     waiting_target = State()
+    waiting_rewrite_channel = State()
+    waiting_rewrite_limit = State()
     # --- auth ---
     auth_api_id = State()
     auth_api_hash = State()
@@ -118,6 +120,12 @@ def main_menu_kb(is_running: bool) -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="✏️ Текст описания", callback_data="admin:caption"),
             ],
             [
+                InlineKeyboardButton(
+                    text="📝 Применить шаблон к каналу",
+                    callback_data="admin:rewrite",
+                ),
+            ],
+            [
                 InlineKeyboardButton(text="⏱ Интервал", callback_data="admin:interval"),
                 InlineKeyboardButton(text="📦 Лимит", callback_data="admin:limit"),
             ],
@@ -141,6 +149,42 @@ def cancel_kb() -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="❌ Отмена", callback_data="admin:cancel")]
         ]
     )
+
+
+def rewrite_channel_kb(target: str) -> InlineKeyboardMarkup:
+    rows = []
+    if target:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=f"📤 Канал-назначение ({target})",
+                    callback_data="admin:rewrite_target",
+                )
+            ]
+        )
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text="✍️ Указать другой канал",
+                callback_data="admin:rewrite_custom",
+            )
+        ]
+    )
+    rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data="admin:cancel")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def after_caption_kb(is_running: bool, target: str) -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton(
+                text="📝 Применить этот шаблон к каналу",
+                callback_data="admin:rewrite",
+            )
+        ]
+    ]
+    rows.extend(main_menu_kb(is_running).inline_keyboard)
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 async def _status_text(db: Database) -> str:
@@ -193,7 +237,8 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
         "2️⃣ Укажите каналы и стартовую ссылку\n"
         "3️⃣ Задайте описание: просто напишите текст с жирным/ссылками — "
         "разметку собирать вручную <b>не нужно</b>\n"
-        "4️⃣ Старт автопостинга",
+        "4️⃣ Старт автопостинга\n"
+        "5️⃣ <b>/rewrite</b> — применить текущий шаблон ко всем постам в канале",
         reply_markup=main_menu_kb(db.get_settings().is_running),
         parse_mode="HTML",
     )
@@ -352,6 +397,23 @@ async def cmd_run_now(message: Message) -> None:
     await _do_run_now(message.answer)
 
 
+@router.message(Command("rewrite", "apply_caption"))
+async def cmd_rewrite(message: Message, state: FSMContext, command: CommandObject) -> None:
+    if await _deny_if_not_admin(message.from_user.id if message.from_user else None, message.answer):
+        return
+    if _auth is None or not _auth.is_ready:
+        await message.answer("⚠️ Нужен юзербот: /login")
+        return
+    # /rewrite @channel [limit]
+    args = (command.args or "").strip().split()
+    if args:
+        channel = args[0]
+        limit = int(args[1]) if len(args) > 1 and args[1].isdigit() else None
+        await _run_rewrite(message.answer, channel, limit)
+        return
+    await _prompt_rewrite(message, state)
+
+
 # ---------------------------------------------------------------------------
 # Callbacks
 # ---------------------------------------------------------------------------
@@ -477,6 +539,49 @@ async def cb_run_now(callback: CallbackQuery) -> None:
         return
     await callback.answer("Запуск…")
     await _do_run_now(callback.message.answer)  # type: ignore[union-attr]
+
+
+@router.callback_query(F.data == "admin:rewrite")
+async def cb_rewrite(callback: CallbackQuery, state: FSMContext) -> None:
+    if await _deny_if_not_admin(callback.from_user.id, callback.answer):
+        return
+    await callback.answer()
+    await _prompt_rewrite(callback.message, state)  # type: ignore[arg-type]
+
+
+@router.callback_query(F.data == "admin:rewrite_target")
+async def cb_rewrite_target(callback: CallbackQuery, state: FSMContext) -> None:
+    if await _deny_if_not_admin(callback.from_user.id, callback.answer):
+        return
+    target = _require_db().get_settings().target_channel
+    if not target:
+        await callback.answer("Сначала задайте канал-назначение", show_alert=True)
+        return
+    await state.update_data(rewrite_channel=target)
+    await state.set_state(AdminStates.waiting_rewrite_limit)
+    await callback.message.answer(  # type: ignore[union-attr]
+        f"Канал: <code>{target}</code>\n\n"
+        "Сколько последних постов обновить?\n"
+        "• Пришлите число (например <code>50</code>)\n"
+        "• Или <code>all</code> — все посты в канале",
+        reply_markup=cancel_kb(),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin:rewrite_custom")
+async def cb_rewrite_custom(callback: CallbackQuery, state: FSMContext) -> None:
+    if await _deny_if_not_admin(callback.from_user.id, callback.answer):
+        return
+    await state.set_state(AdminStates.waiting_rewrite_channel)
+    await callback.message.answer(  # type: ignore[union-attr]
+        "✍️ Пришлите канал, где заменить описания:\n"
+        "<code>@username</code> или <code>-100...</code>",
+        reply_markup=cancel_kb(),
+        parse_mode="HTML",
+    )
+    await callback.answer()
 
 
 @router.callback_query(F.data == "admin:cancel")
@@ -671,10 +776,12 @@ async def on_caption(message: Message, state: FSMContext) -> None:
     _require_db().set_caption(text)
     await state.clear()
     # Превью показываем экранированным — битый HTML не уронит ответ
+    s = _require_db().get_settings()
     await message.answer(
         "✅ Описание сохранено. Форматирование (жирный / курсив / ссылки) учтено.\n\n"
-        f"<b>Превью:</b>\n<code>{safe_preview(text, 400)}</code>",
-        reply_markup=main_menu_kb(_require_db().get_settings().is_running),
+        f"<b>Превью:</b>\n<code>{safe_preview(text, 400)}</code>\n\n"
+        "Можно сразу применить этот шаблон ко всем постам в канале ↓",
+        reply_markup=after_caption_kb(s.is_running, s.target_channel),
         parse_mode="HTML",
     )
 
@@ -751,6 +858,52 @@ async def on_target(message: Message, state: FSMContext) -> None:
     )
 
 
+@router.message(AdminStates.waiting_rewrite_channel)
+async def on_rewrite_channel(message: Message, state: FSMContext) -> None:
+    if await _deny_if_not_admin(message.from_user.id if message.from_user else None, message.answer):
+        return
+    channel = (message.text or "").strip()
+    if not channel:
+        await message.answer("❌ Укажите канал")
+        return
+    await state.update_data(rewrite_channel=channel)
+    await state.set_state(AdminStates.waiting_rewrite_limit)
+    await message.answer(
+        f"Канал: <code>{channel}</code>\n\n"
+        "Сколько последних постов обновить?\n"
+        "• Число, например <code>50</code>\n"
+        "• Или <code>all</code> — все посты",
+        reply_markup=cancel_kb(),
+        parse_mode="HTML",
+    )
+
+
+@router.message(AdminStates.waiting_rewrite_limit)
+async def on_rewrite_limit(message: Message, state: FSMContext) -> None:
+    if await _deny_if_not_admin(message.from_user.id if message.from_user else None, message.answer):
+        return
+    raw = (message.text or "").strip().lower()
+    limit: int | None
+    if raw in {"all", "все", "*", "0"}:
+        limit = None
+    else:
+        try:
+            limit = int(raw)
+            if limit < 1:
+                raise ValueError("Число должно быть ≥ 1")
+        except ValueError as e:
+            await message.answer(f"❌ {e}\nПришлите число или <code>all</code>.", parse_mode="HTML")
+            return
+
+    data = await state.get_data()
+    channel = data.get("rewrite_channel") or ""
+    await state.clear()
+    if not channel:
+        await message.answer("❌ Канал не выбран")
+        return
+    await _run_rewrite(message.answer, channel, limit)
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -804,6 +957,64 @@ async def _do_run_now(answer) -> None:
     finally:
         if not was_running:
             db.set_running(False)
+
+
+async def _prompt_rewrite(message: Message, state: FSMContext) -> None:
+    if _auth is None or not _auth.is_ready:
+        await message.answer("⚠️ Нужен юзербот с правом редактировать посты: /login")
+        return
+    db = _require_db()
+    s = db.get_settings()
+    if not (s.caption_template or "").strip():
+        await message.answer("⚠️ Сначала задайте шаблон: «✏️ Текст описания»")
+        return
+    await state.clear()
+    await message.answer(
+        "<b>📝 Применить текущий шаблон к постам в канале</b>\n\n"
+        "Юзербот заменит подписи/текст постов на текущее описание "
+        "(жирный, курсив, ссылки сохранятся из шаблона).\n\n"
+        f"Превью шаблона:\n<code>{safe_preview(s.caption_template, 200)}</code>\n\n"
+        "Выберите канал:",
+        reply_markup=rewrite_channel_kb(s.target_channel),
+        parse_mode="HTML",
+    )
+
+
+async def _run_rewrite(answer, channel: str, limit: int | None) -> None:
+    if _auth is None or not _auth.is_ready:
+        await answer("⚠️ Нужен юзербот: /login")
+        return
+    poster = _require_poster()
+    if not hasattr(poster, "rewrite_captions_in_channel"):
+        await answer("❌ Массовое редактирование доступно только в режиме USERBOT")
+        return
+
+    limit_label = str(limit) if limit is not None else "все"
+    await answer(
+        f"⏳ Обновляю описания в <code>{channel}</code> "
+        f"(лимит: <b>{limit_label}</b>)…\nЭто может занять время.",
+        parse_mode="HTML",
+    )
+    try:
+        result = await poster.rewrite_captions_in_channel(channel, max_posts=limit)
+    except ValueError as e:
+        await answer(f"❌ {e}")
+        return
+    except Exception as e:
+        logger.exception("rewrite")
+        await answer(f"❌ Ошибка: {e}")
+        return
+
+    await answer(
+        "✅ Готово.\n"
+        f"Канал: <code>{channel}</code>\n"
+        f"Просмотрено: <b>{result.get('scanned', 0)}</b>\n"
+        f"Обновлено: <b>{result.get('updated', 0)}</b>\n"
+        f"Пропущено: <b>{result.get('skipped', 0)}</b>\n"
+        f"Ошибок: <b>{result.get('errors', 0)}</b>",
+        reply_markup=main_menu_kb(_require_db().get_settings().is_running),
+        parse_mode="HTML",
+    )
 
 
 def setup_dispatcher(dp: Dispatcher) -> None:
