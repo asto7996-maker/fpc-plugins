@@ -2357,58 +2357,96 @@ class MangaBuffService:
         rank: str = "",
         search: str = "",
     ) -> List[Dict[str, Any]]:
-        """Все страницы инвентаря."""
+        """Все страницы инвентаря (с ретраем и дедупом)."""
         await self._refresh_user_id(page)
         uid = self._mb_user_id
         if not uid:
             return []
+        # CSRF нужен на любой странице сайта — если его нет, зайдём на /trades
         try:
-            data = await page.evaluate(
-                """async ({uid, perPage, rank, search}) => {
-                  const csrf = (document.querySelector('meta[name="csrf-token"]')
-                    || {}).content || '';
-                  const all = [];
-                  let pageNo = 1;
-                  let last = 1;
-                  while (pageNo <= last && pageNo <= 40) {
-                    const body = new URLSearchParams();
-                    body.set('page', String(pageNo));
-                    body.set('per_page', String(perPage || 70));
-                    body.set('search', search || '');
-                    body.set('rank', (rank || '').toLowerCase());
-                    const resp = await fetch('/cards-filter/' + uid, {
-                      method: 'POST',
-                      headers: {
-                        'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
-                        'X-CSRF-TOKEN': csrf,
-                        'X-Requested-With': 'XMLHttpRequest'
-                      },
-                      body: body.toString(),
-                      credentials: 'same-origin'
-                    });
-                    if (!resp.ok) break;
-                    let json = null;
-                    try { json = await resp.json(); } catch (e) { break; }
-                    const rows = (json && json.data) ? json.data : [];
-                    all.push(...rows);
-                    last = (json && json.last_page) ? Number(json.last_page) : pageNo;
-                    if (!rows.length) break;
-                    pageNo += 1;
-                  }
-                  return {ok: true, data: all};
-                }""",
-                {
-                    "uid": uid,
-                    "perPage": int(per_page),
-                    "rank": (rank or "").strip(),
-                    "search": (search or "").strip(),
-                },
+            has_csrf = await page.evaluate(
+                """() => !!(document.querySelector('meta[name="csrf-token"]')||{}).content"""
             )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("cards-filter all: %s", exc)
-            return []
-        rows = (data or {}).get("data") or []
-        return [r for r in rows if isinstance(r, dict)]
+        except Exception:  # noqa: BLE001
+            has_csrf = False
+        if not has_csrf:
+            await self._safe_goto(page, "https://mangabuff.ru/trades")
+            await asyncio.sleep(0.4)
+
+        last_err = ""
+        for attempt in range(3):
+            try:
+                data = await page.evaluate(
+                    """async ({uid, perPage, rank, search}) => {
+                      const csrf = (document.querySelector('meta[name="csrf-token"]')
+                        || {}).content || '';
+                      if (!csrf) return {ok:false, err:'no_csrf', data:[]};
+                      const all = [];
+                      const seen = new Set();
+                      let pageNo = 1;
+                      let last = 1;
+                      while (pageNo <= last && pageNo <= 40) {
+                        const body = new URLSearchParams();
+                        body.set('page', String(pageNo));
+                        body.set('per_page', String(perPage || 70));
+                        body.set('search', search || '');
+                        body.set('rank', (rank || '').toLowerCase());
+                        const resp = await fetch('/cards-filter/' + uid, {
+                          method: 'POST',
+                          headers: {
+                            'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+                            'X-CSRF-TOKEN': csrf,
+                            'X-Requested-With': 'XMLHttpRequest',
+                            'Accept': 'application/json'
+                          },
+                          body: body.toString(),
+                          credentials: 'same-origin'
+                        });
+                        if (!resp.ok) return {ok:false, err:'http_'+resp.status, data:all};
+                        let json = null;
+                        try { json = await resp.json(); } catch (e) {
+                          return {ok:false, err:'bad_json', data:all};
+                        }
+                        const rows = (json && json.data) ? json.data : [];
+                        for (const r of rows) {
+                          const id = r && r.id != null ? String(r.id) : '';
+                          if (!id || seen.has(id)) continue;
+                          seen.add(id);
+                          all.push(r);
+                        }
+                        last = (json && json.last_page) ? Number(json.last_page) : pageNo;
+                        if (!rows.length) break;
+                        pageNo += 1;
+                      }
+                      return {ok: true, data: all};
+                    }""",
+                    {
+                        "uid": uid,
+                        "perPage": int(per_page),
+                        "rank": (rank or "").strip(),
+                        "search": (search or "").strip(),
+                    },
+                )
+            except Exception as exc:  # noqa: BLE001
+                last_err = str(exc)
+                logger.warning("cards-filter all attempt %s: %s", attempt + 1, exc)
+                await asyncio.sleep(0.8)
+                continue
+            rows = [
+                r for r in ((data or {}).get("data") or []) if isinstance(r, dict)
+            ]
+            if rows:
+                return rows
+            last_err = str((data or {}).get("err") or "empty")
+            logger.info(
+                "MangaBuff inventory empty attempt=%s err=%s → retry",
+                attempt + 1,
+                last_err,
+            )
+            await self._safe_goto(page, "https://mangabuff.ru/trades")
+            await asyncio.sleep(0.9 + attempt * 0.5)
+        logger.warning("cards-filter all failed: %s", last_err)
+        return []
 
     async def _enrich_card_drop_rarity(self, page: Page, info: CardDropInfo) -> None:
         """Подтянуть редкость/id из инвентаря, если в уведомлении её нет."""
@@ -6413,20 +6451,39 @@ class MangaBuffService:
             return 0
         my_cards = await self._tradable_inventory_cards(page)
         units = self._build_profitable_offer_units(my_cards)
+        logger.info(
+            "MangaBuff trades inventory: tradable=%s units=%s sample=%s",
+            len(my_cards),
+            len(units),
+            [
+                (
+                    u.get("kind"),
+                    [c.get("rank") for c in u.get("offer_cards") or []],
+                    u.get("want_rank"),
+                )
+                for u in units[:5]
+            ],
+        )
         if not units:
             # карты заняты старыми pending — сброс исходящих и повтор
             try:
                 await self._safe_goto(
                     page, "https://mangabuff.ru/trades/rejectAll?type_trade=sender"
                 )
-                await asyncio.sleep(1.4)
+                await asyncio.sleep(2.0)
                 logger.info("MangaBuff trades: reset outgoing (no free cards)")
             except Exception as exc:  # noqa: BLE001
                 logger.debug("reset outgoing: %s", exc)
             if not await self._safe_goto(page, "https://mangabuff.ru/trades"):
                 return 0
+            await asyncio.sleep(0.6)
             my_cards = await self._tradable_inventory_cards(page)
             units = self._build_profitable_offer_units(my_cards)
+            logger.info(
+                "MangaBuff trades after reset: tradable=%s units=%s",
+                len(my_cards),
+                len(units),
+            )
         if not units:
             logger.info("MangaBuff trades: no profitable offer units")
             return 0
