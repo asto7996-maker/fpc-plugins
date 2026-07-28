@@ -40,6 +40,21 @@ logger = logging.getLogger(__name__)
 __all__ = ["ChannelPoster", "parse_post_link"]
 
 
+def _chat_ref(value: str | int) -> str | int:
+    """Нормализовать id канала: '-100123' → int, '@name' → str."""
+    if isinstance(value, int):
+        return value
+    raw = (value or "").strip()
+    if not raw:
+        raise ValueError("Канал не задан")
+    if raw.startswith("@"):
+        return raw
+    try:
+        return int(raw)
+    except ValueError:
+        return raw if raw.startswith("@") else f"@{raw}"
+
+
 def _is_media_message(msg: Message) -> bool:
     """Есть ли у сообщения медиа, которое мы умеем копировать."""
     return bool(
@@ -140,8 +155,8 @@ class ChannelPoster:
             logger.debug("Автопостинг на паузе — цикл пропущен")
             return 0
 
-        source = settings.source_channel or config.SOURCE_CHANNEL
-        target = settings.target_channel or config.TARGET_CHANNEL
+        source = _chat_ref(settings.source_channel or config.SOURCE_CHANNEL)
+        target = _chat_ref(settings.target_channel or config.TARGET_CHANNEL)
         progress_id = settings.progress_id
         limit = settings.posts_per_cycle
         caption = settings.caption_template
@@ -153,7 +168,7 @@ class ChannelPoster:
             return 0
 
         logger.info(
-            "Старт цикла: source=%s target=%s after_id=%s limit=%s",
+            "Старт цикла USERBOT: source=%s target=%s after_id=%s limit=%s",
             source,
             target,
             progress_id,
@@ -286,26 +301,47 @@ class ChannelPoster:
         """Опубликовать одиночный пост (фото/видео/документ/текст)."""
         try:
             if _is_media_message(msg):
-                # copy_message копирует медиа БЕЗ метки Forwarded from
-                # и позволяет подменить подпись
-                sent = await self.client.copy_message(
-                    chat_id=target,
-                    from_chat_id=msg.chat.id,
-                    message_id=msg.id,
-                    caption=caption or None,
-                    parse_mode=enums.ParseMode.HTML if caption else None,
-                )
+                # copy_message — без метки Forwarded from, подпись = HTML-шаблон
+                try:
+                    sent = await self.client.copy_message(
+                        chat_id=target,
+                        from_chat_id=msg.chat.id,
+                        message_id=msg.id,
+                        caption=caption or None,
+                        parse_mode=enums.ParseMode.HTML if caption else None,
+                    )
+                except RPCError as cap_err:
+                    # Битый HTML — отправим как обычный текст
+                    if caption and "parse" in str(cap_err).lower():
+                        logger.warning("HTML parse fail, retry plain: %s", cap_err)
+                        sent = await self.client.copy_message(
+                            chat_id=target,
+                            from_chat_id=msg.chat.id,
+                            message_id=msg.id,
+                            caption=caption,
+                        )
+                    else:
+                        raise
             else:
-                # Чистый текст — отправляем шаблон (или исходный текст, если шаблон пуст)
                 text = caption if caption else (msg.text or msg.caption or "")
                 if not text:
                     return "skip"
-                sent = await self.client.send_message(
-                    chat_id=target,
-                    text=text,
-                    parse_mode=enums.ParseMode.HTML,
-                    disable_web_page_preview=False,
-                )
+                try:
+                    sent = await self.client.send_message(
+                        chat_id=target,
+                        text=text,
+                        parse_mode=enums.ParseMode.HTML,
+                        disable_web_page_preview=False,
+                    )
+                except RPCError as cap_err:
+                    if "parse" in str(cap_err).lower():
+                        sent = await self.client.send_message(
+                            chat_id=target,
+                            text=text,
+                            disable_web_page_preview=False,
+                        )
+                    else:
+                        raise
 
             target_id = sent.id if isinstance(sent, Message) else None
             self.db.add_history(
@@ -323,7 +359,6 @@ class ChannelPoster:
         except FloodWait:
             raise
         except RPCError as e:
-            # Медиа недоступно / удалено и т.п.
             logger.error("Не удалось опубликовать ID %s: %s", msg.id, e)
             self.db.add_history(
                 source_message_id=msg.id,

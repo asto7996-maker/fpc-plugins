@@ -1,20 +1,20 @@
 """
-admin_bot.py — админ-панель на aiogram 3.x.
+admin_bot.py — админ-панель aiogram 3.x + мастер входа юзербота.
 
-Команды и inline-меню позволяют:
-  • менять шаблон описания (HTML);
-  • настраивать интервал и лимит постов за цикл;
-  • задавать стартовую ссылку на пост;
-  • запускать / ставить на паузу автопостинг;
-  • смотреть статус.
+Вход аккаунта (/login):
+  API_ID → API_HASH → телефон → код → пароль 2FA
+
+Описание постов:
+  Просто пришлите сообщение с обычным форматированием Telegram
+  (жирный, курсив, ссылка «в слово») — HTML соберётся сам.
 """
 
 from __future__ import annotations
 
 import logging
-from typing import Callable, Optional
+from typing import Awaitable, Callable, Optional
 
-from aiogram import Bot, Dispatcher, F, Router
+from aiogram import Dispatcher, F, Router
 from aiogram.filters import Command, CommandObject
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -27,16 +27,12 @@ from aiogram.types import (
 
 import config
 from database import Database
+from formatting import extract_caption_html, safe_preview, validate_telegram_html
 from links import parse_post_link
 
 logger = logging.getLogger(__name__)
-
 router = Router()
 
-
-# ---------------------------------------------------------------------------
-# FSM-состояния для пошагового ввода настроек
-# ---------------------------------------------------------------------------
 
 class AdminStates(StatesGroup):
     waiting_caption = State()
@@ -45,24 +41,34 @@ class AdminStates(StatesGroup):
     waiting_link = State()
     waiting_source = State()
     waiting_target = State()
+    # --- auth ---
+    auth_api_id = State()
+    auth_api_hash = State()
+    auth_phone = State()
+    auth_code = State()
+    auth_password = State()
 
 
-# Зависимости внедряются из main.py через set_dependencies()
 _db: Optional[Database] = None
 _poster = None
 _trigger_cycle: Optional[Callable] = None
+_auth = None
+_on_userbot_ready: Optional[Callable[[], Awaitable[None]]] = None
 
 
 def set_dependencies(
     db: Database,
     poster,
     trigger_cycle: Optional[Callable] = None,
+    auth=None,
+    on_userbot_ready: Optional[Callable[[], Awaitable[None]]] = None,
 ) -> None:
-    """Привязать Database / Poster к хендлерам админки."""
-    global _db, _poster, _trigger_cycle
+    global _db, _poster, _trigger_cycle, _auth, _on_userbot_ready
     _db = db
     _poster = poster
     _trigger_cycle = trigger_cycle
+    _auth = auth
+    _on_userbot_ready = on_userbot_ready
 
 
 def _require_db() -> Database:
@@ -78,13 +84,18 @@ def _require_poster():
 
 
 def is_admin(user_id: Optional[int]) -> bool:
-    """Проверка, что пользователь есть в ADMIN_IDS."""
     if user_id is None:
         return False
-    # Если список админов пуст — разрешаем всем (удобно при первом запуске)
     if not config.ADMIN_IDS:
         return True
     return user_id in config.ADMIN_IDS
+
+
+async def _deny_if_not_admin(event_user_id: Optional[int], reply) -> bool:
+    if is_admin(event_user_id):
+        return False
+    await reply("⛔ Доступ только для администраторов.")
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -101,35 +112,24 @@ def main_menu_kb(is_running: bool) -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text=toggle_text, callback_data=toggle_cb),
             ],
             [
-                InlineKeyboardButton(
-                    text="✏️ Текст описания", callback_data="admin:caption"
-                ),
+                InlineKeyboardButton(text="🔐 Вход юзербота", callback_data="admin:login"),
             ],
             [
-                InlineKeyboardButton(
-                    text="⏱ Интервал (часы)", callback_data="admin:interval"
-                ),
-                InlineKeyboardButton(
-                    text="📦 Постов за цикл", callback_data="admin:limit"
-                ),
+                InlineKeyboardButton(text="✏️ Текст описания", callback_data="admin:caption"),
             ],
             [
-                InlineKeyboardButton(
-                    text="🔗 Стартовая ссылка", callback_data="admin:link"
-                ),
+                InlineKeyboardButton(text="⏱ Интервал", callback_data="admin:interval"),
+                InlineKeyboardButton(text="📦 Лимит", callback_data="admin:limit"),
             ],
             [
-                InlineKeyboardButton(
-                    text="📥 Источник", callback_data="admin:source"
-                ),
-                InlineKeyboardButton(
-                    text="📤 Назначение", callback_data="admin:target"
-                ),
+                InlineKeyboardButton(text="🔗 Старт-ссылка", callback_data="admin:link"),
             ],
             [
-                InlineKeyboardButton(
-                    text="⚡ Запустить цикл сейчас", callback_data="admin:run_now"
-                ),
+                InlineKeyboardButton(text="📥 Источник", callback_data="admin:source"),
+                InlineKeyboardButton(text="📤 Назначение", callback_data="admin:target"),
+            ],
+            [
+                InlineKeyboardButton(text="⚡ Цикл сейчас", callback_data="admin:run_now"),
             ],
         ]
     )
@@ -143,40 +143,35 @@ def cancel_kb() -> InlineKeyboardMarkup:
     )
 
 
-def _status_text(db: Database) -> str:
+async def _status_text(db: Database) -> str:
     s = db.get_settings()
     state = "🟢 Работает" if s.is_running else "🔴 На паузе"
-    caption_preview = s.caption_template.strip()
-    if len(caption_preview) > 200:
-        caption_preview = caption_preview[:200] + "…"
-    if not caption_preview:
-        caption_preview = "<i>(пусто)</i>"
+    caption_preview = safe_preview(s.caption_template, 250) or "<i>(пусто)</i>"
+
+    auth_line = "🔴 Юзербот не авторизован"
+    if _auth is not None:
+        try:
+            auth_line = await _auth.status_text()
+        except Exception as e:
+            auth_line = f"⚠️ Статус юзербота: {e}"
+
+    engine = "USERBOT" if (_auth and _auth.is_ready) else "Bot API (fallback)"
 
     return (
-        "<b>📊 Статус Channel Reposter</b>\n\n"
-        f"Состояние: <b>{state}</b>\n"
-        f"Источник: <code>{s.source_channel or config.SOURCE_CHANNEL}</code>\n"
-        f"Назначение: <code>{s.target_channel or config.TARGET_CHANNEL}</code>\n"
-        f"Progress ID (последний обработанный): <code>{s.progress_id}</code>\n"
-        f"Следующий пост: <code>{s.progress_id + 1 if s.progress_id else '—'}</code>\n"
-        f"Интервал: <b>{s.interval_hours}</b> ч.\n"
-        f"Постов за цикл: <b>{s.posts_per_cycle}</b>\n"
-        f"Успешно переслано: <b>{db.history_count()}</b>\n"
-        f"Стартовая ссылка: <code>{s.start_link or 'не задана'}</code>\n\n"
-        f"<b>Шаблон описания:</b>\n{caption_preview}"
+        "<b>📊 Channel Reposter</b>\n\n"
+        f"{auth_line}\n"
+        f"Движок: <b>{engine}</b>\n"
+        f"Автопостинг: <b>{state}</b>\n"
+        f"Источник: <code>{s.source_channel or '—'}</code>\n"
+        f"Назначение: <code>{s.target_channel or '—'}</code>\n"
+        f"Progress ID: <code>{s.progress_id}</code>\n"
+        f"Следующий: <code>{s.progress_id + 1 if s.progress_id else '—'}</code>\n"
+        f"Интервал: <b>{s.interval_hours}</b> ч. | "
+        f"За цикл: <b>{s.posts_per_cycle}</b>\n"
+        f"Успешно: <b>{db.history_count()}</b>\n"
+        f"Старт-ссылка: <code>{s.start_link or 'не задана'}</code>\n\n"
+        f"<b>Описание (превью):</b>\n<code>{caption_preview}</code>"
     )
-
-
-# ---------------------------------------------------------------------------
-# Фильтр админа
-# ---------------------------------------------------------------------------
-
-async def _deny_if_not_admin(event_user_id: Optional[int], reply) -> bool:
-    """Вернуть True, если доступ запрещён (и отправить ответ)."""
-    if is_admin(event_user_id):
-        return False
-    await reply("⛔ Доступ только для администраторов.")
-    return True
 
 
 # ---------------------------------------------------------------------------
@@ -189,21 +184,17 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
         return
     await state.clear()
     db = _require_db()
-    s = db.get_settings()
     await message.answer(
-        "<b>Channel Reposter — админ-панель</b>\n\n"
-        "Бот перезаливает медиа из канала-источника в канал-назначение "
-        "с единым HTML-описанием.\n\n"
-        "Используйте меню ниже или команды:\n"
-        "/status — статус\n"
-        "/set_caption — изменить описание\n"
-        "/set_interval &lt;часы&gt;\n"
-        "/set_limit &lt;число&gt;\n"
-        "/set_link &lt;ссылка на пост&gt;\n"
-        "/run — старт автопостинга\n"
-        "/pause — пауза\n"
-        "/run_now — выполнить цикл прямо сейчас",
-        reply_markup=main_menu_kb(s.is_running),
+        "<b>Channel Reposter</b>\n\n"
+        "Юзербот копирует медиа из канала-источника в назначение "
+        "<b>без</b> метки Forwarded from.\n"
+        "В источнике достаточно подписки; в назначении — права админа у аккаунта.\n\n"
+        "1️⃣ <b>/login</b> — вход аккаунта (api_id, api_hash, телефон, код, пароль)\n"
+        "2️⃣ Укажите каналы и стартовую ссылку\n"
+        "3️⃣ Задайте описание: просто напишите текст с жирным/ссылками — "
+        "разметку собирать вручную <b>не нужно</b>\n"
+        "4️⃣ Старт автопостинга",
+        reply_markup=main_menu_kb(db.get_settings().is_running),
         parse_mode="HTML",
     )
 
@@ -214,10 +205,17 @@ async def cmd_status(message: Message) -> None:
         return
     db = _require_db()
     await message.answer(
-        _status_text(db),
+        await _status_text(db),
         reply_markup=main_menu_kb(db.get_settings().is_running),
         parse_mode="HTML",
     )
+
+
+@router.message(Command("login", "auth"))
+async def cmd_login(message: Message, state: FSMContext) -> None:
+    if await _deny_if_not_admin(message.from_user.id if message.from_user else None, message.answer):
+        return
+    await _start_login(message, state)
 
 
 @router.message(Command("run"))
@@ -225,12 +223,11 @@ async def cmd_run(message: Message) -> None:
     if await _deny_if_not_admin(message.from_user.id if message.from_user else None, message.answer):
         return
     db = _require_db()
-    s = db.get_settings()
-    if s.progress_id <= 0:
-        await message.answer(
-            "⚠️ Сначала задайте стартовую ссылку (/set_link или кнопка «Стартовая ссылка»).",
-            parse_mode="HTML",
-        )
+    if db.get_progress_id() <= 0:
+        await message.answer("⚠️ Сначала задайте стартовую ссылку.")
+        return
+    if _auth is None or not _auth.is_ready:
+        await message.answer("⚠️ Сначала авторизуйте юзербота: /login")
         return
     db.set_running(True)
     await message.answer(
@@ -244,8 +241,7 @@ async def cmd_run(message: Message) -> None:
 async def cmd_pause(message: Message) -> None:
     if await _deny_if_not_admin(message.from_user.id if message.from_user else None, message.answer):
         return
-    db = _require_db()
-    db.set_running(False)
+    _require_db().set_running(False)
     await message.answer(
         "⏸ Автопостинг <b>на паузе</b>.",
         reply_markup=main_menu_kb(False),
@@ -257,18 +253,21 @@ async def cmd_pause(message: Message) -> None:
 async def cmd_set_caption(message: Message, state: FSMContext, command: CommandObject) -> None:
     if await _deny_if_not_admin(message.from_user.id if message.from_user else None, message.answer):
         return
-    # Можно передать текст сразу: /set_caption <b>текст</b>
     if command.args and command.args.strip():
+        # Аргументы команды — как есть (HTML от пользователя)
+        err = validate_telegram_html(command.args.strip())
+        if err:
+            await message.answer(f"❌ {err}", parse_mode="HTML")
+            return
         _require_db().set_caption(command.args.strip())
-        await message.answer("✅ Шаблон описания обновлён.", parse_mode="HTML")
+        await message.answer("✅ Описание обновлено.")
         return
     await state.set_state(AdminStates.waiting_caption)
     await message.answer(
-        "✏️ Пришлите новый шаблон описания.\n"
-        "Поддерживается <b>HTML</b>: "
-        "<code>&lt;b&gt;жирный&lt;/b&gt;</code>, "
-        "<code>&lt;i&gt;курсив&lt;/i&gt;</code>, "
-        "<code>&lt;a href=\"https://...\"&gt;ссылка&lt;/a&gt;</code>.",
+        "✏️ Пришлите <b>одно сообщение</b> с описанием.\n\n"
+        "Как в обычном чате: выделите жирный/курсив, вставьте ссылку в слово — "
+        "бот <b>сам</b> сохранит форматирование.\n"
+        "Ручная HTML-вёрстка не обязательна (но тоже принимается).",
         reply_markup=cancel_kb(),
         parse_mode="HTML",
     )
@@ -282,19 +281,12 @@ async def cmd_set_interval(message: Message, state: FSMContext, command: Command
         try:
             hours = float(command.args.strip().replace(",", "."))
             _require_db().set_interval_hours(hours)
-            await message.answer(
-                f"✅ Интервал установлен: <b>{hours}</b> ч.",
-                parse_mode="HTML",
-            )
+            await message.answer(f"✅ Интервал: <b>{hours}</b> ч.", parse_mode="HTML")
         except ValueError as e:
             await message.answer(f"❌ {e}")
         return
     await state.set_state(AdminStates.waiting_interval)
-    await message.answer(
-        "⏱ Введите интервал между циклами в <b>часах</b> (например <code>6</code> или <code>0.5</code>):",
-        reply_markup=cancel_kb(),
-        parse_mode="HTML",
-    )
+    await message.answer("⏱ Интервал в часах:", reply_markup=cancel_kb())
 
 
 @router.message(Command("set_limit"))
@@ -305,19 +297,12 @@ async def cmd_set_limit(message: Message, state: FSMContext, command: CommandObj
         try:
             count = int(command.args.strip())
             _require_db().set_posts_per_cycle(count)
-            await message.answer(
-                f"✅ Постов за цикл: <b>{count}</b>",
-                parse_mode="HTML",
-            )
+            await message.answer(f"✅ Лимит: <b>{count}</b>", parse_mode="HTML")
         except ValueError as e:
             await message.answer(f"❌ {e}")
         return
     await state.set_state(AdminStates.waiting_limit)
-    await message.answer(
-        "📦 Введите количество постов за один цикл (целое число ≥ 1):",
-        reply_markup=cancel_kb(),
-        parse_mode="HTML",
-    )
+    await message.answer("📦 Постов за цикл:", reply_markup=cancel_kb())
 
 
 @router.message(Command("set_link"))
@@ -329,14 +314,35 @@ async def cmd_set_link(message: Message, state: FSMContext, command: CommandObje
         return
     await state.set_state(AdminStates.waiting_link)
     await message.answer(
-        "🔗 Пришлите ссылку на пост в канале-источнике.\n"
-        "Публикация начнётся со <b>следующего</b> поста после указанного.\n\n"
-        "Примеры:\n"
-        "<code>https://t.me/c/123456789/500</code>\n"
-        "<code>https://t.me/channel_username/500</code>",
+        "🔗 Ссылка на пост (публикация со <b>следующего</b>):\n"
+        "<code>https://t.me/c/123456789/500</code>",
         reply_markup=cancel_kb(),
         parse_mode="HTML",
     )
+
+
+@router.message(Command("set_source"))
+async def cmd_set_source(message: Message, state: FSMContext, command: CommandObject) -> None:
+    if await _deny_if_not_admin(message.from_user.id if message.from_user else None, message.answer):
+        return
+    if command.args and command.args.strip():
+        _require_db().set_source_channel(command.args.strip())
+        await message.answer(f"✅ Источник: <code>{command.args.strip()}</code>", parse_mode="HTML")
+        return
+    await state.set_state(AdminStates.waiting_source)
+    await message.answer("📥 Канал-источник (@user или -100...):", reply_markup=cancel_kb())
+
+
+@router.message(Command("set_target"))
+async def cmd_set_target(message: Message, state: FSMContext, command: CommandObject) -> None:
+    if await _deny_if_not_admin(message.from_user.id if message.from_user else None, message.answer):
+        return
+    if command.args and command.args.strip():
+        _require_db().set_target_channel(command.args.strip())
+        await message.answer(f"✅ Назначение: <code>{command.args.strip()}</code>", parse_mode="HTML")
+        return
+    await state.set_state(AdminStates.waiting_target)
+    await message.answer("📤 Канал-назначение:", reply_markup=cancel_kb())
 
 
 @router.message(Command("run_now"))
@@ -346,46 +352,8 @@ async def cmd_run_now(message: Message) -> None:
     await _do_run_now(message.answer)
 
 
-@router.message(Command("set_source"))
-async def cmd_set_source(message: Message, state: FSMContext, command: CommandObject) -> None:
-    if await _deny_if_not_admin(message.from_user.id if message.from_user else None, message.answer):
-        return
-    if command.args and command.args.strip():
-        _require_db().set_source_channel(command.args.strip())
-        await message.answer(
-            f"✅ Источник: <code>{command.args.strip()}</code>",
-            parse_mode="HTML",
-        )
-        return
-    await state.set_state(AdminStates.waiting_source)
-    await message.answer(
-        "📥 Пришлите канал-источник: <code>@username</code> или <code>-100...</code>",
-        reply_markup=cancel_kb(),
-        parse_mode="HTML",
-    )
-
-
-@router.message(Command("set_target"))
-async def cmd_set_target(message: Message, state: FSMContext, command: CommandObject) -> None:
-    if await _deny_if_not_admin(message.from_user.id if message.from_user else None, message.answer):
-        return
-    if command.args and command.args.strip():
-        _require_db().set_target_channel(command.args.strip())
-        await message.answer(
-            f"✅ Назначение: <code>{command.args.strip()}</code>",
-            parse_mode="HTML",
-        )
-        return
-    await state.set_state(AdminStates.waiting_target)
-    await message.answer(
-        "📤 Пришлите канал-назначение: <code>@username</code> или <code>-100...</code>",
-        reply_markup=cancel_kb(),
-        parse_mode="HTML",
-    )
-
-
 # ---------------------------------------------------------------------------
-# Callback-кнопки меню
+# Callbacks
 # ---------------------------------------------------------------------------
 
 @router.callback_query(F.data == "admin:status")
@@ -394,7 +362,7 @@ async def cb_status(callback: CallbackQuery) -> None:
         return
     db = _require_db()
     await callback.message.edit_text(  # type: ignore[union-attr]
-        _status_text(db),
+        await _status_text(db),
         reply_markup=main_menu_kb(db.get_settings().is_running),
         parse_mode="HTML",
     )
@@ -407,11 +375,14 @@ async def cb_start(callback: CallbackQuery) -> None:
         return
     db = _require_db()
     if db.get_progress_id() <= 0:
-        await callback.answer("Сначала задайте стартовую ссылку", show_alert=True)
+        await callback.answer("Сначала стартовая ссылка", show_alert=True)
+        return
+    if _auth is None or not _auth.is_ready:
+        await callback.answer("Сначала /login юзербота", show_alert=True)
         return
     db.set_running(True)
     await callback.message.edit_text(  # type: ignore[union-attr]
-        "▶️ Автопостинг <b>запущен</b>.\n\n" + _status_text(db),
+        "▶️ Автопостинг запущен.\n\n" + await _status_text(db),
         reply_markup=main_menu_kb(True),
         parse_mode="HTML",
     )
@@ -425,11 +396,19 @@ async def cb_pause(callback: CallbackQuery) -> None:
     db = _require_db()
     db.set_running(False)
     await callback.message.edit_text(  # type: ignore[union-attr]
-        "⏸ Автопостинг <b>на паузе</b>.\n\n" + _status_text(db),
+        "⏸ На паузе.\n\n" + await _status_text(db),
         reply_markup=main_menu_kb(False),
         parse_mode="HTML",
     )
-    await callback.answer("На паузе")
+    await callback.answer("Пауза")
+
+
+@router.callback_query(F.data == "admin:login")
+async def cb_login(callback: CallbackQuery, state: FSMContext) -> None:
+    if await _deny_if_not_admin(callback.from_user.id, callback.answer):
+        return
+    await callback.answer()
+    await _start_login(callback.message, state)  # type: ignore[arg-type]
 
 
 @router.callback_query(F.data == "admin:caption")
@@ -438,11 +417,9 @@ async def cb_caption(callback: CallbackQuery, state: FSMContext) -> None:
         return
     await state.set_state(AdminStates.waiting_caption)
     await callback.message.answer(  # type: ignore[union-attr]
-        "✏️ Пришлите новый шаблон описания (HTML).\n"
-        "Пример:\n"
-        "<code>&lt;b&gt;Каталог&lt;/b&gt; — &lt;a href=\"https://t.me/shop\"&gt;открыть&lt;/a&gt;</code>",
+        "✏️ Пришлите описание одним сообщением.\n"
+        "Форматируйте как в Telegram — HTML соберётся автоматически.",
         reply_markup=cancel_kb(),
-        parse_mode="HTML",
     )
     await callback.answer()
 
@@ -452,11 +429,7 @@ async def cb_interval(callback: CallbackQuery, state: FSMContext) -> None:
     if await _deny_if_not_admin(callback.from_user.id, callback.answer):
         return
     await state.set_state(AdminStates.waiting_interval)
-    await callback.message.answer(  # type: ignore[union-attr]
-        "⏱ Введите интервал в часах:",
-        reply_markup=cancel_kb(),
-        parse_mode="HTML",
-    )
+    await callback.message.answer("⏱ Часы:", reply_markup=cancel_kb())  # type: ignore[union-attr]
     await callback.answer()
 
 
@@ -465,11 +438,7 @@ async def cb_limit(callback: CallbackQuery, state: FSMContext) -> None:
     if await _deny_if_not_admin(callback.from_user.id, callback.answer):
         return
     await state.set_state(AdminStates.waiting_limit)
-    await callback.message.answer(  # type: ignore[union-attr]
-        "📦 Введите число постов за цикл:",
-        reply_markup=cancel_kb(),
-        parse_mode="HTML",
-    )
+    await callback.message.answer("📦 Число постов:", reply_markup=cancel_kb())  # type: ignore[union-attr]
     await callback.answer()
 
 
@@ -479,10 +448,7 @@ async def cb_link(callback: CallbackQuery, state: FSMContext) -> None:
         return
     await state.set_state(AdminStates.waiting_link)
     await callback.message.answer(  # type: ignore[union-attr]
-        "🔗 Пришлите ссылку на пост (старт со следующего):\n"
-        "<code>https://t.me/c/123456789/500</code>",
-        reply_markup=cancel_kb(),
-        parse_mode="HTML",
+        "🔗 Ссылка на пост:", reply_markup=cancel_kb()
     )
     await callback.answer()
 
@@ -492,11 +458,7 @@ async def cb_source(callback: CallbackQuery, state: FSMContext) -> None:
     if await _deny_if_not_admin(callback.from_user.id, callback.answer):
         return
     await state.set_state(AdminStates.waiting_source)
-    await callback.message.answer(  # type: ignore[union-attr]
-        "📥 Пришлите канал-источник (@username или -100...):",
-        reply_markup=cancel_kb(),
-        parse_mode="HTML",
-    )
+    await callback.message.answer("📥 Источник:", reply_markup=cancel_kb())  # type: ignore[union-attr]
     await callback.answer()
 
 
@@ -505,11 +467,7 @@ async def cb_target(callback: CallbackQuery, state: FSMContext) -> None:
     if await _deny_if_not_admin(callback.from_user.id, callback.answer):
         return
     await state.set_state(AdminStates.waiting_target)
-    await callback.message.answer(  # type: ignore[union-attr]
-        "📤 Пришлите канал-назначение (@username или -100...):",
-        reply_markup=cancel_kb(),
-        parse_mode="HTML",
-    )
+    await callback.message.answer("📤 Назначение:", reply_markup=cancel_kb())  # type: ignore[union-attr]
     await callback.answer()
 
 
@@ -517,7 +475,7 @@ async def cb_target(callback: CallbackQuery, state: FSMContext) -> None:
 async def cb_run_now(callback: CallbackQuery) -> None:
     if await _deny_if_not_admin(callback.from_user.id, callback.answer):
         return
-    await callback.answer("Запускаю цикл…")
+    await callback.answer("Запуск…")
     await _do_run_now(callback.message.answer)  # type: ignore[union-attr]
 
 
@@ -533,23 +491,189 @@ async def cb_cancel(callback: CallbackQuery, state: FSMContext) -> None:
 
 
 # ---------------------------------------------------------------------------
-# FSM: приём значений
+# Auth FSM
+# ---------------------------------------------------------------------------
+
+async def _start_login(message: Message, state: FSMContext) -> None:
+    if _auth is None:
+        await message.answer("❌ Auth-модуль не подключён")
+        return
+
+    # Подставим уже сохранённые значения как подсказку
+    creds = _auth.load_credentials()
+    hint = ""
+    if creds and creds.api_id:
+        hint = f"\n\nРанее: api_id=<code>{creds.api_id}</code>, phone=<code>{creds.phone or '—'}</code>"
+
+    await state.set_state(AdminStates.auth_api_id)
+    await message.answer(
+        "🔐 <b>Вход юзербота</b>\n\n"
+        "1/5 — пришлите <b>API_ID</b> (число с https://my.telegram.org/apps)."
+        f"{hint}",
+        reply_markup=cancel_kb(),
+        parse_mode="HTML",
+    )
+
+
+@router.message(AdminStates.auth_api_id)
+async def on_auth_api_id(message: Message, state: FSMContext) -> None:
+    if await _deny_if_not_admin(message.from_user.id if message.from_user else None, message.answer):
+        return
+    raw = (message.text or "").strip()
+    if not raw.isdigit():
+        await message.answer("❌ API_ID должен быть числом")
+        return
+    await state.update_data(api_id=int(raw))
+    await state.set_state(AdminStates.auth_api_hash)
+    await message.answer(
+        "2/5 — пришлите <b>API_HASH</b> (строка с my.telegram.org).",
+        reply_markup=cancel_kb(),
+        parse_mode="HTML",
+    )
+
+
+@router.message(AdminStates.auth_api_hash)
+async def on_auth_api_hash(message: Message, state: FSMContext) -> None:
+    if await _deny_if_not_admin(message.from_user.id if message.from_user else None, message.answer):
+        return
+    raw = (message.text or "").strip()
+    if len(raw) < 16:
+        await message.answer("❌ Похоже на некорректный API_HASH")
+        return
+    await state.update_data(api_hash=raw)
+    await state.set_state(AdminStates.auth_phone)
+    await message.answer(
+        "3/5 — номер телефона аккаунта в международном формате:\n"
+        "<code>+79001234567</code>",
+        reply_markup=cancel_kb(),
+        parse_mode="HTML",
+    )
+
+
+@router.message(AdminStates.auth_phone)
+async def on_auth_phone(message: Message, state: FSMContext) -> None:
+    if await _deny_if_not_admin(message.from_user.id if message.from_user else None, message.answer):
+        return
+    phone = (message.text or "").strip()
+    if len(phone) < 8:
+        await message.answer("❌ Слишком короткий номер")
+        return
+
+    data = await state.get_data()
+    from userbot_auth import AuthCredentials
+
+    creds = AuthCredentials(
+        api_id=int(data["api_id"]),
+        api_hash=data["api_hash"],
+        phone=phone,
+        password="",
+    )
+    await message.answer("⏳ Отправляю код…")
+    try:
+        info = await _auth.begin_login(creds)
+    except Exception as e:
+        logger.exception("begin_login")
+        await message.answer(f"❌ Не удалось отправить код: {e}")
+        await state.clear()
+        return
+
+    await state.set_state(AdminStates.auth_code)
+    await message.answer(
+        f"✅ {info}\n\n"
+        "4/5 — пришлите <b>код</b> из Telegram/SMS (только цифры).",
+        reply_markup=cancel_kb(),
+        parse_mode="HTML",
+    )
+
+
+@router.message(AdminStates.auth_code)
+async def on_auth_code(message: Message, state: FSMContext) -> None:
+    if await _deny_if_not_admin(message.from_user.id if message.from_user else None, message.answer):
+        return
+    code = (message.text or "").strip()
+    try:
+        result = await _auth.confirm_code(code)
+    except ValueError as e:
+        await message.answer(f"❌ {e}")
+        return
+    except Exception as e:
+        logger.exception("confirm_code")
+        await message.answer(f"❌ Ошибка входа: {e}")
+        await state.clear()
+        return
+
+    if result == "password_required":
+        await state.set_state(AdminStates.auth_password)
+        await message.answer(
+            "5/5 — включена двухфакторка. Пришлите <b>облачный пароль</b> 2FA.",
+            reply_markup=cancel_kb(),
+            parse_mode="HTML",
+        )
+        return
+
+    await state.clear()
+    if _on_userbot_ready:
+        await _on_userbot_ready()
+    me_line = await _auth.status_text()
+    await message.answer(
+        f"✅ Вход выполнен!\n{me_line}\n\n"
+        "Теперь укажите каналы, стартовую ссылку и описание — затем «Старт».",
+        reply_markup=main_menu_kb(_require_db().get_settings().is_running),
+        parse_mode="HTML",
+    )
+
+
+@router.message(AdminStates.auth_password)
+async def on_auth_password(message: Message, state: FSMContext) -> None:
+    if await _deny_if_not_admin(message.from_user.id if message.from_user else None, message.answer):
+        return
+    password = (message.text or "").strip()
+    # Удалим сообщение с паролем из чата, если можем
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+    try:
+        await _auth.confirm_password(password)
+    except Exception as e:
+        logger.exception("confirm_password")
+        await message.answer(f"❌ Неверный пароль или ошибка: {e}")
+        return
+
+    await state.clear()
+    if _on_userbot_ready:
+        await _on_userbot_ready()
+    me_line = await _auth.status_text()
+    await message.answer(
+        f"✅ 2FA принят, вход выполнен!\n{me_line}",
+        reply_markup=main_menu_kb(_require_db().get_settings().is_running),
+        parse_mode="HTML",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Обычные FSM
 # ---------------------------------------------------------------------------
 
 @router.message(AdminStates.waiting_caption)
 async def on_caption(message: Message, state: FSMContext) -> None:
     if await _deny_if_not_admin(message.from_user.id if message.from_user else None, message.answer):
         return
-    # Берём HTML-текст, если клиент прислал форматирование
-    text = message.html_text or message.text or message.caption or ""
-    text = text.strip()
+    text = extract_caption_html(message)
     if not text:
-        await message.answer("❌ Пустой текст. Пришлите описание или /cancel.")
+        await message.answer("❌ Пустой текст")
+        return
+    err = validate_telegram_html(text)
+    if err:
+        await message.answer(f"❌ {err}", parse_mode="HTML")
         return
     _require_db().set_caption(text)
     await state.clear()
+    # Превью показываем экранированным — битый HTML не уронит ответ
     await message.answer(
-        "✅ Шаблон описания сохранён. Он будет подставляться под все следующие посты.",
+        "✅ Описание сохранено. Форматирование (жирный / курсив / ссылки) учтено.\n\n"
+        f"<b>Превью:</b>\n<code>{safe_preview(text, 400)}</code>",
         reply_markup=main_menu_kb(_require_db().get_settings().is_running),
         parse_mode="HTML",
     )
@@ -559,12 +683,11 @@ async def on_caption(message: Message, state: FSMContext) -> None:
 async def on_interval(message: Message, state: FSMContext) -> None:
     if await _deny_if_not_admin(message.from_user.id if message.from_user else None, message.answer):
         return
-    raw = (message.text or "").strip().replace(",", ".")
     try:
-        hours = float(raw)
+        hours = float((message.text or "").strip().replace(",", "."))
         _require_db().set_interval_hours(hours)
     except ValueError as e:
-        await message.answer(f"❌ {e}\nВведите число, например <code>6</code>.", parse_mode="HTML")
+        await message.answer(f"❌ {e}")
         return
     await state.clear()
     await message.answer(
@@ -586,7 +709,7 @@ async def on_limit(message: Message, state: FSMContext) -> None:
         return
     await state.clear()
     await message.answer(
-        f"✅ Постов за цикл: <b>{count}</b>",
+        f"✅ Лимит: <b>{count}</b>",
         reply_markup=main_menu_kb(_require_db().get_settings().is_running),
         parse_mode="HTML",
     )
@@ -596,9 +719,8 @@ async def on_limit(message: Message, state: FSMContext) -> None:
 async def on_link(message: Message, state: FSMContext) -> None:
     if await _deny_if_not_admin(message.from_user.id if message.from_user else None, message.answer):
         return
-    link = (message.text or "").strip()
     await state.clear()
-    await _apply_link(message, link)
+    await _apply_link(message, (message.text or "").strip())
 
 
 @router.message(AdminStates.waiting_source)
@@ -606,9 +728,6 @@ async def on_source(message: Message, state: FSMContext) -> None:
     if await _deny_if_not_admin(message.from_user.id if message.from_user else None, message.answer):
         return
     value = (message.text or "").strip()
-    if not value:
-        await message.answer("❌ Пустое значение")
-        return
     _require_db().set_source_channel(value)
     await state.clear()
     await message.answer(
@@ -623,9 +742,6 @@ async def on_target(message: Message, state: FSMContext) -> None:
     if await _deny_if_not_admin(message.from_user.id if message.from_user else None, message.answer):
         return
     value = (message.text or "").strip()
-    if not value:
-        await message.answer("❌ Пустое значение")
-        return
     _require_db().set_target_channel(value)
     await state.clear()
     await message.answer(
@@ -636,29 +752,28 @@ async def on_target(message: Message, state: FSMContext) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Вспомогательные действия
+# Helpers
 # ---------------------------------------------------------------------------
 
 async def _apply_link(message: Message, link: str) -> None:
     poster = _require_poster()
     db = _require_db()
     try:
-        # Быстрая валидация формата
         parse_post_link(link)
         chat_ref, msg_id = await poster.apply_start_link(link)
     except ValueError as e:
         await message.answer(f"❌ {e}")
         return
     except Exception as e:
-        logger.exception("Ошибка применения ссылки")
-        await message.answer(f"❌ Не удалось применить ссылку: {e}")
+        logger.exception("apply_start_link")
+        await message.answer(f"❌ {e}")
         return
 
     await message.answer(
-        "✅ Стартовая точка сохранена.\n"
+        "✅ Старт сохранён.\n"
         f"Чат: <code>{chat_ref}</code>\n"
-        f"Указанный пост ID: <code>{msg_id}</code> <i>(не публикуется)</i>\n"
-        f"Следующий к публикации: <code>{msg_id + 1}</code>",
+        f"Указанный ID: <code>{msg_id}</code> <i>(не публикуется)</i>\n"
+        f"Следующий: <code>{msg_id + 1}</code>",
         reply_markup=main_menu_kb(db.get_settings().is_running),
         parse_mode="HTML",
     )
@@ -666,37 +781,30 @@ async def _apply_link(message: Message, link: str) -> None:
 
 async def _do_run_now(answer) -> None:
     db = _require_db()
-    poster = _require_poster()
     if db.get_progress_id() <= 0:
-        await answer(
-            "⚠️ Сначала задайте стартовую ссылку.",
-            parse_mode="HTML",
-        )
+        await answer("⚠️ Сначала стартовая ссылка.")
+        return
+    if _auth is None or not _auth.is_ready:
+        await answer("⚠️ Сначала авторизуйте юзербота: /login")
         return
 
-    # Временно включим флаг running на время цикла
     was_running = db.get_settings().is_running
     db.set_running(True)
-    await answer("⚡ Запускаю цикл публикации…")
+    await answer("⚡ Цикл…")
     try:
-        if _trigger_cycle is not None:
-            count = await _trigger_cycle()
-        else:
-            count = await poster.run_cycle()
+        count = await _trigger_cycle() if _trigger_cycle else await _require_poster().run_cycle()
         await answer(
-            f"✅ Цикл завершён. Опубликовано: <b>{count}</b>",
+            f"✅ Готово. Опубликовано: <b>{count}</b>",
             reply_markup=main_menu_kb(db.get_settings().is_running),
             parse_mode="HTML",
         )
     except Exception as e:
-        logger.exception("Ошибка ручного цикла")
-        await answer(f"❌ Ошибка цикла: {e}")
+        logger.exception("run_now")
+        await answer(f"❌ {e}")
     finally:
-        # Если до этого был на паузе — вернём паузу
         if not was_running:
             db.set_running(False)
 
 
 def setup_dispatcher(dp: Dispatcher) -> None:
-    """Подключить роутер админки к диспетчеру aiogram."""
     dp.include_router(router)

@@ -1,11 +1,11 @@
 """
 main.py — точка входа Channel Reposter.
 
-Режимы:
-  • Bot API (по умолчанию, если нет API_ID/API_HASH) — достаточно BOT_TOKEN;
-    бот должен быть админом обоих каналов.
-  • Userbot (Pyrogram) — если заданы API_ID + API_HASH; при первом запуске
-    нужна интерактивная авторизация по телефону.
+Юзербот (Pyrogram) копирует посты: в источнике достаточно подписки,
+в назначении аккаунт должен быть администратором.
+
+Вход в аккаунт: команда /login в админ-боте
+(API_ID → API_HASH → телефон → код → пароль 2FA).
 """
 
 from __future__ import annotations
@@ -24,7 +24,9 @@ from aiogram.fsm.storage.memory import MemoryStorage
 import admin_bot
 import config
 from database import Database
+from poster import ChannelPoster
 from poster_botapi import ChannelPosterBotAPI
+from userbot_auth import UserbotAuth
 
 logging.basicConfig(
     level=logging.INFO,
@@ -42,7 +44,44 @@ class PosterLike(Protocol):
     async def apply_start_link(self, link: str) -> Any: ...
 
 
-async def run_cycle_safe(poster: PosterLike) -> int:
+class AppState:
+    """Общее состояние процесса: auth + текущий poster."""
+
+    def __init__(self) -> None:
+        self.db: Database | None = None
+        self.bot: Bot | None = None
+        self.auth: UserbotAuth | None = None
+        self.poster: PosterLike | None = None
+
+    def bind_poster(self) -> None:
+        assert self.db and self.bot and self.auth
+        if self.auth.is_ready and self.auth.client is not None:
+            self.poster = ChannelPoster(client=self.auth.client, db=self.db)
+            logger.info("Активный движок: USERBOT (Pyrogram)")
+        else:
+            self.poster = ChannelPosterBotAPI(bot=self.bot, db=self.db)
+            logger.info("Активный движок: Bot API (fallback до /login)")
+
+        admin_bot.set_dependencies(
+            db=self.db,
+            poster=self.poster,
+            trigger_cycle=lambda: run_cycle_safe(self.poster),
+            auth=self.auth,
+            on_userbot_ready=self.on_userbot_ready,
+        )
+
+    async def on_userbot_ready(self) -> None:
+        """Колбэк после успешного /login — переключаем poster на юзербот."""
+        self.bind_poster()
+        logger.info("Юзербот готов, poster переключён")
+
+
+STATE = AppState()
+
+
+async def run_cycle_safe(poster: PosterLike | None) -> int:
+    if poster is None:
+        return 0
     if _cycle_lock.locked():
         logger.warning("Цикл уже выполняется — пропуск")
         return 0
@@ -50,22 +89,19 @@ async def run_cycle_safe(poster: PosterLike) -> int:
         return await poster.run_cycle()
 
 
-async def scheduler_loop(poster: PosterLike, db: Database) -> None:
+async def scheduler_loop() -> None:
     logger.info("Планировщик запущен")
     await asyncio.sleep(5)
-
     while True:
-        settings = db.get_settings()
+        assert STATE.db is not None
+        settings = STATE.db.get_settings()
         if settings.is_running:
             try:
-                count = await run_cycle_safe(poster)
+                count = await run_cycle_safe(STATE.poster)
                 logger.info("Планировщик: опубликовано %s", count)
             except Exception:
                 logger.exception("Ошибка в цикле планировщика")
-        else:
-            logger.debug("Планировщик: автопостинг на паузе")
-
-        settings = db.get_settings()
+        settings = STATE.db.get_settings()
         interval_sec = max(settings.interval_hours, 0.05) * 3600
         logger.info(
             "Следующий цикл через %.1f ч. (%.0f сек.)",
@@ -78,11 +114,7 @@ async def scheduler_loop(poster: PosterLike, db: Database) -> None:
 async def main() -> None:
     db = Database(config.DATABASE_PATH)
     db.ensure_defaults(
-        caption=(
-            "<b>Новый пост</b>\n"
-            "<i>Описание можно изменить через админ-панель</i>\n"
-            '<a href="https://t.me/">Ссылка</a>'
-        ),
+        caption="<b>Описание</b>\n<i>Пришлите текст с форматированием через бота — HTML соберётся сам</i>",
         interval_hours=config.DEFAULT_INTERVAL_HOURS,
         posts_per_cycle=config.DEFAULT_POSTS_PER_CYCLE,
         source_channel=config.SOURCE_CHANNEL or "",
@@ -95,59 +127,28 @@ async def main() -> None:
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
     me = await bot.get_me()
-    logger.info("Бот: @%s (id=%s)", me.username, me.id)
+    logger.info("Админ-бот: @%s (id=%s)", me.username, me.id)
 
-    userbot = None
-    poster: PosterLike
+    workdir = Path(__file__).resolve().parent
+    auth = UserbotAuth(db=db, workdir=workdir)
 
-    if config.userbot_enabled():
-        from pyrogram import Client
-        from poster import ChannelPoster
+    STATE.db = db
+    STATE.bot = bot
+    STATE.auth = auth
 
-        workdir = str(Path(__file__).resolve().parent)
-        userbot = Client(
-            name=config.SESSION_NAME,
-            api_id=config.API_ID,
-            api_hash=config.API_HASH,
-            workdir=workdir,
-        )
-        poster = ChannelPoster(client=userbot, db=db)
-        await userbot.start()
-        ube = await userbot.get_me()
-        logger.info(
-            "Режим USERBOT: %s (id=%s)",
-            ube.username or ube.first_name,
-            ube.id,
-        )
-        for label, chat in (
-            ("источник", db.get_settings().source_channel or config.SOURCE_CHANNEL),
-            ("назначение", db.get_settings().target_channel or config.TARGET_CHANNEL),
-        ):
-            if not chat:
-                continue
-            try:
-                info = await userbot.get_chat(chat)
-                logger.info("Канал-%s: %s (id=%s)", label, info.title, info.id)
-            except Exception as e:
-                logger.warning("Канал-%s (%s) недоступен: %s", label, chat, e)
+    started = await auth.try_start_existing()
+    if started:
+        logger.info("Юзербот поднят из существующей сессии")
     else:
-        poster = ChannelPosterBotAPI(bot=bot, db=db)
-        logger.info(
-            "Режим BOT API (без юзербота). "
-            "Добавьте бота админом в оба канала. "
-            "Для альбомов «как есть» задайте API_ID/API_HASH и USERBOT_MODE=1."
-        )
+        logger.info("Юзербот не авторизован — используйте /login в боте")
+
+    STATE.bind_poster()
 
     dp = Dispatcher(storage=MemoryStorage())
-    admin_bot.set_dependencies(
-        db=db,
-        poster=poster,
-        trigger_cycle=lambda: run_cycle_safe(poster),
-    )
     admin_bot.setup_dispatcher(dp)
 
-    scheduler_task = asyncio.create_task(scheduler_loop(poster, db), name="scheduler")
-    logger.info("Админ-панель онлайн. Напишите боту /start — https://t.me/%s", me.username)
+    scheduler_task = asyncio.create_task(scheduler_loop(), name="scheduler")
+    logger.info("Онлайн: https://t.me/%s  →  /start  или  /login", me.username)
 
     try:
         await dp.start_polling(bot)
@@ -157,8 +158,7 @@ async def main() -> None:
             await scheduler_task
         except asyncio.CancelledError:
             pass
-        if userbot is not None:
-            await userbot.stop()
+        await auth.stop()
         await bot.session.close()
         logger.info("Остановка завершена")
 
