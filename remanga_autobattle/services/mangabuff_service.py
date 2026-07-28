@@ -6822,16 +6822,22 @@ class MangaBuffService:
             "locked": 0,
             "skipped": 0,
         }
-        # уже зафиксировали красивый рекорд
-        if bool(self.stats.quiz_target_locked) or int(
-            self.stats.quiz_best_streak or 0
-        ) >= target:
+        # Не фармим, если уже зафиксировали цель (или боевой рекорд ≥ 555).
+        # Кастомный target ниже текущего best (для тестов) — не блокируем.
+        best = int(self.stats.quiz_best_streak or 0)
+        if bool(self.stats.quiz_target_locked):
             stats["skipped"] = 1
-            stats["best"] = int(self.stats.quiz_best_streak or 0)
             logger.info(
-                "MangaBuff quiz skip: already locked/best=%s target=%s",
-                self.stats.quiz_best_streak,
-                target,
+                "MangaBuff quiz skip: target already locked (best=%s)",
+                best,
+            )
+            return stats
+        if target >= QUIZ_TARGET_STREAK and best >= QUIZ_TARGET_STREAK:
+            stats["skipped"] = 1
+            logger.info(
+                "MangaBuff quiz skip: best=%s already ≥ production target %s",
+                best,
+                QUIZ_TARGET_STREAK,
             )
             return stats
 
