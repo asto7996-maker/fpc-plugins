@@ -384,7 +384,13 @@ async def cb_interval(c: CallbackQuery, state: FSMContext) -> None:
         return
     await _ack(c)
     await state.set_state(S.interval)
-    await c.message.answer("⏱ Интервал в часах (например <code>0.5</code>):", reply_markup=cancel_kb(), parse_mode="HTML")  # type: ignore
+    await c.message.answer(  # type: ignore
+        "⏱ Интервал между циклами в <b>часах</b>.\n"
+        "Примеры: <code>0.002</code> ≈ 7 сек · <code>0.05</code> ≈ 3 мин\n"
+        "<i>Не ставьте целые часы вроде 9 — бот будет долго молчать.</i>",
+        reply_markup=cancel_kb(),
+        parse_mode="HTML",
+    )
 
 
 @router.callback_query(F.data == "a:limit")
@@ -644,13 +650,28 @@ async def on_interval(message: Message, state: FSMContext) -> None:
         return
     try:
         h = float((message.text or "").strip().replace(",", "."))
+        if h <= 0:
+            raise ValueError("нужно число > 0")
+        # Частая ошибка: вводят минуты/часы как «9» → 9 часов простоя
+        if h > 1:
+            await message.answer(
+                f"⚠️ <code>{h}</code> ч. — это {h:g} часов паузы.\n"
+                "Для быстрой перезаливки укажите долю часа, например:\n"
+                "• <code>0.002</code> ≈ 7 сек\n"
+                "• <code>0.05</code> ≈ 3 мин\n"
+                "• <code>0.25</code> ≈ 15 мин",
+                parse_mode="HTML",
+                reply_markup=cancel_kb(),
+            )
+            return
         _require_db().set_interval_hours(h)
     except ValueError as e:
         await message.answer(f"❌ {e}")
         return
     await state.clear()
+    secs = h * 3600
     await message.answer(
-        f"✅ Интервал: <b>{h}</b> ч.",
+        f"✅ Интервал: <b>{h}</b> ч. (≈ <b>{secs:.0f}</b> сек между циклами)",
         reply_markup=menu_kb(_require_db().get_settings().is_running),
         parse_mode="HTML",
     )

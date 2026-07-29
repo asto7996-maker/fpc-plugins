@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+import time
 from typing import Optional
 
 from pyrogram import Client, enums
@@ -139,6 +140,7 @@ class ChannelPoster:
         self._rewrite_cancel = False
         self._busy = False
         self._abort_cycle = False
+        self._busy_since = 0.0
 
     async def _materialize_message(self, msg: Message) -> Optional[Message]:
         """
@@ -307,6 +309,18 @@ class ChannelPoster:
     def cancel_rewrite(self) -> None:
         self._rewrite_cancel = True
 
+    def force_unlock(self) -> None:
+        """Снять залипший busy после обрыва сети / вечного FloodWait."""
+        logger.warning(
+            "force_unlock busy=%s since=%.0f abort=%s",
+            self._busy,
+            self._busy_since,
+            self._abort_cycle,
+        )
+        self._abort_cycle = True
+        self._busy = False
+        self._busy_since = 0.0
+
     async def run_cycle(self) -> int:
         # Если уже идёт цикл — прерываем и ждём, не возвращаем тихо 0
         if self._busy:
@@ -314,14 +328,16 @@ class ChannelPoster:
             self.request_abort()
             ok = await self.wait_until_idle(timeout=180.0)
             if not ok or self._busy:
-                logger.warning("cycle skipped: still busy after wait")
-                return 0
+                logger.warning("cycle still busy — force unlock")
+                self.force_unlock()
         self._abort_cycle = False
         self._busy = True
+        self._busy_since = time.monotonic()
         try:
             return await self._run_cycle_inner()
         finally:
             self._busy = False
+            self._busy_since = 0.0
             self._abort_cycle = False
 
     async def _latest_message_id(self, source: int | str) -> int:
@@ -416,9 +432,11 @@ class ChannelPoster:
             try:
                 result = await self._process(source, target, next_id, caption)
             except FloodWait as e:
-                wait = min(int(e.value), 120)
+                wait = min(int(e.value), 60)
                 logger.warning("FloodWait %ss", wait)
                 await asyncio.sleep(wait + 1)
+                if self._abort_cycle:
+                    break
                 continue
             except ChatWriteForbidden:
                 logger.error("Нет прав писать в назначение (нужен админ юзербота)")

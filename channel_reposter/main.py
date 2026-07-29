@@ -77,6 +77,21 @@ async def _worker_scheduler() -> None:
                 continue
             now = time.monotonic()
             s = db.get_settings()
+
+            # Залипший цикл (обрыв сети / вечный await) — принудительно снять
+            if (
+                poster is not None
+                and getattr(poster, "_busy", False)
+                and getattr(poster, "_busy_since", 0) > 0
+                and now - poster._busy_since > 300
+            ):
+                logger.error(
+                    "Cycle stuck for %.0fs — force unlock",
+                    now - poster._busy_since,
+                )
+                poster.force_unlock()
+                next_due = 0.0
+
             if s.is_running and poster is not None and now >= next_due:
                 if getattr(poster, "_busy", False):
                     logger.info("Scheduler: busy")
@@ -89,17 +104,24 @@ async def _worker_scheduler() -> None:
                         n = 0
                     if n == 0:
                         idle += 1
-                        # На кончике источника — реже; иначе быстро
                         delay = min(60.0, 10.0 * idle)
                     else:
                         idle = 0
                         # interval_hours → секунды; минимум 5с между циклами
-                        delay = max(float(s.interval_hours) * 3600.0, 5.0)
+                        # защита от случайных «9 часов» в настройке
+                        hours = float(s.interval_hours)
+                        if hours > 1:
+                            logger.warning(
+                                "interval_hours=%.3f too large for catch-up; using 10s",
+                                hours,
+                            )
+                            delay = 10.0
+                        else:
+                            delay = max(hours * 3600.0, 5.0)
                     next_due = time.monotonic() + delay
                     logger.info("Next cycle in %.0fs", delay)
         except Exception:
             logger.exception("scheduler tick")
-        # Будим чаще, чтобы не ждать 20с после короткого цикла
         await asyncio.sleep(5)
 
 
