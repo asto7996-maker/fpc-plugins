@@ -14,6 +14,7 @@ from pathlib import Path
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
+from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ParseMode
 from aiogram.fsm.storage.memory import MemoryStorage
 
@@ -52,9 +53,10 @@ async def _worker_bootstrap(db: Database, workdir: Path) -> str:
         logger.warning("Нет сессии юзербота")
         return "none"
 
-    # Отдельный Bot-клиент в worker-потоке для публикации
+    # Отдельный Bot-клиент в worker-потоке для публикации (длинный timeout на большие видео)
     publish_bot = Bot(
         token=config.BOT_TOKEN,
+        session=AiohttpSession(timeout=600.0),
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
     BRIDGE.publish_bot = publish_bot
@@ -65,22 +67,32 @@ async def _worker_bootstrap(db: Database, workdir: Path) -> str:
 
 
 async def _worker_scheduler() -> None:
+    """Циклы по интервалу + быстрый повтор, если автопост включён и цикл дал 0."""
     logger.info("Scheduler started")
     await asyncio.sleep(5)
+    idle_rounds = 0
     while True:
         db = BRIDGE.db
         poster = BRIDGE.poster
         if db is None:
             await asyncio.sleep(5)
             continue
+        published = 0
         if db.get_settings().is_running and poster is not None:
             try:
-                n = await poster.run_cycle()
-                logger.info("Scheduler published %s", n)
+                published = await poster.run_cycle()
+                logger.info("Scheduler published %s", published)
             except Exception:
                 logger.exception("scheduler")
-        wait = max(db.get_settings().interval_hours, 0.05) * 3600
-        logger.info("Next cycle in %.1f h", db.get_settings().interval_hours)
+        if db.get_settings().is_running and published == 0:
+            idle_rounds += 1
+            # Пока идут ошибки/дыры — не ждать 9 часов, пробовать чаще
+            wait = min(120.0, 15.0 * idle_rounds)
+            logger.info("No posts this round — retry in %.0fs", wait)
+        else:
+            idle_rounds = 0
+            wait = max(db.get_settings().interval_hours, 0.05) * 3600
+            logger.info("Next cycle in %.1f h", db.get_settings().interval_hours)
         await asyncio.sleep(wait)
 
 

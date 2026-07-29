@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+import re
 import tempfile
 from pathlib import Path
 from typing import Optional
@@ -33,6 +34,11 @@ from database import Database
 from links import parse_post_link
 
 logger = logging.getLogger(__name__)
+
+# Bot API лимит загрузки ~50 МБ
+BOT_UPLOAD_LIMIT = 49 * 1024 * 1024
+DOWNLOAD_RETRIES = 3
+UPLOAD_RETRIES = 3
 
 
 def _chat_ref(value: str | int) -> str | int:
@@ -61,6 +67,73 @@ def _is_media(msg: Message) -> bool:
     )
 
 
+def _media_ext(msg: Message) -> str:
+    name = None
+    if msg.video and msg.video.file_name:
+        name = msg.video.file_name
+    elif msg.document and msg.document.file_name:
+        name = msg.document.file_name
+    elif msg.audio and msg.audio.file_name:
+        name = msg.audio.file_name
+    elif msg.animation and msg.animation.file_name:
+        name = msg.animation.file_name
+    if name:
+        suf = Path(name).suffix
+        if suf:
+            return re.sub(r"[^a-zA-Z0-9.]", "", suf)[:12] or ".bin"
+    if msg.photo:
+        return ".jpg"
+    if msg.video or msg.animation:
+        return ".mp4"
+    if msg.audio or msg.voice:
+        return ".ogg"
+    return ".bin"
+
+
+def _approx_size(msg: Message) -> Optional[int]:
+    for attr in ("video", "document", "audio", "animation", "voice", "video_note"):
+        obj = getattr(msg, attr, None)
+        if obj is not None and getattr(obj, "file_size", None):
+            return int(obj.file_size)
+    if msg.photo:
+        # берём самое большое превью
+        try:
+            return int(msg.photo[-1].file_size or 0)
+        except Exception:
+            return None
+    return None
+
+
+def _is_transient(err: BaseException) -> bool:
+    text = str(err).upper()
+    # Постоянные ошибки загрузки — не ретраим media_group, идём в fallback
+    permanent = (
+        "ENTITY TOO LARGE",
+        "TOO BIG",
+        "FILE_TOO_LARGE",
+        "REQUEST_ENTITY_TOO_LARGE",
+        "FORBIDDEN",
+        "WRITE_FORBIDDEN",
+        "CHAT_WRITE",
+        "HAVE NO RIGHTS",
+    )
+    if any(k in text for k in permanent):
+        return False
+    keys = (
+        "TIMEOUT",
+        "TIMED OUT",
+        "CONNECTION",
+        "NETWORK",
+        "SERVER DISCONNECTED",
+        "TEMPORARY",
+        "RESET BY PEER",
+        "TOO MANY REQUESTS",
+    )
+    return any(k in text for k in keys) or isinstance(
+        err, (TimeoutError, asyncio.TimeoutError, ConnectionError, OSError)
+    )
+
+
 class HybridPoster:
     """Чтение через Pyrogram, публикация через aiogram Bot."""
 
@@ -75,7 +148,6 @@ class HybridPoster:
     async def apply_start_link(self, link: str) -> tuple[str | int, int]:
         chat_ref, message_id = parse_post_link(link)
         self.db.set_source_channel(str(chat_ref) if isinstance(chat_ref, int) else str(chat_ref))
-        # normalize @
         src = str(chat_ref)
         if isinstance(chat_ref, str) and not chat_ref.startswith("@"):
             src = "@" + chat_ref
@@ -102,11 +174,18 @@ class HybridPoster:
         next_id = settings.progress_id + 1
         published = 0
         empty_streak = 0
+        retry_streak = 0
         self._seen_grouped.clear()
 
-        logger.info("Hybrid cycle %s → %s after=%s limit=%s", source, target, settings.progress_id, limit)
+        logger.info(
+            "Hybrid cycle %s → %s after=%s limit=%s",
+            source,
+            target,
+            settings.progress_id,
+            limit,
+        )
 
-        while published < limit and empty_streak < 50:
+        while published < limit and empty_streak < 50 and retry_streak < 5:
             if not self.db.get_settings().is_running:
                 break
             if self.db.was_processed(next_id):
@@ -123,7 +202,6 @@ class HybridPoster:
                 logger.error("Нет прав писать в назначение (для бота проверьте админку)")
                 break
             except (ChannelPrivate, RPCError) as e:
-                # Не двигаем progress на фатальных ошибках записи
                 if "WRITE_FORBIDDEN" in str(e).upper() or "CHAT_WRITE" in str(e).upper():
                     logger.error("Write forbidden: %s", e)
                     break
@@ -134,6 +212,12 @@ class HybridPoster:
                 empty_streak += 1
                 continue
 
+            if result == "retry":
+                retry_streak += 1
+                wait = min(30, 3 * retry_streak)
+                logger.warning("retry id=%s in %ss (streak=%s)", next_id, wait, retry_streak)
+                await asyncio.sleep(wait)
+                continue
             if result == "empty":
                 empty_streak += 1
                 self.db.set_progress_id(next_id)
@@ -141,6 +225,7 @@ class HybridPoster:
                 continue
             if result == "skip":
                 empty_streak = 0
+                retry_streak = 0
                 self.db.set_progress_id(next_id)
                 next_id += 1
                 continue
@@ -148,11 +233,15 @@ class HybridPoster:
                 break
 
             empty_streak = 0
+            retry_streak = 0
             published += 1
-            self.db.set_progress_id(next_id)
-            next_id += 1
+            cur = max(self.db.get_progress_id(), next_id)
+            self.db.set_progress_id(cur)
+            next_id = cur + 1
             if published < limit:
-                await asyncio.sleep(random.uniform(config.POST_DELAY_MIN, config.POST_DELAY_MAX))
+                await asyncio.sleep(
+                    random.uniform(config.POST_DELAY_MIN, config.POST_DELAY_MAX)
+                )
 
         logger.info("Hybrid done published=%s", published)
         return published
@@ -180,58 +269,109 @@ class HybridPoster:
             return "skip"
         return await self._publish_single(target, msg, caption)
 
-    async def _download(self, msg: Message) -> Optional[Path]:
-        """Скачать медиа сообщения во временный файл."""
+    async def _download(self, msg: Message, attempt: int = 1) -> Optional[Path]:
+        """Скачать медиа в безопасное уникальное имя файла."""
         if not _is_media(msg):
             return None
+        dest = self._tmp / f"{msg.id}_{attempt}{_media_ext(msg)}"
         try:
-            path = await self.client.download_media(msg, file_name=str(self._tmp) + "/")
+            path = await self.client.download_media(msg, file_name=str(dest))
             if not path:
                 return None
-            return Path(path)
+            p = Path(path)
+            if not p.exists() or p.stat().st_size <= 0:
+                logger.warning("empty download id=%s", msg.id)
+                return None
+            if p.stat().st_size > BOT_UPLOAD_LIMIT:
+                logger.error(
+                    "file too large for Bot API id=%s size=%s",
+                    msg.id,
+                    p.stat().st_size,
+                )
+                try:
+                    p.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                return None
+            return p
         except FloodWait:
             raise
         except ValueError:
-            # веб-превью / без файла
             logger.warning("no downloadable media id=%s", msg.id)
             return None
-        except Exception:
-            logger.exception("download fail id=%s", msg.id)
+        except Exception as e:
+            logger.warning("download fail id=%s attempt=%s: %s", msg.id, attempt, e)
+            try:
+                dest.unlink(missing_ok=True)
+            except Exception:
+                pass
+            for leftover in self._tmp.glob(f"{msg.id}_*"):
+                try:
+                    leftover.unlink(missing_ok=True)
+                except Exception:
+                    pass
+            if attempt < DOWNLOAD_RETRIES and _is_transient(e):
+                await asyncio.sleep(2 * attempt)
+                return await self._download(msg, attempt + 1)
+            logger.exception("download give up id=%s", msg.id)
             return None
 
+    async def _send_with_retry(self, coro_factory, *, label: str):
+        last_err: Optional[BaseException] = None
+        for attempt in range(1, UPLOAD_RETRIES + 1):
+            try:
+                return await coro_factory()
+            except TelegramRetryAfter as e:
+                await asyncio.sleep(int(e.retry_after) + 1)
+                last_err = e
+            except Exception as e:
+                last_err = e
+                if not _is_transient(e) or attempt >= UPLOAD_RETRIES:
+                    raise
+                logger.warning("%s upload retry %s: %s", label, attempt, e)
+                await asyncio.sleep(2 * attempt)
+        assert last_err is not None
+        raise last_err
+
     async def _publish_single(self, target, msg: Message, caption: str) -> str:
+        path: Optional[Path] = None
         try:
             if _is_media(msg):
+                size = _approx_size(msg)
+                if size and size > BOT_UPLOAD_LIMIT:
+                    logger.error("skip oversized id=%s size=%s", msg.id, size)
+                    self.db.add_history(msg.id, status="error", error=f"too large: {size}")
+                    return "skip"
                 path = await self._download(msg)
                 if path is None:
-                    self.db.add_history(msg.id, status="error", error="download failed")
-                    return "skip"
-                try:
-                    file = FSInputFile(path)
-                    kwargs = {"chat_id": target, "caption": caption or None}
-                    if caption:
-                        kwargs["parse_mode"] = ParseMode.HTML
+                    # временный сбой скачивания — не двигаем progress
+                    return "retry"
+                file = FSInputFile(path)
+                kwargs = {"chat_id": target, "caption": caption or None}
+                if caption:
+                    kwargs["parse_mode"] = ParseMode.HTML
+
+                async def _send():
                     if msg.photo:
-                        sent = await self.bot.send_photo(photo=file, **kwargs)
-                    elif msg.video or msg.animation:
-                        sent = await self.bot.send_video(video=file, **kwargs)
-                    elif msg.audio:
-                        sent = await self.bot.send_audio(audio=file, **kwargs)
-                    else:
-                        sent = await self.bot.send_document(document=file, **kwargs)
-                finally:
-                    try:
-                        path.unlink(missing_ok=True)
-                    except Exception:
-                        pass
+                        return await self.bot.send_photo(photo=file, **kwargs)
+                    if msg.video or msg.animation:
+                        return await self.bot.send_video(video=file, **kwargs)
+                    if msg.audio:
+                        return await self.bot.send_audio(audio=file, **kwargs)
+                    return await self.bot.send_document(document=file, **kwargs)
+
+                sent = await self._send_with_retry(_send, label=f"single:{msg.id}")
             else:
                 text = caption if caption else (msg.text or msg.caption or "")
                 if not text:
                     return "skip"
-                sent = await self.bot.send_message(
-                    chat_id=target,
-                    text=text,
-                    parse_mode=ParseMode.HTML,
+                sent = await self._send_with_retry(
+                    lambda: self.bot.send_message(
+                        chat_id=target,
+                        text=text,
+                        parse_mode=ParseMode.HTML,
+                    ),
+                    label=f"text:{msg.id}",
                 )
 
             self.db.add_history(
@@ -241,17 +381,28 @@ class HybridPoster:
             )
             logger.info("Hybrid published %s → %s", msg.id, sent.message_id)
             return "ok"
-        except TelegramRetryAfter as e:
-            await asyncio.sleep(int(e.retry_after) + 1)
-            return await self._publish_single(target, msg, caption)
         except Exception as e:
             err = str(e).upper()
             if "WRITE_FORBIDDEN" in err or "CHAT_WRITE" in err or "FORBIDDEN" in err:
                 logger.error("Fatal write: %s", e)
                 return "fatal"
+            if _is_transient(e):
+                logger.error("publish single transient %s: %s", msg.id, e)
+                return "retry"
+            # слишком большой / неподдерживаемый — пропускаем
+            if "TOO BIG" in err or "REQUEST ENTITY TOO LARGE" in err or "FILE_PART" in err:
+                logger.error("skip oversized/unsupported %s: %s", msg.id, e)
+                self.db.add_history(msg.id, status="error", error=str(e))
+                return "skip"
             logger.error("publish single %s: %s", msg.id, e)
             self.db.add_history(msg.id, status="error", error=str(e))
             return "skip"
+        finally:
+            if path is not None:
+                try:
+                    path.unlink(missing_ok=True)
+                except Exception:
+                    pass
 
     async def _publish_album(self, source, target, anchor: Message, caption: str) -> str:
         gid = str(anchor.media_group_id)
@@ -259,18 +410,37 @@ class HybridPoster:
         try:
             album = await self.client.get_media_group(source, anchor.id)
         except Exception as e:
+            if _is_transient(e):
+                self._seen_grouped.discard(gid)
+                return "retry"
             self.db.add_history(anchor.id, grouped_id=gid, status="error", error=str(e))
             return "skip"
 
         album = sorted(album, key=lambda m: m.id)
-        media = []
         paths: list[Path] = []
         try:
-            for i, m in enumerate(album):
+            downloaded: list[tuple[Message, Path]] = []
+            fail_dl = 0
+            for m in album:
                 path = await self._download(m)
                 if path is None:
+                    fail_dl += 1
                     continue
                 paths.append(path)
+                downloaded.append((m, path))
+
+            if not downloaded:
+                # все файлы не скачались — вероятно временный сбой DC
+                self._seen_grouped.discard(gid)
+                return "retry"
+
+            # 1) пробуем media_group только для компактных наборов (фото/мелкие)
+            # Большие видео-альбомы (>~45МБ суммарно) сразу шлём по одному —
+            # иначе Bot API отвечает Request Entity Too Large.
+            media = []
+            total_size = 0
+            for i, (m, path) in enumerate(downloaded):
+                total_size += path.stat().st_size
                 file = FSInputFile(path)
                 cap = caption if i == 0 else None
                 parse = ParseMode.HTML if (i == 0 and caption) else None
@@ -281,26 +451,88 @@ class HybridPoster:
                 else:
                     media.append(InputMediaDocument(media=file, caption=cap, parse_mode=parse))
 
-            if not media:
-                return "skip"
+            sent_ok = False
+            first_id = None
+            use_group = 1 < len(media) <= 10 and total_size <= BOT_UPLOAD_LIMIT
+            if use_group:
+                try:
+                    sent_list = await self._send_with_retry(
+                        lambda: self.bot.send_media_group(chat_id=target, media=media),
+                        label=f"album:{gid}",
+                    )
+                    first_id = sent_list[0].message_id if sent_list else None
+                    sent_ok = True
+                except Exception as e:
+                    err = str(e).upper()
+                    if "WRITE_FORBIDDEN" in err or "CHAT_WRITE" in err:
+                        logger.error("Fatal album write: %s", e)
+                        return "fatal"
+                    logger.warning(
+                        "album media_group fail %s size=%s: %s — fallback single",
+                        gid,
+                        total_size,
+                        e,
+                    )
+            else:
+                logger.info(
+                    "album %s send one-by-one (files=%s size=%s)",
+                    gid,
+                    len(downloaded),
+                    total_size,
+                )
 
-            sent_list = await self.bot.send_media_group(chat_id=target, media=media)
-            first_id = sent_list[0].message_id if sent_list else None
-            max_src = anchor.id
+            # 2) fallback: по одному (надёжнее для больших MOV)
+            if not sent_ok:
+                published_any = False
+                for i, (m, path) in enumerate(downloaded):
+                    file = FSInputFile(path)
+                    cap = caption if i == 0 else None
+                    kwargs = {"chat_id": target, "caption": cap}
+                    if cap:
+                        kwargs["parse_mode"] = ParseMode.HTML
+
+                    async def _one(mm=m, ff=file, kw=kwargs):
+                        if mm.photo:
+                            return await self.bot.send_photo(photo=ff, **kw)
+                        if mm.video or mm.animation:
+                            return await self.bot.send_video(video=ff, **kw)
+                        return await self.bot.send_document(document=ff, **kw)
+
+                    try:
+                        sent = await self._send_with_retry(_one, label=f"album-item:{m.id}")
+                        if first_id is None:
+                            first_id = sent.message_id
+                        published_any = True
+                        await asyncio.sleep(1.2)
+                    except Exception as e:
+                        if _is_transient(e):
+                            self._seen_grouped.discard(gid)
+                            logger.error("album item transient %s: %s", m.id, e)
+                            return "retry"
+                        err = str(e).upper()
+                        if "WRITE_FORBIDDEN" in err or "CHAT_WRITE" in err:
+                            return "fatal"
+                        logger.error("album item skip %s: %s", m.id, e)
+
+                if not published_any:
+                    self._seen_grouped.discard(gid)
+                    return "retry"
+                sent_ok = True
+
+            max_src = max(m.id for m in album)
             for m in album:
-                max_src = max(max_src, m.id)
                 self.db.add_history(
                     source_message_id=m.id,
                     target_message_id=first_id,
                     grouped_id=gid,
                     status="ok",
                 )
-            # Прогресс сразу на последний ID альбома (не на якорь)
             self.db.set_progress_id(max_src)
             logger.info(
-                "Hybrid album %s (%s files) → %s (progress=%s)",
+                "Hybrid album %s (%s/%s files) → %s (progress=%s)",
                 gid,
-                len(media),
+                len(downloaded),
+                len(album),
                 first_id,
                 max_src,
             )
@@ -314,6 +546,10 @@ class HybridPoster:
             if "WRITE_FORBIDDEN" in err or "CHAT_WRITE" in err:
                 logger.error("Fatal album write: %s", e)
                 return "fatal"
+            if _is_transient(e):
+                self._seen_grouped.discard(gid)
+                logger.error("album transient %s: %s", gid, e)
+                return "retry"
             logger.error("album fail %s: %s", gid, e)
             self.db.add_history(anchor.id, grouped_id=gid, status="error", error=str(e))
             return "skip"
