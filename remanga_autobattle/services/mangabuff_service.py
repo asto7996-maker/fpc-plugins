@@ -1566,6 +1566,13 @@ class MangaBuffService:
                 slug,
                 snapshot,
             )
+            # «Нет глав» / пустой тайтл — сразу в exhausted, без 4 ретраев
+            try:
+                btns = " ".join(str(x) for x in (snapshot or {}).get("btns") or [])
+                if re.search(r"нет\s*глав|глав[аы]\s*\(\s*0\s*\)", btns, re.I):
+                    self._mark_title_exhausted(slug, "no chapters on card")
+            except Exception:  # noqa: BLE001
+                pass
         except Exception:  # noqa: BLE001
             logger.warning("MangaBuff title card missing continue/read: %s", slug)
         return True
@@ -3800,48 +3807,48 @@ class MangaBuffService:
                 if len(titles) >= limit:
                     break
         random.shuffle(titles)
-        # доп. страницы каталога — иначе вечно одни и те же дочитанные топы
-        if len(titles) < limit:
-            for page_n in (2, 3, 5, 8):
-                if len(titles) >= limit:
-                    break
-                if not await self._safe_goto(page, f"{CATALOG_URL}?page={page_n}"):
-                    continue
-                more = await page.evaluate(
-                    """(limit) => {
-                      const as = [...document.querySelectorAll('a[href*="/manga/"]')];
-                      const out = [];
-                      const seen = new Set();
-                      for (const a of as) {
-                        const h = a.href.split('?')[0];
-                        const m = h.match(/mangabuff\\.ru\\/manga\\/([^\\/\\?#]+)$/);
-                        if (!m) continue;
-                        const slug = m[1];
-                        if (['top','genre','genres'].includes(slug)) continue;
-                        if (seen.has(slug)) continue;
-                        seen.add(slug);
-                        out.push({
-                          slug,
-                          title: (a.innerText || slug).trim().split('\\n')[0].slice(0, 80),
-                          href: h,
-                        });
-                        if (out.length >= limit) break;
-                      }
-                      return out;
-                    }""",
-                    limit,
-                )
-                have = {t["slug"] for t in titles}
-                for t in more or []:
-                    if t["slug"] not in have and not self._title_is_exhausted(t["slug"]):
-                        titles.append(t)
-                        have.add(t["slug"])
-                    if len(titles) >= limit:
-                        break
-        # выкинуть уже исчерпанные из текущего набора
-        titles = [t for t in titles if not self._title_is_exhausted(str(t.get("slug") or ""))]
+        # всегда подмешиваем глубокий каталог — топ часто уже дочитан
+        have = {t["slug"] for t in titles}
+        for page_n in (2, 3, 5, 8, 12):
+            if len(titles) >= limit * 2:
+                break
+            if not await self._safe_goto(page, f"{CATALOG_URL}?page={page_n}"):
+                continue
+            more = await page.evaluate(
+                """(limit) => {
+                  const as = [...document.querySelectorAll('a[href*="/manga/"]')];
+                  const out = [];
+                  const seen = new Set();
+                  for (const a of as) {
+                    const h = a.href.split('?')[0];
+                    const m = h.match(/mangabuff\\.ru\\/manga\\/([^\\/\\?#]+)$/);
+                    if (!m) continue;
+                    const slug = m[1];
+                    if (['top','genre','genres'].includes(slug)) continue;
+                    if (seen.has(slug)) continue;
+                    seen.add(slug);
+                    out.push({
+                      slug,
+                      title: (a.innerText || slug).trim().split('\\n')[0].slice(0, 80),
+                      href: h,
+                    });
+                    if (out.length >= limit) break;
+                  }
+                  return out;
+                }""",
+                limit,
+            )
+            for t in more or []:
+                if t["slug"] not in have and not self._title_is_exhausted(t["slug"]):
+                    titles.append(t)
+                    have.add(t["slug"])
+        # выкинуть уже исчерпанные
+        titles = [
+            t
+            for t in titles
+            if not self._title_is_exhausted(str(t.get("slug") or ""))
+        ]
         random.shuffle(titles)
-        # чуть чаще оставляем топовые в начале
         return titles[:limit]
 
     async def _estimate_title_chapters(self, slug: str) -> int:
@@ -5243,15 +5250,22 @@ class MangaBuffService:
                 return start_url
             if slug and self._title_is_exhausted(slug):
                 return None
-            logger.warning(
-                "MangaBuff cannot open %s (attempt %s/%s)",
-                slug or title_href,
-                attempt,
-                attempts,
-            )
-            await self._tempo_pause(1.0, 2.2)
+            # пустой/битый тайтл после 1-й попытки — не жечь минуты
+            if attempt >= 1 and slug:
+                logger.warning(
+                    "MangaBuff cannot open %s (attempt %s/%s)",
+                    slug or title_href,
+                    attempt,
+                    attempts,
+                )
+                if attempt >= 2:
+                    self._mark_title_exhausted(slug, "unopenable")
+                    return None
+            await self._tempo_pause(0.8, 1.5)
             if slug:
                 await self._safe_goto(page, f"https://mangabuff.ru/manga/{slug}")
+        if slug:
+            self._mark_title_exhausted(slug, "unopenable")
         return None
 
     async def _maybe_comment(self, page: Page) -> bool:
