@@ -141,6 +141,7 @@ class ChannelPoster:
         self._busy = False
         self._abort_cycle = False
         self._busy_since = 0.0
+        self._cycle_gen = 0
 
     async def _materialize_message(self, msg: Message) -> Optional[Message]:
         """
@@ -312,12 +313,14 @@ class ChannelPoster:
     def force_unlock(self) -> None:
         """Снять залипший busy после обрыва сети / вечного FloodWait."""
         logger.warning(
-            "force_unlock busy=%s since=%.0f abort=%s",
+            "force_unlock busy=%s since=%.0f abort=%s gen=%s",
             self._busy,
             self._busy_since,
             self._abort_cycle,
+            self._cycle_gen,
         )
         self._abort_cycle = True
+        self._cycle_gen += 1  # любой старый цикл сразу выйдет
         self._busy = False
         self._busy_since = 0.0
 
@@ -330,15 +333,20 @@ class ChannelPoster:
             if not ok or self._busy:
                 logger.warning("cycle still busy — force unlock")
                 self.force_unlock()
+
+        self._cycle_gen += 1
+        my_gen = self._cycle_gen
         self._abort_cycle = False
         self._busy = True
         self._busy_since = time.monotonic()
         try:
-            return await self._run_cycle_inner()
+            return await self._run_cycle_inner(my_gen)
         finally:
-            self._busy = False
-            self._busy_since = 0.0
-            self._abort_cycle = False
+            # Снимаем busy только если это всё ещё «наш» цикл
+            if my_gen == self._cycle_gen:
+                self._busy = False
+                self._busy_since = 0.0
+                self._abort_cycle = False
 
     async def _latest_message_id(self, source: int | str) -> int:
         """ID последнего поста в канале (0 если пусто)."""
@@ -349,7 +357,7 @@ class ChannelPoster:
             logger.warning("latest_message_id failed: %s", e)
         return 0
 
-    async def _run_cycle_inner(self) -> int:
+    async def _run_cycle_inner(self, my_gen: int) -> int:
         settings = self.db.get_settings()
         if not settings.is_running:
             return 0
@@ -374,7 +382,6 @@ class ChannelPoster:
             rewind = self.db.max_ok_source_id()
             if rewind > latest:
                 rewind = latest
-            # не выше latest, но и не теряем неопубликованный хвост после last ok
             logger.warning(
                 "progress %s > latest %s — откат к %s",
                 settings.progress_id,
@@ -392,7 +399,7 @@ class ChannelPoster:
             )
             return 0
 
-        limit = settings.posts_per_cycle
+        limit = max(1, int(settings.posts_per_cycle))
         caption = settings.caption_template or ""
         next_id = settings.progress_id + 1
         published = 0
@@ -400,7 +407,8 @@ class ChannelPoster:
         self._seen_grouped.clear()
 
         logger.info(
-            "USERBOT cycle %s → %s after=%s latest=%s limit=%s",
+            "USERBOT cycle gen=%s %s → %s after=%s latest=%s limit=%s",
+            my_gen,
             source,
             target,
             settings.progress_id,
@@ -409,8 +417,17 @@ class ChannelPoster:
         )
 
         while published < limit and empty_streak < 50:
-            if self._abort_cycle:
-                logger.info("cycle aborted by request (published=%s)", published)
+            if self._abort_cycle or my_gen != self._cycle_gen:
+                logger.info(
+                    "cycle aborted gen=%s/%s published=%s",
+                    my_gen,
+                    self._cycle_gen,
+                    published,
+                )
+                break
+            # Лимит можно уменьшить на лету — подхватываем каждый шаг
+            limit = max(1, int(self.db.get_settings().posts_per_cycle))
+            if published >= limit:
                 break
             if not self.db.get_settings().is_running:
                 break
@@ -435,7 +452,7 @@ class ChannelPoster:
                 wait = min(int(e.value), 60)
                 logger.warning("FloodWait %ss", wait)
                 await asyncio.sleep(wait + 1)
-                if self._abort_cycle:
+                if self._abort_cycle or my_gen != self._cycle_gen:
                     break
                 continue
             except ChatWriteForbidden:
@@ -493,7 +510,7 @@ class ChannelPoster:
                     random.uniform(config.POST_DELAY_MIN, config.POST_DELAY_MAX)
                 )
 
-        logger.info("USERBOT done published=%s", published)
+        logger.info("USERBOT done gen=%s published=%s limit=%s", my_gen, published, limit)
         return published
 
     # ------------------------------------------------------------------ process

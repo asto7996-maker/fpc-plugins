@@ -683,13 +683,18 @@ async def on_limit(message: Message, state: FSMContext) -> None:
         return
     try:
         n = int((message.text or "").strip())
+        if n < 1:
+            raise ValueError("нужно целое число ≥ 1")
+        if n > 100:
+            raise ValueError("слишком много (макс. 100 за цикл)")
         _require_db().set_posts_per_cycle(n)
     except ValueError as e:
         await message.answer(f"❌ {e}")
         return
     await state.clear()
     await message.answer(
-        f"✅ Лимит: <b>{n}</b>",
+        f"✅ Лимит: <b>{n}</b> публикаций за цикл\n"
+        f"<i>Альбом считается как 1 публикация (не по числу фото/видео).</i>",
         reply_markup=menu_kb(_require_db().get_settings().is_running),
         parse_mode="HTML",
     )
