@@ -1,9 +1,8 @@
-Pinned bottom nav + PlatformProvider fix
+Pinned bottom nav + PlatformProvider fix + blackscreen fix
 
-Live: index-d1377d3f.js / index-830cf3f3.css
+Live: index-119ecf90.js / index-830cf3f3.css
 
-1) CSS: removed #root{transform:translateZ(0)} breaking position:fixed bottom nav.
-2) usePlatform (we): never throws; returns Yc()/safe web fallback if context missing.
-3) Patched ALL historical index-*.js on server (stale Telegram caches).
-4) ErrorBoundary Hn(): treats PlatformProvider errors as chunk-reload (auto refresh).
-5) Support chunk cache-bust + Caddy static max-age=60 must-revalidate.
+1) Sticky nav: removed #root transform containing block.
+2) usePlatform: return e||Yc() (no throw).
+3) BLACK SCREEN FIX: never put ?query on ES module entry src — it duplicates
+   the module graph vs chunk imports and blanks the app.
