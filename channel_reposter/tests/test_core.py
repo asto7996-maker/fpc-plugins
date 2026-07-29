@@ -17,6 +17,62 @@ sys.path.insert(0, str(ROOT))
 
 from database import Database  # noqa: E402
 from links import normalize_channel, parse_post_link  # noqa: E402
+from poster import _attach_caption, _is_unsupported_media  # noqa: E402
+from pyrogram.types import InputMediaPhoto  # noqa: E402
+from pyrogram import enums  # noqa: E402
+
+
+class CaptionAttachTests(unittest.TestCase):
+    def test_attach_caption_sets_html(self) -> None:
+        item = InputMediaPhoto(media="file_id_x")
+        _attach_caption(item, "<b>hi</b>")
+        self.assertEqual(item.caption, "<b>hi</b>")
+        self.assertEqual(item.parse_mode, enums.ParseMode.HTML)
+
+    def test_attach_caption_empty_noop(self) -> None:
+        item = InputMediaPhoto(media="file_id_x", caption="keep")
+        _attach_caption(item, "")
+        self.assertEqual(item.caption, "keep")
+
+
+class UnsupportedMediaHeuristicTests(unittest.TestCase):
+    def test_text_not_unsupported(self) -> None:
+        class M:
+            empty = False
+            service = None
+            photo = None
+            video = None
+            document = None
+            audio = None
+            animation = None
+            voice = None
+            video_note = None
+            sticker = None
+            poll = None
+            dice = None
+            text = "hello"
+            caption = None
+
+        self.assertFalse(_is_unsupported_media(M()))  # type: ignore[arg-type]
+
+    def test_empty_media_album_item_is_unsupported(self) -> None:
+        class M:
+            empty = False
+            service = None
+            photo = None
+            video = None
+            document = None
+            audio = None
+            animation = None
+            voice = None
+            video_note = None
+            sticker = None
+            poll = None
+            dice = None
+            text = None
+            caption = None
+
+        self.assertTrue(_is_unsupported_media(M()))  # type: ignore[arg-type]
 
 
 class ParseLinkTests(unittest.TestCase):

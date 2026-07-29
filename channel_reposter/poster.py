@@ -91,6 +91,18 @@ def _is_media(msg: Message) -> bool:
     )
 
 
+def _is_unsupported_media(msg: Message) -> bool:
+    """Медиа, которое текущий слой Pyrogram не разобрал (MessageMediaUnsupported)."""
+    if getattr(msg, "empty", False) or msg.service:
+        return False
+    if _is_media(msg) or msg.sticker or msg.poll or msg.dice:
+        return False
+    if msg.text or msg.caption:
+        return False
+    # В альбоме / «пустой» пост без текста — почти наверняка unsupported media
+    return True
+
+
 def _build_input_media(msg: Message, caption: Optional[str] = None):
     parse_mode = enums.ParseMode.HTML if caption else None
     if msg.photo:
@@ -108,6 +120,15 @@ def _build_input_media(msg: Message, caption: Optional[str] = None):
     return None
 
 
+def _attach_caption(item, caption: Optional[str]):
+    """Повесить подпись на уже собранный InputMedia*."""
+    if item is None or not caption:
+        return item
+    item.caption = caption
+    item.parse_mode = enums.ParseMode.HTML
+    return item
+
+
 class ChannelPoster:
     """Движок: юзербот читает источник и публикует в назначение."""
 
@@ -117,6 +138,74 @@ class ChannelPoster:
         self._seen_grouped: set[str] = set()
         self._rewrite_cancel = False
         self._busy = False
+
+    async def _materialize_message(self, msg: Message) -> Optional[Message]:
+        """
+        Получить сообщение с нормальным file_id.
+        MessageMediaUnsupported → forward в Saved Messages (drop_author),
+        откуда Pyrogram уже видит video/document.
+        """
+        if _build_input_media(msg) is not None:
+            return msg
+        if not _is_unsupported_media(msg):
+            return None
+        try:
+            from pyrogram import raw
+
+            r = await self.client.invoke(
+                raw.functions.messages.ForwardMessages(
+                    to_peer=await self.client.resolve_peer("me"),
+                    from_peer=await self.client.resolve_peer(msg.chat.id),
+                    id=[msg.id],
+                    random_id=[self.client.rnd_id()],
+                    drop_author=True,
+                    drop_media_captions=True,
+                )
+            )
+            new_id = None
+            for u in r.updates:
+                if hasattr(u, "id") and hasattr(u, "random_id") and not hasattr(u, "pts"):
+                    # UpdateMessageID
+                    new_id = u.id
+                if hasattr(u, "message") and getattr(u.message, "id", None):
+                    new_id = u.message.id
+            if not new_id:
+                logger.warning("materialize %s: no new message id in updates", msg.id)
+                return None
+            temp = await self.client.get_messages("me", new_id)
+            if temp is None or getattr(temp, "empty", False):
+                return None
+            if _build_input_media(temp) is None:
+                await self.client.delete_messages("me", new_id)
+                logger.warning("materialize %s: still unsupported after forward", msg.id)
+                return None
+            # помечаем id для очистки после сборки file_id
+            temp._reposter_tmp_id = new_id  # type: ignore[attr-defined]
+            return temp
+        except Exception as e:
+            logger.warning("materialize %s failed: %s", msg.id, e)
+            return None
+
+    async def _input_media_from_msg(
+        self, msg: Message, caption: Optional[str] = None
+    ):
+        """InputMedia* из сообщения; unsupported — через Saved Messages."""
+        item = _build_input_media(msg, caption=None)
+        tmp_id = None
+        if item is None:
+            temp = await self._materialize_message(msg)
+            if temp is None:
+                return None
+            tmp_id = getattr(temp, "_reposter_tmp_id", None)
+            item = _build_input_media(temp, caption=None)
+            if tmp_id:
+                try:
+                    await self.client.delete_messages("me", tmp_id)
+                except Exception:
+                    pass
+        if item is None:
+            return None
+        return _attach_caption(item, caption)
 
     # ------------------------------------------------------------------ API
 
@@ -295,9 +384,13 @@ class ChannelPoster:
                 return "skip"
             return await self._publish_album(source, target, msg, caption)
 
-        if not _is_media(msg) and not (msg.text or msg.caption):
-            return "skip"
-        return await self._publish_single(target, msg, caption)
+        if _is_media(msg) or (msg.text or msg.caption):
+            return await self._publish_single(target, msg, caption)
+
+        if _is_unsupported_media(msg):
+            return await self._publish_single(target, msg, caption)
+
+        return "skip"
 
     async def _publish_single(self, target, msg: Message, caption: str) -> str:
         try:
@@ -320,7 +413,7 @@ class ChannelPoster:
                         )
                     else:
                         raise
-            else:
+            elif msg.text or msg.caption:
                 text = caption if caption else (msg.text or msg.caption or "")
                 if not text:
                     return "skip"
@@ -335,8 +428,66 @@ class ChannelPoster:
                         sent = await self.client.send_message(chat_id=target, text=text)
                     else:
                         raise
+            else:
+                # MessageMediaUnsupported и т.п. — материализуем и шлём с шаблоном
+                item = await self._input_media_from_msg(msg, caption=caption or None)
+                if item is None:
+                    logger.warning("skip unsupported single %s", msg.id)
+                    self.db.add_history(msg.id, status="error", error="unsupported media")
+                    return "skip"
+                media_type = type(item).__name__
+                try:
+                    if isinstance(item, InputMediaPhoto):
+                        sent = await self.client.send_photo(
+                            target,
+                            item.media,
+                            caption=caption or None,
+                            parse_mode=enums.ParseMode.HTML if caption else None,
+                        )
+                    elif isinstance(item, InputMediaVideo):
+                        sent = await self.client.send_video(
+                            target,
+                            item.media,
+                            caption=caption or None,
+                            parse_mode=enums.ParseMode.HTML if caption else None,
+                        )
+                    else:
+                        sent = await self.client.send_document(
+                            target,
+                            item.media,
+                            caption=caption or None,
+                            parse_mode=enums.ParseMode.HTML if caption else None,
+                        )
+                except RPCError as e:
+                    if caption and "parse" in str(e).lower():
+                        if isinstance(item, InputMediaPhoto):
+                            sent = await self.client.send_photo(
+                                target, item.media, caption=caption
+                            )
+                        elif isinstance(item, InputMediaVideo):
+                            sent = await self.client.send_video(
+                                target, item.media, caption=caption
+                            )
+                        else:
+                            sent = await self.client.send_document(
+                                target, item.media, caption=caption
+                            )
+                    else:
+                        logger.error("unsupported single %s (%s): %s", msg.id, media_type, e)
+                        raise
 
             tid = sent.id if isinstance(sent, Message) else None
+            # страховка: шаблон должен быть на медиа
+            if (
+                caption
+                and isinstance(sent, Message)
+                and _is_media(sent)
+                and not (sent.caption or "").strip()
+            ):
+                logger.warning(
+                    "single %s published without caption — template was expected",
+                    msg.id,
+                )
             self.db.add_history(msg.id, target_message_id=tid, status="ok")
             logger.info("published %s → %s", msg.id, tid)
             return "ok"
@@ -344,7 +495,7 @@ class ChannelPoster:
             raise
         except ChatWriteForbidden:
             return "fatal"
-        except RPCError as e:
+        except (RPCError, ValueError) as e:
             err = str(e).upper()
             if "WRITE_FORBIDDEN" in err or "CHAT_WRITE" in err:
                 return "fatal"
@@ -416,34 +567,70 @@ class ChannelPoster:
     async def _send_album_with_caption(
         self, target, album: list[Message], caption: str
     ) -> list[Message]:
-        """Собрать InputMedia* и отправить альбом; caption только на первом."""
+        """
+        Собрать InputMedia* и отправить альбом.
+        Подпись — на ПЕРВОМ успешно собранном медиа (не на index 0 альбома:
+        первый файл часто MessageMediaUnsupported и раньше «съедал» шаблон).
+        """
         media_list = []
-        for i, m in enumerate(album):
-            item = _build_input_media(
-                m, caption=caption if i == 0 and caption else None
-            )
-            if item is not None:
-                media_list.append(item)
+        caption_pending = caption or None
+        for m in album:
+            item = await self._input_media_from_msg(m, caption=None)
+            if item is None:
+                logger.warning(
+                    "album item %s skipped (unsupported/unreadable media)", m.id
+                )
+                continue
+            if caption_pending:
+                _attach_caption(item, caption_pending)
+                caption_pending = None
+            media_list.append(item)
+
         if not media_list:
             raise ValueError("album has no copyable media")
+        if caption and caption_pending:
+            # на всякий случай — шаблон так и не повесили
+            _attach_caption(media_list[0], caption)
 
         try:
-            return await self.client.send_media_group(chat_id=target, media=media_list)
+            sent = await self.client.send_media_group(chat_id=target, media=media_list)
         except RPCError as e:
             if caption and "parse" in str(e).lower():
-                media_list = []
-                for i, m in enumerate(album):
-                    item = _build_input_media(
-                        m, caption=caption if i == 0 and caption else None
-                    )
-                    if item is not None:
-                        if hasattr(item, "parse_mode"):
-                            item.parse_mode = None
-                        media_list.append(item)
-                return await self.client.send_media_group(
+                for item in media_list:
+                    if getattr(item, "caption", None):
+                        item.parse_mode = None
+                sent = await self.client.send_media_group(
                     chat_id=target, media=media_list
                 )
-            raise
+            else:
+                raise
+
+        if caption and sent and not (sent[0].caption or "").strip():
+            # не редактируем (метки «изменено» нет) — пересылаем заново один раз
+            logger.warning(
+                "album sent without caption, retrying with explicit template on first media"
+            )
+            try:
+                await self.client.delete_messages(target, [m.id for m in sent])
+            except Exception:
+                pass
+            for item in media_list:
+                item.caption = None
+                item.parse_mode = None
+            _attach_caption(media_list[0], caption)
+            try:
+                sent = await self.client.send_media_group(
+                    chat_id=target, media=media_list
+                )
+            except RPCError:
+                media_list[0].parse_mode = None
+                sent = await self.client.send_media_group(
+                    chat_id=target, media=media_list
+                )
+            if not (sent[0].caption or "").strip():
+                logger.error("album still without caption after retry")
+
+        return sent
 
     # ------------------------------------------------------------------ rewrite
 
