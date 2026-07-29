@@ -1450,9 +1450,13 @@ async def get_main_menu_text(user, texts, db: AsyncSession):
     try:
         subscription = getattr(user, 'subscription', None)
         if settings.is_multi_tariff_enabled():
-            from app.database.crud.subscription import get_all_subscriptions_by_user_id
+            # Prefer already-loaded relationship to avoid an extra DB round-trip
+            # on every main-menu render (same selection rules as before).
+            subscriptions = list(getattr(user, 'subscriptions', None) or [])
+            if not subscriptions:
+                from app.database.crud.subscription import get_all_subscriptions_by_user_id
 
-            subscriptions = await get_all_subscriptions_by_user_id(db, user.id)
+                subscriptions = await get_all_subscriptions_by_user_id(db, user.id)
             active = [s for s in subscriptions if getattr(s, 'is_active', False)]
             subscription = active[0] if active else (subscriptions[0] if subscriptions else None)
 
