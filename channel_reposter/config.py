@@ -38,6 +38,14 @@ SOURCE_CHANNEL: str = _optional("SOURCE_CHANNEL")
 TARGET_CHANNEL: str = _optional("TARGET_CHANNEL")
 ADMIN_IDS: list[int] = _parse_int_list(_optional("ADMIN_IDS"))
 
+# Юзербот (сессия уже может быть сохранена в SQLite / .session)
+_API_ID_RAW = _optional("API_ID")
+API_ID: int | None = int(_API_ID_RAW) if _API_ID_RAW.isdigit() else None
+API_HASH: str = _optional("API_HASH")
+PHONE: str = _optional("PHONE")
+PASSWORD: str = _optional("PASSWORD")
+SESSION_NAME: str = _optional("SESSION_NAME", "reposter_userbot") or "reposter_userbot"
+
 DATABASE_PATH: Path = Path(
     _optional("DATABASE_PATH", str(_BASE_DIR / "data" / "reposter.db"))
     or str(_BASE_DIR / "data" / "reposter.db")

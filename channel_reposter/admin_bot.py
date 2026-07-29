@@ -44,20 +44,26 @@ _poster = None
 _trigger: Optional[Callable] = None
 _bot_username = ""
 _rewrite_task: Optional[asyncio.Task] = None
+_bridge = None
+_bot = None
 
 
 def set_dependencies(
     db: Database,
-    poster,
+    poster=None,
     trigger_cycle: Optional[Callable] = None,
     bot_username: str = "",
+    bridge=None,
+    bot=None,
     **_kwargs,
 ) -> None:
-    global _db, _poster, _trigger, _bot_username
+    global _db, _poster, _trigger, _bot_username, _bridge, _bot
     _db = db
     _poster = poster
     _trigger = trigger_cycle
     _bot_username = bot_username or ""
+    _bridge = bridge
+    _bot = bot
 
 
 def _require_db() -> Database:
@@ -66,8 +72,24 @@ def _require_db() -> Database:
 
 
 def _require_poster():
+    """Юзербот-poster если есть, иначе Bot API fallback."""
+    if _bridge is not None and getattr(_bridge, "poster", None) is not None:
+        return _bridge.poster
     assert _poster is not None
     return _poster
+
+
+def _has_userbot() -> bool:
+    return bool(_bridge and _bridge.auth and _bridge.auth.is_ready and _bridge.poster)
+
+
+async def _call_poster(method_name: str, *args, **kwargs):
+    """Вызов метода poster в правильном loop (worker или текущий)."""
+    poster = _require_poster()
+    method = getattr(poster, method_name)
+    if _bridge is not None and poster is getattr(_bridge, "poster", None):
+        return await _bridge.call(method(*args, **kwargs))
+    return await method(*args, **kwargs)
 
 
 def is_admin(uid: Optional[int]) -> bool:
@@ -111,7 +133,10 @@ def menu_kb(running: bool) -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="📥 Источник", callback_data="a:source"),
                 InlineKeyboardButton(text="📤 Назначение", callback_data="a:target"),
             ],
-            [InlineKeyboardButton(text="⚡ Цикл сейчас", callback_data="a:run")],
+            [
+                InlineKeyboardButton(text="⚡ Цикл сейчас", callback_data="a:run"),
+                InlineKeyboardButton(text="🧪 Тест", callback_data="a:test"),
+            ],
         ]
     )
 
@@ -126,9 +151,11 @@ def status_text(db: Database) -> str:
     s = db.get_settings()
     st = "🟢 Работает" if s.is_running else "🔴 На паузе"
     bot = f"@{_bot_username}" if _bot_username else "бот"
+    engine = "🟢 USERBOT (читает источник)" if _has_userbot() else "🔴 нет сессии копирования"
     return (
-        f"<b>📊 Channel Reposter</b> (Bot API)\n\n"
-        f"Бот: <code>{bot}</code>\n"
+        f"<b>📊 Channel Reposter</b>\n\n"
+        f"Админ-бот: <code>{bot}</code>\n"
+        f"Движок копирования: {engine}\n"
         f"Автопостинг: <b>{st}</b>\n"
         f"Источник: <code>{s.source_channel or '—'}</code>\n"
         f"Назначение: <code>{s.target_channel or '—'}</code>\n"
@@ -138,8 +165,8 @@ def status_text(db: Database) -> str:
         f"Скопировано: <b>{db.history_count()}</b>\n"
         f"Старт-ссылка: <code>{s.start_link or 'не задана'}</code>\n\n"
         f"<b>Описание:</b>\n<code>{safe_preview(s.caption_template, 250)}</code>\n\n"
-        f"<i>Добавьте {bot} админом только в <b>ваш</b> канал-назначение. "
-        f"Источник — публичный канал (@username), админство там не нужно.</i>"
+        f"<i>{bot} — админ только в вашем канале. "
+        f"Чтение источника — через сохранённый аккаунт. /test</i>"
     )
 
 
@@ -154,17 +181,12 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
     bot = f"@{_bot_username}" if _bot_username else "бота"
     await message.answer(
         "<b>Channel Reposter</b>\n\n"
-        "Без api_id / api_hash. Обычный бот.\n\n"
-        f"1️⃣ Добавьте {bot} <b>админом</b> только в <b>ваш</b> канал "
-        "(куда публиковать) — с правом писать сообщения.\n"
-        "2️⃣ «📤 Назначение» — ваш канал\n"
-        "3️⃣ «📥 Источник» — публичный канал (@username), откуда брать контент "
-        "(админом там быть не нужно)\n"
-        "4️⃣ «🔗 Старт-ссылка» — пост в источнике, <b>после которого</b> начинать\n"
-        "5️⃣ «✏️ Текст описания» — можно с жирным/ссылками как в чате\n"
-        "6️⃣ «▶️ Старт»\n\n"
-        "Команды: /status /set_source /set_target /set_link /set_caption "
-        "/run /pause /run_now /rewrite",
+        f"1️⃣ {bot} — <b>админ только в вашем</b> канале.\n"
+        "2️⃣ Источник — публичный @channel (бот туда не нужен).\n"
+        "3️⃣ Старт-ссылка, описание, «▶️ Старт».\n\n"
+        "Схема: аккаунт читает источник → бот публикует у вас.\n"
+        "<b>/test</b> — диагностика + пробный пост.\n"
+        "/status /set_source /set_target /set_link /set_caption /run /pause /run_now",
         reply_markup=menu_kb(db.get_settings().is_running),
         parse_mode="HTML",
     )
@@ -332,10 +354,17 @@ async def cmd_rewrite(message: Message, state: FSMContext, command: CommandObjec
 async def cmd_cancel_rewrite(message: Message) -> None:
     if await _deny(message.from_user.id if message.from_user else None, message.answer):
         return
-    poster = _poster
-    if poster and hasattr(poster, "cancel_rewrite"):
+    poster = _require_poster()
+    if hasattr(poster, "cancel_rewrite"):
         poster.cancel_rewrite()
     await message.answer("⏹ Запрошена остановка rewrite.")
+
+
+@router.message(Command("test"))
+async def cmd_test(message: Message) -> None:
+    if await _deny(message.from_user.id if message.from_user else None, message.answer):
+        return
+    await _run_test(message)
 
 
 # ----- callbacks -----
@@ -456,6 +485,14 @@ async def cb_run(c: CallbackQuery) -> None:
         return
     await c.answer("Запуск…")
     await _do_run_now(c.message.answer)  # type: ignore[union-attr]
+
+
+@router.callback_query(F.data == "a:test")
+async def cb_test(c: CallbackQuery) -> None:
+    if await _deny(c.from_user.id, c.answer):
+        return
+    await c.answer()
+    await _run_test(c.message)  # type: ignore[arg-type]
 
 
 @router.callback_query(F.data == "a:rewrite")
@@ -606,16 +643,13 @@ async def on_rw_lim(message: Message, state: FSMContext) -> None:
 async def _apply_link(message: Message, link: str) -> None:
     try:
         chat, mid = parse_post_link(link)
-        # Для Bot API надёжнее публичный @username, не t.me/c/...
         if isinstance(chat, int):
             await message.answer(
-                "⚠️ Ссылка вида <code>t.me/c/…</code> — приватный канал.\n"
-                "Без админства в источнике бот его не прочитает.\n"
-                "Укажите публичный источник <code>@username</code> "
-                "и ссылку вида <code>https://t.me/username/123</code>.",
+                "⚠️ Приватная ссылка t.me/c/…\n"
+                "Лучше публичная: <code>https://t.me/username/123</code>",
                 parse_mode="HTML",
             )
-        chat, mid = await _require_poster().apply_start_link(link)
+        chat, mid = await _call_poster("apply_start_link", link)
     except Exception as e:
         await message.answer(f"❌ {e}")
         return
@@ -632,13 +666,20 @@ async def _do_run_now(answer) -> None:
     db = _require_db()
     s = db.get_settings()
     if not s.source_channel or not s.target_channel or s.progress_id <= 0:
-        await answer("⚠️ Нужны каналы и стартовая ссылка.")
+        await answer("⚠️ Нужны каналы и стартовая ссылка. Сначала /test")
+        return
+    if not _has_userbot():
+        await answer(
+            "❌ Нет сессии для чтения источника.\n"
+            "Обычный бот не видит посты чужого канала, если он там не админ.\n"
+            "Нужна рабочая сессия юзербота (уже была) или /login."
+        )
         return
     was = s.is_running
     db.set_running(True)
     await answer("⚡ Цикл…")
     try:
-        n = await _trigger() if _trigger else await _require_poster().run_cycle()
+        n = await _call_poster("run_cycle")
         await answer(
             f"✅ Опубликовано: <b>{n}</b>",
             reply_markup=menu_kb(db.get_settings().is_running),
@@ -650,6 +691,137 @@ async def _do_run_now(answer) -> None:
     finally:
         if not was:
             db.set_running(False)
+
+
+async def _run_test(message: Message) -> None:
+    """Полная диагностика + пробная публикация 1 поста."""
+    db = _require_db()
+    s = db.get_settings()
+    lines = ["<b>🧪 Тест-режим</b>\n"]
+    ok_flags = []
+
+    # 1) settings
+    src = (s.source_channel or "").strip()
+    dst = (s.target_channel or "").strip()
+    if src and not src.startswith("@") and not src.lstrip("-").isdigit():
+        src = "@" + src
+        db.set_source_channel(src)
+    if dst and not dst.startswith("@") and not dst.lstrip("-").isdigit():
+        dst = "@" + dst
+        db.set_target_channel(dst)
+
+    lines.append(f"Источник: <code>{src or '❌ не задан'}</code>")
+    lines.append(f"Назначение: <code>{dst or '❌ не задан'}</code>")
+    lines.append(f"Progress: <code>{s.progress_id}</code> → next <code>{s.progress_id + 1 if s.progress_id else '—'}</code>")
+    ok_flags.append(bool(src and dst and s.progress_id > 0))
+
+    # 2) bot admin in target
+    if _bot is None or not dst:
+        lines.append("Бот в назначении: ❌ нет бота/канала")
+        ok_flags.append(False)
+    else:
+        try:
+            me = await _bot.get_me()
+            member = await _bot.get_chat_member(dst, me.id)
+            can_post = getattr(member, "can_post_messages", None)
+            status = member.status
+            good = status in ("administrator", "creator") and (can_post in (True, None) or status == "creator")
+            lines.append(
+                f"Бот админ в вашем канале: {'✅' if good else '❌'} "
+                f"(status=<code>{status}</code>, can_post=<code>{can_post}</code>)"
+            )
+            ok_flags.append(bool(good))
+        except Exception as e:
+            lines.append(f"Бот админ в вашем канале: ❌ {e}")
+            ok_flags.append(False)
+
+    # 3) userbot session
+    if _has_userbot():
+        try:
+            b = _bridge
+            st = await b.call(b.auth.status_text())
+            lines.append(f"Сессия копирования: ✅ {st}")
+            ok_flags.append(True)
+        except Exception as e:
+            lines.append(f"Сессия копирования: ❌ {e}")
+            ok_flags.append(False)
+    else:
+        lines.append(
+            "Сессия копирования: ❌ нет\n"
+            "<i>Без неё Bot API не читает чужой канал (бот не может быть «подписчиком»).</i>"
+        )
+        ok_flags.append(False)
+
+    # 4) userbot can see source
+    if _has_userbot() and src:
+        try:
+            async def _probe_source():
+                client = _bridge.auth.client
+                chat = await client.get_chat(src)
+                return f"{chat.title} (id={chat.id})"
+
+            info = await _bridge.call(_probe_source())
+            lines.append(f"Источник доступен аккаунту: ✅ {info}")
+            ok_flags.append(True)
+        except Exception as e:
+            lines.append(f"Источник доступен аккаунту: ❌ {e}")
+            ok_flags.append(False)
+
+    # 5) Bot API copy probe (expected fail if bot not in source)
+    if _bot and src and dst and s.progress_id > 0:
+        mid = s.progress_id + 1
+        try:
+            sent = await _bot.copy_message(chat_id=dst, from_chat_id=src, message_id=mid)
+            lines.append(f"Bot API copy #{mid}: ✅ (msg {sent.message_id})")
+            try:
+                await _bot.delete_message(dst, sent.message_id)
+            except Exception:
+                pass
+        except Exception as e:
+            lines.append(
+                f"Bot API copy #{mid}: ❌ <code>{e}</code>\n"
+                f"<i>Это нормально, если бот не админ в источнике — копируем юзерботом.</i>"
+            )
+
+    # 6) Real publish test via userbot (1 post), then optional note
+    await message.answer("\n".join(lines), parse_mode="HTML")
+
+    if not _has_userbot():
+        await message.answer(
+            "🛠 Чтобы заработало без добавления бота в источник — нужна сессия аккаунта.\n"
+            "Если раньше уже делали /login, перезапустите процесс; иначе выполните /login один раз.",
+            reply_markup=menu_kb(db.get_settings().is_running),
+        )
+        return
+
+    await message.answer("⏳ Пробую опубликовать <b>1</b> пост юзерботом…", parse_mode="HTML")
+    was = db.get_settings().is_running
+    db.set_running(True)
+    # temporarily limit 1
+    old_limit = db.get_settings().posts_per_cycle
+    db.set_posts_per_cycle(1)
+    try:
+        n = await _call_poster("run_cycle")
+        if n > 0:
+            await message.answer(
+                f"✅ Тест успешен: опубликовано <b>{n}</b> пост(ов).\nМожно жать «Старт».",
+                reply_markup=menu_kb(was),
+                parse_mode="HTML",
+            )
+        else:
+            await message.answer(
+                "⚠️ Движок отработал, но 0 постов.\n"
+                "Возможны дыры в ID после progress, нет медиа, или аккаунт не видит посты.\n"
+                "Попробуйте обновить стартовую ссылку на свежий пост.",
+                reply_markup=menu_kb(was),
+                parse_mode="HTML",
+            )
+    except Exception as e:
+        logger.exception("test cycle")
+        await message.answer(f"❌ Ошибка теста: {e}", reply_markup=menu_kb(was))
+    finally:
+        db.set_posts_per_cycle(old_limit)
+        db.set_running(was)
 
 
 async def _prompt_rewrite(message: Message, state: FSMContext) -> None:
@@ -664,15 +836,14 @@ async def _prompt_rewrite(message: Message, state: FSMContext) -> None:
         await state.set_state(S.rewrite_limit)
         await message.answer(
             f"Канал: <code>{target}</code>\n"
-            "Сколько последних <b>опубликованных ботом</b> постов обновить?\n"
-            "Число или <code>all</code>\n\n"
-            "<i>Обновляются только посты, которые бот сам скопировал.</i>",
+            "Сколько последних опубликованных постов обновить?\n"
+            "Число или <code>all</code>",
             reply_markup=cancel_kb(),
             parse_mode="HTML",
         )
         return
     await state.set_state(S.rewrite_channel)
-    await message.answer("✍️ Канал назначения (@name / -100...):", reply_markup=cancel_kb())
+    await message.answer("✍️ Канал назначения:", reply_markup=cancel_kb())
 
 
 async def _run_rewrite(message: Message, channel: str, limit: Optional[int]) -> None:
@@ -684,16 +855,11 @@ async def _run_rewrite(message: Message, channel: str, limit: Optional[int]) -> 
         await message.answer("⚠️ Rewrite уже идёт. /cancel_rewrite")
         return
 
-    await message.answer(
-        f"⏳ Обновляю подписи в <code>{channel}</code>…",
-        parse_mode="HTML",
-    )
+    await message.answer(f"⏳ Обновляю подписи в <code>{channel}</code>…", parse_mode="HTML")
 
     async def job():
         try:
-            result = await _require_poster().rewrite_captions_in_channel(
-                channel, max_posts=limit
-            )
+            result = await _call_poster("rewrite_captions_in_channel", channel, max_posts=limit)
             st = "⏹ Отменено" if result.get("cancelled") else "✅ Готово"
             await message.answer(
                 f"{st}\n"
