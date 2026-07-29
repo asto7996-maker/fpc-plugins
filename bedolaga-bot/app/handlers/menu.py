@@ -1477,20 +1477,13 @@ async def get_main_menu_text(user, texts, db: AsyncSession):
         'MAIN_MENU_TAGLINE',
         'Ваш надежный инструмент для защиты приватности и безопасного интернет-соединения.',
     )
-    support = (settings.get_support_username() if hasattr(settings, 'get_support_username') else None) or getattr(
-        settings, 'SUPPORT_USERNAME', '@HelperSlllS'
-    )
-    support = (support or '@HelperSlllS').strip()
-    if support and not support.startswith('@') and not support.startswith('http'):
-        support = f'@{support}'
 
     base_text = (
         f'{pe("⭐️")} <b>Добро пожаловать!</b>\n'
         f'{pe("👤")} <b>Ваш профиль:</b>\n'
         f'{pe("💰")} Баланс: <b>{html.escape(balance)}</b>\n'
         f'{pe("📝")} Тариф: {tariff_line}\n\n'
-        f'{pe("💡")} <i>{html.escape(tagline)}</i>\n'
-        f'{html.escape(support)}'
+        f'{pe("💡")} <i>{html.escape(tagline)}</i>'
     )
 
     info_sections: list[str] = []
