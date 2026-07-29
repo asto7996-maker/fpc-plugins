@@ -182,6 +182,8 @@ class HybridPoster:
 
     async def _download(self, msg: Message) -> Optional[Path]:
         """Скачать медиа сообщения во временный файл."""
+        if not _is_media(msg):
+            return None
         try:
             path = await self.client.download_media(msg, file_name=str(self._tmp) + "/")
             if not path:
@@ -189,6 +191,10 @@ class HybridPoster:
             return Path(path)
         except FloodWait:
             raise
+        except ValueError:
+            # веб-превью / без файла
+            logger.warning("no downloadable media id=%s", msg.id)
+            return None
         except Exception:
             logger.exception("download fail id=%s", msg.id)
             return None
@@ -280,14 +286,24 @@ class HybridPoster:
 
             sent_list = await self.bot.send_media_group(chat_id=target, media=media)
             first_id = sent_list[0].message_id if sent_list else None
+            max_src = anchor.id
             for m in album:
+                max_src = max(max_src, m.id)
                 self.db.add_history(
                     source_message_id=m.id,
                     target_message_id=first_id,
                     grouped_id=gid,
                     status="ok",
                 )
-            logger.info("Hybrid album %s (%s files) → %s", gid, len(media), first_id)
+            # Прогресс сразу на последний ID альбома (не на якорь)
+            self.db.set_progress_id(max_src)
+            logger.info(
+                "Hybrid album %s (%s files) → %s (progress=%s)",
+                gid,
+                len(media),
+                first_id,
+                max_src,
+            )
             return "ok"
         except TelegramRetryAfter as e:
             self._seen_grouped.discard(gid)
