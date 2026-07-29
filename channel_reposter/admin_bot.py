@@ -44,6 +44,7 @@ _poster = None
 _trigger: Optional[Callable] = None
 _bot_username = ""
 _rewrite_task: Optional[asyncio.Task] = None
+_cycle_task: Optional[asyncio.Task] = None
 _bridge = None
 _bot = None
 
@@ -83,13 +84,18 @@ def _has_userbot() -> bool:
     return bool(_bridge and _bridge.auth and _bridge.auth.is_ready and _bridge.poster)
 
 
-async def _call_poster(method_name: str, *args, **kwargs):
+async def _call_poster(method_name: str, *args, timeout: Optional[float] = 120.0, **kwargs):
     """Вызов метода poster в правильном loop (worker или текущий)."""
     poster = _require_poster()
     method = getattr(poster, method_name)
     if _bridge is not None and poster is getattr(_bridge, "poster", None):
-        return await _bridge.call(method(*args, **kwargs))
+        return await _bridge.call(method(*args, **kwargs), timeout=timeout)
     return await method(*args, **kwargs)
+
+
+def _spawn_bg(coro) -> asyncio.Task:
+    """Фоновая задача на admin-loop — не блокирует кнопки."""
+    return asyncio.create_task(coro)
 
 
 def is_admin(uid: Optional[int]) -> bool:
@@ -670,6 +676,8 @@ async def _apply_link(message: Message, link: str) -> None:
 
 
 async def _do_run_now(answer) -> None:
+    """Запуск цикла в фоне — кнопки админки не зависают."""
+    global _cycle_task
     db = _require_db()
     s = db.get_settings()
     if not s.source_channel or not s.target_channel or s.progress_id <= 0:
@@ -682,22 +690,31 @@ async def _do_run_now(answer) -> None:
             "Нужна рабочая сессия юзербота (уже была) или /login."
         )
         return
+    if _cycle_task and not _cycle_task.done():
+        await answer("⏳ Цикл уже выполняется, подождите…")
+        return
+
     was = s.is_running
     db.set_running(True)
-    await answer("⚡ Цикл…")
-    try:
-        n = await _call_poster("run_cycle")
-        await answer(
-            f"✅ Опубликовано: <b>{n}</b>",
-            reply_markup=menu_kb(db.get_settings().is_running),
-            parse_mode="HTML",
-        )
-    except Exception as e:
-        logger.exception("run_now")
-        await answer(f"❌ {e}")
-    finally:
-        if not was:
-            db.set_running(False)
+    await answer("⚡ Цикл запущен в фоне. Кнопки работают.")
+
+    async def _job():
+        try:
+            # Без таймаута на весь цикл — но админ-loop свободен
+            n = await _call_poster("run_cycle", timeout=None)
+            await answer(
+                f"✅ Опубликовано: <b>{n}</b>",
+                reply_markup=menu_kb(db.get_settings().is_running),
+                parse_mode="HTML",
+            )
+        except Exception as e:
+            logger.exception("run_now")
+            await answer(f"❌ {e}")
+        finally:
+            if not was:
+                db.set_running(False)
+
+    _cycle_task = _spawn_bg(_job())
 
 
 async def _run_test(message: Message) -> None:
@@ -746,7 +763,7 @@ async def _run_test(message: Message) -> None:
     if _has_userbot():
         try:
             b = _bridge
-            st = await b.call(b.auth.status_text())
+            st = await b.call(b.auth.status_text(), timeout=15)
             lines.append(f"Сессия копирования: ✅ {st}")
             ok_flags.append(True)
         except Exception as e:
@@ -767,7 +784,7 @@ async def _run_test(message: Message) -> None:
                 chat = await client.get_chat(src)
                 return f"{chat.title} (id={chat.id})"
 
-            info = await _bridge.call(_probe_source())
+            info = await _bridge.call(_probe_source(), timeout=20)
             lines.append(f"Источник доступен аккаунту: ✅ {info}")
             ok_flags.append(True)
         except Exception as e:
@@ -790,7 +807,7 @@ async def _run_test(message: Message) -> None:
                 f"<i>Это нормально, если бот не админ в источнике — копируем юзерботом.</i>"
             )
 
-    # 6) Real publish test via userbot (1 post), then optional note
+    # 6) diagnostics first (быстро), публикация — в фоне
     await message.answer("\n".join(lines), parse_mode="HTML")
 
     if not _has_userbot():
@@ -801,34 +818,48 @@ async def _run_test(message: Message) -> None:
         )
         return
 
-    await message.answer("⏳ Пробую опубликовать <b>1</b> пост юзерботом…", parse_mode="HTML")
+    global _cycle_task
+    if _cycle_task and not _cycle_task.done():
+        await message.answer(
+            "⏳ Публикация уже идёт в фоне. Кнопки свободны — смотрите статус.",
+            reply_markup=menu_kb(db.get_settings().is_running),
+        )
+        return
+
+    await message.answer(
+        "⏳ Публикую <b>1</b> пост в фоне… Кнопки не зависают.",
+        parse_mode="HTML",
+    )
     was = db.get_settings().is_running
     db.set_running(True)
-    # temporarily limit 1
     old_limit = db.get_settings().posts_per_cycle
     db.set_posts_per_cycle(1)
-    try:
-        n = await _call_poster("run_cycle")
-        if n > 0:
-            await message.answer(
-                f"✅ Тест успешен: опубликовано <b>{n}</b> пост(ов).\nМожно жать «Старт».",
-                reply_markup=menu_kb(was),
-                parse_mode="HTML",
-            )
-        else:
-            await message.answer(
-                "⚠️ Движок отработал, но 0 постов.\n"
-                "Возможны дыры в ID после progress, нет медиа, или аккаунт не видит посты.\n"
-                "Попробуйте обновить стартовую ссылку на свежий пост.",
-                reply_markup=menu_kb(was),
-                parse_mode="HTML",
-            )
-    except Exception as e:
-        logger.exception("test cycle")
-        await message.answer(f"❌ Ошибка теста: {e}", reply_markup=menu_kb(was))
-    finally:
-        db.set_posts_per_cycle(old_limit)
-        db.set_running(was)
+
+    async def _job():
+        try:
+            n = await _call_poster("run_cycle", timeout=None)
+            if n > 0:
+                await message.answer(
+                    f"✅ Тест успешен: опубликовано <b>{n}</b> пост(ов).\nМожно жать «Старт».",
+                    reply_markup=menu_kb(was),
+                    parse_mode="HTML",
+                )
+            else:
+                await message.answer(
+                    "⚠️ Движок отработал, но 0 постов.\n"
+                    "Возможны дыры в ID после progress, нет медиа, или аккаунт не видит посты.\n"
+                    "Попробуйте обновить стартовую ссылку на свежий пост.",
+                    reply_markup=menu_kb(was),
+                    parse_mode="HTML",
+                )
+        except Exception as e:
+            logger.exception("test cycle")
+            await message.answer(f"❌ Ошибка теста: {e}", reply_markup=menu_kb(was))
+        finally:
+            db.set_posts_per_cycle(old_limit)
+            db.set_running(was)
+
+    _cycle_task = _spawn_bg(_job())
 
 
 async def _prompt_rewrite(message: Message, state: FSMContext) -> None:
@@ -866,7 +897,9 @@ async def _run_rewrite(message: Message, channel: str, limit: Optional[int]) -> 
 
     async def job():
         try:
-            result = await _call_poster("rewrite_captions_in_channel", channel, max_posts=limit)
+            result = await _call_poster(
+                "rewrite_captions_in_channel", channel, max_posts=limit, timeout=None
+            )
             st = "⏹ Отменено" if result.get("cancelled") else "✅ Готово"
             await message.answer(
                 f"{st}\n"

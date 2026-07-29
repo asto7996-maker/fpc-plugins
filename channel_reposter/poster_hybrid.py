@@ -143,6 +143,7 @@ class HybridPoster:
         self.db = db
         self._seen_grouped: set[str] = set()
         self._rewrite_cancel = False
+        self._busy = False
         self._tmp = Path(tempfile.mkdtemp(prefix="reposter_"))
 
     async def apply_start_link(self, link: str) -> tuple[str | int, int]:
@@ -160,6 +161,16 @@ class HybridPoster:
         self._rewrite_cancel = True
 
     async def run_cycle(self) -> int:
+        if self._busy:
+            logger.warning("cycle skipped: already busy")
+            return 0
+        self._busy = True
+        try:
+            return await self._run_cycle_inner()
+        finally:
+            self._busy = False
+
+    async def _run_cycle_inner(self) -> int:
         settings = self.db.get_settings()
         if not settings.is_running:
             return 0
@@ -196,7 +207,9 @@ class HybridPoster:
             try:
                 result = await self._process(source, target, next_id, caption)
             except FloodWait as e:
-                await asyncio.sleep(int(e.value) + 1)
+                wait = min(int(e.value), 120)
+                logger.warning("FloodWait %ss (capped from %s)", wait, e.value)
+                await asyncio.sleep(wait + 1)
                 continue
             except ChatWriteForbidden:
                 logger.error("Нет прав писать в назначение (для бота проверьте админку)")
@@ -457,10 +470,12 @@ class HybridPoster:
             return config.ADMIN_IDS[0]
         return None
 
-    async def _stage_file_id(self, msg: Message, path: Path) -> Optional[tuple[str, str]]:
+    async def _stage_file_id(
+        self, msg: Message, path: Path, attempt: int = 1
+    ) -> Optional[tuple[str, str]]:
         """
         Загрузить файл в staging-чат → file_id → удалить.
-        Возвращает (file_id, kind) где kind: photo|video|document|audio.
+        Таймаут на файл, FloodWait ограничен — иначе админка «замирает» на часы.
         """
         stage = self._staging_chat()
         if stage is None:
@@ -468,33 +483,60 @@ class HybridPoster:
             return None
         file = FSInputFile(path)
         sent = None
+        upload_timeout = 90.0
         try:
             if msg.photo:
-                sent = await self.bot.send_photo(
-                    chat_id=stage, photo=file, disable_notification=True
+                sent = await asyncio.wait_for(
+                    self.bot.send_photo(
+                        chat_id=stage, photo=file, disable_notification=True
+                    ),
+                    timeout=upload_timeout,
                 )
                 kind, fid = "photo", sent.photo[-1].file_id
             elif msg.video or msg.animation:
-                sent = await self.bot.send_video(
-                    chat_id=stage, video=file, disable_notification=True
+                sent = await asyncio.wait_for(
+                    self.bot.send_video(
+                        chat_id=stage, video=file, disable_notification=True
+                    ),
+                    timeout=upload_timeout,
                 )
-                kind, fid = "video", sent.video.file_id if sent.video else sent.document.file_id
+                kind, fid = (
+                    "video",
+                    sent.video.file_id if sent.video else sent.document.file_id,
+                )
             elif msg.audio:
-                sent = await self.bot.send_audio(
-                    chat_id=stage, audio=file, disable_notification=True
+                sent = await asyncio.wait_for(
+                    self.bot.send_audio(
+                        chat_id=stage, audio=file, disable_notification=True
+                    ),
+                    timeout=upload_timeout,
                 )
                 kind, fid = "audio", sent.audio.file_id
             else:
-                sent = await self.bot.send_document(
-                    chat_id=stage, document=file, disable_notification=True
+                sent = await asyncio.wait_for(
+                    self.bot.send_document(
+                        chat_id=stage, document=file, disable_notification=True
+                    ),
+                    timeout=upload_timeout,
                 )
                 kind, fid = "document", sent.document.file_id
             return fid, kind
         except TelegramRetryAfter as e:
-            await asyncio.sleep(int(e.retry_after) + 1)
-            return await self._stage_file_id(msg, path)
+            wait = int(e.retry_after)
+            if wait > 60 or attempt >= 2:
+                logger.error("stage flood id=%s wait=%ss — skip file", msg.id, wait)
+                return None
+            logger.warning("stage flood id=%s sleep %ss", msg.id, wait)
+            await asyncio.sleep(wait + 1)
+            return await self._stage_file_id(msg, path, attempt + 1)
+        except asyncio.TimeoutError:
+            logger.error("stage timeout id=%s after %.0fs", msg.id, upload_timeout)
+            return None
         except Exception as e:
             logger.error("stage upload id=%s: %s", msg.id, e)
+            if attempt < 2 and _is_transient(e):
+                await asyncio.sleep(2)
+                return await self._stage_file_id(msg, path, attempt + 1)
             return None
         finally:
             if sent is not None:

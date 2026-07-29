@@ -53,10 +53,11 @@ async def _worker_bootstrap(db: Database, workdir: Path) -> str:
         logger.warning("Нет сессии юзербота")
         return "none"
 
-    # Отдельный Bot-клиент в worker-потоке для публикации (длинный timeout на большие видео)
+    # Отдельный Bot-клиент в worker-потоке для публикации
+    # 180s хватает на один файл; альбом идёт по файлам со своими таймаутами
     publish_bot = Bot(
         token=config.BOT_TOKEN,
-        session=AiohttpSession(timeout=600.0),
+        session=AiohttpSession(timeout=180.0),
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
     BRIDGE.publish_bot = publish_bot

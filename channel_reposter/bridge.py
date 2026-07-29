@@ -104,10 +104,17 @@ class WorkerBridge:
             raise RuntimeError("Worker не запущен")
         return asyncio.run_coroutine_threadsafe(coro, self._loop)
 
-    async def call(self, coro, timeout: Optional[float] = None) -> Any:
-        """Await результата worker-корутины из admin-loop."""
+    async def call(self, coro, timeout: Optional[float] = 120.0) -> Any:
+        """Await результата worker-корутины из admin-loop (с таймаутом)."""
         fut = self.submit(coro)
-        return await asyncio.wrap_future(fut)
+        wrapped = asyncio.wrap_future(fut)
+        if timeout is None:
+            return await wrapped
+        try:
+            return await asyncio.wait_for(wrapped, timeout=timeout)
+        except asyncio.TimeoutError:
+            fut.cancel()
+            raise TimeoutError(f"Worker timeout after {timeout}s")
 
     def notify(self, chat_id: int, text: str, **kwargs) -> None:
         """Отправить сообщение админу через aiogram (thread-safe)."""
