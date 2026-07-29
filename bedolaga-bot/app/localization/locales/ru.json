@@ -1305,7 +1305,7 @@
   "PERIOD_360_DAYS": "📅 360 дней - {settings.format_price(settings.PRICE_360_DAYS)}",
   "PERIOD_60_DAYS": "📅 60 дней - {settings.format_price(settings.PRICE_60_DAYS)}",
   "PERIOD_90_DAYS": "📅 90 дней - {settings.format_price(settings.PRICE_90_DAYS)}",
-  "POST_REGISTRATION_TRIAL_BUTTON": "🚀 Подключиться бесплатно 🚀",
+  "POST_REGISTRATION_TRIAL_BUTTON": "Подключиться бесплатно",
   "PRIVACY_POLICY_EMPTY_ALERT": "Политика конфиденциальности ещё не заполнена.",
   "PRIVACY_POLICY_HEADER": "🛡️ <b>Политика конфиденциальности</b>",
   "PRIVACY_POLICY_NOT_AVAILABLE": "Политика конфиденциальности временно недоступна.",
@@ -1460,7 +1460,7 @@
   "SERVER_STATUS_UPDATED_AT": "⏱ Обновлено: {time}",
   "SHOW_QR_BUTTON": "📱 Показать QR код",
   "SHOW_SUBSCRIPTION_LINK": "📋 Показать ссылку подписки",
-  "SKIP_BUTTON": "⏭️ Пропустить",
+  "SKIP_BUTTON": "Пропустить",
   "STARS_PAYMENT_ENROLLMENT_ERROR": "❌ Произошла ошибка при зачислении средств. Обратитесь в поддержку, платеж будет проверен вручную.",
   "STARS_PAYMENT_PROCESSING_ERROR": "❌ Техническая ошибка при обработке платежа. Обратитесь в поддержку для решения проблемы.",
   "STARS_PAYMENT_SUCCESS": "🎉 <b>Платеж успешно обработан!</b>\n\n⭐ Потрачено звезд: {stars_spent}\n💰 Зачислено на баланс: {amount} ₽\n🆔 ID транзакции: {transaction_id}...\n\nСпасибо за пополнение! 🚀",
@@ -1998,6 +1998,8 @@
   "REPLY_INFO": "Информация",
   "REPLY_SUPPORT": "Тех. поддержка",
   "WELCOME_REPLY_KEYBOARD_PROMPT": " ",
+  "ONBOARDING_CONSENT_TEXT": "{star} <b>Добро пожаловать!</b>\n\nПримите документы, чтобы продолжить:\n{doc} <a href=\"https://telegra.ph/POLZOVATELSKOE-SOGLASHENIE--PRAVILA-07-20\">Пользовательское соглашение</a>\n{lock} <a href=\"https://telegra.ph/POLITIKA-KONFIDENCIALNOSTI-07-20-83\">Политика конфиденциальности</a>\n\n<i>Нажимая «Согласиться», вы принимаете условия.</i>",
+  "ONBOARDING_CONSENT_DECLINED_TEXT": "{warn} Без согласия бот недоступен.\n\n<i>Ознакомьтесь с документами и нажмите «Согласиться».</i>",
   "ONBOARDING_CONSENT_ACCEPT": "Согласиться",
   "ONBOARDING_CONSENT_DECLINE": "Отказаться"
 }

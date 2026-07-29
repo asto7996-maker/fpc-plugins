@@ -198,15 +198,15 @@ _LANGUAGE_DISPLAY_NAMES = {
 
 ONBOARDING_CONSENT_TEXT = (
     '{star} <b>Добро пожаловать!</b>\n\n'
-    'Для продолжения ознакомьтесь и примите:\n'
+    'Примите документы, чтобы продолжить:\n'
     '{doc} <a href="https://telegra.ph/POLZOVATELSKOE-SOGLASHENIE--PRAVILA-07-20">Пользовательское соглашение</a>\n'
     '{lock} <a href="https://telegra.ph/POLITIKA-KONFIDENCIALNOSTI-07-20-83">Политика конфиденциальности</a>\n\n'
-    '<i>Нажимая «Согласиться», вы принимаете все условия.</i>'
+    '<i>Нажимая «Согласиться», вы принимаете условия.</i>'
 )
 
 ONBOARDING_CONSENT_DECLINED_TEXT = (
-    '{warn} Без согласия с документами использование бота невозможно.\n\n'
-    '<i>Ознакомьтесь с условиями и нажмите «Согласиться».</i>'
+    '{warn} Без согласия бот недоступен.\n\n'
+    '<i>Ознакомьтесь с документами и нажмите «Согласиться».</i>'
 )
 
 
@@ -322,16 +322,26 @@ def get_channel_sub_keyboard(
 
 
 def get_post_registration_keyboard(language: str = DEFAULT_LANGUAGE) -> InlineKeyboardMarkup:
+    from app.utils.premium_emoji import premium_button
+
     texts = get_texts(language)
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton(
-                    text=texts.t('POST_REGISTRATION_TRIAL_BUTTON', '🚀 Подключиться бесплатно 🚀'),
+                premium_button(
+                    texts.t('POST_REGISTRATION_TRIAL_BUTTON', 'Подключиться бесплатно'),
+                    icon='connect',
                     callback_data='trial_activate',
+                    style='success',
                 )
             ],
-            [InlineKeyboardButton(text=texts.t('SKIP_BUTTON', 'Пропустить ➡️'), callback_data='back_to_menu')],
+            [
+                premium_button(
+                    texts.t('SKIP_BUTTON', 'Пропустить'),
+                    icon='back',
+                    callback_data='back_to_menu',
+                )
+            ],
         ]
     )
 
