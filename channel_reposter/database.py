@@ -180,6 +180,19 @@ class Database:
         """Сохранить ID последнего обработанного поста (для продолжения после рестарта)."""
         self.set(SETTING_PROGRESS_ID, message_id)
 
+    def max_ok_source_id(self) -> int:
+        """Максимальный source_message_id со статусом ok (0 если пусто)."""
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT MAX(source_message_id) AS m FROM history
+                WHERE status = 'ok'
+                """
+            ).fetchone()
+        if not row or row["m"] is None:
+            return 0
+        return int(row["m"])
+
     def set_start_link(self, link: str) -> None:
         self.set(SETTING_START_LINK, link)
 

@@ -271,6 +271,15 @@ class ChannelPoster:
         finally:
             self._busy = False
 
+    async def _latest_message_id(self, source: int | str) -> int:
+        """ID последнего поста в канале (0 если пусто)."""
+        try:
+            async for msg in self.client.get_chat_history(source, limit=1):
+                return int(msg.id)
+        except Exception as e:
+            logger.warning("latest_message_id failed: %s", e)
+        return 0
+
     async def _run_cycle_inner(self) -> int:
         settings = self.db.get_settings()
         if not settings.is_running:
@@ -286,6 +295,34 @@ class ChannelPoster:
             logger.warning("progress_id не задан")
             return 0
 
+        latest = await self._latest_message_id(source)
+        if latest <= 0:
+            logger.warning("Источник пуст или недоступен")
+            return 0
+
+        # Progress ускакал вперёд по ещё несуществующим ID (дыра у «конца» канала)
+        if settings.progress_id > latest:
+            rewind = self.db.max_ok_source_id()
+            if rewind > latest:
+                rewind = latest
+            # не выше latest, но и не теряем неопубликованный хвост после last ok
+            logger.warning(
+                "progress %s > latest %s — откат к %s",
+                settings.progress_id,
+                latest,
+                rewind,
+            )
+            self.db.set_progress_id(rewind)
+            settings = self.db.get_settings()
+
+        if settings.progress_id >= latest:
+            logger.info(
+                "Нет новых постов: progress=%s latest=%s",
+                settings.progress_id,
+                latest,
+            )
+            return 0
+
         limit = settings.posts_per_cycle
         caption = settings.caption_template or ""
         next_id = settings.progress_id + 1
@@ -294,16 +331,27 @@ class ChannelPoster:
         self._seen_grouped.clear()
 
         logger.info(
-            "USERBOT cycle %s → %s after=%s limit=%s",
+            "USERBOT cycle %s → %s after=%s latest=%s limit=%s",
             source,
             target,
             settings.progress_id,
+            latest,
             limit,
         )
 
         while published < limit and empty_streak < 50:
             if not self.db.get_settings().is_running:
                 break
+            if next_id > latest:
+                # Обновим «кончик» — вдруг за время цикла появились новые посты
+                latest = await self._latest_message_id(source)
+                if next_id > latest:
+                    logger.info(
+                        "Дошли до конца источника (next=%s latest=%s)",
+                        next_id,
+                        latest,
+                    )
+                    break
             if self.db.was_processed(next_id):
                 self.db.set_progress_id(next_id)
                 next_id += 1
@@ -335,6 +383,17 @@ class ChannelPoster:
                 continue
 
             if result == "empty":
+                # Пустой ID — это дыра только если ПОСЛЕ него уже есть посты.
+                # Если next_id за «кончиком» канала — не двигаем progress в будущее.
+                if next_id > latest:
+                    latest = await self._latest_message_id(source)
+                if next_id > latest:
+                    logger.info(
+                        "Ждём новые посты (пусто id=%s, latest=%s), progress не трогаем",
+                        next_id,
+                        latest,
+                    )
+                    break
                 empty_streak += 1
                 self.db.set_progress_id(next_id)
                 next_id += 1
