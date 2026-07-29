@@ -53,26 +53,24 @@ class AdminStates(StatesGroup):
 
 
 _db: Optional[Database] = None
-_poster = None
-_trigger_cycle: Optional[Callable] = None
-_auth = None
-_on_userbot_ready: Optional[Callable[[], Awaitable[None]]] = None
-_rewrite_task: Optional[asyncio.Task] = None
+_bridge = None
+_on_worker_ready: Optional[Callable[[], Awaitable[None]]] = None
+_rewrite_running = False
 
 
 def set_dependencies(
     db: Database,
-    poster,
+    poster=None,
     trigger_cycle: Optional[Callable] = None,
     auth=None,
     on_userbot_ready: Optional[Callable[[], Awaitable[None]]] = None,
+    bridge=None,
+    on_worker_userbot_ready: Optional[Callable[[], Awaitable[None]]] = None,
 ) -> None:
-    global _db, _poster, _trigger_cycle, _auth, _on_userbot_ready
+    global _db, _bridge, _on_worker_ready
     _db = db
-    _poster = poster
-    _trigger_cycle = trigger_cycle
-    _auth = auth
-    _on_userbot_ready = on_userbot_ready
+    _bridge = bridge
+    _on_worker_ready = on_worker_userbot_ready or on_userbot_ready
 
 
 def _require_db() -> Database:
@@ -81,10 +79,15 @@ def _require_db() -> Database:
     return _db
 
 
-def _require_poster():
-    if _poster is None:
-        raise RuntimeError("Poster не инициализирован")
-    return _poster
+def _require_bridge():
+    if _bridge is None:
+        raise RuntimeError("Worker bridge не инициализирован")
+    return _bridge
+
+
+def _userbot_ready() -> bool:
+    b = _bridge
+    return bool(b and b.auth and b.auth.is_ready)
 
 
 def is_admin(user_id: Optional[int]) -> bool:
@@ -195,13 +198,14 @@ async def _status_text(db: Database) -> str:
     caption_preview = safe_preview(s.caption_template, 250) or "<i>(пусто)</i>"
 
     auth_line = "🔴 Юзербот не авторизован"
-    if _auth is not None:
-        try:
-            auth_line = await _auth.status_text()
-        except Exception as e:
-            auth_line = f"⚠️ Статус юзербота: {e}"
-
-    engine = "USERBOT" if (_auth and _auth.is_ready) else "Bot API (fallback)"
+    engine = "ожидает /login"
+    try:
+        b = _require_bridge()
+        if b.auth is not None:
+            auth_line = await b.call(b.auth.status_text(), timeout=15)
+        engine = "USERBOT (отдельный поток)" if _userbot_ready() else "нет юзербота"
+    except Exception as e:
+        auth_line = f"⚠️ Статус юзербота: {e}"
 
     return (
         "<b>📊 Channel Reposter</b>\n\n"
@@ -273,7 +277,7 @@ async def cmd_run(message: Message) -> None:
     if db.get_progress_id() <= 0:
         await message.answer("⚠️ Сначала задайте стартовую ссылку.")
         return
-    if _auth is None or not _auth.is_ready:
+    if not _userbot_ready():
         await message.answer("⚠️ Сначала авторизуйте юзербота: /login")
         return
     db.set_running(True)
@@ -403,7 +407,7 @@ async def cmd_run_now(message: Message) -> None:
 async def cmd_rewrite(message: Message, state: FSMContext, command: CommandObject) -> None:
     if await _deny_if_not_admin(message.from_user.id if message.from_user else None, message.answer):
         return
-    if _auth is None or not _auth.is_ready:
+    if not _userbot_ready():
         await message.answer("⚠️ Нужен юзербот: /login")
         return
     # /rewrite @channel [limit]
@@ -411,7 +415,12 @@ async def cmd_rewrite(message: Message, state: FSMContext, command: CommandObjec
     if args:
         channel = args[0]
         limit = int(args[1]) if len(args) > 1 and args[1].isdigit() else None
-        await _run_rewrite(message.answer, channel, limit)
+        await _run_rewrite(
+            message.answer,
+            channel,
+            limit,
+            chat_id=message.chat.id if message.chat else None,
+        )
         return
     await _prompt_rewrite(message, state)
 
@@ -441,7 +450,7 @@ async def cb_start(callback: CallbackQuery) -> None:
     if db.get_progress_id() <= 0:
         await callback.answer("Сначала стартовая ссылка", show_alert=True)
         return
-    if _auth is None or not _auth.is_ready:
+    if not _userbot_ready():
         await callback.answer("Сначала /login юзербота", show_alert=True)
         return
     db.set_running(True)
@@ -602,12 +611,17 @@ async def cb_cancel(callback: CallbackQuery, state: FSMContext) -> None:
 # ---------------------------------------------------------------------------
 
 async def _start_login(message: Message, state: FSMContext) -> None:
-    if _auth is None:
+    try:
+        b = _require_bridge()
+    except RuntimeError:
+        await message.answer("❌ Worker не подключён")
+        return
+    if b.auth is None:
         await message.answer("❌ Auth-модуль не подключён")
         return
 
     # Подставим уже сохранённые значения как подсказку
-    creds = _auth.load_credentials()
+    creds = b.auth.load_credentials()
     hint = ""
     if creds and creds.api_id:
         hint = f"\n\nРанее: api_id=<code>{creds.api_id}</code>, phone=<code>{creds.phone or '—'}</code>"
@@ -677,7 +691,8 @@ async def on_auth_phone(message: Message, state: FSMContext) -> None:
     )
     await message.answer("⏳ Отправляю код…")
     try:
-        info = await _auth.begin_login(creds)
+        b = _require_bridge()
+        info = await b.call(b.auth.begin_login(creds))
     except Exception as e:
         logger.exception("begin_login")
         await message.answer(f"❌ Не удалось отправить код: {e}")
@@ -699,7 +714,8 @@ async def on_auth_code(message: Message, state: FSMContext) -> None:
         return
     code = (message.text or "").strip()
     try:
-        result = await _auth.confirm_code(code)
+        b = _require_bridge()
+        result = await b.call(b.auth.confirm_code(code))
     except ValueError as e:
         await message.answer(f"❌ {e}")
         return
@@ -719,9 +735,9 @@ async def on_auth_code(message: Message, state: FSMContext) -> None:
         return
 
     await state.clear()
-    if _on_userbot_ready:
-        await _on_userbot_ready()
-    me_line = await _auth.status_text()
+    if _on_worker_ready:
+        await b.call(_on_worker_ready())
+    me_line = await b.call(b.auth.status_text())
     await message.answer(
         f"✅ Вход выполнен!\n{me_line}\n\n"
         "Теперь укажите каналы, стартовую ссылку и описание — затем «Старт».",
@@ -742,16 +758,17 @@ async def on_auth_password(message: Message, state: FSMContext) -> None:
         pass
 
     try:
-        await _auth.confirm_password(password)
+        b = _require_bridge()
+        await b.call(b.auth.confirm_password(password))
     except Exception as e:
         logger.exception("confirm_password")
         await message.answer(f"❌ Неверный пароль или ошибка: {e}")
         return
 
     await state.clear()
-    if _on_userbot_ready:
-        await _on_userbot_ready()
-    me_line = await _auth.status_text()
+    if _on_worker_ready:
+        await b.call(_on_worker_ready())
+    me_line = await b.call(b.auth.status_text())
     await message.answer(
         f"✅ 2FA принят, вход выполнен!\n{me_line}",
         reply_markup=main_menu_kb(_require_db().get_settings().is_running),
@@ -903,7 +920,12 @@ async def on_rewrite_limit(message: Message, state: FSMContext) -> None:
     if not channel:
         await message.answer("❌ Канал не выбран")
         return
-    await _run_rewrite(message.answer, channel, limit)
+    await _run_rewrite(
+        message.answer,
+        channel,
+        limit,
+        chat_id=message.chat.id if message.chat else None,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -911,11 +933,14 @@ async def on_rewrite_limit(message: Message, state: FSMContext) -> None:
 # ---------------------------------------------------------------------------
 
 async def _apply_link(message: Message, link: str) -> None:
-    poster = _require_poster()
     db = _require_db()
+    b = _require_bridge()
+    if b.poster is None:
+        await message.answer("⚠️ Сначала /login")
+        return
     try:
         parse_post_link(link)
-        chat_ref, msg_id = await poster.apply_start_link(link)
+        chat_ref, msg_id = await b.call(b.poster.apply_start_link(link))
     except ValueError as e:
         await message.answer(f"❌ {e}")
         return
@@ -939,15 +964,16 @@ async def _do_run_now(answer) -> None:
     if db.get_progress_id() <= 0:
         await answer("⚠️ Сначала стартовая ссылка.")
         return
-    if _auth is None or not _auth.is_ready:
+    if not _userbot_ready():
         await answer("⚠️ Сначала авторизуйте юзербота: /login")
         return
 
     was_running = db.get_settings().is_running
     db.set_running(True)
-    await answer("⚡ Цикл…")
+    await answer("⚡ Цикл запущен в worker-потоке…")
     try:
-        count = await _trigger_cycle() if _trigger_cycle else await _require_poster().run_cycle()
+        b = _require_bridge()
+        count = await b.call(b.poster.run_cycle())
         await answer(
             f"✅ Готово. Опубликовано: <b>{count}</b>",
             reply_markup=main_menu_kb(db.get_settings().is_running),
@@ -962,7 +988,7 @@ async def _do_run_now(answer) -> None:
 
 
 async def _prompt_rewrite(message: Message, state: FSMContext) -> None:
-    if _auth is None or not _auth.is_ready:
+    if not _userbot_ready():
         await message.answer("⚠️ Нужен юзербот с правом редактировать посты: /login")
         return
     db = _require_db()
@@ -982,17 +1008,12 @@ async def _prompt_rewrite(message: Message, state: FSMContext) -> None:
     )
 
 
-async def _run_rewrite(answer, channel: str, limit: int | None) -> None:
-    global _rewrite_task
-    if _auth is None or not _auth.is_ready:
+async def _run_rewrite(answer, channel: str, limit: int | None, chat_id: int | None = None) -> None:
+    global _rewrite_running
+    if not _userbot_ready():
         await answer("⚠️ Нужен юзербот: /login")
         return
-    poster = _require_poster()
-    if not hasattr(poster, "rewrite_captions_in_channel"):
-        await answer("❌ Массовое редактирование доступно только в режиме USERBOT")
-        return
-
-    if _rewrite_task is not None and not _rewrite_task.done():
+    if _rewrite_running:
         await answer(
             "⚠️ Уже идёт обновление описаний.\n"
             "Дождитесь окончания или отправьте /cancel_rewrite",
@@ -1002,44 +1023,49 @@ async def _run_rewrite(answer, channel: str, limit: int | None) -> None:
 
     limit_label = str(limit) if limit is not None else "все"
     await answer(
-        f"⏳ Запустил обновление в <code>{channel}</code> "
-        f"(лимит: <b>{limit_label}</b>) в фоне.\n"
-        "Бот продолжает отвечать. Отмена: /cancel_rewrite\n"
-        "Между правками пауза 3–5 сек — чтобы не словить FloodWait.",
+        f"⏳ Обновление в <code>{channel}</code> "
+        f"(лимит: <b>{limit_label}</b>) идёт в отдельном потоке.\n"
+        "Команды бота работают. Отмена: /cancel_rewrite",
         parse_mode="HTML",
     )
 
-    async def _job() -> None:
+    b = _require_bridge()
+    notify_chat = chat_id
+
+    async def _job():
+        global _rewrite_running
+        _rewrite_running = True
         try:
-            result = await poster.rewrite_captions_in_channel(channel, max_posts=limit)
+            result = await b.poster.rewrite_captions_in_channel(channel, max_posts=limit)
             status = "⏹ Отменено" if result.get("cancelled") else "✅ Готово"
-            await answer(
+            text = (
                 f"{status}.\n"
                 f"Канал: <code>{channel}</code>\n"
                 f"Просмотрено: <b>{result.get('scanned', 0)}</b>\n"
                 f"Обновлено: <b>{result.get('updated', 0)}</b>\n"
                 f"Пропущено: <b>{result.get('skipped', 0)}</b>\n"
-                f"Ошибок: <b>{result.get('errors', 0)}</b>",
-                reply_markup=main_menu_kb(_require_db().get_settings().is_running),
-                parse_mode="HTML",
+                f"Ошибок: <b>{result.get('errors', 0)}</b>"
             )
-        except ValueError as e:
-            await answer(f"❌ {e}")
+            if notify_chat:
+                b.notify(notify_chat, text, parse_mode="HTML")
         except Exception as e:
             logger.exception("rewrite")
-            await answer(f"❌ Ошибка: {e}")
+            if notify_chat:
+                b.notify(notify_chat, f"❌ Ошибка rewrite: {e}")
+        finally:
+            _rewrite_running = False
 
-    _rewrite_task = asyncio.create_task(_job(), name="rewrite-captions")
+    b.submit(_job())
 
 
 @router.message(Command("cancel_rewrite", "stop_rewrite"))
 async def cmd_cancel_rewrite(message: Message) -> None:
     if await _deny_if_not_admin(message.from_user.id if message.from_user else None, message.answer):
         return
-    poster = _poster
-    if poster is not None and hasattr(poster, "cancel_rewrite"):
-        poster.cancel_rewrite()
-    if _rewrite_task is not None and not _rewrite_task.done():
+    b = _bridge
+    if b and b.poster is not None and hasattr(b.poster, "cancel_rewrite"):
+        b.poster.cancel_rewrite()
+    if _rewrite_running:
         await message.answer("⏹ Останавливаю обновление описаний…")
     else:
         await message.answer("Сейчас массовое обновление не запущено.")
