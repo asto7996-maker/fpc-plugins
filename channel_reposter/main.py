@@ -64,7 +64,7 @@ async def _worker_bootstrap(db: Database, workdir: Path) -> str:
 
 
 async def _worker_scheduler() -> None:
-    logger.info("Scheduler tick=20s")
+    logger.info("Scheduler tick=5s")
     await asyncio.sleep(3)
     next_due = 0.0
     idle = 0
@@ -89,15 +89,18 @@ async def _worker_scheduler() -> None:
                         n = 0
                     if n == 0:
                         idle += 1
-                        delay = min(90.0, 15.0 * idle)
+                        # На кончике источника — реже; иначе быстро
+                        delay = min(60.0, 10.0 * idle)
                     else:
                         idle = 0
-                        delay = max(s.interval_hours, 0.05) * 3600
+                        # interval_hours → секунды; минимум 5с между циклами
+                        delay = max(float(s.interval_hours) * 3600.0, 5.0)
                     next_due = time.monotonic() + delay
                     logger.info("Next cycle in %.0fs", delay)
         except Exception:
             logger.exception("scheduler tick")
-        await asyncio.sleep(20)
+        # Будим чаще, чтобы не ждать 20с после короткого цикла
+        await asyncio.sleep(5)
 
 
 async def _heartbeat(bot: Bot) -> None:
