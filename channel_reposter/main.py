@@ -1,9 +1,9 @@
 """
-main.py — точка входа.
+main.py — Channel Reposter только на Bot API (без api_id / api_hash).
 
-Архитектура:
-  • главный поток / asyncio — aiogram админ-панель (всегда отзывчивая);
-  • отдельный поток — Pyrogram юзербот + планировщик + rewrite.
+1. Добавьте @бота админом в канал-источник и канал-назначение
+2. /start → укажите каналы и стартовую ссылку
+3. Старт автопостинга
 """
 
 from __future__ import annotations
@@ -11,7 +11,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import sys
-from pathlib import Path
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
@@ -20,10 +19,8 @@ from aiogram.fsm.storage.memory import MemoryStorage
 
 import admin_bot
 import config
-from bridge import BRIDGE
 from database import Database
-from poster import ChannelPoster
-from userbot_auth import UserbotAuth
+from poster_botapi import ChannelPosterBotAPI
 
 logging.basicConfig(
     level=logging.INFO,
@@ -33,118 +30,87 @@ logging.basicConfig(
 )
 logger = logging.getLogger("main")
 
-
-async def _worker_bootstrap(db: Database, workdir: Path) -> None:
-    """Инициализация юзербота внутри worker-потока."""
-    auth = UserbotAuth(db=db, workdir=workdir)
-    BRIDGE.auth = auth
-    BRIDGE.db = db
-
-    started = await auth.try_start_existing()
-    if started and auth.client is not None:
-        BRIDGE.poster = ChannelPoster(client=auth.client, db=db)
-        logger.info("Worker: USERBOT готов")
-    else:
-        BRIDGE.poster = None
-        logger.info("Worker: юзербот не авторизован — /login в боте")
+_cycle_lock = asyncio.Lock()
+POSTER: ChannelPosterBotAPI | None = None
+DB: Database | None = None
 
 
-async def _worker_scheduler() -> None:
-    """Планировщик циклов публикации — только в worker-loop."""
-    logger.info("Worker scheduler started")
+async def run_cycle_safe() -> int:
+    if POSTER is None:
+        return 0
+    if _cycle_lock.locked():
+        logger.warning("Цикл уже идёт")
+        return 0
+    async with _cycle_lock:
+        return await POSTER.run_cycle()
+
+
+async def scheduler_loop() -> None:
+    logger.info("Планировщик запущен")
     await asyncio.sleep(5)
     while True:
-        db = BRIDGE.db
-        poster = BRIDGE.poster
-        if db is None:
-            await asyncio.sleep(5)
-            continue
-        settings = db.get_settings()
-        if settings.is_running and poster is not None:
+        assert DB is not None
+        settings = DB.get_settings()
+        if settings.is_running:
             try:
-                count = await poster.run_cycle()
-                logger.info("Scheduler: опубликовано %s", count)
+                n = await run_cycle_safe()
+                logger.info("Планировщик: %s пост(ов)", n)
             except Exception:
-                logger.exception("Ошибка цикла планировщика")
-        elif settings.is_running and poster is None:
-            logger.warning("Автопостинг включён, но юзербот не готов")
-
-        settings = db.get_settings()
-        interval_sec = max(settings.interval_hours, 0.05) * 3600
-        logger.info(
-            "Следующий цикл через %.1f ч. (%.0f сек.)",
-            settings.interval_hours,
-            interval_sec,
-        )
-        await asyncio.sleep(interval_sec)
-
-
-async def _on_userbot_ready() -> None:
-    """После /login — создать poster в worker-потоке."""
-    auth = BRIDGE.auth
-    db = BRIDGE.db
-    if auth is None or db is None or not auth.is_ready or auth.client is None:
-        return
-    BRIDGE.poster = ChannelPoster(client=auth.client, db=db)
-    logger.info("Worker: poster пересоздан после login")
+                logger.exception("Ошибка цикла")
+        settings = DB.get_settings()
+        wait = max(settings.interval_hours, 0.05) * 3600
+        logger.info("Следующий цикл через %.1f ч.", settings.interval_hours)
+        await asyncio.sleep(wait)
 
 
 async def main() -> None:
-    db = Database(config.DATABASE_PATH)
-    db.ensure_defaults(
-        caption="<b>Описание</b>\n<i>Пришлите текст с форматированием через бота — HTML соберётся сам</i>",
+    global POSTER, DB
+
+    DB = Database(config.DATABASE_PATH)
+    DB.ensure_defaults(
+        caption=(
+            "<b>Описание</b>\n"
+            "<i>Пришлите текст с форматированием — HTML соберётся сам</i>"
+        ),
         interval_hours=config.DEFAULT_INTERVAL_HOURS,
         posts_per_cycle=config.DEFAULT_POSTS_PER_CYCLE,
         source_channel=config.SOURCE_CHANNEL or "",
         target_channel=config.TARGET_CHANNEL or "",
     )
-    logger.info("SQLite: %s", config.DATABASE_PATH)
 
     bot = Bot(
         token=config.BOT_TOKEN,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
     me = await bot.get_me()
-    logger.info("Админ-бот: @%s (id=%s)", me.username, me.id)
+    logger.info("Бот @%s (id=%s) — режим Bot API", me.username, me.id)
 
-    # --- worker thread ---
-    workdir = Path(__file__).resolve().parent
-    BRIDGE.start()
-    BRIDGE.admin_loop = asyncio.get_running_loop()
-
-    async def _notify(chat_id: int, text: str, **kwargs):
-        await bot.send_message(chat_id, text, **kwargs)
-
-    BRIDGE.notify_fn = _notify
-
-    await BRIDGE.call(_worker_bootstrap(db, workdir))
-    BRIDGE.submit(_worker_scheduler())
-
-    # --- admin panel (этот loop больше не трогает Pyrogram напрямую) ---
+    POSTER = ChannelPosterBotAPI(bot=bot, db=DB)
     admin_bot.set_dependencies(
-        db=db,
-        poster=None,  # операции через BRIDGE
-        trigger_cycle=None,
-        auth=None,
-        on_userbot_ready=None,
-        bridge=BRIDGE,
-        on_worker_userbot_ready=_on_userbot_ready,
+        db=DB,
+        poster=POSTER,
+        trigger_cycle=run_cycle_safe,
+        bot_username=me.username or "",
     )
 
     dp = Dispatcher(storage=MemoryStorage())
     admin_bot.setup_dispatcher(dp)
-    logger.info("Онлайн: https://t.me/%s  →  /start", me.username)
 
+    sched = asyncio.create_task(scheduler_loop(), name="scheduler")
+    logger.info("Онлайн: https://t.me/%s → /start", me.username)
     try:
         await dp.start_polling(bot, drop_pending_updates=True)
     finally:
-        BRIDGE.stop()
+        sched.cancel()
+        try:
+            await sched
+        except asyncio.CancelledError:
+            pass
         await bot.session.close()
-        logger.info("Остановка завершена")
 
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("Остановлено пользователем (Ctrl+C)")
+        logger.info("Stop")

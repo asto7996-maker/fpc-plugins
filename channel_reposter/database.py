@@ -239,3 +239,17 @@ class Database:
                 "SELECT COUNT(*) AS c FROM history WHERE status = 'ok'"
             ).fetchone()
         return int(row["c"]) if row else 0
+
+    def list_target_message_ids(self, limit: Optional[int] = None) -> list[int]:
+        """ID сообщений в канале-назначении, которые бот успешно опубликовал."""
+        sql = """
+            SELECT DISTINCT target_message_id AS mid
+            FROM history
+            WHERE status = 'ok' AND target_message_id IS NOT NULL
+            ORDER BY target_message_id DESC
+        """
+        if limit is not None and limit > 0:
+            sql += f" LIMIT {int(limit)}"
+        with self._connect() as conn:
+            rows = conn.execute(sql).fetchall()
+        return [int(r["mid"]) for r in rows if r["mid"] is not None]

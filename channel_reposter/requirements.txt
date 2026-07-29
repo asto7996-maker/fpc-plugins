@@ -1,8 +1,3 @@
-# Channel Reposter — зависимости
-# Python 3.10+
-
-pyrogram==2.0.106
-# tgcrypto ускоряет шифрование, но требует компилятор и python3-dev.
-# Опционально: pip install tgcrypto
+# Channel Reposter — Bot API only
 aiogram==3.15.0
 python-dotenv==1.0.1

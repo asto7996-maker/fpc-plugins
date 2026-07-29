@@ -1,5 +1,5 @@
 """
-config.py — загрузка настроек из переменных окружения (.env).
+config.py — настройки из .env (только Bot API).
 """
 
 from __future__ import annotations
@@ -16,10 +16,7 @@ load_dotenv(_BASE_DIR / ".env")
 def _require(name: str) -> str:
     value = os.getenv(name, "").strip()
     if not value:
-        raise RuntimeError(
-            f"Не задана обязательная переменная окружения: {name}. "
-            f"Скопируйте .env.example в .env и заполните значения."
-        )
+        raise RuntimeError(f"Задайте {name} в .env")
     return value
 
 
@@ -28,28 +25,17 @@ def _optional(name: str, default: str = "") -> str:
 
 
 def _parse_int_list(raw: str) -> list[int]:
-    result: list[int] = []
+    out: list[int] = []
     for part in raw.split(","):
         part = part.strip()
         if part:
-            result.append(int(part))
-    return result
+            out.append(int(part))
+    return out
 
 
 BOT_TOKEN: str = _require("BOT_TOKEN")
-
-_API_ID_RAW = _optional("API_ID")
-API_ID: int | None = int(_API_ID_RAW) if _API_ID_RAW.isdigit() else None
-API_HASH: str = _optional("API_HASH")
-SESSION_NAME: str = _optional("SESSION_NAME", "reposter_userbot") or "reposter_userbot"
-
-# Данные аккаунта для юзербота (можно ввести через /login в боте)
-PHONE: str = _optional("PHONE")
-PASSWORD: str = _optional("PASSWORD")  # облачный пароль 2FA
-
 SOURCE_CHANNEL: str = _optional("SOURCE_CHANNEL")
 TARGET_CHANNEL: str = _optional("TARGET_CHANNEL")
-
 ADMIN_IDS: list[int] = _parse_int_list(_optional("ADMIN_IDS"))
 
 DATABASE_PATH: Path = Path(
@@ -63,5 +49,3 @@ DEFAULT_INTERVAL_HOURS: float = float(_optional("DEFAULT_INTERVAL_HOURS", "6") o
 DEFAULT_POSTS_PER_CYCLE: int = int(_optional("DEFAULT_POSTS_PER_CYCLE", "5") or "5")
 POST_DELAY_MIN: float = float(_optional("POST_DELAY_MIN", "3") or "3")
 POST_DELAY_MAX: float = float(_optional("POST_DELAY_MAX", "5") or "5")
-
-PARSE_MODE: str = "html"

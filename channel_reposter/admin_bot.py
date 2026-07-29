@@ -1,19 +1,12 @@
 """
-admin_bot.py — админ-панель aiogram 3.x + мастер входа юзербота.
-
-Вход аккаунта (/login):
-  API_ID → API_HASH → телефон → код → пароль 2FA
-
-Описание постов:
-  Просто пришлите сообщение с обычным форматированием Telegram
-  (жирный, курсив, ссылка «в слово») — HTML соберётся сам.
+admin_bot.py — админ-панель (только Bot API, без api_id/api_hash).
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Awaitable, Callable, Optional
+from typing import Callable, Optional
 
 from aiogram import Dispatcher, F, Router
 from aiogram.filters import Command, CommandObject
@@ -35,277 +28,193 @@ logger = logging.getLogger(__name__)
 router = Router()
 
 
-class AdminStates(StatesGroup):
-    waiting_caption = State()
-    waiting_interval = State()
-    waiting_limit = State()
-    waiting_link = State()
-    waiting_source = State()
-    waiting_target = State()
-    waiting_rewrite_channel = State()
-    waiting_rewrite_limit = State()
-    # --- auth ---
-    auth_api_id = State()
-    auth_api_hash = State()
-    auth_phone = State()
-    auth_code = State()
-    auth_password = State()
+class S(StatesGroup):
+    caption = State()
+    interval = State()
+    limit = State()
+    link = State()
+    source = State()
+    target = State()
+    rewrite_channel = State()
+    rewrite_limit = State()
 
 
 _db: Optional[Database] = None
-_bridge = None
-_on_worker_ready: Optional[Callable[[], Awaitable[None]]] = None
-_rewrite_running = False
+_poster = None
+_trigger: Optional[Callable] = None
+_bot_username = ""
+_rewrite_task: Optional[asyncio.Task] = None
 
 
 def set_dependencies(
     db: Database,
-    poster=None,
+    poster,
     trigger_cycle: Optional[Callable] = None,
-    auth=None,
-    on_userbot_ready: Optional[Callable[[], Awaitable[None]]] = None,
-    bridge=None,
-    on_worker_userbot_ready: Optional[Callable[[], Awaitable[None]]] = None,
+    bot_username: str = "",
+    **_kwargs,
 ) -> None:
-    global _db, _bridge, _on_worker_ready
+    global _db, _poster, _trigger, _bot_username
     _db = db
-    _bridge = bridge
-    _on_worker_ready = on_worker_userbot_ready or on_userbot_ready
+    _poster = poster
+    _trigger = trigger_cycle
+    _bot_username = bot_username or ""
 
 
 def _require_db() -> Database:
-    if _db is None:
-        raise RuntimeError("Database не инициализирована")
+    assert _db is not None
     return _db
 
 
-def _require_bridge():
-    if _bridge is None:
-        raise RuntimeError("Worker bridge не инициализирован")
-    return _bridge
+def _require_poster():
+    assert _poster is not None
+    return _poster
 
 
-def _userbot_ready() -> bool:
-    b = _bridge
-    return bool(b and b.auth and b.auth.is_ready)
-
-
-def is_admin(user_id: Optional[int]) -> bool:
-    if user_id is None:
+def is_admin(uid: Optional[int]) -> bool:
+    if uid is None:
         return False
     if not config.ADMIN_IDS:
         return True
-    return user_id in config.ADMIN_IDS
+    return uid in config.ADMIN_IDS
 
 
-async def _deny_if_not_admin(event_user_id: Optional[int], reply) -> bool:
-    if is_admin(event_user_id):
+async def _deny(uid: Optional[int], reply) -> bool:
+    if is_admin(uid):
         return False
-    await reply("⛔ Доступ только для администраторов.")
+    await reply("⛔ Только для администраторов.")
     return True
 
 
-# ---------------------------------------------------------------------------
-# Клавиатуры
-# ---------------------------------------------------------------------------
-
-def main_menu_kb(is_running: bool) -> InlineKeyboardMarkup:
-    toggle_text = "⏸ Пауза" if is_running else "▶️ Старт"
-    toggle_cb = "admin:pause" if is_running else "admin:start"
+def menu_kb(running: bool) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton(text="📊 Статус", callback_data="admin:status"),
-                InlineKeyboardButton(text=toggle_text, callback_data=toggle_cb),
-            ],
-            [
-                InlineKeyboardButton(text="🔐 Вход юзербота", callback_data="admin:login"),
-            ],
-            [
-                InlineKeyboardButton(text="✏️ Текст описания", callback_data="admin:caption"),
-            ],
-            [
+                InlineKeyboardButton(text="📊 Статус", callback_data="a:status"),
                 InlineKeyboardButton(
-                    text="📝 Применить шаблон к каналу",
-                    callback_data="admin:rewrite",
+                    text="⏸ Пауза" if running else "▶️ Старт",
+                    callback_data="a:pause" if running else "a:start",
                 ),
             ],
+            [InlineKeyboardButton(text="✏️ Текст описания", callback_data="a:caption")],
             [
-                InlineKeyboardButton(text="⏱ Интервал", callback_data="admin:interval"),
-                InlineKeyboardButton(text="📦 Лимит", callback_data="admin:limit"),
+                InlineKeyboardButton(
+                    text="📝 Применить шаблон к опубликованным",
+                    callback_data="a:rewrite",
+                )
             ],
             [
-                InlineKeyboardButton(text="🔗 Старт-ссылка", callback_data="admin:link"),
+                InlineKeyboardButton(text="⏱ Интервал", callback_data="a:interval"),
+                InlineKeyboardButton(text="📦 Лимит", callback_data="a:limit"),
             ],
+            [InlineKeyboardButton(text="🔗 Старт-ссылка", callback_data="a:link")],
             [
-                InlineKeyboardButton(text="📥 Источник", callback_data="admin:source"),
-                InlineKeyboardButton(text="📤 Назначение", callback_data="admin:target"),
+                InlineKeyboardButton(text="📥 Источник", callback_data="a:source"),
+                InlineKeyboardButton(text="📤 Назначение", callback_data="a:target"),
             ],
-            [
-                InlineKeyboardButton(text="⚡ Цикл сейчас", callback_data="admin:run_now"),
-            ],
+            [InlineKeyboardButton(text="⚡ Цикл сейчас", callback_data="a:run")],
         ]
     )
 
 
 def cancel_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="❌ Отмена", callback_data="admin:cancel")]
-        ]
+        inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="a:cancel")]]
     )
 
 
-def rewrite_channel_kb(target: str) -> InlineKeyboardMarkup:
-    rows = []
-    if target:
-        rows.append(
-            [
-                InlineKeyboardButton(
-                    text=f"📤 Канал-назначение ({target})",
-                    callback_data="admin:rewrite_target",
-                )
-            ]
-        )
-    rows.append(
-        [
-            InlineKeyboardButton(
-                text="✍️ Указать другой канал",
-                callback_data="admin:rewrite_custom",
-            )
-        ]
-    )
-    rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data="admin:cancel")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-def after_caption_kb(is_running: bool, target: str) -> InlineKeyboardMarkup:
-    rows = [
-        [
-            InlineKeyboardButton(
-                text="📝 Применить этот шаблон к каналу",
-                callback_data="admin:rewrite",
-            )
-        ]
-    ]
-    rows.extend(main_menu_kb(is_running).inline_keyboard)
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-async def _status_text(db: Database) -> str:
+def status_text(db: Database) -> str:
     s = db.get_settings()
-    state = "🟢 Работает" if s.is_running else "🔴 На паузе"
-    caption_preview = safe_preview(s.caption_template, 250) or "<i>(пусто)</i>"
-
-    auth_line = "🔴 Юзербот не авторизован"
-    engine = "ожидает /login"
-    try:
-        b = _require_bridge()
-        if b.auth is not None:
-            auth_line = await b.call(b.auth.status_text(), timeout=15)
-        engine = "USERBOT (отдельный поток)" if _userbot_ready() else "нет юзербота"
-    except Exception as e:
-        auth_line = f"⚠️ Статус юзербота: {e}"
-
+    st = "🟢 Работает" if s.is_running else "🔴 На паузе"
+    bot = f"@{_bot_username}" if _bot_username else "бот"
     return (
-        "<b>📊 Channel Reposter</b>\n\n"
-        f"{auth_line}\n"
-        f"Движок: <b>{engine}</b>\n"
-        f"Автопостинг: <b>{state}</b>\n"
+        f"<b>📊 Channel Reposter</b> (Bot API)\n\n"
+        f"Бот: <code>{bot}</code>\n"
+        f"Автопостинг: <b>{st}</b>\n"
         f"Источник: <code>{s.source_channel or '—'}</code>\n"
         f"Назначение: <code>{s.target_channel or '—'}</code>\n"
         f"Progress ID: <code>{s.progress_id}</code>\n"
         f"Следующий: <code>{s.progress_id + 1 if s.progress_id else '—'}</code>\n"
-        f"Интервал: <b>{s.interval_hours}</b> ч. | "
-        f"За цикл: <b>{s.posts_per_cycle}</b>\n"
-        f"Успешно: <b>{db.history_count()}</b>\n"
+        f"Интервал: <b>{s.interval_hours}</b> ч. | За цикл: <b>{s.posts_per_cycle}</b>\n"
+        f"Скопировано: <b>{db.history_count()}</b>\n"
         f"Старт-ссылка: <code>{s.start_link or 'не задана'}</code>\n\n"
-        f"<b>Описание (превью):</b>\n<code>{caption_preview}</code>"
+        f"<b>Описание:</b>\n<code>{safe_preview(s.caption_template, 250)}</code>\n\n"
+        f"<i>Добавьте {bot} админом в оба канала со всеми правами.</i>"
     )
 
 
-# ---------------------------------------------------------------------------
-# Команды
-# ---------------------------------------------------------------------------
+# ----- commands -----
 
 @router.message(Command("start", "menu", "help"))
 async def cmd_start(message: Message, state: FSMContext) -> None:
-    if await _deny_if_not_admin(message.from_user.id if message.from_user else None, message.answer):
+    if await _deny(message.from_user.id if message.from_user else None, message.answer):
         return
     await state.clear()
     db = _require_db()
+    bot = f"@{_bot_username}" if _bot_username else "бота"
     await message.answer(
         "<b>Channel Reposter</b>\n\n"
-        "Юзербот копирует медиа из канала-источника в назначение "
-        "<b>без</b> метки Forwarded from.\n"
-        "В источнике достаточно подписки; в назначении — права админа у аккаунта.\n\n"
-        "1️⃣ <b>/login</b> — вход аккаунта (api_id, api_hash, телефон, код, пароль)\n"
-        "2️⃣ Укажите каналы и стартовую ссылку\n"
-        "3️⃣ Задайте описание: просто напишите текст с жирным/ссылками — "
-        "разметку собирать вручную <b>не нужно</b>\n"
-        "4️⃣ Старт автопостинга\n"
-        "5️⃣ <b>/rewrite</b> — применить текущий шаблон ко всем постам в канале",
-        reply_markup=main_menu_kb(db.get_settings().is_running),
+        "Без api_id / api_hash. Работает как обычный бот.\n\n"
+        f"1️⃣ Добавьте {bot} <b>админом</b> в канал-источник и канал-назначение "
+        "(права на сообщения / публикацию).\n"
+        "2️⃣ «📥 Источник» и «📤 Назначение»\n"
+        "3️⃣ «🔗 Старт-ссылка» — пост, <b>после которого</b> начинать\n"
+        "4️⃣ «✏️ Текст описания» — можно с жирным/ссылками как в чате\n"
+        "5️⃣ «▶️ Старт»\n\n"
+        "Команды: /status /set_source /set_target /set_link /set_caption "
+        "/run /pause /run_now /rewrite",
+        reply_markup=menu_kb(db.get_settings().is_running),
         parse_mode="HTML",
     )
 
 
 @router.message(Command("status"))
 async def cmd_status(message: Message) -> None:
-    if await _deny_if_not_admin(message.from_user.id if message.from_user else None, message.answer):
+    if await _deny(message.from_user.id if message.from_user else None, message.answer):
         return
     db = _require_db()
     await message.answer(
-        await _status_text(db),
-        reply_markup=main_menu_kb(db.get_settings().is_running),
+        status_text(db),
+        reply_markup=menu_kb(db.get_settings().is_running),
         parse_mode="HTML",
     )
-
-
-@router.message(Command("login", "auth"))
-async def cmd_login(message: Message, state: FSMContext) -> None:
-    if await _deny_if_not_admin(message.from_user.id if message.from_user else None, message.answer):
-        return
-    await _start_login(message, state)
 
 
 @router.message(Command("run"))
 async def cmd_run(message: Message) -> None:
-    if await _deny_if_not_admin(message.from_user.id if message.from_user else None, message.answer):
+    if await _deny(message.from_user.id if message.from_user else None, message.answer):
         return
     db = _require_db()
-    if db.get_progress_id() <= 0:
-        await message.answer("⚠️ Сначала задайте стартовую ссылку.")
+    s = db.get_settings()
+    if not s.source_channel or not s.target_channel:
+        await message.answer("⚠️ Укажите источник и назначение.")
         return
-    if not _userbot_ready():
-        await message.answer("⚠️ Сначала авторизуйте юзербота: /login")
+    if s.progress_id <= 0:
+        await message.answer("⚠️ Сначала стартовая ссылка.")
         return
     db.set_running(True)
-    await message.answer(
-        "▶️ Автопостинг <b>запущен</b>.",
-        reply_markup=main_menu_kb(True),
-        parse_mode="HTML",
-    )
+    await message.answer("▶️ Автопостинг запущен.", reply_markup=menu_kb(True), parse_mode="HTML")
 
 
 @router.message(Command("pause"))
 async def cmd_pause(message: Message) -> None:
-    if await _deny_if_not_admin(message.from_user.id if message.from_user else None, message.answer):
+    if await _deny(message.from_user.id if message.from_user else None, message.answer):
         return
     _require_db().set_running(False)
-    await message.answer(
-        "⏸ Автопостинг <b>на паузе</b>.",
-        reply_markup=main_menu_kb(False),
-        parse_mode="HTML",
-    )
+    await message.answer("⏸ Пауза.", reply_markup=menu_kb(False), parse_mode="HTML")
+
+
+@router.message(Command("run_now"))
+async def cmd_run_now(message: Message) -> None:
+    if await _deny(message.from_user.id if message.from_user else None, message.answer):
+        return
+    await _do_run_now(message.answer)
 
 
 @router.message(Command("set_caption"))
-async def cmd_set_caption(message: Message, state: FSMContext, command: CommandObject) -> None:
-    if await _deny_if_not_admin(message.from_user.id if message.from_user else None, message.answer):
+async def cmd_caption(message: Message, state: FSMContext, command: CommandObject) -> None:
+    if await _deny(message.from_user.id if message.from_user else None, message.answer):
         return
     if command.args and command.args.strip():
-        # Аргументы команды — как есть (HTML от пользователя)
         err = validate_telegram_html(command.args.strip())
         if err:
             await message.answer(f"❌ {err}", parse_mode="HTML")
@@ -313,480 +222,244 @@ async def cmd_set_caption(message: Message, state: FSMContext, command: CommandO
         _require_db().set_caption(command.args.strip())
         await message.answer("✅ Описание обновлено.")
         return
-    await state.set_state(AdminStates.waiting_caption)
+    await state.set_state(S.caption)
     await message.answer(
-        "✏️ Пришлите <b>одно сообщение</b> с описанием.\n\n"
-        "Как в обычном чате: выделите жирный/курсив, вставьте ссылку в слово — "
-        "бот <b>сам</b> сохранит форматирование.\n"
-        "Ручная HTML-вёрстка не обязательна (но тоже принимается).",
+        "✏️ Пришлите описание одним сообщением.\n"
+        "Форматируйте как в Telegram — HTML соберётся сам.",
         reply_markup=cancel_kb(),
-        parse_mode="HTML",
     )
 
 
 @router.message(Command("set_interval"))
-async def cmd_set_interval(message: Message, state: FSMContext, command: CommandObject) -> None:
-    if await _deny_if_not_admin(message.from_user.id if message.from_user else None, message.answer):
+async def cmd_interval(message: Message, state: FSMContext, command: CommandObject) -> None:
+    if await _deny(message.from_user.id if message.from_user else None, message.answer):
         return
-    if command.args and command.args.strip():
+    if command.args:
         try:
-            hours = float(command.args.strip().replace(",", "."))
-            _require_db().set_interval_hours(hours)
-            await message.answer(f"✅ Интервал: <b>{hours}</b> ч.", parse_mode="HTML")
+            h = float(command.args.strip().replace(",", "."))
+            _require_db().set_interval_hours(h)
+            await message.answer(f"✅ Интервал: <b>{h}</b> ч.", parse_mode="HTML")
         except ValueError as e:
             await message.answer(f"❌ {e}")
         return
-    await state.set_state(AdminStates.waiting_interval)
-    await message.answer("⏱ Интервал в часах:", reply_markup=cancel_kb())
+    await state.set_state(S.interval)
+    await message.answer("⏱ Часы между циклами:", reply_markup=cancel_kb())
 
 
 @router.message(Command("set_limit"))
-async def cmd_set_limit(message: Message, state: FSMContext, command: CommandObject) -> None:
-    if await _deny_if_not_admin(message.from_user.id if message.from_user else None, message.answer):
+async def cmd_limit(message: Message, state: FSMContext, command: CommandObject) -> None:
+    if await _deny(message.from_user.id if message.from_user else None, message.answer):
         return
-    if command.args and command.args.strip():
+    if command.args:
         try:
-            count = int(command.args.strip())
-            _require_db().set_posts_per_cycle(count)
-            await message.answer(f"✅ Лимит: <b>{count}</b>", parse_mode="HTML")
+            n = int(command.args.strip())
+            _require_db().set_posts_per_cycle(n)
+            await message.answer(f"✅ Лимит: <b>{n}</b>", parse_mode="HTML")
         except ValueError as e:
             await message.answer(f"❌ {e}")
         return
-    await state.set_state(AdminStates.waiting_limit)
+    await state.set_state(S.limit)
     await message.answer("📦 Постов за цикл:", reply_markup=cancel_kb())
 
 
 @router.message(Command("set_link"))
-async def cmd_set_link(message: Message, state: FSMContext, command: CommandObject) -> None:
-    if await _deny_if_not_admin(message.from_user.id if message.from_user else None, message.answer):
+async def cmd_link(message: Message, state: FSMContext, command: CommandObject) -> None:
+    if await _deny(message.from_user.id if message.from_user else None, message.answer):
         return
-    if command.args and command.args.strip():
+    if command.args:
         await _apply_link(message, command.args.strip())
         return
-    await state.set_state(AdminStates.waiting_link)
+    await state.set_state(S.link)
     await message.answer(
         "🔗 Ссылка на пост (публикация со <b>следующего</b>):\n"
-        "<code>https://t.me/c/123456789/500</code>",
+        "<code>https://t.me/channel/123</code>",
         reply_markup=cancel_kb(),
         parse_mode="HTML",
     )
 
 
 @router.message(Command("set_source"))
-async def cmd_set_source(message: Message, state: FSMContext, command: CommandObject) -> None:
-    if await _deny_if_not_admin(message.from_user.id if message.from_user else None, message.answer):
+async def cmd_source(message: Message, state: FSMContext, command: CommandObject) -> None:
+    if await _deny(message.from_user.id if message.from_user else None, message.answer):
         return
-    if command.args and command.args.strip():
+    if command.args:
         _require_db().set_source_channel(command.args.strip())
         await message.answer(f"✅ Источник: <code>{command.args.strip()}</code>", parse_mode="HTML")
         return
-    await state.set_state(AdminStates.waiting_source)
-    await message.answer("📥 Канал-источник (@user или -100...):", reply_markup=cancel_kb())
+    await state.set_state(S.source)
+    await message.answer("📥 Канал-источник (@name или -100...):", reply_markup=cancel_kb())
 
 
 @router.message(Command("set_target"))
-async def cmd_set_target(message: Message, state: FSMContext, command: CommandObject) -> None:
-    if await _deny_if_not_admin(message.from_user.id if message.from_user else None, message.answer):
+async def cmd_target(message: Message, state: FSMContext, command: CommandObject) -> None:
+    if await _deny(message.from_user.id if message.from_user else None, message.answer):
         return
-    if command.args and command.args.strip():
+    if command.args:
         _require_db().set_target_channel(command.args.strip())
         await message.answer(f"✅ Назначение: <code>{command.args.strip()}</code>", parse_mode="HTML")
         return
-    await state.set_state(AdminStates.waiting_target)
+    await state.set_state(S.target)
     await message.answer("📤 Канал-назначение:", reply_markup=cancel_kb())
-
-
-@router.message(Command("run_now"))
-async def cmd_run_now(message: Message) -> None:
-    if await _deny_if_not_admin(message.from_user.id if message.from_user else None, message.answer):
-        return
-    await _do_run_now(message.answer)
 
 
 @router.message(Command("rewrite", "apply_caption"))
 async def cmd_rewrite(message: Message, state: FSMContext, command: CommandObject) -> None:
-    if await _deny_if_not_admin(message.from_user.id if message.from_user else None, message.answer):
+    if await _deny(message.from_user.id if message.from_user else None, message.answer):
         return
-    if not _userbot_ready():
-        await message.answer("⚠️ Нужен юзербот: /login")
-        return
-    # /rewrite @channel [limit]
     args = (command.args or "").strip().split()
     if args:
         channel = args[0]
         limit = int(args[1]) if len(args) > 1 and args[1].isdigit() else None
-        await _run_rewrite(
-            message.answer,
-            channel,
-            limit,
-            chat_id=message.chat.id if message.chat else None,
-        )
+        await _run_rewrite(message, channel, limit)
         return
     await _prompt_rewrite(message, state)
 
 
-# ---------------------------------------------------------------------------
-# Callbacks
-# ---------------------------------------------------------------------------
+@router.message(Command("cancel_rewrite", "stop_rewrite"))
+async def cmd_cancel_rewrite(message: Message) -> None:
+    if await _deny(message.from_user.id if message.from_user else None, message.answer):
+        return
+    poster = _poster
+    if poster and hasattr(poster, "cancel_rewrite"):
+        poster.cancel_rewrite()
+    await message.answer("⏹ Запрошена остановка rewrite.")
 
-@router.callback_query(F.data == "admin:status")
-async def cb_status(callback: CallbackQuery) -> None:
-    if await _deny_if_not_admin(callback.from_user.id, callback.answer):
+
+# ----- callbacks -----
+
+@router.callback_query(F.data == "a:status")
+async def cb_status(c: CallbackQuery) -> None:
+    if await _deny(c.from_user.id, c.answer):
         return
     db = _require_db()
-    await callback.message.edit_text(  # type: ignore[union-attr]
-        await _status_text(db),
-        reply_markup=main_menu_kb(db.get_settings().is_running),
-        parse_mode="HTML",
+    await c.message.edit_text(  # type: ignore[union-attr]
+        status_text(db), reply_markup=menu_kb(db.get_settings().is_running), parse_mode="HTML"
     )
-    await callback.answer()
+    await c.answer()
 
 
-@router.callback_query(F.data == "admin:start")
-async def cb_start(callback: CallbackQuery) -> None:
-    if await _deny_if_not_admin(callback.from_user.id, callback.answer):
+@router.callback_query(F.data == "a:start")
+async def cb_start(c: CallbackQuery) -> None:
+    if await _deny(c.from_user.id, c.answer):
         return
     db = _require_db()
-    if db.get_progress_id() <= 0:
-        await callback.answer("Сначала стартовая ссылка", show_alert=True)
-        return
-    if not _userbot_ready():
-        await callback.answer("Сначала /login юзербота", show_alert=True)
+    s = db.get_settings()
+    if not s.source_channel or not s.target_channel or s.progress_id <= 0:
+        await c.answer("Сначала каналы и стартовая ссылка", show_alert=True)
         return
     db.set_running(True)
-    await callback.message.edit_text(  # type: ignore[union-attr]
-        "▶️ Автопостинг запущен.\n\n" + await _status_text(db),
-        reply_markup=main_menu_kb(True),
+    await c.message.edit_text(  # type: ignore[union-attr]
+        "▶️ Запущено.\n\n" + status_text(db),
+        reply_markup=menu_kb(True),
         parse_mode="HTML",
     )
-    await callback.answer("Запущено")
+    await c.answer("Старт")
 
 
-@router.callback_query(F.data == "admin:pause")
-async def cb_pause(callback: CallbackQuery) -> None:
-    if await _deny_if_not_admin(callback.from_user.id, callback.answer):
+@router.callback_query(F.data == "a:pause")
+async def cb_pause(c: CallbackQuery) -> None:
+    if await _deny(c.from_user.id, c.answer):
         return
     db = _require_db()
     db.set_running(False)
-    await callback.message.edit_text(  # type: ignore[union-attr]
-        "⏸ На паузе.\n\n" + await _status_text(db),
-        reply_markup=main_menu_kb(False),
+    await c.message.edit_text(  # type: ignore[union-attr]
+        "⏸ Пауза.\n\n" + status_text(db),
+        reply_markup=menu_kb(False),
         parse_mode="HTML",
     )
-    await callback.answer("Пауза")
+    await c.answer("Пауза")
 
 
-@router.callback_query(F.data == "admin:login")
-async def cb_login(callback: CallbackQuery, state: FSMContext) -> None:
-    if await _deny_if_not_admin(callback.from_user.id, callback.answer):
+@router.callback_query(F.data == "a:caption")
+async def cb_caption(c: CallbackQuery, state: FSMContext) -> None:
+    if await _deny(c.from_user.id, c.answer):
         return
-    await callback.answer()
-    await _start_login(callback.message, state)  # type: ignore[arg-type]
-
-
-@router.callback_query(F.data == "admin:caption")
-async def cb_caption(callback: CallbackQuery, state: FSMContext) -> None:
-    if await _deny_if_not_admin(callback.from_user.id, callback.answer):
-        return
-    await state.set_state(AdminStates.waiting_caption)
-    await callback.message.answer(  # type: ignore[union-attr]
-        "✏️ Пришлите описание одним сообщением.\n"
-        "Форматируйте как в Telegram — HTML соберётся автоматически.",
+    await state.set_state(S.caption)
+    await c.message.answer(  # type: ignore[union-attr]
+        "✏️ Пришлите описание (можно с форматированием Telegram):",
         reply_markup=cancel_kb(),
     )
-    await callback.answer()
+    await c.answer()
 
 
-@router.callback_query(F.data == "admin:interval")
-async def cb_interval(callback: CallbackQuery, state: FSMContext) -> None:
-    if await _deny_if_not_admin(callback.from_user.id, callback.answer):
+@router.callback_query(F.data == "a:interval")
+async def cb_interval(c: CallbackQuery, state: FSMContext) -> None:
+    if await _deny(c.from_user.id, c.answer):
         return
-    await state.set_state(AdminStates.waiting_interval)
-    await callback.message.answer("⏱ Часы:", reply_markup=cancel_kb())  # type: ignore[union-attr]
-    await callback.answer()
+    await state.set_state(S.interval)
+    await c.message.answer("⏱ Часы:", reply_markup=cancel_kb())  # type: ignore[union-attr]
+    await c.answer()
 
 
-@router.callback_query(F.data == "admin:limit")
-async def cb_limit(callback: CallbackQuery, state: FSMContext) -> None:
-    if await _deny_if_not_admin(callback.from_user.id, callback.answer):
+@router.callback_query(F.data == "a:limit")
+async def cb_limit(c: CallbackQuery, state: FSMContext) -> None:
+    if await _deny(c.from_user.id, c.answer):
         return
-    await state.set_state(AdminStates.waiting_limit)
-    await callback.message.answer("📦 Число постов:", reply_markup=cancel_kb())  # type: ignore[union-attr]
-    await callback.answer()
+    await state.set_state(S.limit)
+    await c.message.answer("📦 Число:", reply_markup=cancel_kb())  # type: ignore[union-attr]
+    await c.answer()
 
 
-@router.callback_query(F.data == "admin:link")
-async def cb_link(callback: CallbackQuery, state: FSMContext) -> None:
-    if await _deny_if_not_admin(callback.from_user.id, callback.answer):
+@router.callback_query(F.data == "a:link")
+async def cb_link(c: CallbackQuery, state: FSMContext) -> None:
+    if await _deny(c.from_user.id, c.answer):
         return
-    await state.set_state(AdminStates.waiting_link)
-    await callback.message.answer(  # type: ignore[union-attr]
-        "🔗 Ссылка на пост:", reply_markup=cancel_kb()
-    )
-    await callback.answer()
+    await state.set_state(S.link)
+    await c.message.answer("🔗 Ссылка на пост:", reply_markup=cancel_kb())  # type: ignore[union-attr]
+    await c.answer()
 
 
-@router.callback_query(F.data == "admin:source")
-async def cb_source(callback: CallbackQuery, state: FSMContext) -> None:
-    if await _deny_if_not_admin(callback.from_user.id, callback.answer):
+@router.callback_query(F.data == "a:source")
+async def cb_source(c: CallbackQuery, state: FSMContext) -> None:
+    if await _deny(c.from_user.id, c.answer):
         return
-    await state.set_state(AdminStates.waiting_source)
-    await callback.message.answer("📥 Источник:", reply_markup=cancel_kb())  # type: ignore[union-attr]
-    await callback.answer()
+    await state.set_state(S.source)
+    await c.message.answer("📥 Источник:", reply_markup=cancel_kb())  # type: ignore[union-attr]
+    await c.answer()
 
 
-@router.callback_query(F.data == "admin:target")
-async def cb_target(callback: CallbackQuery, state: FSMContext) -> None:
-    if await _deny_if_not_admin(callback.from_user.id, callback.answer):
+@router.callback_query(F.data == "a:target")
+async def cb_target(c: CallbackQuery, state: FSMContext) -> None:
+    if await _deny(c.from_user.id, c.answer):
         return
-    await state.set_state(AdminStates.waiting_target)
-    await callback.message.answer("📤 Назначение:", reply_markup=cancel_kb())  # type: ignore[union-attr]
-    await callback.answer()
+    await state.set_state(S.target)
+    await c.message.answer("📤 Назначение:", reply_markup=cancel_kb())  # type: ignore[union-attr]
+    await c.answer()
 
 
-@router.callback_query(F.data == "admin:run_now")
-async def cb_run_now(callback: CallbackQuery) -> None:
-    if await _deny_if_not_admin(callback.from_user.id, callback.answer):
+@router.callback_query(F.data == "a:run")
+async def cb_run(c: CallbackQuery) -> None:
+    if await _deny(c.from_user.id, c.answer):
         return
-    await callback.answer("Запуск…")
-    await _do_run_now(callback.message.answer)  # type: ignore[union-attr]
+    await c.answer("Запуск…")
+    await _do_run_now(c.message.answer)  # type: ignore[union-attr]
 
 
-@router.callback_query(F.data == "admin:rewrite")
-async def cb_rewrite(callback: CallbackQuery, state: FSMContext) -> None:
-    if await _deny_if_not_admin(callback.from_user.id, callback.answer):
+@router.callback_query(F.data == "a:rewrite")
+async def cb_rewrite(c: CallbackQuery, state: FSMContext) -> None:
+    if await _deny(c.from_user.id, c.answer):
         return
-    await callback.answer()
-    await _prompt_rewrite(callback.message, state)  # type: ignore[arg-type]
+    await c.answer()
+    await _prompt_rewrite(c.message, state)  # type: ignore[arg-type]
 
 
-@router.callback_query(F.data == "admin:rewrite_target")
-async def cb_rewrite_target(callback: CallbackQuery, state: FSMContext) -> None:
-    if await _deny_if_not_admin(callback.from_user.id, callback.answer):
-        return
-    target = _require_db().get_settings().target_channel
-    if not target:
-        await callback.answer("Сначала задайте канал-назначение", show_alert=True)
-        return
-    await state.update_data(rewrite_channel=target)
-    await state.set_state(AdminStates.waiting_rewrite_limit)
-    await callback.message.answer(  # type: ignore[union-attr]
-        f"Канал: <code>{target}</code>\n\n"
-        "Сколько последних постов обновить?\n"
-        "• Пришлите число (например <code>50</code>)\n"
-        "• Или <code>all</code> — все посты в канале",
-        reply_markup=cancel_kb(),
-        parse_mode="HTML",
-    )
-    await callback.answer()
-
-
-@router.callback_query(F.data == "admin:rewrite_custom")
-async def cb_rewrite_custom(callback: CallbackQuery, state: FSMContext) -> None:
-    if await _deny_if_not_admin(callback.from_user.id, callback.answer):
-        return
-    await state.set_state(AdminStates.waiting_rewrite_channel)
-    await callback.message.answer(  # type: ignore[union-attr]
-        "✍️ Пришлите канал, где заменить описания:\n"
-        "<code>@username</code> или <code>-100...</code>",
-        reply_markup=cancel_kb(),
-        parse_mode="HTML",
-    )
-    await callback.answer()
-
-
-@router.callback_query(F.data == "admin:cancel")
-async def cb_cancel(callback: CallbackQuery, state: FSMContext) -> None:
+@router.callback_query(F.data == "a:cancel")
+async def cb_cancel(c: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
     db = _require_db()
-    await callback.message.answer(  # type: ignore[union-attr]
-        "Отменено.",
-        reply_markup=main_menu_kb(db.get_settings().is_running),
-    )
-    await callback.answer()
+    await c.message.answer("Отменено.", reply_markup=menu_kb(db.get_settings().is_running))  # type: ignore[union-attr]
+    await c.answer()
 
 
-# ---------------------------------------------------------------------------
-# Auth FSM
-# ---------------------------------------------------------------------------
+# ----- FSM -----
 
-async def _start_login(message: Message, state: FSMContext) -> None:
-    try:
-        b = _require_bridge()
-    except RuntimeError:
-        await message.answer("❌ Worker не подключён")
-        return
-    if b.auth is None:
-        await message.answer("❌ Auth-модуль не подключён")
-        return
-
-    # Подставим уже сохранённые значения как подсказку
-    creds = b.auth.load_credentials()
-    hint = ""
-    if creds and creds.api_id:
-        hint = f"\n\nРанее: api_id=<code>{creds.api_id}</code>, phone=<code>{creds.phone or '—'}</code>"
-
-    await state.set_state(AdminStates.auth_api_id)
-    await message.answer(
-        "🔐 <b>Вход юзербота</b>\n\n"
-        "1/5 — пришлите <b>API_ID</b> (число с https://my.telegram.org/apps)."
-        f"{hint}",
-        reply_markup=cancel_kb(),
-        parse_mode="HTML",
-    )
-
-
-@router.message(AdminStates.auth_api_id)
-async def on_auth_api_id(message: Message, state: FSMContext) -> None:
-    if await _deny_if_not_admin(message.from_user.id if message.from_user else None, message.answer):
-        return
-    raw = (message.text or "").strip()
-    if not raw.isdigit():
-        await message.answer("❌ API_ID должен быть числом")
-        return
-    await state.update_data(api_id=int(raw))
-    await state.set_state(AdminStates.auth_api_hash)
-    await message.answer(
-        "2/5 — пришлите <b>API_HASH</b> (строка с my.telegram.org).",
-        reply_markup=cancel_kb(),
-        parse_mode="HTML",
-    )
-
-
-@router.message(AdminStates.auth_api_hash)
-async def on_auth_api_hash(message: Message, state: FSMContext) -> None:
-    if await _deny_if_not_admin(message.from_user.id if message.from_user else None, message.answer):
-        return
-    raw = (message.text or "").strip()
-    if len(raw) < 16:
-        await message.answer("❌ Похоже на некорректный API_HASH")
-        return
-    await state.update_data(api_hash=raw)
-    await state.set_state(AdminStates.auth_phone)
-    await message.answer(
-        "3/5 — номер телефона аккаунта в международном формате:\n"
-        "<code>+79001234567</code>",
-        reply_markup=cancel_kb(),
-        parse_mode="HTML",
-    )
-
-
-@router.message(AdminStates.auth_phone)
-async def on_auth_phone(message: Message, state: FSMContext) -> None:
-    if await _deny_if_not_admin(message.from_user.id if message.from_user else None, message.answer):
-        return
-    phone = (message.text or "").strip()
-    if len(phone) < 8:
-        await message.answer("❌ Слишком короткий номер")
-        return
-
-    data = await state.get_data()
-    from userbot_auth import AuthCredentials
-
-    creds = AuthCredentials(
-        api_id=int(data["api_id"]),
-        api_hash=data["api_hash"],
-        phone=phone,
-        password="",
-    )
-    await message.answer("⏳ Отправляю код…")
-    try:
-        b = _require_bridge()
-        info = await b.call(b.auth.begin_login(creds))
-    except Exception as e:
-        logger.exception("begin_login")
-        await message.answer(f"❌ Не удалось отправить код: {e}")
-        await state.clear()
-        return
-
-    await state.set_state(AdminStates.auth_code)
-    await message.answer(
-        f"✅ {info}\n\n"
-        "4/5 — пришлите <b>код</b> из Telegram/SMS (только цифры).",
-        reply_markup=cancel_kb(),
-        parse_mode="HTML",
-    )
-
-
-@router.message(AdminStates.auth_code)
-async def on_auth_code(message: Message, state: FSMContext) -> None:
-    if await _deny_if_not_admin(message.from_user.id if message.from_user else None, message.answer):
-        return
-    code = (message.text or "").strip()
-    try:
-        b = _require_bridge()
-        result = await b.call(b.auth.confirm_code(code))
-    except ValueError as e:
-        await message.answer(f"❌ {e}")
-        return
-    except Exception as e:
-        logger.exception("confirm_code")
-        await message.answer(f"❌ Ошибка входа: {e}")
-        await state.clear()
-        return
-
-    if result == "password_required":
-        await state.set_state(AdminStates.auth_password)
-        await message.answer(
-            "5/5 — включена двухфакторка. Пришлите <b>облачный пароль</b> 2FA.",
-            reply_markup=cancel_kb(),
-            parse_mode="HTML",
-        )
-        return
-
-    await state.clear()
-    if _on_worker_ready:
-        await b.call(_on_worker_ready())
-    me_line = await b.call(b.auth.status_text())
-    await message.answer(
-        f"✅ Вход выполнен!\n{me_line}\n\n"
-        "Теперь укажите каналы, стартовую ссылку и описание — затем «Старт».",
-        reply_markup=main_menu_kb(_require_db().get_settings().is_running),
-        parse_mode="HTML",
-    )
-
-
-@router.message(AdminStates.auth_password)
-async def on_auth_password(message: Message, state: FSMContext) -> None:
-    if await _deny_if_not_admin(message.from_user.id if message.from_user else None, message.answer):
-        return
-    password = (message.text or "").strip()
-    # Удалим сообщение с паролем из чата, если можем
-    try:
-        await message.delete()
-    except Exception:
-        pass
-
-    try:
-        b = _require_bridge()
-        await b.call(b.auth.confirm_password(password))
-    except Exception as e:
-        logger.exception("confirm_password")
-        await message.answer(f"❌ Неверный пароль или ошибка: {e}")
-        return
-
-    await state.clear()
-    if _on_worker_ready:
-        await b.call(_on_worker_ready())
-    me_line = await b.call(b.auth.status_text())
-    await message.answer(
-        f"✅ 2FA принят, вход выполнен!\n{me_line}",
-        reply_markup=main_menu_kb(_require_db().get_settings().is_running),
-        parse_mode="HTML",
-    )
-
-
-# ---------------------------------------------------------------------------
-# Обычные FSM
-# ---------------------------------------------------------------------------
-
-@router.message(AdminStates.waiting_caption)
+@router.message(S.caption)
 async def on_caption(message: Message, state: FSMContext) -> None:
-    if await _deny_if_not_admin(message.from_user.id if message.from_user else None, message.answer):
+    if await _deny(message.from_user.id if message.from_user else None, message.answer):
         return
     text = extract_caption_html(message)
     if not text:
-        await message.answer("❌ Пустой текст")
+        await message.answer("❌ Пусто")
         return
     err = validate_telegram_html(text)
     if err:
@@ -794,281 +467,216 @@ async def on_caption(message: Message, state: FSMContext) -> None:
         return
     _require_db().set_caption(text)
     await state.clear()
-    # Превью показываем экранированным — битый HTML не уронит ответ
     s = _require_db().get_settings()
     await message.answer(
-        "✅ Описание сохранено. Форматирование (жирный / курсив / ссылки) учтено.\n\n"
-        f"<b>Превью:</b>\n<code>{safe_preview(text, 400)}</code>\n\n"
-        "Можно сразу применить этот шаблон ко всем постам в канале ↓",
-        reply_markup=after_caption_kb(s.is_running, s.target_channel),
+        f"✅ Сохранено.\n<code>{safe_preview(text, 400)}</code>",
+        reply_markup=menu_kb(s.is_running),
         parse_mode="HTML",
     )
 
 
-@router.message(AdminStates.waiting_interval)
+@router.message(S.interval)
 async def on_interval(message: Message, state: FSMContext) -> None:
-    if await _deny_if_not_admin(message.from_user.id if message.from_user else None, message.answer):
+    if await _deny(message.from_user.id if message.from_user else None, message.answer):
         return
     try:
-        hours = float((message.text or "").strip().replace(",", "."))
-        _require_db().set_interval_hours(hours)
+        h = float((message.text or "").strip().replace(",", "."))
+        _require_db().set_interval_hours(h)
     except ValueError as e:
         await message.answer(f"❌ {e}")
         return
     await state.clear()
     await message.answer(
-        f"✅ Интервал: <b>{hours}</b> ч.",
-        reply_markup=main_menu_kb(_require_db().get_settings().is_running),
+        f"✅ {h} ч.",
+        reply_markup=menu_kb(_require_db().get_settings().is_running),
         parse_mode="HTML",
     )
 
 
-@router.message(AdminStates.waiting_limit)
+@router.message(S.limit)
 async def on_limit(message: Message, state: FSMContext) -> None:
-    if await _deny_if_not_admin(message.from_user.id if message.from_user else None, message.answer):
+    if await _deny(message.from_user.id if message.from_user else None, message.answer):
         return
     try:
-        count = int((message.text or "").strip())
-        _require_db().set_posts_per_cycle(count)
+        n = int((message.text or "").strip())
+        _require_db().set_posts_per_cycle(n)
     except ValueError as e:
         await message.answer(f"❌ {e}")
         return
     await state.clear()
     await message.answer(
-        f"✅ Лимит: <b>{count}</b>",
-        reply_markup=main_menu_kb(_require_db().get_settings().is_running),
+        f"✅ Лимит {n}",
+        reply_markup=menu_kb(_require_db().get_settings().is_running),
         parse_mode="HTML",
     )
 
 
-@router.message(AdminStates.waiting_link)
+@router.message(S.link)
 async def on_link(message: Message, state: FSMContext) -> None:
-    if await _deny_if_not_admin(message.from_user.id if message.from_user else None, message.answer):
+    if await _deny(message.from_user.id if message.from_user else None, message.answer):
         return
     await state.clear()
     await _apply_link(message, (message.text or "").strip())
 
 
-@router.message(AdminStates.waiting_source)
+@router.message(S.source)
 async def on_source(message: Message, state: FSMContext) -> None:
-    if await _deny_if_not_admin(message.from_user.id if message.from_user else None, message.answer):
+    if await _deny(message.from_user.id if message.from_user else None, message.answer):
         return
-    value = (message.text or "").strip()
-    _require_db().set_source_channel(value)
+    v = (message.text or "").strip()
+    _require_db().set_source_channel(v)
     await state.clear()
     await message.answer(
-        f"✅ Источник: <code>{value}</code>",
-        reply_markup=main_menu_kb(_require_db().get_settings().is_running),
+        f"✅ Источник: <code>{v}</code>",
+        reply_markup=menu_kb(_require_db().get_settings().is_running),
         parse_mode="HTML",
     )
 
 
-@router.message(AdminStates.waiting_target)
+@router.message(S.target)
 async def on_target(message: Message, state: FSMContext) -> None:
-    if await _deny_if_not_admin(message.from_user.id if message.from_user else None, message.answer):
+    if await _deny(message.from_user.id if message.from_user else None, message.answer):
         return
-    value = (message.text or "").strip()
-    _require_db().set_target_channel(value)
+    v = (message.text or "").strip()
+    _require_db().set_target_channel(v)
     await state.clear()
     await message.answer(
-        f"✅ Назначение: <code>{value}</code>",
-        reply_markup=main_menu_kb(_require_db().get_settings().is_running),
+        f"✅ Назначение: <code>{v}</code>",
+        reply_markup=menu_kb(_require_db().get_settings().is_running),
         parse_mode="HTML",
     )
 
 
-@router.message(AdminStates.waiting_rewrite_channel)
-async def on_rewrite_channel(message: Message, state: FSMContext) -> None:
-    if await _deny_if_not_admin(message.from_user.id if message.from_user else None, message.answer):
+@router.message(S.rewrite_channel)
+async def on_rw_ch(message: Message, state: FSMContext) -> None:
+    if await _deny(message.from_user.id if message.from_user else None, message.answer):
         return
-    channel = (message.text or "").strip()
-    if not channel:
-        await message.answer("❌ Укажите канал")
-        return
-    await state.update_data(rewrite_channel=channel)
-    await state.set_state(AdminStates.waiting_rewrite_limit)
+    await state.update_data(rw_ch=(message.text or "").strip())
+    await state.set_state(S.rewrite_limit)
     await message.answer(
-        f"Канал: <code>{channel}</code>\n\n"
-        "Сколько последних постов обновить?\n"
-        "• Число, например <code>50</code>\n"
-        "• Или <code>all</code> — все посты",
+        "Сколько последних опубликованных постов обновить?\n"
+        "Число или <code>all</code>",
         reply_markup=cancel_kb(),
         parse_mode="HTML",
     )
 
 
-@router.message(AdminStates.waiting_rewrite_limit)
-async def on_rewrite_limit(message: Message, state: FSMContext) -> None:
-    if await _deny_if_not_admin(message.from_user.id if message.from_user else None, message.answer):
+@router.message(S.rewrite_limit)
+async def on_rw_lim(message: Message, state: FSMContext) -> None:
+    if await _deny(message.from_user.id if message.from_user else None, message.answer):
         return
     raw = (message.text or "").strip().lower()
-    limit: int | None
-    if raw in {"all", "все", "*", "0"}:
-        limit = None
-    else:
-        try:
-            limit = int(raw)
-            if limit < 1:
-                raise ValueError("Число должно быть ≥ 1")
-        except ValueError as e:
-            await message.answer(f"❌ {e}\nПришлите число или <code>all</code>.", parse_mode="HTML")
-            return
-
-    data = await state.get_data()
-    channel = data.get("rewrite_channel") or ""
-    await state.clear()
-    if not channel:
-        await message.answer("❌ Канал не выбран")
+    try:
+        limit = None if raw in {"all", "все", "*"} else int(raw)
+        if limit is not None and limit < 1:
+            raise ValueError("Число ≥ 1")
+    except ValueError:
+        await message.answer("❌ Число или <code>all</code>", parse_mode="HTML")
         return
-    await _run_rewrite(
-        message.answer,
-        channel,
-        limit,
-        chat_id=message.chat.id if message.chat else None,
-    )
+    data = await state.get_data()
+    await state.clear()
+    await _run_rewrite(message, data.get("rw_ch") or "", limit)
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+# ----- helpers -----
 
 async def _apply_link(message: Message, link: str) -> None:
-    db = _require_db()
-    b = _require_bridge()
-    if b.poster is None:
-        await message.answer("⚠️ Сначала /login")
-        return
     try:
         parse_post_link(link)
-        chat_ref, msg_id = await b.call(b.poster.apply_start_link(link))
-    except ValueError as e:
-        await message.answer(f"❌ {e}")
-        return
+        chat, mid = await _require_poster().apply_start_link(link)
     except Exception as e:
-        logger.exception("apply_start_link")
         await message.answer(f"❌ {e}")
         return
-
     await message.answer(
-        "✅ Старт сохранён.\n"
-        f"Чат: <code>{chat_ref}</code>\n"
-        f"Указанный ID: <code>{msg_id}</code> <i>(не публикуется)</i>\n"
-        f"Следующий: <code>{msg_id + 1}</code>",
-        reply_markup=main_menu_kb(db.get_settings().is_running),
+        f"✅ Старт: <code>{chat}</code>\n"
+        f"Указанный ID <code>{mid}</code> не публикуется\n"
+        f"Следующий: <code>{mid + 1}</code>",
+        reply_markup=menu_kb(_require_db().get_settings().is_running),
         parse_mode="HTML",
     )
 
 
 async def _do_run_now(answer) -> None:
     db = _require_db()
-    if db.get_progress_id() <= 0:
-        await answer("⚠️ Сначала стартовая ссылка.")
+    s = db.get_settings()
+    if not s.source_channel or not s.target_channel or s.progress_id <= 0:
+        await answer("⚠️ Нужны каналы и стартовая ссылка.")
         return
-    if not _userbot_ready():
-        await answer("⚠️ Сначала авторизуйте юзербота: /login")
-        return
-
-    was_running = db.get_settings().is_running
+    was = s.is_running
     db.set_running(True)
-    await answer("⚡ Цикл запущен в worker-потоке…")
+    await answer("⚡ Цикл…")
     try:
-        b = _require_bridge()
-        count = await b.call(b.poster.run_cycle())
+        n = await _trigger() if _trigger else await _require_poster().run_cycle()
         await answer(
-            f"✅ Готово. Опубликовано: <b>{count}</b>",
-            reply_markup=main_menu_kb(db.get_settings().is_running),
+            f"✅ Опубликовано: <b>{n}</b>",
+            reply_markup=menu_kb(db.get_settings().is_running),
             parse_mode="HTML",
         )
     except Exception as e:
         logger.exception("run_now")
         await answer(f"❌ {e}")
     finally:
-        if not was_running:
+        if not was:
             db.set_running(False)
 
 
 async def _prompt_rewrite(message: Message, state: FSMContext) -> None:
-    if not _userbot_ready():
-        await message.answer("⚠️ Нужен юзербот с правом редактировать посты: /login")
-        return
     db = _require_db()
     s = db.get_settings()
     if not (s.caption_template or "").strip():
-        await message.answer("⚠️ Сначала задайте шаблон: «✏️ Текст описания»")
+        await message.answer("⚠️ Сначала задайте описание.")
         return
-    await state.clear()
-    await message.answer(
-        "<b>📝 Применить текущий шаблон к постам в канале</b>\n\n"
-        "Юзербот заменит подписи/текст постов на текущее описание "
-        "(жирный, курсив, ссылки сохранятся из шаблона).\n\n"
-        f"Превью шаблона:\n<code>{safe_preview(s.caption_template, 200)}</code>\n\n"
-        "Выберите канал:",
-        reply_markup=rewrite_channel_kb(s.target_channel),
-        parse_mode="HTML",
-    )
-
-
-async def _run_rewrite(answer, channel: str, limit: int | None, chat_id: int | None = None) -> None:
-    global _rewrite_running
-    if not _userbot_ready():
-        await answer("⚠️ Нужен юзербот: /login")
-        return
-    if _rewrite_running:
-        await answer(
-            "⚠️ Уже идёт обновление описаний.\n"
-            "Дождитесь окончания или отправьте /cancel_rewrite",
+    target = s.target_channel
+    if target:
+        await state.update_data(rw_ch=target)
+        await state.set_state(S.rewrite_limit)
+        await message.answer(
+            f"Канал: <code>{target}</code>\n"
+            "Сколько последних <b>опубликованных ботом</b> постов обновить?\n"
+            "Число или <code>all</code>\n\n"
+            "<i>Обновляются только посты, которые бот сам скопировал.</i>",
+            reply_markup=cancel_kb(),
             parse_mode="HTML",
         )
         return
+    await state.set_state(S.rewrite_channel)
+    await message.answer("✍️ Канал назначения (@name / -100...):", reply_markup=cancel_kb())
 
-    limit_label = str(limit) if limit is not None else "все"
-    await answer(
-        f"⏳ Обновление в <code>{channel}</code> "
-        f"(лимит: <b>{limit_label}</b>) идёт в отдельном потоке.\n"
-        "Команды бота работают. Отмена: /cancel_rewrite",
+
+async def _run_rewrite(message: Message, channel: str, limit: Optional[int]) -> None:
+    global _rewrite_task
+    if not channel:
+        await message.answer("❌ Канал не задан")
+        return
+    if _rewrite_task and not _rewrite_task.done():
+        await message.answer("⚠️ Rewrite уже идёт. /cancel_rewrite")
+        return
+
+    await message.answer(
+        f"⏳ Обновляю подписи в <code>{channel}</code>…",
         parse_mode="HTML",
     )
 
-    b = _require_bridge()
-    notify_chat = chat_id
-
-    async def _job():
-        global _rewrite_running
-        _rewrite_running = True
+    async def job():
         try:
-            result = await b.poster.rewrite_captions_in_channel(channel, max_posts=limit)
-            status = "⏹ Отменено" if result.get("cancelled") else "✅ Готово"
-            text = (
-                f"{status}.\n"
-                f"Канал: <code>{channel}</code>\n"
+            result = await _require_poster().rewrite_captions_in_channel(
+                channel, max_posts=limit
+            )
+            st = "⏹ Отменено" if result.get("cancelled") else "✅ Готово"
+            await message.answer(
+                f"{st}\n"
                 f"Просмотрено: <b>{result.get('scanned', 0)}</b>\n"
                 f"Обновлено: <b>{result.get('updated', 0)}</b>\n"
                 f"Пропущено: <b>{result.get('skipped', 0)}</b>\n"
-                f"Ошибок: <b>{result.get('errors', 0)}</b>"
+                f"Ошибок: <b>{result.get('errors', 0)}</b>",
+                reply_markup=menu_kb(_require_db().get_settings().is_running),
+                parse_mode="HTML",
             )
-            if notify_chat:
-                b.notify(notify_chat, text, parse_mode="HTML")
         except Exception as e:
             logger.exception("rewrite")
-            if notify_chat:
-                b.notify(notify_chat, f"❌ Ошибка rewrite: {e}")
-        finally:
-            _rewrite_running = False
+            await message.answer(f"❌ {e}")
 
-    b.submit(_job())
-
-
-@router.message(Command("cancel_rewrite", "stop_rewrite"))
-async def cmd_cancel_rewrite(message: Message) -> None:
-    if await _deny_if_not_admin(message.from_user.id if message.from_user else None, message.answer):
-        return
-    b = _bridge
-    if b and b.poster is not None and hasattr(b.poster, "cancel_rewrite"):
-        b.poster.cancel_rewrite()
-    if _rewrite_running:
-        await message.answer("⏹ Останавливаю обновление описаний…")
-    else:
-        await message.answer("Сейчас массовое обновление не запущено.")
+    _rewrite_task = asyncio.create_task(job())
 
 
 def setup_dispatcher(dp: Dispatcher) -> None:

@@ -1,12 +1,4 @@
-"""
-bot.py — альтернативная точка входа (алиас для main.py).
-
-Запуск:
-    python bot.py
-    # или
-    python main.py
-"""
-
+"""Алиас запуска: python bot.py"""
 from main import main
 import asyncio
 import logging
@@ -23,4 +15,4 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logging.getLogger("bot").info("Остановлено пользователем (Ctrl+C)")
+        logging.getLogger("bot").info("Stop")
