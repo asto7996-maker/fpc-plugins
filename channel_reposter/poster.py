@@ -355,7 +355,7 @@ class ChannelPoster:
     async def _publish_album(
         self, source, target, anchor: Message, caption: str
     ) -> str:
-        """Альбом одним media_group — без дробления на отдельные посты."""
+        """Альбом одним media_group — подпись сразу при отправке, без edit."""
         gid = str(anchor.media_group_id)
         self._seen_grouped.add(gid)
         try:
@@ -365,72 +365,24 @@ class ChannelPoster:
             return "skip"
 
         album = sorted(album, key=lambda m: m.id)
-        captions: list[str] = [
-            (caption if i == 0 and caption else "") for i, _ in enumerate(album)
-        ]
-
         sent_list = None
         try:
-            try:
-                sent_list = await self.client.copy_media_group(
-                    chat_id=target,
-                    from_chat_id=anchor.chat.id,
-                    message_id=anchor.id,
-                    captions=captions,
-                )
-            except (ValueError, RPCError) as e:
-                logger.warning("copy_media_group fallback to file_id: %s", e)
-                media_list = []
-                for i, m in enumerate(album):
-                    item = _build_input_media(
-                        m, caption=caption if i == 0 and caption else None
-                    )
-                    if item is not None:
-                        media_list.append(item)
-                if not media_list:
-                    return "skip"
+            if caption:
+                # Шаблон задан — публикуем через send_media_group с caption сразу,
+                # чтобы не было метки «изменено» от последующего edit.
+                sent_list = await self._send_album_with_caption(target, album, caption)
+            else:
                 try:
-                    sent_list = await self.client.send_media_group(
-                        chat_id=target, media=media_list
+                    sent_list = await self.client.copy_media_group(
+                        chat_id=target,
+                        from_chat_id=anchor.chat.id,
+                        message_id=anchor.id,
                     )
-                except RPCError as e2:
-                    if caption and "parse" in str(e2).lower():
-                        media_list = []
-                        for i, m in enumerate(album):
-                            item = _build_input_media(
-                                m, caption=caption if i == 0 and caption else None
-                            )
-                            if item is not None:
-                                # без parse_mode
-                                if hasattr(item, "parse_mode"):
-                                    item.parse_mode = None
-                                media_list.append(item)
-                        sent_list = await self.client.send_media_group(
-                            chat_id=target, media=media_list
-                        )
-                    else:
-                        raise
+                except (ValueError, RPCError) as e:
+                    logger.warning("copy_media_group fallback to file_id: %s", e)
+                    sent_list = await self._send_album_with_caption(target, album, "")
 
             first_id = sent_list[0].id if sent_list else None
-            # если copy без подписи — допишем на первый
-            if caption and sent_list and not (sent_list[0].caption or ""):
-                try:
-                    await self.client.edit_message_caption(
-                        chat_id=target,
-                        message_id=sent_list[0].id,
-                        caption=caption,
-                        parse_mode=enums.ParseMode.HTML,
-                    )
-                except RPCError:
-                    try:
-                        await self.client.edit_message_caption(
-                            chat_id=target,
-                            message_id=sent_list[0].id,
-                            caption=caption,
-                        )
-                    except RPCError as e:
-                        logger.warning("caption edit fail: %s", e)
-
             max_src = max(m.id for m in album)
             for m in album:
                 self.db.add_history(
@@ -460,6 +412,38 @@ class ChannelPoster:
             logger.error("album %s: %s", gid, e)
             self.db.add_history(anchor.id, grouped_id=gid, status="error", error=str(e))
             return "skip"
+
+    async def _send_album_with_caption(
+        self, target, album: list[Message], caption: str
+    ) -> list[Message]:
+        """Собрать InputMedia* и отправить альбом; caption только на первом."""
+        media_list = []
+        for i, m in enumerate(album):
+            item = _build_input_media(
+                m, caption=caption if i == 0 and caption else None
+            )
+            if item is not None:
+                media_list.append(item)
+        if not media_list:
+            raise ValueError("album has no copyable media")
+
+        try:
+            return await self.client.send_media_group(chat_id=target, media=media_list)
+        except RPCError as e:
+            if caption and "parse" in str(e).lower():
+                media_list = []
+                for i, m in enumerate(album):
+                    item = _build_input_media(
+                        m, caption=caption if i == 0 and caption else None
+                    )
+                    if item is not None:
+                        if hasattr(item, "parse_mode"):
+                            item.parse_mode = None
+                        media_list.append(item)
+                return await self.client.send_media_group(
+                    chat_id=target, media=media_list
+                )
+            raise
 
     # ------------------------------------------------------------------ rewrite
 
