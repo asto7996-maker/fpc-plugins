@@ -138,6 +138,7 @@ class ChannelPoster:
         self._seen_grouped: set[str] = set()
         self._rewrite_cancel = False
         self._busy = False
+        self._abort_cycle = False
 
     async def _materialize_message(self, msg: Message) -> Optional[Message]:
         """
@@ -209,14 +210,44 @@ class ChannelPoster:
 
     # ------------------------------------------------------------------ API
 
+    def request_abort(self) -> None:
+        """Прервать текущий цикл как можно скорее."""
+        self._abort_cycle = True
+
+    async def wait_until_idle(self, timeout: float = 120.0) -> bool:
+        """Дождаться окончания цикла. True = свободен."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while self._busy:
+            if loop.time() >= deadline:
+                return False
+            await asyncio.sleep(0.25)
+        return True
+
     async def apply_start_link(self, link: str) -> tuple[str | int, int]:
-        """Старт ПОСЛЕ указанного поста (сам пост не публикуется)."""
+        """
+        Старт ПОСЛЕ указанного поста (сам пост не публикуется).
+        Останавливает текущий цикл и сбрасывает историю после этой точки.
+        """
         chat_ref, message_id = parse_post_link(link)
         src = normalize_channel(chat_ref)
+
+        self.request_abort()
+        await self.wait_until_idle(timeout=180.0)
+
+        cleared = self.db.clear_history_after(message_id)
         self.db.set_source_channel(src)
         self.db.set_start_link(link)
         self.db.set_progress_id(message_id)
-        logger.info("Start link → chat=%s after_id=%s (next=%s)", src, message_id, message_id + 1)
+        self._seen_grouped.clear()
+        self._abort_cycle = False
+        logger.info(
+            "Start link → chat=%s after_id=%s (next=%s), history_cleared_after=%s",
+            src,
+            message_id,
+            message_id + 1,
+            cleared,
+        )
         return chat_ref, message_id
 
     async def seek_oldest(self) -> int:
@@ -224,6 +255,9 @@ class ChannelPoster:
         Начать с самого старого поста источника → к новым.
         Сбрасывает историю ok, чтобы не пропускать уже «обработанные» id.
         """
+        self.request_abort()
+        await self.wait_until_idle(timeout=180.0)
+
         settings = self.db.get_settings()
         source = await _resolve_chat(
             self.client, settings.source_channel or config.SOURCE_CHANNEL
@@ -257,10 +291,11 @@ class ChannelPoster:
         if found <= 0:
             raise RuntimeError("Не удалось найти первый пост в источнике")
 
-        # Полный проход oldest→newest: иначе was_processed пропустит старые
         cleared = self.db.clear_history()
         self.db.set_progress_id(found - 1)
         self.db.set_start_link(f"oldest:{found}")
+        self._seen_grouped.clear()
+        self._abort_cycle = False
         logger.info(
             "Oldest post id=%s → progress=%s (history cleared=%s)",
             found,
@@ -273,14 +308,21 @@ class ChannelPoster:
         self._rewrite_cancel = True
 
     async def run_cycle(self) -> int:
+        # Если уже идёт цикл — прерываем и ждём, не возвращаем тихо 0
         if self._busy:
-            logger.warning("cycle skipped: busy")
-            return 0
+            logger.info("cycle waiting: busy")
+            self.request_abort()
+            ok = await self.wait_until_idle(timeout=180.0)
+            if not ok or self._busy:
+                logger.warning("cycle skipped: still busy after wait")
+                return 0
+        self._abort_cycle = False
         self._busy = True
         try:
             return await self._run_cycle_inner()
         finally:
             self._busy = False
+            self._abort_cycle = False
 
     async def _latest_message_id(self, source: int | str) -> int:
         """ID последнего поста в канале (0 если пусто)."""
@@ -351,6 +393,9 @@ class ChannelPoster:
         )
 
         while published < limit and empty_streak < 50:
+            if self._abort_cycle:
+                logger.info("cycle aborted by request (published=%s)", published)
+                break
             if not self.db.get_settings().is_running:
                 break
             if next_id > latest:

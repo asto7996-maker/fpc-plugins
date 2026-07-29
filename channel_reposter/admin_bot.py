@@ -769,7 +769,9 @@ async def _apply_link(message: Message, link: str) -> None:
         await message.answer(
             f"✅ Старт после <code>{mid}</code>\n"
             f"Чат: <code>{chat}</code>\n"
-            f"Следующий пост: <code>{mid + 1}</code>",
+            f"Следующий пост: <code>{mid + 1}</code>\n"
+            f"Фоновый цикл остановлен, история после этой точки сброшена.\n"
+            f"Нажмите ▶️ Старт или ⚡ Цикл сейчас.",
             parse_mode="HTML",
             reply_markup=menu_kb(_require_db().get_settings().is_running),
         )
@@ -799,11 +801,22 @@ async def _do_run_now(answer) -> None:
     async def _job():
         try:
             n = await _call_poster("run_cycle", timeout=None)
-            await answer(
-                f"✅ Опубликовано: <b>{n}</b>",
-                reply_markup=menu_kb(db.get_settings().is_running),
-                parse_mode="HTML",
-            )
+            if n == 0:
+                s2 = db.get_settings()
+                await answer(
+                    f"✅ Опубликовано: <b>0</b>\n"
+                    f"<i>Progress <code>{s2.progress_id}</code> → next "
+                    f"<code>{s2.progress_id + 1}</code>. "
+                    f"Если ждали старт-ссылку — задайте её снова после остановки цикла.</i>",
+                    reply_markup=menu_kb(db.get_settings().is_running),
+                    parse_mode="HTML",
+                )
+            else:
+                await answer(
+                    f"✅ Опубликовано: <b>{n}</b>",
+                    reply_markup=menu_kb(db.get_settings().is_running),
+                    parse_mode="HTML",
+                )
         except Exception as e:
             logger.exception("run_now")
             await answer(f"❌ {e}")

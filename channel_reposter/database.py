@@ -263,6 +263,15 @@ class Database:
             cur = conn.execute("DELETE FROM history")
             return int(cur.rowcount or 0)
 
+    def clear_history_after(self, source_message_id: int) -> int:
+        """Удалить историю с source_message_id > порога (для старта со ссылки)."""
+        with self._connect() as conn:
+            cur = conn.execute(
+                "DELETE FROM history WHERE source_message_id > ?",
+                (int(source_message_id),),
+            )
+            return int(cur.rowcount or 0)
+
     def list_target_message_ids(self, limit: Optional[int] = None) -> list[int]:
         """ID сообщений в канале-назначении, которые бот успешно опубликовал."""
         sql = """
