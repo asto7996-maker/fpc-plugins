@@ -138,7 +138,8 @@ def status_text(db: Database) -> str:
         f"Скопировано: <b>{db.history_count()}</b>\n"
         f"Старт-ссылка: <code>{s.start_link or 'не задана'}</code>\n\n"
         f"<b>Описание:</b>\n<code>{safe_preview(s.caption_template, 250)}</code>\n\n"
-        f"<i>Добавьте {bot} админом в оба канала со всеми правами.</i>"
+        f"<i>Добавьте {bot} админом только в <b>ваш</b> канал-назначение. "
+        f"Источник — публичный канал (@username), админство там не нужно.</i>"
     )
 
 
@@ -153,13 +154,15 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
     bot = f"@{_bot_username}" if _bot_username else "бота"
     await message.answer(
         "<b>Channel Reposter</b>\n\n"
-        "Без api_id / api_hash. Работает как обычный бот.\n\n"
-        f"1️⃣ Добавьте {bot} <b>админом</b> в канал-источник и канал-назначение "
-        "(права на сообщения / публикацию).\n"
-        "2️⃣ «📥 Источник» и «📤 Назначение»\n"
-        "3️⃣ «🔗 Старт-ссылка» — пост, <b>после которого</b> начинать\n"
-        "4️⃣ «✏️ Текст описания» — можно с жирным/ссылками как в чате\n"
-        "5️⃣ «▶️ Старт»\n\n"
+        "Без api_id / api_hash. Обычный бот.\n\n"
+        f"1️⃣ Добавьте {bot} <b>админом</b> только в <b>ваш</b> канал "
+        "(куда публиковать) — с правом писать сообщения.\n"
+        "2️⃣ «📤 Назначение» — ваш канал\n"
+        "3️⃣ «📥 Источник» — публичный канал (@username), откуда брать контент "
+        "(админом там быть не нужно)\n"
+        "4️⃣ «🔗 Старт-ссылка» — пост в источнике, <b>после которого</b> начинать\n"
+        "5️⃣ «✏️ Текст описания» — можно с жирным/ссылками как в чате\n"
+        "6️⃣ «▶️ Старт»\n\n"
         "Команды: /status /set_source /set_target /set_link /set_caption "
         "/run /pause /run_now /rewrite",
         reply_markup=menu_kb(db.get_settings().is_running),
@@ -287,7 +290,12 @@ async def cmd_source(message: Message, state: FSMContext, command: CommandObject
         await message.answer(f"✅ Источник: <code>{command.args.strip()}</code>", parse_mode="HTML")
         return
     await state.set_state(S.source)
-    await message.answer("📥 Канал-источник (@name или -100...):", reply_markup=cancel_kb())
+    await message.answer(
+        "📥 Канал-источник — публичный <code>@username</code>\n"
+        "<i>Админом бота там делать не нужно.</i>",
+        reply_markup=cancel_kb(),
+        parse_mode="HTML",
+    )
 
 
 @router.message(Command("set_target"))
@@ -299,7 +307,12 @@ async def cmd_target(message: Message, state: FSMContext, command: CommandObject
         await message.answer(f"✅ Назначение: <code>{command.args.strip()}</code>", parse_mode="HTML")
         return
     await state.set_state(S.target)
-    await message.answer("📤 Канал-назначение:", reply_markup=cancel_kb())
+    await message.answer(
+        "📤 Ваш канал-назначение (@name или -100…)\n"
+        f"<i>Сюда добавьте бота админом.</i>",
+        reply_markup=cancel_kb(),
+        parse_mode="HTML",
+    )
 
 
 @router.message(Command("rewrite", "apply_caption"))
@@ -414,7 +427,12 @@ async def cb_source(c: CallbackQuery, state: FSMContext) -> None:
     if await _deny(c.from_user.id, c.answer):
         return
     await state.set_state(S.source)
-    await c.message.answer("📥 Источник:", reply_markup=cancel_kb())  # type: ignore[union-attr]
+    await c.message.answer(  # type: ignore[union-attr]
+        "📥 Источник — публичный <code>@username</code>\n"
+        "<i>Админство бота в источнике не нужно.</i>",
+        reply_markup=cancel_kb(),
+        parse_mode="HTML",
+    )
     await c.answer()
 
 
@@ -423,7 +441,12 @@ async def cb_target(c: CallbackQuery, state: FSMContext) -> None:
     if await _deny(c.from_user.id, c.answer):
         return
     await state.set_state(S.target)
-    await c.message.answer("📤 Назначение:", reply_markup=cancel_kb())  # type: ignore[union-attr]
+    await c.message.answer(  # type: ignore[union-attr]
+        "📤 Ваш канал (назначение).\n"
+        "<i>Бот должен быть там админом.</i>",
+        reply_markup=cancel_kb(),
+        parse_mode="HTML",
+    )
     await c.answer()
 
 
@@ -582,7 +605,16 @@ async def on_rw_lim(message: Message, state: FSMContext) -> None:
 
 async def _apply_link(message: Message, link: str) -> None:
     try:
-        parse_post_link(link)
+        chat, mid = parse_post_link(link)
+        # Для Bot API надёжнее публичный @username, не t.me/c/...
+        if isinstance(chat, int):
+            await message.answer(
+                "⚠️ Ссылка вида <code>t.me/c/…</code> — приватный канал.\n"
+                "Без админства в источнике бот его не прочитает.\n"
+                "Укажите публичный источник <code>@username</code> "
+                "и ссылку вида <code>https://t.me/username/123</code>.",
+                parse_mode="HTML",
+            )
         chat, mid = await _require_poster().apply_start_link(link)
     except Exception as e:
         await message.answer(f"❌ {e}")
