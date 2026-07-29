@@ -660,9 +660,13 @@ async def on_link(message: Message, state: FSMContext) -> None:
 async def on_source(message: Message, state: FSMContext) -> None:
     if await _deny(message.from_user.id if message.from_user else None, message.answer):
         return
-    raw = (message.text or "").strip()
-    if raw and not raw.startswith("@") and not raw.lstrip("-").isdigit():
-        raw = "@" + raw
+    from links import normalize_channel
+
+    try:
+        raw = normalize_channel((message.text or "").strip())
+    except ValueError as e:
+        await message.answer(f"❌ {e}")
+        return
     _require_db().set_source_channel(raw)
     await state.clear()
     await message.answer(
@@ -676,9 +680,13 @@ async def on_source(message: Message, state: FSMContext) -> None:
 async def on_target(message: Message, state: FSMContext) -> None:
     if await _deny(message.from_user.id if message.from_user else None, message.answer):
         return
-    raw = (message.text or "").strip()
-    if raw and not raw.startswith("@") and not raw.lstrip("-").isdigit():
-        raw = "@" + raw
+    from links import normalize_channel
+
+    try:
+        raw = normalize_channel((message.text or "").strip())
+    except ValueError as e:
+        await message.answer(f"❌ {e}")
+        return
     _require_db().set_target_channel(raw)
     await state.clear()
     await message.answer(
@@ -711,8 +719,10 @@ async def _apply_link(message: Message, link: str) -> None:
     if not _has_userbot():
         # всё равно сохраним progress локально
         try:
+            from links import normalize_channel
+
             chat, mid = parse_post_link(link)
-            src = str(chat) if isinstance(chat, int) else (chat if str(chat).startswith("@") else f"@{chat}")
+            src = normalize_channel(chat)
             db = _require_db()
             db.set_source_channel(src)
             db.set_start_link(link)
@@ -781,6 +791,23 @@ async def _run_test(message: Message) -> None:
     global _cycle_task
     db = _require_db()
     s = db.get_settings()
+    # Починить старые записи вида @https://t.me/...
+    from links import normalize_channel
+
+    try:
+        if s.source_channel:
+            fixed = normalize_channel(s.source_channel)
+            if fixed != s.source_channel:
+                db.set_source_channel(fixed)
+                s = db.get_settings()
+        if s.target_channel:
+            fixed = normalize_channel(s.target_channel)
+            if fixed != s.target_channel:
+                db.set_target_channel(fixed)
+                s = db.get_settings()
+    except ValueError:
+        pass
+
     lines = ["<b>🧪 Диагностика</b>\n"]
     src = (s.source_channel or "").strip()
     dst = (s.target_channel or "").strip()
@@ -797,24 +824,43 @@ async def _run_test(message: Message) -> None:
             try:
                 async def _probe():
                     me = await _bridge.auth.client.get_me()
+                    uname = f"@{me.username}" if me.username else me.first_name
+                    from pyrogram import raw
+
+                    # Сначала ResolveUsername — иначе CHANNEL_INVALID на холодной сессии
+                    chat_id = dst
                     try:
-                        member = await _bridge.auth.client.get_chat_member(dst, me.id)
+                        username = dst.lstrip("@")
+                        if username and not username.lstrip("-").isdigit():
+                            r = await _bridge.auth.client.invoke(
+                                raw.functions.contacts.ResolveUsername(username=username)
+                            )
+                            if hasattr(r.peer, "channel_id"):
+                                chat_id = int(f"-100{r.peer.channel_id}")
+                    except Exception as e:
                         return (
-                            f"✅ {me.first_name} · <code>{member.status}</code>",
+                            f"❌ канал не найден: <code>{e}</code>\n"
+                            f"<i>Проверьте username назначения (не полную ссылку).</i>",
+                            False,
+                        )
+                    try:
+                        member = await _bridge.auth.client.get_chat_member(chat_id, me.id)
+                        return (
+                            f"✅ {uname} (id <code>{me.id}</code>) · <code>{member.status}</code>",
                             True,
                         )
-                    except Exception as e:
-                        # попробуем написать тестовое (и удалить)
+                    except Exception:
                         try:
                             sent = await _bridge.auth.client.send_message(
-                                dst, "⚙️ probe"
+                                chat_id, "⚙️ probe"
                             )
-                            await _bridge.auth.client.delete_messages(dst, sent.id)
-                            return f"✅ {me.first_name} может писать", True
+                            await _bridge.auth.client.delete_messages(chat_id, sent.id)
+                            return f"✅ {uname} (id <code>{me.id}</code>) может писать", True
                         except Exception as e2:
                             return (
                                 f"❌ нет доступа: <code>{e2}</code>\n"
-                                f"<i>Добавьте аккаунт юзербота админом в {dst} с правом постить.</i>",
+                                f"<i>Добавьте юзербота {uname} (id <code>{me.id}</code>) "
+                                f"админом в {dst} с правом «Публикация сообщений».</i>",
                                 False,
                             )
 

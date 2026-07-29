@@ -34,7 +34,7 @@ from pyrogram.types import (
 
 import config
 from database import Database
-from links import parse_post_link
+from links import normalize_channel, parse_post_link
 
 logger = logging.getLogger(__name__)
 
@@ -42,15 +42,41 @@ logger = logging.getLogger(__name__)
 def _chat_ref(value: str | int) -> str | int:
     if isinstance(value, int):
         return value
-    raw = (value or "").strip()
+    raw = normalize_channel(value)
     if not raw:
         raise ValueError("Канал не задан")
-    if raw.startswith("@"):
-        return raw
-    try:
+    if raw.lstrip("-").isdigit():
         return int(raw)
-    except ValueError:
-        return f"@{raw}"
+    return raw
+
+
+async def _resolve_chat(client: Client, value: str | int) -> int:
+    """
+    Вернуть числовой chat_id. Для @username сначала ResolveUsername,
+    чтобы в сессии был access_hash (иначе бывает CHANNEL_INVALID).
+    """
+    ref = _chat_ref(value)
+    if isinstance(ref, int):
+        return ref
+
+    username = str(ref).lstrip("@")
+    try:
+        from pyrogram import raw
+
+        r = await client.invoke(
+            raw.functions.contacts.ResolveUsername(username=username)
+        )
+        if hasattr(r.peer, "channel_id"):
+            return int(f"-100{r.peer.channel_id}")
+        if hasattr(r.peer, "chat_id"):
+            return -r.peer.chat_id
+        if hasattr(r.peer, "user_id"):
+            return int(r.peer.user_id)
+    except Exception as e:
+        logger.debug("ResolveUsername(%s) fallback: %s", username, e)
+
+    chat = await client.get_chat(ref)
+    return int(chat.id)
 
 
 def _is_media(msg: Message) -> bool:
@@ -97,10 +123,7 @@ class ChannelPoster:
     async def apply_start_link(self, link: str) -> tuple[str | int, int]:
         """Старт ПОСЛЕ указанного поста (сам пост не публикуется)."""
         chat_ref, message_id = parse_post_link(link)
-        if isinstance(chat_ref, int):
-            src = str(chat_ref)
-        else:
-            src = chat_ref if chat_ref.startswith("@") else f"@{chat_ref}"
+        src = normalize_channel(chat_ref)
         self.db.set_source_channel(src)
         self.db.set_start_link(link)
         self.db.set_progress_id(message_id)
@@ -110,7 +133,9 @@ class ChannelPoster:
     async def seek_oldest(self) -> int:
         """Найти первый существующий пост в источнике; progress = id-1."""
         settings = self.db.get_settings()
-        source = _chat_ref(settings.source_channel or config.SOURCE_CHANNEL)
+        source = await _resolve_chat(
+            self.client, settings.source_channel or config.SOURCE_CHANNEL
+        )
         found = 0
         empty = 0
         for mid in range(1, 20001):
@@ -162,8 +187,12 @@ class ChannelPoster:
         if not settings.is_running:
             return 0
 
-        source = _chat_ref(settings.source_channel or config.SOURCE_CHANNEL)
-        target = _chat_ref(settings.target_channel or config.TARGET_CHANNEL)
+        source = await _resolve_chat(
+            self.client, settings.source_channel or config.SOURCE_CHANNEL
+        )
+        target = await _resolve_chat(
+            self.client, settings.target_channel or config.TARGET_CHANNEL
+        )
         if settings.progress_id < 0:
             logger.warning("progress_id не задан")
             return 0
@@ -441,7 +470,7 @@ class ChannelPoster:
         caption: Optional[str] = None,
         max_posts: Optional[int] = None,
     ) -> dict:
-        chat = _chat_ref(channel)
+        chat = await _resolve_chat(self.client, channel)
         text = caption if caption is not None else (self.db.get_settings().caption_template or "")
         if not text.strip():
             raise ValueError("Сначала задайте шаблон описания")

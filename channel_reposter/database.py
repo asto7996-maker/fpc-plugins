@@ -184,10 +184,14 @@ class Database:
         self.set(SETTING_START_LINK, link)
 
     def set_source_channel(self, channel: str) -> None:
-        self.set(SETTING_SOURCE_CHANNEL, channel)
+        from links import normalize_channel
+
+        self.set(SETTING_SOURCE_CHANNEL, normalize_channel(channel))
 
     def set_target_channel(self, channel: str) -> None:
-        self.set(SETTING_TARGET_CHANNEL, channel)
+        from links import normalize_channel
+
+        self.set(SETTING_TARGET_CHANNEL, normalize_channel(channel))
 
     # ------------------------------------------------------------------
     # История

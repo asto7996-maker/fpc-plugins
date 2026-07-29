@@ -16,7 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from database import Database  # noqa: E402
-from links import parse_post_link  # noqa: E402
+from links import normalize_channel, parse_post_link  # noqa: E402
 
 
 class ParseLinkTests(unittest.TestCase):
@@ -38,6 +38,45 @@ class ParseLinkTests(unittest.TestCase):
     def test_invalid(self) -> None:
         with self.assertRaises(ValueError):
             parse_post_link("https://example.com/foo")
+
+
+class NormalizeChannelTests(unittest.TestCase):
+    def test_username_variants(self) -> None:
+        self.assertEqual(normalize_channel("@sw3atsh0p"), "@sw3atsh0p")
+        self.assertEqual(normalize_channel("sw3atsh0p"), "@sw3atsh0p")
+        self.assertEqual(normalize_channel("https://t.me/sw3atsh0p"), "@sw3atsh0p")
+        self.assertEqual(
+            normalize_channel("@https://t.me/sw3atsh0p"), "@sw3atsh0p"
+        )
+        self.assertEqual(
+            normalize_channel("https://t.me/porno_sliv_altushek_v_tg/6185"),
+            "@porno_sliv_altushek_v_tg",
+        )
+        self.assertEqual(
+            normalize_channel("@https://t.me/porno_sliv_altushek_v_tg"),
+            "@porno_sliv_altushek_v_tg",
+        )
+
+    def test_numeric_id(self) -> None:
+        self.assertEqual(normalize_channel("-100123"), "-100123")
+        self.assertEqual(normalize_channel(12345), "12345")
+
+    def test_db_setters_normalize(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        db = Database(Path(tmp.name) / "n.db")
+        db.ensure_defaults(
+            caption="x",
+            interval_hours=1,
+            posts_per_cycle=1,
+            source_channel="@src",
+            target_channel="@dst",
+        )
+        db.set_source_channel("@https://t.me/porno_sliv_altushek_v_tg")
+        db.set_target_channel("https://t.me/sw3atsh0p")
+        s = db.get_settings()
+        self.assertEqual(s.source_channel, "@porno_sliv_altushek_v_tg")
+        self.assertEqual(s.target_channel, "@sw3atsh0p")
 
 
 class DatabaseTests(unittest.TestCase):

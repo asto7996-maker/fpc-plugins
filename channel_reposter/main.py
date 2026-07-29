@@ -36,10 +36,9 @@ logger = logging.getLogger("main")
 
 
 def _norm_channel(val: str) -> str:
-    v = (val or "").strip()
-    if v and not v.startswith("@") and not v.lstrip("-").isdigit():
-        return "@" + v
-    return v
+    from links import normalize_channel
+
+    return normalize_channel(val)
 
 
 async def _worker_bootstrap(db: Database, workdir: Path) -> str:
