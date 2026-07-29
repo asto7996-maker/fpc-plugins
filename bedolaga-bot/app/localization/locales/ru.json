@@ -1994,6 +1994,9 @@
   "MAIN_MENU_TARIFF_TRIAL": "Тестовая подписка",
   "MAIN_MENU_TARIFF_ACTIVE": "Активна",
   "REPLY_CABINET_BUTTON": "Кабинет",
+  "REPLY_MAIN_MENU": "Главное меню",
+  "REPLY_INFO": "Информация",
+  "REPLY_SUPPORT": "Тех. поддержка",
   "WELCOME_REPLY_KEYBOARD_PROMPT": " ",
   "ONBOARDING_CONSENT_ACCEPT": "Согласиться",
   "ONBOARDING_CONSENT_DECLINE": "Отказаться"
