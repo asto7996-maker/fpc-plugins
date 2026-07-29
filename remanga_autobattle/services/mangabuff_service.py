@@ -7610,7 +7610,20 @@ class MangaBuffService:
 
         if not await self._safe_goto(page, "https://mangabuff.ru/trades"):
             return 0
-        my_cards = await self._tradable_inventory_cards(page)
+        raw_inv = await self._fetch_all_inventory_cards(page, per_page=70)
+        if not raw_inv:
+            logger.warning(
+                "MangaBuff trades: inventory fetch empty/failed — skip rejectAll"
+            )
+            return 0
+        my_cards = []
+        for r in raw_inv:
+            if not self._card_tradable(r):
+                continue
+            if str(r.get("rank") or "").upper() == "X":
+                continue
+            my_cards.append(r)
+        my_cards.sort(key=lambda r: rank_value(str(r.get("rank") or "")))
         units = self._build_profitable_offer_units(my_cards)
         logger.info(
             "MangaBuff trades inventory: tradable=%s units=%s sample=%s",
@@ -7626,13 +7639,21 @@ class MangaBuffService:
             ],
         )
         if not units:
-            # карты заняты старыми pending — сброс исходящих и повтор
+            # сброс исходящих только если карты реально заняты в trade
+            locked = sum(1 for r in raw_inv if int(r.get("in_trade") or 0))
+            if locked <= 0:
+                logger.info(
+                    "MangaBuff trades: no free units and no in_trade cards — stop"
+                )
+                return 0
             try:
                 await self._safe_goto(
                     page, "https://mangabuff.ru/trades/rejectAll?type_trade=sender"
                 )
                 await asyncio.sleep(2.0)
-                logger.info("MangaBuff trades: reset outgoing (no free cards)")
+                logger.info(
+                    "MangaBuff trades: reset outgoing (in_trade=%s)", locked
+                )
             except Exception as exc:  # noqa: BLE001
                 logger.debug("reset outgoing: %s", exc)
             if not await self._safe_goto(page, "https://mangabuff.ru/trades"):
