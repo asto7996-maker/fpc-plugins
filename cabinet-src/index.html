@@ -2,71 +2,40 @@
 <html lang="ru" class="dark">
   <head>
     <meta charset="UTF-8" />
-    <link
-      rel="icon"
-      href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2064%2064'%3E%3Crect%20width='64'%20height='64'%20rx='14'%20fill='%230a0f1a'/%3E%3Ctext%20x='50%25'%20y='50%25'%20font-family='Manrope,Arial,sans-serif'%20font-size='38'%20font-weight='700'%20fill='%23ffffff'%20text-anchor='middle'%20dominant-baseline='central'%3EV%3C/text%3E%3C/svg%3E"
-    />
-    <meta
-      name="viewport"
-      content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover"
-    />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
     <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
     <meta http-equiv="Pragma" content="no-cache" />
     <meta name="theme-color" content="#0a0f1a" />
     <meta name="mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
-    <meta name="format-detection" content="telephone=no" />
-    <meta name="referrer" content="strict-origin-when-cross-origin" />
     <title>VPN</title>
-    <link rel="preconnect" href="https://fonts.googleapis.com" />
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-    <link
-      href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Manrope:wght@400;500;600;700;800&family=Outfit:wght@400;500;600;700&display=swap"
-      rel="stylesheet"
-      media="print"
-      onload="this.media = 'all'"
-    />
-    <noscript>
-      <link
-        href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Manrope:wght@400;500;600;700;800&family=Outfit:wght@400;500;600;700&display=swap"
-        rel="stylesheet"
-      />
-    </noscript>
     <script>
-      // Load Telegram Web App script only inside Telegram environment
-      (function () {
-        var isTelegram =
-          window.TelegramWebviewProxy ||
-          location.hash.indexOf('tgWebApp') !== -1 ||
-          location.search.indexOf('tgWebApp') !== -1;
-        if (isTelegram) {
-          var s = document.createElement('script');
-          s.src = 'https://telegram.org/js/telegram-web-app.js';
-          s.async = true;
-          document.head.appendChild(s);
+      (function(){
+        function bad(msg){
+          return msg && (String(msg).indexOf('usePlatform')>=0 || String(msg).indexOf('PlatformProvider')>=0);
         }
+        function bust(){
+          try{
+            var k='paskod_plat_bust', last=Number(sessionStorage.getItem(k)||'0'), now=Date.now();
+            if(now-last<8000) return;
+            sessionStorage.setItem(k, String(now));
+            var u=new URL(location.href); u.searchParams.set('_cb', String(now));
+            location.replace(u.toString());
+          }catch(e){ location.reload(); }
+        }
+        window.addEventListener('error', function(ev){ if(bad(ev && ev.message) || bad(ev && ev.error && ev.error.message)) bust(); });
+        window.addEventListener('unhandledrejection', function(ev){ var r=ev && ev.reason; if(bad(r)||bad(r&&r.message)) bust(); });
       })();
     </script>
-    <style>
-      body {
-        background-color: #0a0f1a;
-      }
-    </style>
-    <script type="module" crossorigin src="/assets/index-21876d32.js"></script>
-    <link rel="modulepreload" crossorigin href="/assets/vendor-react-B5aZ5G0Y.js">
-    <link rel="modulepreload" crossorigin href="/assets/vendor-query-qJWxXJpd.js">
-    <link rel="modulepreload" crossorigin href="/assets/vendor-utils-rksnccus.js">
-    <link rel="modulepreload" crossorigin href="/assets/vendor-telegram-BljK9Sw_.js">
-    <link rel="modulepreload" crossorigin href="/assets/vendor-twemoji-D9HvikB8.js">
-    <link rel="modulepreload" crossorigin href="/assets/vendor-i18n-BxdFJVG3.js">
-    <link rel="modulepreload" crossorigin href="/assets/vendor-motion-yrvsEvRj.js">
-    <link rel="modulepreload" crossorigin href="/assets/vendor-radix-CmBkAP5K.js">
-    <link rel="modulepreload" crossorigin href="/assets/vendor-cmdk-CTFjeOaw.js">
-    <link rel="stylesheet" crossorigin href="/assets/index-8bc68721.css">
+    <script>
+      (function(){
+        var isTelegram=window.TelegramWebviewProxy||location.hash.indexOf('tgWebApp')!==-1||location.search.indexOf('tgWebApp')!==-1;
+        if(isTelegram){ var s=document.createElement('script'); s.src='https://telegram.org/js/telegram-web-app.js'; s.async=true; document.head.appendChild(s); }
+      })();
+    </script>
+    <style>body{background-color:#0a0f1a;margin:0}</style>
+    <script type="module" crossorigin src="/assets/v7/index-a89cf6b8.js"></script>
+    <link rel="stylesheet" crossorigin href="/assets/v7/index-ffaf3eb8.css">
   </head>
-  <body>
-
-
-    <div id="root"></div>
-  </body>
+  <body><div id="root"></div></body>
 </html>
