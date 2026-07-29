@@ -1,0 +1,8 @@
+Pinned bottom nav + PlatformProvider fix
+
+Assets: index-a45bf9c2.js / index-830cf3f3.css
+
+1) CSS: removed #root{transform:translateZ(0)} which made position:fixed
+   bottom nav scroll away with page. Reinforced nav.fixed.z-50 as viewport-fixed.
+2) JS: usePlatform (we) returns Yc() web fallback instead of throwing when
+   React context is missing (stale Support chunk / duplicate module races).
