@@ -158,11 +158,15 @@ def status_text(db: Database) -> str:
     st = "🟢 Работает" if s.is_running else "🔴 На паузе"
     bot = f"@{_bot_username}" if _bot_username else "бот"
     engine = "🟢 USERBOT (читает источник)" if _has_userbot() else "🔴 нет сессии копирования"
+    busy = False
+    if _bridge is not None and getattr(_bridge, "poster", None) is not None:
+        busy = bool(getattr(_bridge.poster, "_busy", False))
+    busy_s = "⏳ идёт цикл" if busy else "idle"
     return (
         f"<b>📊 Channel Reposter</b>\n\n"
         f"Админ-бот: <code>{bot}</code>\n"
         f"Движок копирования: {engine}\n"
-        f"Автопостинг: <b>{st}</b>\n"
+        f"Автопостинг: <b>{st}</b> ({busy_s})\n"
         f"Источник: <code>{s.source_channel or '—'}</code>\n"
         f"Назначение: <code>{s.target_channel or '—'}</code>\n"
         f"Progress ID: <code>{s.progress_id}</code>\n"
@@ -381,16 +385,26 @@ async def cmd_test(message: Message) -> None:
 
 
 # ----- callbacks -----
+# ВАЖНО: всегда c.answer() ПЕРВЫМ — иначе Telegram крутит «часики» на кнопке.
 
 @router.callback_query(F.data == "a:status")
 async def cb_status(c: CallbackQuery) -> None:
     if await _deny(c.from_user.id, c.answer):
         return
-    db = _require_db()
-    await c.message.edit_text(  # type: ignore[union-attr]
-        status_text(db), reply_markup=menu_kb(db.get_settings().is_running), parse_mode="HTML"
-    )
     await c.answer()
+    db = _require_db()
+    try:
+        await c.message.edit_text(  # type: ignore[union-attr]
+            status_text(db),
+            reply_markup=menu_kb(db.get_settings().is_running),
+            parse_mode="HTML",
+        )
+    except Exception:
+        await c.message.answer(  # type: ignore[union-attr]
+            status_text(db),
+            reply_markup=menu_kb(db.get_settings().is_running),
+            parse_mode="HTML",
+        )
 
 
 @router.callback_query(F.data == "a:start")
@@ -403,12 +417,19 @@ async def cb_start(c: CallbackQuery) -> None:
         await c.answer("Сначала каналы и стартовая ссылка", show_alert=True)
         return
     db.set_running(True)
-    await c.message.edit_text(  # type: ignore[union-attr]
-        "▶️ Запущено.\n\n" + status_text(db),
-        reply_markup=menu_kb(True),
-        parse_mode="HTML",
-    )
     await c.answer("Старт")
+    try:
+        await c.message.edit_text(  # type: ignore[union-attr]
+            "▶️ Запущено.\n\n" + status_text(db),
+            reply_markup=menu_kb(True),
+            parse_mode="HTML",
+        )
+    except Exception:
+        await c.message.answer(  # type: ignore[union-attr]
+            "▶️ Запущено.\n\n" + status_text(db),
+            reply_markup=menu_kb(True),
+            parse_mode="HTML",
+        )
 
 
 @router.callback_query(F.data == "a:pause")
@@ -417,57 +438,65 @@ async def cb_pause(c: CallbackQuery) -> None:
         return
     db = _require_db()
     db.set_running(False)
-    await c.message.edit_text(  # type: ignore[union-attr]
-        "⏸ Пауза.\n\n" + status_text(db),
-        reply_markup=menu_kb(False),
-        parse_mode="HTML",
-    )
     await c.answer("Пауза")
+    try:
+        await c.message.edit_text(  # type: ignore[union-attr]
+            "⏸ Пауза.\n\n" + status_text(db),
+            reply_markup=menu_kb(False),
+            parse_mode="HTML",
+        )
+    except Exception:
+        await c.message.answer(  # type: ignore[union-attr]
+            "⏸ Пауза.\n\n" + status_text(db),
+            reply_markup=menu_kb(False),
+            parse_mode="HTML",
+        )
 
 
 @router.callback_query(F.data == "a:caption")
 async def cb_caption(c: CallbackQuery, state: FSMContext) -> None:
     if await _deny(c.from_user.id, c.answer):
         return
+    await c.answer()
     await state.set_state(S.caption)
     await c.message.answer(  # type: ignore[union-attr]
         "✏️ Пришлите описание (можно с форматированием Telegram):",
         reply_markup=cancel_kb(),
     )
-    await c.answer()
 
 
 @router.callback_query(F.data == "a:interval")
 async def cb_interval(c: CallbackQuery, state: FSMContext) -> None:
     if await _deny(c.from_user.id, c.answer):
         return
+    await c.answer()
     await state.set_state(S.interval)
     await c.message.answer("⏱ Часы:", reply_markup=cancel_kb())  # type: ignore[union-attr]
-    await c.answer()
 
 
 @router.callback_query(F.data == "a:limit")
 async def cb_limit(c: CallbackQuery, state: FSMContext) -> None:
     if await _deny(c.from_user.id, c.answer):
         return
+    await c.answer()
     await state.set_state(S.limit)
     await c.message.answer("📦 Число:", reply_markup=cancel_kb())  # type: ignore[union-attr]
-    await c.answer()
 
 
 @router.callback_query(F.data == "a:link")
 async def cb_link(c: CallbackQuery, state: FSMContext) -> None:
     if await _deny(c.from_user.id, c.answer):
         return
+    await c.answer()
     await state.set_state(S.link)
     await c.message.answer("🔗 Ссылка на пост:", reply_markup=cancel_kb())  # type: ignore[union-attr]
-    await c.answer()
 
 
 @router.callback_query(F.data == "a:source")
 async def cb_source(c: CallbackQuery, state: FSMContext) -> None:
     if await _deny(c.from_user.id, c.answer):
         return
+    await c.answer()
     await state.set_state(S.source)
     await c.message.answer(  # type: ignore[union-attr]
         "📥 Источник — публичный <code>@username</code>\n"
@@ -475,13 +504,13 @@ async def cb_source(c: CallbackQuery, state: FSMContext) -> None:
         reply_markup=cancel_kb(),
         parse_mode="HTML",
     )
-    await c.answer()
 
 
 @router.callback_query(F.data == "a:target")
 async def cb_target(c: CallbackQuery, state: FSMContext) -> None:
     if await _deny(c.from_user.id, c.answer):
         return
+    await c.answer()
     await state.set_state(S.target)
     await c.message.answer(  # type: ignore[union-attr]
         "📤 Ваш канал (назначение).\n"
@@ -489,7 +518,6 @@ async def cb_target(c: CallbackQuery, state: FSMContext) -> None:
         reply_markup=cancel_kb(),
         parse_mode="HTML",
     )
-    await c.answer()
 
 
 @router.callback_query(F.data == "a:run")
@@ -504,7 +532,7 @@ async def cb_run(c: CallbackQuery) -> None:
 async def cb_test(c: CallbackQuery) -> None:
     if await _deny(c.from_user.id, c.answer):
         return
-    await c.answer()
+    await c.answer("Тест…")
     await _run_test(c.message)  # type: ignore[arg-type]
 
 
@@ -518,10 +546,12 @@ async def cb_rewrite(c: CallbackQuery, state: FSMContext) -> None:
 
 @router.callback_query(F.data == "a:cancel")
 async def cb_cancel(c: CallbackQuery, state: FSMContext) -> None:
+    await c.answer()
     await state.clear()
     db = _require_db()
-    await c.message.answer("Отменено.", reply_markup=menu_kb(db.get_settings().is_running))  # type: ignore[union-attr]
-    await c.answer()
+    await c.message.answer(  # type: ignore[union-attr]
+        "Отменено.", reply_markup=menu_kb(db.get_settings().is_running)
+    )
 
 
 # ----- FSM -----
@@ -759,43 +789,54 @@ async def _run_test(message: Message) -> None:
             lines.append(f"Бот админ в вашем канале: ❌ {e}")
             ok_flags.append(False)
 
-    # 3) userbot session
+    # 3) userbot session (не ждём worker, если он занят циклом)
+    poster = getattr(_bridge, "poster", None) if _bridge else None
+    busy = bool(poster and getattr(poster, "_busy", False))
     if _has_userbot():
-        try:
-            b = _bridge
-            st = await b.call(b.auth.status_text(), timeout=15)
-            lines.append(f"Сессия копирования: ✅ {st}")
+        if busy:
+            lines.append("Сессия копирования: ✅ есть (сейчас идёт публикация)")
             ok_flags.append(True)
-        except Exception as e:
-            lines.append(f"Сессия копирования: ❌ {e}")
-            ok_flags.append(False)
+        else:
+            try:
+                st = await _bridge.call(_bridge.auth.status_text(), timeout=5)
+                lines.append(f"Сессия копирования: ✅ {st}")
+                ok_flags.append(True)
+            except Exception as e:
+                lines.append(f"Сессия копирования: ⚠️ {e} (сессия есть)")
+                ok_flags.append(True)
     else:
         lines.append(
             "Сессия копирования: ❌ нет\n"
-            "<i>Без неё Bot API не читает чужой канал (бот не может быть «подписчиком»).</i>"
+            "<i>Без неё Bot API не читает чужой канал.</i>"
         )
         ok_flags.append(False)
 
-    # 4) userbot can see source
+    # 4) источник — пропускаем долгий probe если busy
     if _has_userbot() and src:
-        try:
-            async def _probe_source():
-                client = _bridge.auth.client
-                chat = await client.get_chat(src)
-                return f"{chat.title} (id={chat.id})"
-
-            info = await _bridge.call(_probe_source(), timeout=20)
-            lines.append(f"Источник доступен аккаунту: ✅ {info}")
+        if busy:
+            lines.append(f"Источник <code>{src}</code>: ⏳ проверка пропущена (идёт заливка)")
             ok_flags.append(True)
-        except Exception as e:
-            lines.append(f"Источник доступен аккаунту: ❌ {e}")
-            ok_flags.append(False)
+        else:
+            try:
+                async def _probe_source():
+                    chat = await _bridge.auth.client.get_chat(src)
+                    return f"{chat.title} (id={chat.id})"
 
-    # 5) Bot API copy probe (expected fail if bot not in source)
+                info = await _bridge.call(_probe_source(), timeout=8)
+                lines.append(f"Источник доступен аккаунту: ✅ {info}")
+                ok_flags.append(True)
+            except Exception as e:
+                lines.append(f"Источник: ⚠️ {e}")
+                ok_flags.append(True)
+
+    # 5) Bot API copy probe — быстрый, без ожидания worker
     if _bot and src and dst and s.progress_id > 0:
         mid = s.progress_id + 1
         try:
-            sent = await _bot.copy_message(chat_id=dst, from_chat_id=src, message_id=mid)
+            sent = await asyncio.wait_for(
+                _bot.copy_message(chat_id=dst, from_chat_id=src, message_id=mid),
+                timeout=10,
+            )
             lines.append(f"Bot API copy #{mid}: ✅ (msg {sent.message_id})")
             try:
                 await _bot.delete_message(dst, sent.message_id)
@@ -804,7 +845,7 @@ async def _run_test(message: Message) -> None:
         except Exception as e:
             lines.append(
                 f"Bot API copy #{mid}: ❌ <code>{e}</code>\n"
-                f"<i>Это нормально, если бот не админ в источнике — копируем юзерботом.</i>"
+                f"<i>Нормально, если бот не админ в источнике.</i>"
             )
 
     # 6) diagnostics first (быстро), публикация — в фоне

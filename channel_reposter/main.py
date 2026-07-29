@@ -3,6 +3,10 @@ main.py — админ-бот + гибридное копирование.
 
 Юзербот читает чужой канал (подписка аккаунта).
 Бот публикует в ваш канал (где он админ).
+
+Админ-loop и worker-loop полностью разделены:
+  • polling никогда не ждёт publish/stage;
+  • планировщик будит сам себя каждые 20 сек (не sleep(часы)).
 """
 
 from __future__ import annotations
@@ -10,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import sys
+import time
 from pathlib import Path
 
 from aiogram import Bot, Dispatcher
@@ -53,11 +58,9 @@ async def _worker_bootstrap(db: Database, workdir: Path) -> str:
         logger.warning("Нет сессии юзербота")
         return "none"
 
-    # Отдельный Bot-клиент в worker-потоке для публикации
-    # 180s хватает на один файл; альбом идёт по файлам со своими таймаутами
     publish_bot = Bot(
         token=config.BOT_TOKEN,
-        session=AiohttpSession(timeout=180.0),
+        session=AiohttpSession(timeout=120.0),
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
     BRIDGE.publish_bot = publish_bot
@@ -68,33 +71,62 @@ async def _worker_bootstrap(db: Database, workdir: Path) -> str:
 
 
 async def _worker_scheduler() -> None:
-    """Циклы по интервалу + быстрый повтор, если автопост включён и цикл дал 0."""
-    logger.info("Scheduler started")
-    await asyncio.sleep(5)
+    """Тик каждые 20с: если автопост включён и подошёл интервал — цикл."""
+    logger.info("Scheduler started (tick=20s)")
+    await asyncio.sleep(3)
+    next_due = 0.0
     idle_rounds = 0
     while True:
-        db = BRIDGE.db
-        poster = BRIDGE.poster
-        if db is None:
-            await asyncio.sleep(5)
-            continue
-        published = 0
-        if db.get_settings().is_running and poster is not None:
-            try:
-                published = await poster.run_cycle()
-                logger.info("Scheduler published %s", published)
-            except Exception:
-                logger.exception("scheduler")
-        if db.get_settings().is_running and published == 0:
-            idle_rounds += 1
-            # Пока идут ошибки/дыры — не ждать 9 часов, пробовать чаще
-            wait = min(120.0, 15.0 * idle_rounds)
-            logger.info("No posts this round — retry in %.0fs", wait)
-        else:
-            idle_rounds = 0
-            wait = max(db.get_settings().interval_hours, 0.05) * 3600
-            logger.info("Next cycle in %.1f h", db.get_settings().interval_hours)
-        await asyncio.sleep(wait)
+        try:
+            db = BRIDGE.db
+            poster = BRIDGE.poster
+            now = time.monotonic()
+            if db is None:
+                await asyncio.sleep(5)
+                continue
+
+            settings = db.get_settings()
+            if settings.is_running and poster is not None and now >= next_due:
+                if getattr(poster, "_busy", False):
+                    logger.info("Scheduler: cycle busy, wait")
+                else:
+                    try:
+                        published = await poster.run_cycle()
+                        logger.info("Scheduler published %s", published)
+                    except Exception:
+                        logger.exception("scheduler")
+                        published = 0
+                    if published == 0:
+                        idle_rounds += 1
+                        delay = min(90.0, 15.0 * idle_rounds)
+                    else:
+                        idle_rounds = 0
+                        delay = max(settings.interval_hours, 0.05) * 3600
+                    next_due = time.monotonic() + delay
+                    logger.info("Next cycle in %.0fs (%.2fh)", delay, delay / 3600.0)
+        except Exception:
+            logger.exception("scheduler tick")
+        await asyncio.sleep(20)
+
+
+async def _admin_heartbeat(bot: Bot) -> None:
+    """Пишет в лог, что admin-loop жив; помогает ловить залипший polling."""
+    while True:
+        try:
+            me = await asyncio.wait_for(bot.get_me(), timeout=15)
+            wh = await asyncio.wait_for(bot.get_webhook_info(), timeout=15)
+            logger.info(
+                "heartbeat @%s pending=%s webhook=%s",
+                me.username,
+                wh.pending_update_count,
+                "yes" if wh.url else "no",
+            )
+            if wh.url:
+                logger.warning("Webhook set — deleting so polling works")
+                await bot.delete_webhook(drop_pending_updates=False)
+        except Exception:
+            logger.exception("heartbeat")
+        await asyncio.sleep(30)
 
 
 async def main() -> None:
@@ -112,16 +144,18 @@ async def main() -> None:
     if s.target_channel:
         db.set_target_channel(_norm_channel(s.target_channel))
 
-    # Откат progress после пустого прогона с WRITE_FORBIDDEN
-    # (чтобы не ускакал далеко без публикаций)
-    if db.get_progress_id() > 6000 and db.history_count() > 0:
-        # мягкий откат к месту, где точно был контент при тесте
-        pass
-
+    # Admin bot: короткий timeout, чтобы кнопки не висели на сети
     bot = Bot(
         token=config.BOT_TOKEN,
+        session=AiohttpSession(timeout=30.0),
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
+    # На всякий случай сбрасываем webhook
+    try:
+        await bot.delete_webhook(drop_pending_updates=True)
+    except Exception:
+        logger.exception("delete_webhook")
+
     me = await bot.get_me()
     logger.info("Admin bot @%s", me.username)
 
@@ -132,11 +166,16 @@ async def main() -> None:
     BRIDGE.admin_loop = asyncio.get_running_loop()
 
     async def _notify(chat_id: int, text: str, **kwargs):
-        await bot.send_message(chat_id, text, **kwargs)
+        try:
+            await asyncio.wait_for(
+                bot.send_message(chat_id, text, **kwargs), timeout=20
+            )
+        except Exception:
+            logger.exception("notify send")
 
     BRIDGE.notify_fn = _notify
 
-    mode = await BRIDGE.call(_worker_bootstrap(db, workdir))
+    mode = await BRIDGE.call(_worker_bootstrap(db, workdir), timeout=60)
     if mode == "hybrid":
         BRIDGE.submit(_worker_scheduler())
 
@@ -152,16 +191,30 @@ async def main() -> None:
     admin_bot.setup_dispatcher(dp)
     logger.info("Online https://t.me/%s mode=%s", me.username, mode)
 
+    hb = asyncio.create_task(_admin_heartbeat(bot), name="admin-heartbeat")
+
     try:
-        await dp.start_polling(bot, drop_pending_updates=True)
+        await dp.start_polling(
+            bot,
+            drop_pending_updates=True,
+            polling_timeout=20,
+            handle_as_tasks=True,
+            allowed_updates=["message", "callback_query"],
+        )
     finally:
+        hb.cancel()
+        try:
+            await hb
+        except Exception:
+            pass
+
         async def _close_pub():
             pub = getattr(BRIDGE, "publish_bot", None)
             if pub is not None:
                 await pub.session.close()
 
         try:
-            await BRIDGE.call(_close_pub())
+            await BRIDGE.call(_close_pub(), timeout=15)
         except Exception:
             pass
         BRIDGE.stop()
