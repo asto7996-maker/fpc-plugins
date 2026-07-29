@@ -445,7 +445,74 @@ class HybridPoster:
                 except Exception:
                     pass
 
+    def _staging_chat(self) -> Optional[int | str]:
+        """Чат для временной загрузки (получить file_id без публикации в канал)."""
+        raw = self.db.get("staging_chat_id")
+        if raw:
+            try:
+                return int(raw)
+            except ValueError:
+                return raw
+        if config.ADMIN_IDS:
+            return config.ADMIN_IDS[0]
+        return None
+
+    async def _stage_file_id(self, msg: Message, path: Path) -> Optional[tuple[str, str]]:
+        """
+        Загрузить файл в staging-чат → file_id → удалить.
+        Возвращает (file_id, kind) где kind: photo|video|document|audio.
+        """
+        stage = self._staging_chat()
+        if stage is None:
+            logger.error("Нет staging_chat_id — напишите боту /start")
+            return None
+        file = FSInputFile(path)
+        sent = None
+        try:
+            if msg.photo:
+                sent = await self.bot.send_photo(
+                    chat_id=stage, photo=file, disable_notification=True
+                )
+                kind, fid = "photo", sent.photo[-1].file_id
+            elif msg.video or msg.animation:
+                sent = await self.bot.send_video(
+                    chat_id=stage, video=file, disable_notification=True
+                )
+                kind, fid = "video", sent.video.file_id if sent.video else sent.document.file_id
+            elif msg.audio:
+                sent = await self.bot.send_audio(
+                    chat_id=stage, audio=file, disable_notification=True
+                )
+                kind, fid = "audio", sent.audio.file_id
+            else:
+                sent = await self.bot.send_document(
+                    chat_id=stage, document=file, disable_notification=True
+                )
+                kind, fid = "document", sent.document.file_id
+            return fid, kind
+        except TelegramRetryAfter as e:
+            await asyncio.sleep(int(e.retry_after) + 1)
+            return await self._stage_file_id(msg, path)
+        except Exception as e:
+            logger.error("stage upload id=%s: %s", msg.id, e)
+            return None
+        finally:
+            if sent is not None:
+                try:
+                    await self.bot.delete_message(stage, sent.message_id)
+                except Exception:
+                    pass
+
+    def _input_media(self, kind: str, file_id: str, caption: Optional[str]):
+        parse = ParseMode.HTML if caption else None
+        if kind == "photo":
+            return InputMediaPhoto(media=file_id, caption=caption, parse_mode=parse)
+        if kind == "video":
+            return InputMediaVideo(media=file_id, caption=caption, parse_mode=parse)
+        return InputMediaDocument(media=file_id, caption=caption, parse_mode=parse)
+
     async def _publish_album(self, source, target, anchor: Message, caption: str) -> str:
+        """Публикует альбом ОДНИМ media_group (не дробит на отдельные посты)."""
         gid = str(anchor.media_group_id)
         self._seen_grouped.add(gid)
         try:
@@ -462,6 +529,10 @@ class HybridPoster:
         try:
             downloaded: list[tuple[Message, Path]] = []
             for m in album:
+                size = _approx_size(m)
+                if size and size > BOT_UPLOAD_LIMIT:
+                    logger.warning("album skip oversized id=%s size=%s", m.id, size)
+                    continue
                 path = await self._download(m)
                 if path is None:
                     continue
@@ -472,104 +543,142 @@ class HybridPoster:
                 self._seen_grouped.discard(gid)
                 return "retry"
 
-            # media_group: подпись только на первом (ограничение Telegram)
-            media = []
-            total_size = 0
-            for i, (m, path) in enumerate(downloaded):
-                total_size += path.stat().st_size
+            # 1 файл → обычная публикация
+            if len(downloaded) == 1:
+                m, path = downloaded[0]
+                sent = await self._send_media_file(
+                    target=target,
+                    msg=m,
+                    path=path,
+                    caption=caption or None,
+                    label=f"album-single:{m.id}",
+                )
+                max_src = max(x.id for x in album)
+                for x in album:
+                    self.db.add_history(
+                        source_message_id=x.id,
+                        target_message_id=sent.message_id,
+                        grouped_id=gid,
+                        status="ok",
+                    )
+                self.db.set_progress_id(max_src)
+                logger.info("Hybrid album(1) %s → %s", gid, sent.message_id)
+                return "ok"
+
+            # Сначала пробуем прямой media_group с файлами (если суммарно небольшой)
+            total_size = sum(p.stat().st_size for _, p in downloaded)
+            media_direct = []
+            for i, (m, path) in enumerate(downloaded[:10]):
                 file = FSInputFile(path)
                 cap = caption if i == 0 else None
                 parse = ParseMode.HTML if (i == 0 and caption) else None
                 if m.photo:
-                    media.append(InputMediaPhoto(media=file, caption=cap, parse_mode=parse))
+                    media_direct.append(InputMediaPhoto(media=file, caption=cap, parse_mode=parse))
                 elif m.video or m.animation:
-                    media.append(InputMediaVideo(media=file, caption=cap, parse_mode=parse))
+                    media_direct.append(InputMediaVideo(media=file, caption=cap, parse_mode=parse))
                 else:
-                    media.append(InputMediaDocument(media=file, caption=cap, parse_mode=parse))
+                    media_direct.append(InputMediaDocument(media=file, caption=cap, parse_mode=parse))
 
-            sent_ok = False
             first_id = None
-            use_group = 1 < len(media) <= 10 and total_size <= BOT_UPLOAD_LIMIT
-            if use_group:
+            if len(downloaded) <= 10 and total_size <= BOT_UPLOAD_LIMIT:
                 try:
                     sent_list = await self._send_with_retry(
-                        lambda: self.bot.send_media_group(chat_id=target, media=media),
-                        label=f"album:{gid}",
+                        lambda: self.bot.send_media_group(chat_id=target, media=media_direct),
+                        label=f"album-direct:{gid}",
                     )
-                    first_id = sent_list[0].message_id if sent_list else None
-                    sent_ok = True
-                    if caption:
-                        logger.info(
-                            "album %s media_group caption on first → %s",
-                            gid,
-                            first_id,
+                    first_id = sent_list[0].message_id
+                    max_src = max(x.id for x in album)
+                    for x in album:
+                        self.db.add_history(
+                            source_message_id=x.id,
+                            target_message_id=first_id,
+                            grouped_id=gid,
+                            status="ok",
                         )
+                    self.db.set_progress_id(max_src)
+                    logger.info(
+                        "Hybrid album direct %s (%s files) → %s",
+                        gid,
+                        len(media_direct),
+                        first_id,
+                    )
+                    return "ok"
                 except Exception as e:
                     err = str(e).upper()
                     if "WRITE_FORBIDDEN" in err or "CHAT_WRITE" in err:
-                        logger.error("Fatal album write: %s", e)
                         return "fatal"
                     logger.warning(
-                        "album media_group fail %s size=%s: %s — fallback single",
-                        gid,
-                        total_size,
-                        e,
+                        "direct media_group failed (%s) — stage file_ids", e
                     )
-            else:
-                logger.info(
-                    "album %s send one-by-one WITH caption on each (files=%s size=%s)",
-                    gid,
-                    len(downloaded),
-                    total_size,
-                )
 
-            # По одному: шаблон на КАЖДЫЙ файл (иначе выглядят как посты без описания)
-            if not sent_ok:
-                published_any = False
-                for m, path in downloaded:
-                    try:
-                        sent = await self._send_media_file(
-                            target=target,
-                            msg=m,
-                            path=path,
-                            caption=caption or None,
-                            label=f"album-item:{m.id}",
-                        )
-                        if first_id is None:
-                            first_id = sent.message_id
-                        published_any = True
-                        await asyncio.sleep(1.2)
-                    except Exception as e:
-                        if _is_transient(e):
-                            self._seen_grouped.discard(gid)
-                            logger.error("album item transient %s: %s", m.id, e)
-                            return "retry"
-                        err = str(e).upper()
-                        if "WRITE_FORBIDDEN" in err or "CHAT_WRITE" in err:
-                            return "fatal"
-                        logger.error("album item skip %s: %s", m.id, e)
+            # Большие альбомы: upload → file_id → один media_group (без дробления)
+            if self._staging_chat() is None:
+                logger.error("Нужен /start у админа для staging file_id")
+                self._seen_grouped.discard(gid)
+                return "retry"
 
-                if not published_any:
+            staged: list[tuple[Message, str, str]] = []
+            for m, path in downloaded:
+                got = await self._stage_file_id(m, path)
+                if got is None:
+                    logger.warning("stage failed id=%s", m.id)
+                    continue
+                staged.append((m, got[0], got[1]))
+                await asyncio.sleep(0.6)
+
+            if not staged:
+                self._seen_grouped.discard(gid)
+                return "retry"
+
+            # Telegram: max 10 в одной группе. Если >10 — несколько АЛЬБОМОВ (не одиночек).
+            first_id = None
+            for chunk_i in range(0, len(staged), 10):
+                chunk = staged[chunk_i : chunk_i + 10]
+                media = []
+                for j, (_m, fid, kind) in enumerate(chunk):
+                    cap = caption if (chunk_i == 0 and j == 0) else None
+                    media.append(self._input_media(kind, fid, cap))
+                try:
+                    sent_list = await self._send_with_retry(
+                        lambda m=media: self.bot.send_media_group(chat_id=target, media=m),
+                        label=f"album-staged:{gid}:{chunk_i}",
+                    )
+                    if first_id is None and sent_list:
+                        first_id = sent_list[0].message_id
+                    logger.info(
+                        "Hybrid album staged chunk %s+%s → %s",
+                        chunk_i,
+                        len(chunk),
+                        sent_list[0].message_id if sent_list else None,
+                    )
+                    await asyncio.sleep(1.5)
+                except Exception as e:
+                    err = str(e).upper()
+                    if "WRITE_FORBIDDEN" in err or "CHAT_WRITE" in err:
+                        return "fatal"
+                    if _is_transient(e):
+                        self._seen_grouped.discard(gid)
+                        return "retry"
+                    logger.error("staged media_group fail: %s", e)
                     self._seen_grouped.discard(gid)
-                    return "retry"
-                sent_ok = True
+                    self.db.add_history(anchor.id, grouped_id=gid, status="error", error=str(e))
+                    return "skip"
 
-            max_src = max(m.id for m in album)
-            for m in album:
+            max_src = max(x.id for x in album)
+            for x in album:
                 self.db.add_history(
-                    source_message_id=m.id,
+                    source_message_id=x.id,
                     target_message_id=first_id,
                     grouped_id=gid,
                     status="ok",
                 )
             self.db.set_progress_id(max_src)
             logger.info(
-                "Hybrid album %s (%s/%s files) → %s (progress=%s)",
+                "Hybrid album %s (%s/%s files, kept as media_group) → %s",
                 gid,
-                len(downloaded),
+                len(staged),
                 len(album),
                 first_id,
-                max_src,
             )
             return "ok"
         except TelegramRetryAfter as e:

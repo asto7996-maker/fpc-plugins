@@ -172,10 +172,17 @@ def status_text(db: Database) -> str:
 
 # ----- commands -----
 
+def _remember_admin(uid: Optional[int]) -> None:
+    """Сохраняем чат админа — нужен как staging для загрузки file_id альбомов."""
+    if uid and _db is not None:
+        _db.set("staging_chat_id", str(uid))
+
+
 @router.message(Command("start", "menu", "help"))
 async def cmd_start(message: Message, state: FSMContext) -> None:
     if await _deny(message.from_user.id if message.from_user else None, message.answer):
         return
+    _remember_admin(message.from_user.id if message.from_user else None)
     await state.clear()
     db = _require_db()
     bot = f"@{_bot_username}" if _bot_username else "бота"
