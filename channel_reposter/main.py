@@ -176,6 +176,25 @@ async def main() -> None:
     logger.info("Online https://t.me/%s · engine=%s", me.username, mode)
 
     hb = asyncio.create_task(_heartbeat(bot), name="heartbeat")
+
+    # Свежее меню админу после рестарта — старые кнопки часто «мертвые»
+    async def _announce_restart() -> None:
+        await asyncio.sleep(2)
+        raw = db.get("staging_chat_id") or ""
+        if not raw.isdigit():
+            return
+        try:
+            await bot.send_message(
+                int(raw),
+                "♻️ Бот перезапущен.\nНажмите /start — откроется новое меню "
+                "(старые кнопки могут не работать).",
+                reply_markup=admin_bot.menu_kb(db.get_settings().is_running),
+                parse_mode="HTML",
+            )
+        except Exception:
+            logger.exception("restart announce")
+
+    announce = asyncio.create_task(_announce_restart(), name="announce")
     try:
         await dp.start_polling(
             bot,
@@ -185,13 +204,21 @@ async def main() -> None:
             allowed_updates=["message", "callback_query"],
         )
     finally:
+        announce.cancel()
         hb.cancel()
+        for task in (hb, announce):
+            try:
+                await task
+            except BaseException:
+                pass
         try:
-            await hb
+            BRIDGE.stop()
         except Exception:
-            pass
-        BRIDGE.stop()
-        await bot.session.close()
+            logger.exception("bridge stop")
+        try:
+            await bot.session.close()
+        except Exception:
+            logger.exception("bot session close")
 
 
 if __name__ == "__main__":

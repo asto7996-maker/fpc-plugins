@@ -113,10 +113,33 @@ def is_admin(uid: Optional[int]) -> bool:
     return uid in config.ADMIN_IDS
 
 
-async def _deny(uid: Optional[int], reply) -> bool:
+async def _ack(
+    c: CallbackQuery,
+    text: Optional[str] = None,
+    *,
+    show_alert: bool = False,
+) -> None:
+    """answer callback; никогда не роняет хендлер (query too old / already answered)."""
+    try:
+        await c.answer(text=text, show_alert=show_alert)
+    except Exception as e:
+        logger.debug("callback ack skipped: %s", e)
+
+
+async def _deny(uid: Optional[int], reply: Callable) -> bool:
     if is_admin(uid):
         return False
-    await reply("⛔ Только для администраторов.")
+    try:
+        await reply("⛔ Только для администраторов.")
+    except Exception:
+        logger.debug("deny reply failed", exc_info=True)
+    return True
+
+
+async def _deny_cb(c: CallbackQuery) -> bool:
+    if is_admin(c.from_user.id if c.from_user else None):
+        return False
+    await _ack(c, "⛔ Только для администраторов.", show_alert=True)
     return True
 
 
@@ -281,9 +304,9 @@ async def cmd_pause(message: Message) -> None:
 
 @router.callback_query(F.data == "a:status")
 async def cb_status(c: CallbackQuery) -> None:
-    if await _deny(c.from_user.id, c.answer):
+    if await _deny_cb(c):
         return
-    await c.answer()
+    await _ack(c)
     db = _require_db()
     text = status_text(db)
     kb = menu_kb(db.get_settings().is_running)
@@ -295,18 +318,18 @@ async def cb_status(c: CallbackQuery) -> None:
 
 @router.callback_query(F.data == "a:start")
 async def cb_start(c: CallbackQuery) -> None:
-    if await _deny(c.from_user.id, c.answer):
+    if await _deny_cb(c):
         return
     db = _require_db()
     s = db.get_settings()
     if not _has_userbot():
-        await c.answer("Сначала вход юзербота", show_alert=True)
+        await _ack(c, "Сначала вход юзербота", show_alert=True)
         return
     if not s.source_channel or not s.target_channel or s.progress_id < 0:
-        await c.answer("Каналы + стартовая точка", show_alert=True)
+        await _ack(c, "Каналы + стартовая точка", show_alert=True)
         return
     db.set_running(True)
-    await c.answer("Старт")
+    await _ack(c, "Старт")
     text = "▶️ Запущено.\n\n" + status_text(db)
     try:
         await c.message.edit_text(text, reply_markup=menu_kb(True), parse_mode="HTML")  # type: ignore
@@ -316,10 +339,10 @@ async def cb_start(c: CallbackQuery) -> None:
 
 @router.callback_query(F.data == "a:pause")
 async def cb_pause(c: CallbackQuery) -> None:
-    if await _deny(c.from_user.id, c.answer):
+    if await _deny_cb(c):
         return
     _require_db().set_running(False)
-    await c.answer("Пауза")
+    await _ack(c, "Пауза")
     db = _require_db()
     text = "⏸ Пауза.\n\n" + status_text(db)
     try:
@@ -330,9 +353,9 @@ async def cb_pause(c: CallbackQuery) -> None:
 
 @router.callback_query(F.data == "a:login")
 async def cb_login(c: CallbackQuery, state: FSMContext) -> None:
-    if await _deny(c.from_user.id, c.answer):
+    if await _deny_cb(c):
         return
-    await c.answer()
+    await _ack(c)
     await state.set_state(S.api_id)
     await c.message.answer(  # type: ignore
         "🔐 <b>Вход юзербота</b>\n\n"
@@ -344,9 +367,9 @@ async def cb_login(c: CallbackQuery, state: FSMContext) -> None:
 
 @router.callback_query(F.data == "a:caption")
 async def cb_caption(c: CallbackQuery, state: FSMContext) -> None:
-    if await _deny(c.from_user.id, c.answer):
+    if await _deny_cb(c):
         return
-    await c.answer()
+    await _ack(c)
     await state.set_state(S.caption)
     await c.message.answer(  # type: ignore
         "✏️ Пришлите описание (жирный/курсив/ссылки — как в Telegram):",
@@ -356,27 +379,27 @@ async def cb_caption(c: CallbackQuery, state: FSMContext) -> None:
 
 @router.callback_query(F.data == "a:interval")
 async def cb_interval(c: CallbackQuery, state: FSMContext) -> None:
-    if await _deny(c.from_user.id, c.answer):
+    if await _deny_cb(c):
         return
-    await c.answer()
+    await _ack(c)
     await state.set_state(S.interval)
     await c.message.answer("⏱ Интервал в часах (например <code>0.5</code>):", reply_markup=cancel_kb(), parse_mode="HTML")  # type: ignore
 
 
 @router.callback_query(F.data == "a:limit")
 async def cb_limit(c: CallbackQuery, state: FSMContext) -> None:
-    if await _deny(c.from_user.id, c.answer):
+    if await _deny_cb(c):
         return
-    await c.answer()
+    await _ack(c)
     await state.set_state(S.limit)
     await c.message.answer("📦 Сколько постов за один цикл:", reply_markup=cancel_kb())  # type: ignore
 
 
 @router.callback_query(F.data == "a:link")
 async def cb_link(c: CallbackQuery, state: FSMContext) -> None:
-    if await _deny(c.from_user.id, c.answer):
+    if await _deny_cb(c):
         return
-    await c.answer()
+    await _ack(c)
     await state.set_state(S.link)
     await c.message.answer(  # type: ignore
         "🔗 Ссылка на пост-источник:\n"
@@ -389,9 +412,9 @@ async def cb_link(c: CallbackQuery, state: FSMContext) -> None:
 
 @router.callback_query(F.data == "a:oldest")
 async def cb_oldest(c: CallbackQuery) -> None:
-    if await _deny(c.from_user.id, c.answer):
+    if await _deny_cb(c):
         return
-    await c.answer("Ищем…")
+    await _ack(c, "Ищем…")
     if not _has_userbot():
         await c.message.answer("❌ Сначала вход юзербота.")  # type: ignore
         return
@@ -414,9 +437,9 @@ async def cb_oldest(c: CallbackQuery) -> None:
 
 @router.callback_query(F.data == "a:source")
 async def cb_source(c: CallbackQuery, state: FSMContext) -> None:
-    if await _deny(c.from_user.id, c.answer):
+    if await _deny_cb(c):
         return
-    await c.answer()
+    await _ack(c)
     await state.set_state(S.source)
     await c.message.answer(  # type: ignore
         "📥 Источник — публичный <code>@username</code>\n"
@@ -428,9 +451,9 @@ async def cb_source(c: CallbackQuery, state: FSMContext) -> None:
 
 @router.callback_query(F.data == "a:target")
 async def cb_target(c: CallbackQuery, state: FSMContext) -> None:
-    if await _deny(c.from_user.id, c.answer):
+    if await _deny_cb(c):
         return
-    await c.answer()
+    await _ack(c)
     await state.set_state(S.target)
     await c.message.answer(  # type: ignore
         "📤 Назначение — ваш канал.\n"
@@ -442,25 +465,25 @@ async def cb_target(c: CallbackQuery, state: FSMContext) -> None:
 
 @router.callback_query(F.data == "a:run")
 async def cb_run(c: CallbackQuery) -> None:
-    if await _deny(c.from_user.id, c.answer):
+    if await _deny_cb(c):
         return
-    await c.answer("Запуск…")
+    await _ack(c, "Запуск…")
     await _do_run_now(c.message.answer)  # type: ignore
 
 
 @router.callback_query(F.data == "a:test")
 async def cb_test(c: CallbackQuery) -> None:
-    if await _deny(c.from_user.id, c.answer):
+    if await _deny_cb(c):
         return
-    await c.answer("Тест…")
+    await _ack(c, "Тест…")
     await _run_test(c.message)  # type: ignore
 
 
 @router.callback_query(F.data == "a:rewrite")
 async def cb_rewrite(c: CallbackQuery, state: FSMContext) -> None:
-    if await _deny(c.from_user.id, c.answer):
+    if await _deny_cb(c):
         return
-    await c.answer()
+    await _ack(c)
     db = _require_db()
     s = db.get_settings()
     if not (s.caption_template or "").strip():
@@ -481,7 +504,7 @@ async def cb_rewrite(c: CallbackQuery, state: FSMContext) -> None:
 
 @router.callback_query(F.data == "a:cancel")
 async def cb_cancel(c: CallbackQuery, state: FSMContext) -> None:
-    await c.answer()
+    await _ack(c)
     await state.clear()
     db = _require_db()
     await c.message.answer("Отменено.", reply_markup=menu_kb(db.get_settings().is_running))  # type: ignore
@@ -933,3 +956,8 @@ async def _run_rewrite(message: Message, channel: str, limit: Optional[int]) -> 
 
 def setup_dispatcher(dp: Dispatcher) -> None:
     dp.include_router(router)
+
+    @dp.error()
+    async def _on_error(event) -> bool:  # type: ignore[no-untyped-def]
+        logger.exception("Update failed: %s", getattr(event, "exception", event))
+        return True
