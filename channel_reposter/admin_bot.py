@@ -399,7 +399,12 @@ async def cb_limit(c: CallbackQuery, state: FSMContext) -> None:
         return
     await _ack(c)
     await state.set_state(S.limit)
-    await c.message.answer("📦 Сколько постов за один цикл:", reply_markup=cancel_kb())  # type: ignore
+    await c.message.answer(  # type: ignore
+        "📦 Сколько <b>публикаций</b> за один цикл?\n"
+        "<i>Альбом = 1 публикация (не число файлов внутри).</i>",
+        reply_markup=cancel_kb(),
+        parse_mode="HTML",
+    )
 
 
 @router.callback_query(F.data == "a:link")
