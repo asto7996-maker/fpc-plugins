@@ -177,6 +177,13 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(s.posts_per_cycle, 3)
         self.assertTrue(s.is_running)
 
+    def test_max_ok_source_id(self) -> None:
+        self.assertEqual(self.db.max_ok_source_id(), 0)
+        self.db.add_history(10, target_message_id=1, status="ok")
+        self.db.add_history(25, target_message_id=2, status="ok")
+        self.db.add_history(30, status="error", error="x")
+        self.assertEqual(self.db.max_ok_source_id(), 25)
+
 
 if __name__ == "__main__":
     unittest.main()
