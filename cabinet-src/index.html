@@ -4,6 +4,8 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
     <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
+    <meta http-equiv="Pragma" content="no-cache" />
+    <meta http-equiv="Expires" content="0" />
     <meta name="theme-color" content="#0a0f1a" />
     <meta name="mobile-web-app-capable" content="yes" />
     <title>VPN</title>
@@ -18,20 +20,61 @@
         }
       })();
     </script>
-    <style>body{background-color:#0a0f1a;margin:0}#root{min-height:100vh}</style>
-    <script type="module" crossorigin src="/assets/v7/index-a89cf6b8.js"></script>
-    <link rel="modulepreload" crossorigin href="/assets/v7/vendor-react-B5aZ5G0Y.js">
-    <link rel="modulepreload" crossorigin href="/assets/v7/vendor-query-qJWxXJpd.js">
-    <link rel="modulepreload" crossorigin href="/assets/v7/vendor-utils-rksnccus.js">
-    <link rel="modulepreload" crossorigin href="/assets/v7/vendor-telegram-BljK9Sw_.js">
-    <link rel="modulepreload" crossorigin href="/assets/v7/vendor-twemoji-D9HvikB8.js">
-    <link rel="modulepreload" crossorigin href="/assets/v7/vendor-i18n-BxdFJVG3.js">
-    <link rel="modulepreload" crossorigin href="/assets/v7/vendor-motion-yrvsEvRj.js">
-    <link rel="modulepreload" crossorigin href="/assets/v7/vendor-radix-CmBkAP5K.js">
-    <link rel="modulepreload" crossorigin href="/assets/v7/vendor-cmdk-CTFjeOaw.js">
-    <link rel="stylesheet" crossorigin href="/assets/v7/index-ffaf3eb8.css">
+    <style>
+      html,body{background:#0a0f1a;margin:0;color:#e8eef7}
+      #root{min-height:100vh}
+      #boot{position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;background:#0a0f1a;z-index:99999;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif}
+      #boot .spin{width:28px;height:28px;border:3px solid rgba(255,255,255,.15);border-top-color:#5b9fff;border-radius:50%;animation:b .8s linear infinite}
+      #boot p{margin:0;font-size:14px;opacity:.85}
+      #boot.hide{opacity:0;pointer-events:none;transition:opacity .2s}
+      @keyframes b{to{transform:rotate(360deg)}}
+    </style>
+    <script type="module" crossorigin src="/assets/v9/index-a89cf6b8.js"></script>
+    <link rel="modulepreload" crossorigin href="/assets/v9/vendor-react-B5aZ5G0Y.js">
+    <link rel="modulepreload" crossorigin href="/assets/v9/vendor-query-qJWxXJpd.js">
+    <link rel="modulepreload" crossorigin href="/assets/v9/vendor-utils-rksnccus.js">
+    <link rel="modulepreload" crossorigin href="/assets/v9/vendor-telegram-BljK9Sw_.js">
+    <link rel="modulepreload" crossorigin href="/assets/v9/vendor-twemoji-D9HvikB8.js">
+    <link rel="modulepreload" crossorigin href="/assets/v9/vendor-i18n-BxdFJVG3.js">
+    <link rel="modulepreload" crossorigin href="/assets/v9/vendor-motion-yrvsEvRj.js">
+    <link rel="modulepreload" crossorigin href="/assets/v9/vendor-radix-CmBkAP5K.js">
+    <link rel="modulepreload" crossorigin href="/assets/v9/vendor-cmdk-CTFjeOaw.js">
+    <link rel="stylesheet" crossorigin href="/assets/v9/index-ffaf3eb8.css">
   </head>
   <body>
+    <div id="boot" aria-live="polite"><div class="spin"></div><p>Загрузка…</p></div>
     <div id="root"></div>
+    <script>
+      (function () {
+        var boot = document.getElementById('boot');
+        var root = document.getElementById('root');
+        var n = 0;
+        var iv = setInterval(function () {
+          n++;
+          if (root && root.childElementCount > 0) {
+            boot.classList.add('hide');
+            setTimeout(function () { if (boot && boot.parentNode) boot.parentNode.removeChild(boot); }, 250);
+            clearInterval(iv);
+            return;
+          }
+          if (n > 48) {
+            clearInterval(iv);
+            try {
+              var k = 'paskod_boot_retry_v9';
+              if (!sessionStorage.getItem(k)) {
+                sessionStorage.setItem(k, '1');
+                var u = new URL(location.href);
+                u.searchParams.set('_v', '9');
+                location.replace(u.toString());
+              } else if (boot) {
+                boot.innerHTML = '<p style="max-width:260px;text-align:center;line-height:1.4">Не удалось загрузить. Полностью закройте мини-приложение и откройте снова.</p>';
+              }
+            } catch (e) {
+              if (boot) boot.innerHTML = '<p>Не удалось загрузить</p>';
+            }
+          }
+        }, 250);
+      })();
+    </script>
   </body>
 </html>

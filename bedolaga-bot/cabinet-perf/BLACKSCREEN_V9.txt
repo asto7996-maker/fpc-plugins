@@ -1,0 +1,4 @@
+Black screen: Telegram likely cached broken v8/old ESM.
+Deployed clean /assets/v9/ (copy of working v7) + splash + one boot retry.
+Entry: /assets/v9/index-a89cf6b8.js
+Close Mini App fully and reopen to pick new index.html.
