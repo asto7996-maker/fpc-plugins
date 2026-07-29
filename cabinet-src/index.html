@@ -29,17 +29,17 @@
       #boot.hide{opacity:0;pointer-events:none;transition:opacity .2s}
       @keyframes b{to{transform:rotate(360deg)}}
     </style>
-    <script type="module" crossorigin src="/assets/v9/index-a89cf6b8.js"></script>
-    <link rel="modulepreload" crossorigin href="/assets/v9/vendor-react-B5aZ5G0Y.js">
-    <link rel="modulepreload" crossorigin href="/assets/v9/vendor-query-qJWxXJpd.js">
-    <link rel="modulepreload" crossorigin href="/assets/v9/vendor-utils-rksnccus.js">
-    <link rel="modulepreload" crossorigin href="/assets/v9/vendor-telegram-BljK9Sw_.js">
-    <link rel="modulepreload" crossorigin href="/assets/v9/vendor-twemoji-D9HvikB8.js">
-    <link rel="modulepreload" crossorigin href="/assets/v9/vendor-i18n-BxdFJVG3.js">
-    <link rel="modulepreload" crossorigin href="/assets/v9/vendor-motion-yrvsEvRj.js">
-    <link rel="modulepreload" crossorigin href="/assets/v9/vendor-radix-CmBkAP5K.js">
-    <link rel="modulepreload" crossorigin href="/assets/v9/vendor-cmdk-CTFjeOaw.js">
-    <link rel="stylesheet" crossorigin href="/assets/v9/index-ffaf3eb8.css">
+    <script type="module" crossorigin src="/assets/v10/index-a89cf6b8.js"></script>
+    <link rel="modulepreload" crossorigin href="/assets/v10/vendor-react-B5aZ5G0Y.js">
+    <link rel="modulepreload" crossorigin href="/assets/v10/vendor-query-qJWxXJpd.js">
+    <link rel="modulepreload" crossorigin href="/assets/v10/vendor-utils-rksnccus.js">
+    <link rel="modulepreload" crossorigin href="/assets/v10/vendor-telegram-BljK9Sw_.js">
+    <link rel="modulepreload" crossorigin href="/assets/v10/vendor-twemoji-D9HvikB8.js">
+    <link rel="modulepreload" crossorigin href="/assets/v10/vendor-i18n-BxdFJVG3.js">
+    <link rel="modulepreload" crossorigin href="/assets/v10/vendor-motion-yrvsEvRj.js">
+    <link rel="modulepreload" crossorigin href="/assets/v10/vendor-radix-CmBkAP5K.js">
+    <link rel="modulepreload" crossorigin href="/assets/v10/vendor-cmdk-CTFjeOaw.js">
+    <link rel="stylesheet" crossorigin href="/assets/v10/index-ffaf3eb8.css">
   </head>
   <body>
     <div id="boot" aria-live="polite"><div class="spin"></div><p>Загрузка…</p></div>
@@ -60,11 +60,11 @@
           if (n > 48) {
             clearInterval(iv);
             try {
-              var k = 'paskod_boot_retry_v9';
+              var k = 'paskod_boot_retry_v10';
               if (!sessionStorage.getItem(k)) {
                 sessionStorage.setItem(k, '1');
                 var u = new URL(location.href);
-                u.searchParams.set('_v', '9');
+                u.searchParams.set('_v', '10');
                 location.replace(u.toString());
               } else if (boot) {
                 boot.innerHTML = '<p style="max-width:260px;text-align:center;line-height:1.4">Не удалось загрузить. Полностью закройте мини-приложение и откройте снова.</p>';
