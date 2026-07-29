@@ -333,6 +333,46 @@ class HybridPoster:
         assert last_err is not None
         raise last_err
 
+    async def _send_media_file(
+        self,
+        *,
+        target,
+        msg: Message,
+        path: Path,
+        caption: Optional[str],
+        label: str,
+    ):
+        """Отправить один файл с шаблоном; при битом HTML — без parse_mode."""
+        file = FSInputFile(path)
+
+        async def _do(parse: Optional[ParseMode]):
+            kwargs = {"chat_id": target, "caption": caption or None}
+            if caption and parse is not None:
+                kwargs["parse_mode"] = parse
+            if msg.photo:
+                return await self.bot.send_photo(photo=file, **kwargs)
+            if msg.video or msg.animation:
+                return await self.bot.send_video(video=file, **kwargs)
+            if msg.audio:
+                return await self.bot.send_audio(audio=file, **kwargs)
+            if msg.voice:
+                return await self.bot.send_voice(voice=file, **kwargs)
+            return await self.bot.send_document(document=file, **kwargs)
+
+        try:
+            return await self._send_with_retry(
+                lambda: _do(ParseMode.HTML if caption else None),
+                label=label,
+            )
+        except Exception as e:
+            if caption and "parse" in str(e).lower():
+                logger.warning("%s HTML caption failed, plain retry: %s", label, e)
+                return await self._send_with_retry(
+                    lambda: _do(None),
+                    label=f"{label}:plain",
+                )
+            raise
+
     async def _publish_single(self, target, msg: Message, caption: str) -> str:
         path: Optional[Path] = None
         try:
@@ -344,35 +384,37 @@ class HybridPoster:
                     return "skip"
                 path = await self._download(msg)
                 if path is None:
-                    # временный сбой скачивания — не двигаем progress
                     return "retry"
-                file = FSInputFile(path)
-                kwargs = {"chat_id": target, "caption": caption or None}
                 if caption:
-                    kwargs["parse_mode"] = ParseMode.HTML
-
-                async def _send():
-                    if msg.photo:
-                        return await self.bot.send_photo(photo=file, **kwargs)
-                    if msg.video or msg.animation:
-                        return await self.bot.send_video(video=file, **kwargs)
-                    if msg.audio:
-                        return await self.bot.send_audio(audio=file, **kwargs)
-                    return await self.bot.send_document(document=file, **kwargs)
-
-                sent = await self._send_with_retry(_send, label=f"single:{msg.id}")
+                    logger.info("caption on single %s (%s chars)", msg.id, len(caption))
+                sent = await self._send_media_file(
+                    target=target,
+                    msg=msg,
+                    path=path,
+                    caption=caption or None,
+                    label=f"single:{msg.id}",
+                )
             else:
                 text = caption if caption else (msg.text or msg.caption or "")
                 if not text:
                     return "skip"
-                sent = await self._send_with_retry(
-                    lambda: self.bot.send_message(
-                        chat_id=target,
-                        text=text,
-                        parse_mode=ParseMode.HTML,
-                    ),
-                    label=f"text:{msg.id}",
-                )
+                try:
+                    sent = await self._send_with_retry(
+                        lambda: self.bot.send_message(
+                            chat_id=target,
+                            text=text,
+                            parse_mode=ParseMode.HTML,
+                        ),
+                        label=f"text:{msg.id}",
+                    )
+                except Exception as e:
+                    if "parse" in str(e).lower():
+                        sent = await self._send_with_retry(
+                            lambda: self.bot.send_message(chat_id=target, text=text),
+                            label=f"text:{msg.id}:plain",
+                        )
+                    else:
+                        raise
 
             self.db.add_history(
                 source_message_id=msg.id,
@@ -389,7 +431,6 @@ class HybridPoster:
             if _is_transient(e):
                 logger.error("publish single transient %s: %s", msg.id, e)
                 return "retry"
-            # слишком большой / неподдерживаемый — пропускаем
             if "TOO BIG" in err or "REQUEST ENTITY TOO LARGE" in err or "FILE_PART" in err:
                 logger.error("skip oversized/unsupported %s: %s", msg.id, e)
                 self.db.add_history(msg.id, status="error", error=str(e))
@@ -420,23 +461,18 @@ class HybridPoster:
         paths: list[Path] = []
         try:
             downloaded: list[tuple[Message, Path]] = []
-            fail_dl = 0
             for m in album:
                 path = await self._download(m)
                 if path is None:
-                    fail_dl += 1
                     continue
                 paths.append(path)
                 downloaded.append((m, path))
 
             if not downloaded:
-                # все файлы не скачались — вероятно временный сбой DC
                 self._seen_grouped.discard(gid)
                 return "retry"
 
-            # 1) пробуем media_group только для компактных наборов (фото/мелкие)
-            # Большие видео-альбомы (>~45МБ суммарно) сразу шлём по одному —
-            # иначе Bot API отвечает Request Entity Too Large.
+            # media_group: подпись только на первом (ограничение Telegram)
             media = []
             total_size = 0
             for i, (m, path) in enumerate(downloaded):
@@ -462,6 +498,12 @@ class HybridPoster:
                     )
                     first_id = sent_list[0].message_id if sent_list else None
                     sent_ok = True
+                    if caption:
+                        logger.info(
+                            "album %s media_group caption on first → %s",
+                            gid,
+                            first_id,
+                        )
                 except Exception as e:
                     err = str(e).upper()
                     if "WRITE_FORBIDDEN" in err or "CHAT_WRITE" in err:
@@ -475,31 +517,24 @@ class HybridPoster:
                     )
             else:
                 logger.info(
-                    "album %s send one-by-one (files=%s size=%s)",
+                    "album %s send one-by-one WITH caption on each (files=%s size=%s)",
                     gid,
                     len(downloaded),
                     total_size,
                 )
 
-            # 2) fallback: по одному (надёжнее для больших MOV)
+            # По одному: шаблон на КАЖДЫЙ файл (иначе выглядят как посты без описания)
             if not sent_ok:
                 published_any = False
-                for i, (m, path) in enumerate(downloaded):
-                    file = FSInputFile(path)
-                    cap = caption if i == 0 else None
-                    kwargs = {"chat_id": target, "caption": cap}
-                    if cap:
-                        kwargs["parse_mode"] = ParseMode.HTML
-
-                    async def _one(mm=m, ff=file, kw=kwargs):
-                        if mm.photo:
-                            return await self.bot.send_photo(photo=ff, **kw)
-                        if mm.video or mm.animation:
-                            return await self.bot.send_video(video=ff, **kw)
-                        return await self.bot.send_document(document=ff, **kw)
-
+                for m, path in downloaded:
                     try:
-                        sent = await self._send_with_retry(_one, label=f"album-item:{m.id}")
+                        sent = await self._send_media_file(
+                            target=target,
+                            msg=m,
+                            path=path,
+                            caption=caption or None,
+                            label=f"album-item:{m.id}",
+                        )
                         if first_id is None:
                             first_id = sent.message_id
                         published_any = True
