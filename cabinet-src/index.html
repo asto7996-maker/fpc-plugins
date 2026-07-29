@@ -7,13 +7,10 @@
     <meta http-equiv="Pragma" content="no-cache" />
     <meta name="theme-color" content="#0a0f1a" />
     <meta name="mobile-web-app-capable" content="yes" />
-    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
     <title>VPN</title>
     <script>
       (function(){
-        function bad(msg){
-          return msg && (String(msg).indexOf('usePlatform')>=0 || String(msg).indexOf('PlatformProvider')>=0);
-        }
+        function bad(msg){ return msg && (String(msg).indexOf('usePlatform')>=0 || String(msg).indexOf('PlatformProvider')>=0); }
         function bust(){
           try{
             var k='paskod_plat_bust', last=Number(sessionStorage.getItem(k)||'0'), now=Date.now();
@@ -23,8 +20,8 @@
             location.replace(u.toString());
           }catch(e){ location.reload(); }
         }
-        window.addEventListener('error', function(ev){ if(bad(ev && ev.message) || bad(ev && ev.error && ev.error.message)) bust(); });
-        window.addEventListener('unhandledrejection', function(ev){ var r=ev && ev.reason; if(bad(r)||bad(r&&r.message)) bust(); });
+        window.addEventListener('error', function(ev){ if(bad(ev&&ev.message)||bad(ev&&ev.error&&ev.error.message)) bust(); });
+        window.addEventListener('unhandledrejection', function(ev){ var r=ev&&ev.reason; if(bad(r)||bad(r&&r.message)) bust(); });
       })();
     </script>
     <script>
@@ -33,9 +30,13 @@
         if(isTelegram){ var s=document.createElement('script'); s.src='https://telegram.org/js/telegram-web-app.js'; s.async=true; document.head.appendChild(s); }
       })();
     </script>
-    <style>body{background-color:#0a0f1a;margin:0}</style>
-    <script type="module" crossorigin src="/assets/v7/index-a89cf6b8.js"></script>
-    <link rel="stylesheet" crossorigin href="/assets/v7/index-ffaf3eb8.css">
+    <style>
+      body{background:#0a0f1a;margin:0}
+      /* early smooth defaults before CSS bundle */
+      button,a{transition:background-color .2s ease,color .2s ease,opacity .2s ease}
+    </style>
+    <script type="module" crossorigin src="/assets/v8/index-8712de8e.js"></script>
+    <link rel="stylesheet" crossorigin href="/assets/v8/index-1268f021.css">
   </head>
   <body><div id="root"></div></body>
 </html>
