@@ -206,8 +206,9 @@ def status_text(db: Database) -> str:
         f"✅ Скопировано: <b>{db.history_count()}</b>\n"
         f"🔗 Старт: <code>{s.start_link or 'не задан'}</code>\n\n"
         f"<b>Описание</b>\n<code>{safe_preview(s.caption_template, 220)}</code>\n\n"
-        "<i>Юзербот: админ в вашем канале · в источнике достаточно подписки.\n"
-        "Старт — со ссылки на пост или «С начала».</i>"
+        "<i>Порядок: от старых постов к новым.\n"
+        "«📜 С начала» — с первого поста (история сбрасывается).\n"
+        "«🔗 Старт-ссылка» — со следующего после указанного поста.</i>"
     )
 
 
@@ -424,8 +425,11 @@ async def cb_oldest(c: CallbackQuery) -> None:
         try:
             found = await _call_poster("seek_oldest", timeout=180)
             await c.message.answer(  # type: ignore
-                f"✅ Начало: первый пост <code>{found}</code>\n"
-                f"Progress=<code>{found - 1}</code> → next <code>{found}</code>",
+                f"✅ Режим: <b>от самого старого к новым</b>\n"
+                f"Первый пост: <code>{found}</code>\n"
+                f"Progress=<code>{found - 1}</code> → next <code>{found}</code>\n"
+                f"История сброшена — пойдёт полная перезаливка с шаблоном.\n"
+                f"Нажмите ▶️ Старт.",
                 reply_markup=menu_kb(_require_db().get_settings().is_running),
                 parse_mode="HTML",
             )

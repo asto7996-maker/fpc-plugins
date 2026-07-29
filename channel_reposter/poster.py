@@ -220,7 +220,10 @@ class ChannelPoster:
         return chat_ref, message_id
 
     async def seek_oldest(self) -> int:
-        """Найти первый существующий пост в источнике; progress = id-1."""
+        """
+        Начать с самого старого поста источника → к новым.
+        Сбрасывает историю ok, чтобы не пропускать уже «обработанные» id.
+        """
         settings = self.db.get_settings()
         source = await _resolve_chat(
             self.client, settings.source_channel or config.SOURCE_CHANNEL
@@ -253,9 +256,17 @@ class ChannelPoster:
 
         if found <= 0:
             raise RuntimeError("Не удалось найти первый пост в источнике")
+
+        # Полный проход oldest→newest: иначе was_processed пропустит старые
+        cleared = self.db.clear_history()
         self.db.set_progress_id(found - 1)
         self.db.set_start_link(f"oldest:{found}")
-        logger.info("Oldest post id=%s → progress=%s", found, found - 1)
+        logger.info(
+            "Oldest post id=%s → progress=%s (history cleared=%s)",
+            found,
+            found - 1,
+            cleared,
+        )
         return found
 
     def cancel_rewrite(self) -> None:

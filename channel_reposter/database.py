@@ -257,6 +257,12 @@ class Database:
             ).fetchone()
         return int(row["c"]) if row else 0
 
+    def clear_history(self) -> int:
+        """Удалить всю историю публикаций. Возвращает число удалённых строк."""
+        with self._connect() as conn:
+            cur = conn.execute("DELETE FROM history")
+            return int(cur.rowcount or 0)
+
     def list_target_message_ids(self, limit: Optional[int] = None) -> list[int]:
         """ID сообщений в канале-назначении, которые бот успешно опубликовал."""
         sql = """

@@ -184,6 +184,13 @@ class DatabaseTests(unittest.TestCase):
         self.db.add_history(30, status="error", error="x")
         self.assertEqual(self.db.max_ok_source_id(), 25)
 
+    def test_clear_history(self) -> None:
+        self.db.add_history(1, target_message_id=1, status="ok")
+        self.db.add_history(2, status="error", error="e")
+        self.assertEqual(self.db.clear_history(), 2)
+        self.assertEqual(self.db.history_count(), 0)
+        self.assertEqual(self.db.max_ok_source_id(), 0)
+
 
 if __name__ == "__main__":
     unittest.main()
