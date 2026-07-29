@@ -1,0 +1,17 @@
+Cabinet full diagnostic fix
+
+Live: index-e8f662ec.js / index-d340b3b7.css / Support-f832bce4.js
+Loop: useAnimationLoop-d989b507.js
+
+ROOT CAUSE of recurring PlatformProvider error:
+  Deploy regex used r"\1"+hash where hash started with a digit (119...).
+  Python treated \11 as group 11 and CORRUPTED all 153 chunk imports to
+  `import{...}I9ecf90.js"` instead of `from"./index-....js"`.
+  Support then failed to load platform context / threw or ran against broken graph.
+
+FIXES:
+1) Repaired all chunk imports; future rewrites use \g<1>/\g<2>.
+2) usePlatform never throws (return e||Yc()).
+3) Support me() wrapped in try/catch fallback.
+4) New Support+index hashes (no ?query on modules).
+5) Sticky nav CSS kept; mobile backdrop-filter disabled; RAF pauses on scroll.

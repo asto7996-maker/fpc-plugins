@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="ru" class="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+    <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
+    <meta name="theme-color" content="#0a0f1a" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <title>VPN</title>
+    <script>
+      (function () {
+        var isTelegram = window.TelegramWebviewProxy || location.hash.indexOf('tgWebApp') !== -1 || location.search.indexOf('tgWebApp') !== -1;
+        if (isTelegram) {
+          var s = document.createElement('script');
+          s.src = 'https://telegram.org/js/telegram-web-app.js';
+          s.async = true;
+          document.head.appendChild(s);
+        }
+      })();
+    </script>
+    <style>body{background-color:#0a0f1a;margin:0}#root{min-height:100vh}</style>
+    <script type="module" crossorigin src="/assets/v7/index-a89cf6b8.js"></script>
+    <link rel="modulepreload" crossorigin href="/assets/v7/vendor-react-B5aZ5G0Y.js">
+    <link rel="modulepreload" crossorigin href="/assets/v7/vendor-query-qJWxXJpd.js">
+    <link rel="modulepreload" crossorigin href="/assets/v7/vendor-utils-rksnccus.js">
+    <link rel="modulepreload" crossorigin href="/assets/v7/vendor-telegram-BljK9Sw_.js">
+    <link rel="modulepreload" crossorigin href="/assets/v7/vendor-twemoji-D9HvikB8.js">
+    <link rel="modulepreload" crossorigin href="/assets/v7/vendor-i18n-BxdFJVG3.js">
+    <link rel="modulepreload" crossorigin href="/assets/v7/vendor-motion-yrvsEvRj.js">
+    <link rel="modulepreload" crossorigin href="/assets/v7/vendor-radix-CmBkAP5K.js">
+    <link rel="modulepreload" crossorigin href="/assets/v7/vendor-cmdk-CTFjeOaw.js">
+    <link rel="stylesheet" crossorigin href="/assets/v7/index-ffaf3eb8.css">
+  </head>
+  <body>
+    <div id="root"></div>
+  </body>
+</html>

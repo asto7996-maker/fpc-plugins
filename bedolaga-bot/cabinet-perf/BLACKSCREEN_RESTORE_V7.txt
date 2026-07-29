@@ -1,0 +1,4 @@
+Black screen fix: rolled back entry to working /assets/v7/
+v8 Card had interleaved import/function which broke module graph in Telegram WebView.
+Also restored modulepreload + removed boot interceptor reload loops.
+Light v7 smoothness: 120fps loop without html class thrash; nav transition-colors.
