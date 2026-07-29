@@ -119,8 +119,8 @@ QUIZ_ANSWER_DELAY_SEC = 2.4
 QUIZ_RETRY_ON_429_SEC = 8.0
 # Красивый рекорд: идеально до 555, затем специально ошибаемся.
 QUIZ_TARGET_STREAK = 555
-# Сколько S нужно отдать за 1 X (выгодный апгрейд).
-TRADE_S_FOR_X = 2
+# Сколько карт того же ранга хотим взамен одной своей (1 D → 2 D).
+TRADE_SAME_WANT_COUNT = 2
 # Лимит сайта: одновременно не больше 10 лотов — берём самые дорогие.
 MARKET_LOT_LIMIT = 10
 # Режим цены: higher = 1× ранг выше (для X — 2×X); same2 = 2× тот же ранг.
@@ -1899,7 +1899,10 @@ class MangaBuffService:
 
                     s = _ls()
                     if s.mangabuff_auto_trade:
-                        sent = await self._run_card_trades_unlocked(offers=80)
+                        # новые офферы — по расписанию 2ч; здесь только входящие
+                        sent = await self._run_card_trades_unlocked(
+                            offers=0, create_offers=False
+                        )
                         if sent:
                             result.details.append(f"обмены: {sent}")
                             result.events += sent
@@ -5841,6 +5844,9 @@ class MangaBuffService:
 
         logger.info("MangaBuff open title %s", slug)
         total_chapters = await self._estimate_title_chapters(slug)
+        if slug and self._title_is_exhausted(slug):
+            logger.info("MangaBuff skip empty/exhausted title %s after estimate", slug)
+            return 0
         try:
             stale = await self._history_pool_size(page)
             if stale > 0:
@@ -6660,9 +6666,8 @@ class MangaBuffService:
     ) -> List[Dict[str, Any]]:
         """
         Единицы выгодных офферов:
-        - 1×R → 1×(R+1) для R < S
-        - 2×S → 1×X
-        X не отдаём.
+        - 1×R → 2×R (тот же ранг), для любого R кроме X
+        X не отдаём и не просим.
         """
         by_rank: Dict[str, List[Dict[str, Any]]] = {}
         for c in my_cards:
@@ -6671,32 +6676,17 @@ class MangaBuffService:
                 continue
             by_rank.setdefault(r, []).append(c)
         units: List[Dict[str, Any]] = []
-        # сначала пары S → X
-        s_list = list(by_rank.get("S") or [])
-        while len(s_list) >= TRADE_S_FOR_X:
-            pair = [s_list.pop(0) for _ in range(TRADE_S_FOR_X)]
-            units.append(
-                {
-                    "kind": "2s_x",
-                    "offer_cards": pair,
-                    "want_rank": "X",
-                    "want_count": 1,
-                }
-            )
-        # одиночные ранги ниже S: ровно +1
+        # дешёвые ранги раньше — проще набрать 2× того же у партнёра
         for r in CARD_RANK_LADDER:
-            if r in ("S", "X"):
-                continue
-            want = next_higher_rank(r)
-            if not want:
+            if r == "X":
                 continue
             for card in by_rank.get(r) or []:
                 units.append(
                     {
-                        "kind": "plus1",
+                        "kind": "same2",
                         "offer_cards": [card],
-                        "want_rank": want,
-                        "want_count": 1,
+                        "want_rank": r,
+                        "want_count": int(TRADE_SAME_WANT_COUNT),
                     }
                 )
         return units
@@ -6706,38 +6696,32 @@ class MangaBuffService:
         give_cards: Sequence[Dict[str, Any]],
         get_cards: Sequence[Dict[str, Any]],
     ) -> bool:
-        """True только если входящий обмен выгоден нам."""
+        """True только если входящий обмен выгоден нам (1×R отдаём → ≥2×R получаем)."""
         give = [c for c in give_cards if isinstance(c, dict)]
         get = [c for c in get_cards if isinstance(c, dict)]
         if not give or not get:
             return False
-        # никогда не отдаём X
+        # никогда не отдаём X и не принимаем сделки с X
         if any(str(c.get("rank") or "").upper() == "X" for c in give):
+            return False
+        if any(str(c.get("rank") or "").upper() == "X" for c in get):
             return False
         give_ranks = [str(c.get("rank") or "").upper() for c in give]
         get_ranks = [str(c.get("rank") or "").upper() for c in get]
+        if any(not r for r in give_ranks + get_ranks):
+            return False
 
-        # идеальный паттерн: 2S → 1X
-        if (
-            len(give) == TRADE_S_FOR_X
-            and all(r == "S" for r in give_ranks)
-            and len(get) == 1
-            and get_ranks[0] == "X"
-        ):
-            return True
-        # идеальный паттерн: 1×R → 1×(R+1), но S только через 2S→X
-        if len(give) == 1 and len(get) == 1:
-            if give_ranks[0] == "S":
-                return False
-            want = next_higher_rank(give_ranks[0])
-            if want and get_ranks[0] == want:
+        # идеал: отдаём 1×R, получаем ≥2×R того же ранга
+        if len(give) == 1 and len(get) >= int(TRADE_SAME_WANT_COUNT):
+            gr = give_ranks[0]
+            if gr and gr != "X" and all(r == gr for r in get_ranks):
                 return True
-        # общий случай: только явная выгода (≥ +1 ранг по ценности)
+
+        # общий случай: явная выгода по ценности, без X
         gv = trade_bundle_value(give)
         rv = trade_bundle_value(get)
         if gv <= 0:
             return False
-        # минимум ~+15% и строго дороже по сумме рангов
         return rv > gv and rv >= gv * 1.15
 
     async def _fetch_user_cards_by_rank(
@@ -6801,20 +6785,48 @@ class MangaBuffService:
         want_rank: str,
         want_count: int = 1,
     ) -> List[Dict[str, Any]]:
-        """Ровно нужный ранг у партнёра (не выше и не ниже)."""
+        """Ровно нужный ранг у партнёра; предпочитаем разные имена карт."""
+        want_rank_u = (want_rank or "").strip().upper()
+        if want_rank_u == "X":
+            return []
         rows = await self._fetch_user_cards_by_rank(
-            page, receiver_id, want_rank, limit=max(40, want_count * 10)
+            page, receiver_id, want_rank_u, limit=max(40, want_count * 12)
         )
         if not rows:
             return []
-        # чуть хуже копии сначала — легче примут
+        # разные имена сначала («2 других»), без тени/с большим номером — легче примут
         rows.sort(
             key=lambda r: (
                 -int(r.get("has_shadow") or 0),
                 int(r.get("copy_number") or 10**9),
+                str(r.get("name") or ""),
             )
         )
-        return rows[: max(1, int(want_count))]
+        picked: List[Dict[str, Any]] = []
+        seen_names: set[str] = set()
+        need = max(1, int(want_count))
+        # 1-й проход: уникальные имена
+        for r in rows:
+            name = str(r.get("name") or "").strip().lower()
+            if name and name in seen_names:
+                continue
+            if name:
+                seen_names.add(name)
+            picked.append(r)
+            if len(picked) >= need:
+                return picked
+        # 2-й проход: добрать любыми оставшимися
+        picked_ids = {str(c.get("id") or "") for c in picked}
+        for r in rows:
+            cid = str(r.get("id") or "")
+            if cid and cid in picked_ids:
+                continue
+            picked.append(r)
+            if cid:
+                picked_ids.add(cid)
+            if len(picked) >= need:
+                break
+        return picked[:need]
 
     async def _rank_map_for_user(
         self, page: Page, user_id: str
@@ -7040,7 +7052,7 @@ class MangaBuffService:
     ) -> Optional[bool]:
         """
         Исходящий оффер: True=выгодный, False=мусор, None=ранги не ясны (не трогаем).
-        Правила: только +1 ранг или 2S→1X, без отдачи X.
+        Правило: 1×R → 2×R (тот же ранг), без X с обеих сторон.
         """
         give = [c for c in give_cards if isinstance(c, dict)]
         get = [c for c in get_cards if isinstance(c, dict)]
@@ -7048,22 +7060,16 @@ class MangaBuffService:
             return False
         if any(str(c.get("rank") or "").upper() == "X" for c in give):
             return False
+        if any(str(c.get("rank") or "").upper() == "X" for c in get):
+            return False
         if any(not str(c.get("rank") or "").strip() for c in give + get):
             return None
         give_ranks = [str(c.get("rank") or "").upper() for c in give]
         get_ranks = [str(c.get("rank") or "").upper() for c in get]
-        if (
-            len(give) == TRADE_S_FOR_X
-            and all(r == "S" for r in give_ranks)
-            and len(get) == 1
-            and get_ranks[0] == "X"
-        ):
-            return True
-        if len(give) == 1 and len(get) == 1:
-            if give_ranks[0] == "S":
-                return False  # S только парой 2S→1X
-            want = next_higher_rank(give_ranks[0])
-            return bool(want and get_ranks[0] == want)
+        if len(give) == 1 and len(get) >= int(TRADE_SAME_WANT_COUNT):
+            gr = give_ranks[0]
+            if gr and gr != "X" and all(r == gr for r in get_ranks):
+                return True
         return False
 
     async def _cancel_all_outgoing_trades(self, page: Page) -> None:
@@ -7560,9 +7566,13 @@ class MangaBuffService:
     async def run_card_trades(self, offers: int = 40) -> int:
         """Автофарм выгодных обменов: чат/комменты, 1 обмен/человек."""
         async with self._lock:
-            return await self._run_card_trades_unlocked(offers=offers)
+            return await self._run_card_trades_unlocked(
+                offers=offers, create_offers=True
+            )
 
-    async def _run_card_trades_unlocked(self, offers: int = 40) -> int:
+    async def _run_card_trades_unlocked(
+        self, offers: int = 40, *, create_offers: bool = True
+    ) -> int:
         assert self._page is not None
         page = self._page
         await self._ensure_login_unlocked()
@@ -7572,6 +7582,7 @@ class MangaBuffService:
             return 0
 
         # 1) входящие: принять выгодные / отклонить остальное
+        incoming: Dict[str, int] = {}
         try:
             incoming = await self._process_incoming_trades_unlocked(page)
             if incoming.get("seen"):
@@ -7590,6 +7601,13 @@ class MangaBuffService:
         except Exception as exc:  # noqa: BLE001
             logger.debug("cleanup outgoing: %s", exc)
 
+        if not create_offers or int(offers or 0) <= 0:
+            logger.info(
+                "MangaBuff trades: incoming/cleanup only (accepted=%s)",
+                incoming.get("accepted") or 0,
+            )
+            return 0
+
         if not await self._safe_goto(page, "https://mangabuff.ru/trades"):
             return 0
         my_cards = await self._tradable_inventory_cards(page)
@@ -7602,7 +7620,7 @@ class MangaBuffService:
                 (
                     u.get("kind"),
                     [c.get("rank") for c in u.get("offer_cards") or []],
-                    u.get("want_rank"),
+                    f"{u.get('want_count')}x{u.get('want_rank')}",
                 )
                 for u in units[:5]
             ],
@@ -7724,17 +7742,19 @@ class MangaBuffService:
                     str(c.get("rank") or "?") for c in unit["offer_cards"]
                 ]
                 self.stats.touch(
-                    f"обмен {','.join(offer_ranks)}→{want_rank} · user {receiver_id}",
+                    f"обмен 1×{offer_ranks[0] if offer_ranks else '?'}→"
+                    f"{want_count}×{want_rank} · user {receiver_id}",
                     page.url,
                 )
                 logger.info(
-                    "MangaBuff trade sent to %s kind=%s offer=%s[%s] want=%s[%s]",
+                    "MangaBuff trade sent to %s kind=%s offer=%s[%s] want=%sx%s %s",
                     receiver_id,
                     unit.get("kind"),
                     creator_ids,
                     offer_ranks,
-                    receiver_ids,
+                    want_count,
                     want_rank,
+                    receiver_ids,
                 )
                 rate_wait = max(2.0, rate_wait * 0.9)
             else:

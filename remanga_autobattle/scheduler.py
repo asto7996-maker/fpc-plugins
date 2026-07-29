@@ -13,6 +13,7 @@ logger = logging.getLogger(__name__)
 
 JOB_MANGABUFF_READ = "mangabuff_autoread"
 JOB_MANGABUFF_MARKET = "mangabuff_market_maintain"
+JOB_MANGABUFF_TRADE = "mangabuff_auto_trade"
 
 
 class AppScheduler:

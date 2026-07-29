@@ -26,7 +26,12 @@ from aiogram.types import (
 )
 
 from config import Config, load_config
-from scheduler import JOB_MANGABUFF_MARKET, JOB_MANGABUFF_READ, AppScheduler
+from scheduler import (
+    JOB_MANGABUFF_MARKET,
+    JOB_MANGABUFF_READ,
+    JOB_MANGABUFF_TRADE,
+    AppScheduler,
+)
 from services.mangabuff_service import CardDropInfo, MangaBuffService
 from settings_store import load_settings, update_settings
 from ui_theme import (
@@ -832,6 +837,30 @@ class App:
         except Exception as exc:  # noqa: BLE001
             logger.warning("market maintain job: %s", exc)
 
+    async def _trade_cycle_job(self) -> None:
+        """Каждые 2 часа: выгодные обмены 1×R → 2×R (без X)."""
+        if not getattr(load_settings(), "mangabuff_auto_trade", True):
+            return
+        try:
+            if not self.mangabuff.is_started:
+                await self.mangabuff.start(headless=True)
+            # не мешаем активному чтению главы — подождём lock внутри сервиса
+            sent = await self.mangabuff.run_card_trades(offers=80)
+            logger.info("MangaBuff trade job: sent=%s", sent)
+            if sent:
+                chat = self._notify_chat_id or self.config.telegram_admin_id
+                if chat:
+                    try:
+                        await self.bot.send_message(
+                            chat,
+                            f"🔄 Авто-обмены · отправлено <b>{sent}</b>\n"
+                            f"<i>1 карта → 2 того же ранга · без X</i>",
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("trade cycle job: %s", exc)
+
     def _mb_status_card(self) -> str:
         self._sync_mb_stats_from_disk()
         s = load_settings()
@@ -1148,6 +1177,22 @@ class App:
                 logger.info("MangaBuff market maintain job scheduled (1h)")
         except Exception as exc:  # noqa: BLE001
             logger.warning("market job schedule: %s", exc)
+        try:
+            self.scheduler.raw.add_job(
+                self._trade_cycle_job,
+                trigger="interval",
+                hours=2,
+                id=JOB_MANGABUFF_TRADE,
+                replace_existing=True,
+                max_instances=1,
+                coalesce=True,
+            )
+            logger.info("MangaBuff auto-trade job scheduled (2h)")
+            # сразу один цикл при старте (если авто-обмены вкл)
+            if getattr(load_settings(), "mangabuff_auto_trade", True):
+                asyncio.create_task(self._trade_cycle_job())
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("trade job schedule: %s", exc)
         try:
             await self.dp.start_polling(self.bot, handle_signals=True)
         finally:

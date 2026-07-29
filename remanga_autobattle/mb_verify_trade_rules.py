@@ -1,4 +1,4 @@
-"""Verify profitable trade rules: R→R+1, 2S→1X, no X given."""
+"""Verify same-rank 1→2 trade rules: no X, scheduled pattern."""
 from __future__ import annotations
 
 import asyncio
@@ -8,13 +8,16 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-logging.basicConfig(level=logging.INFO, stream=sys.stdout, format="%(levelname)s %(name)s: %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    stream=sys.stdout,
+    format="%(levelname)s %(name)s: %(message)s",
+)
 
 from config import load_config
 from services.mangabuff_service import (
     MangaBuffService,
-    next_higher_rank,
-    TRADE_S_FOR_X,
+    TRADE_SAME_WANT_COUNT,
 )
 
 
@@ -41,7 +44,7 @@ async def main() -> None:
             {
                 "kind": u["kind"],
                 "offer": [c.get("rank") for c in u["offer_cards"]],
-                "want": u["want_rank"],
+                "want": f"{u.get('want_count')}x{u.get('want_rank')}",
             }
         )
     x_offered = any(
@@ -49,6 +52,11 @@ async def main() -> None:
         for u in units
         for c in u["offer_cards"]
     )
+    x_wanted = any(str(u.get("want_rank") or "").upper() == "X" for u in units)
+    bad_kind = [u for u in units if u.get("kind") != "same2"]
+    bad_count = [
+        u for u in units if int(u.get("want_count") or 0) != TRADE_SAME_WANT_COUNT
+    ]
     print(
         json.dumps(
             {
@@ -56,31 +64,57 @@ async def main() -> None:
                 "units": len(units),
                 "sample": sample,
                 "x_in_offers": x_offered,
-                "s_for_x": TRADE_S_FOR_X,
-                "e_wants": next_higher_rank("E"),
-                "a_wants": next_higher_rank("A"),
+                "x_wanted": x_wanted,
+                "want_count": TRADE_SAME_WANT_COUNT,
+                "bad_kind": len(bad_kind),
+                "bad_count": len(bad_count),
             },
             ensure_ascii=False,
         )
     )
-    # unit tests for profitability helpers
-    assert svc._is_outgoing_offer_profitable([{"rank": "E"}], [{"rank": "D"}]) is True
-    assert svc._is_outgoing_offer_profitable([{"rank": "E"}], [{"rank": "S"}]) is False
+
+    # unit helpers
+    assert (
+        svc._is_outgoing_offer_profitable(
+            [{"rank": "D"}], [{"rank": "D"}, {"rank": "D"}]
+        )
+        is True
+    )
+    assert (
+        svc._is_outgoing_offer_profitable([{"rank": "D"}], [{"rank": "D"}]) is False
+    )
+    assert (
+        svc._is_outgoing_offer_profitable(
+            [{"rank": "E"}], [{"rank": "D"}, {"rank": "D"}]
+        )
+        is False
+    )
     assert (
         svc._is_outgoing_offer_profitable(
             [{"rank": "S"}, {"rank": "S"}], [{"rank": "X"}]
         )
-        is True
+        is False
     )
-    assert svc._is_outgoing_offer_profitable([{"rank": "S"}], [{"rank": "X"}]) is False
     assert svc._is_outgoing_offer_profitable([{"rank": "X"}], [{"rank": "X"}]) is False
-    assert svc._is_outgoing_offer_profitable([{"rank": "E"}], [{"rank": ""}]) is None
-    assert svc._is_incoming_trade_profitable([{"rank": "E"}], [{"rank": "D"}])
-    assert not svc._is_incoming_trade_profitable([{"rank": "A"}], [{"rank": "E"}])
+    assert svc._is_incoming_trade_profitable(
+        [{"rank": "D"}], [{"rank": "D"}, {"rank": "D"}]
+    )
+    assert not svc._is_incoming_trade_profitable(
+        [{"rank": "D"}], [{"rank": "D"}]
+    )
+    assert not svc._is_incoming_trade_profitable(
+        [{"rank": "D"}, {"rank": "D"}], [{"rank": "D"}]
+    )
+    assert not x_offered and not x_wanted and not bad_kind and not bad_count
     print("HELPERS_OK")
 
-    sent = await svc._run_card_trades_unlocked(offers=5)
-    print(json.dumps({"sent": sent, "trades_total": svc.stats.trades_sent}, ensure_ascii=False))
+    sent = await svc._run_card_trades_unlocked(offers=5, create_offers=True)
+    print(
+        json.dumps(
+            {"sent": sent, "trades_total": svc.stats.trades_sent},
+            ensure_ascii=False,
+        )
+    )
     await svc.stop()
 
 
