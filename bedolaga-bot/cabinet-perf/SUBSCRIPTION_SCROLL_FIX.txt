@@ -1,0 +1,10 @@
+Subscription scroll jank fix
+
+Live: index-17dcf02e.js / index-c411cf74.css
+Subscription: Subscription-2a29d74c.js
+Loop: useAnimationLoop-cee13a82.js
+
+- Pause RAF + body.is-scrolling on any nested scroll/touch
+- CSS disables transitions/animations while scrolling; hides canvas
+- Removed transition-all / backdrop-blur / blur(4px) glow / hover y:-4
+- Mobile FPS cap 72 during background anim to leave headroom for scroll
