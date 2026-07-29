@@ -6,17 +6,13 @@ from app.utils.premium_emoji import premium_reply_button
 
 
 def get_main_reply_keyboard(language: str = 'ru') -> ReplyKeyboardMarkup:
+    """Compact reply bar like LuxuryVPN: single Cabinet button."""
     texts = get_texts(language)
     cabinet_url = (settings.MINIAPP_CUSTOM_URL or '').strip().rstrip('/')
     if not cabinet_url:
         cabinet_url = 'https://cabinet.paskod.ru'
 
     keyboard = [
-        [premium_reply_button(texts.t('REPLY_MAIN_MENU', 'Главное меню'), icon='home')],
-        [
-            premium_reply_button(texts.t('REPLY_INFO', 'Информация'), icon='info'),
-            premium_reply_button(texts.t('REPLY_SUPPORT', 'Тех. поддержка'), icon='support'),
-        ],
         [
             premium_reply_button(
                 texts.t('REPLY_CABINET_BUTTON', 'Кабинет'),

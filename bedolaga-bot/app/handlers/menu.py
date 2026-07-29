@@ -1480,10 +1480,10 @@ async def get_main_menu_text(user, texts, db: AsyncSession):
 
     base_text = (
         f'{pe("⭐️")} <b>Добро пожаловать!</b>\n'
-        f'{pe("👤")} <b>Ваш профиль:</b>\n'
-        f'{pe("💰")} Баланс: <b>{html.escape(balance)}</b>\n'
-        f'{pe("📝")} Тариф: {tariff_line}\n\n'
-        f'{pe("💡")} <i>{html.escape(tagline)}</i>'
+        f'{pe("👤")} Ваш профиль:\n'
+        f'{pe("💳")} Баланс: {html.escape(balance)}\n'
+        f'{pe("📈")} Тариф: {tariff_line}\n\n'
+        f'{pe("💡")} {html.escape(tagline)}'
     )
 
     info_sections: list[str] = []
