@@ -579,9 +579,23 @@ class HybridPoster:
                 else:
                     media_direct.append(InputMediaDocument(media=file, caption=cap, parse_mode=parse))
 
+            # Прямой multipart только для маленьких фото-альбомов.
+            # Видео/тяжёлые альбомы — через staging file_id, иначе таймаут/Entity Too Large.
             first_id = None
-            if len(downloaded) <= 10 and total_size <= BOT_UPLOAD_LIMIT:
+            only_photos = all(m.photo for m, _ in downloaded)
+            use_direct = (
+                len(downloaded) <= 10
+                and total_size <= 8 * 1024 * 1024
+                and only_photos
+            )
+            if use_direct:
                 try:
+                    logger.info(
+                        "album %s direct media_group files=%s size=%s",
+                        gid,
+                        len(media_direct),
+                        total_size,
+                    )
                     sent_list = await self._send_with_retry(
                         lambda: self.bot.send_media_group(chat_id=target, media=media_direct),
                         label=f"album-direct:{gid}",
@@ -611,12 +625,18 @@ class HybridPoster:
                         "direct media_group failed (%s) — stage file_ids", e
                     )
 
-            # Большие альбомы: upload → file_id → один media_group (без дробления)
+            # Альбом целиком через file_id → один media_group (не дробим на посты)
             if self._staging_chat() is None:
                 logger.error("Нужен /start у админа для staging file_id")
                 self._seen_grouped.discard(gid)
                 return "retry"
 
+            logger.info(
+                "album %s staging file_ids files=%s size=%s",
+                gid,
+                len(downloaded),
+                total_size,
+            )
             staged: list[tuple[Message, str, str]] = []
             for m, path in downloaded:
                 got = await self._stage_file_id(m, path)
@@ -624,6 +644,7 @@ class HybridPoster:
                     logger.warning("stage failed id=%s", m.id)
                     continue
                 staged.append((m, got[0], got[1]))
+                logger.info("staged id=%s kind=%s", m.id, got[1])
                 await asyncio.sleep(0.6)
 
             if not staged:
