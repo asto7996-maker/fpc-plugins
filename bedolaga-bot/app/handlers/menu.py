@@ -246,6 +246,12 @@ async def show_main_menu(
             photo_file_id=None,
             parse_mode='HTML',
         )
+    try:
+        from app.handlers.start import _send_cabinet_reply_keyboard
+
+        await _send_cabinet_reply_keyboard(callback.message, None, db_user.language, texts)
+    except Exception:
+        pass
     if not skip_callback_answer:
         await callback.answer()
 
@@ -1806,6 +1812,7 @@ def register_handlers(dp: Dispatcher):
         StateFilter(None),
         F.text.in_(
             [
+                'Меню',
                 'Главное меню',
                 '🏠 Главное меню',
                 '🏠 Меню',
@@ -1818,13 +1825,13 @@ def register_handlers(dp: Dispatcher):
     dp.message.register(
         handle_reply_info,
         StateFilter(None),
-        F.text.in_(['Информация', 'ℹ️ Информация']),
+        F.text.in_(['Инфо', 'Информация', 'ℹ️ Информация']),
     )
 
     dp.message.register(
         handle_reply_support,
         StateFilter(None),
-        F.text.in_(['Тех. поддержка', '❓ Тех. поддержка']),
+        F.text.in_(['Поддержка', 'Тех. поддержка', '❓ Тех. поддержка']),
     )
 
     dp.callback_query.register(handle_back_to_menu, F.data == 'back_to_menu')

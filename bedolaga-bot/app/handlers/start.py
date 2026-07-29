@@ -294,7 +294,7 @@ async def _redeem_pending_coupon(
 
 
 async def _send_cabinet_reply_keyboard(message_or_bot, chat_id: int | None, language: str, texts=None) -> None:
-    """Attach the bottom «Кабинет» reply keyboard without a noisy prompt."""
+    """Attach the bottom reply keyboard (Menu / Info / Support)."""
     try:
         from app.keyboards.reply import get_main_reply_keyboard
 
