@@ -132,21 +132,31 @@ ICON = {
 }
 
 
-_EMOJI_CHAR_CLASS = (
-    r'[℀-⅏'
-    r'←-⇿'
-    r'⌀-⏿'
-    r'①-⓿'
-    r'■-⛿'
-    r' Crowley-➿'
-    r'⬀- crow'
-    r'〰-〽'
-    r'㊗㊙'
+# Explicit unicode escapes — avoids broken char-range literals across encodings.
+_LEADING_EMOJI_RE = re.compile(
+    r'^'
+    r'['
+    r'\u2100-\u214F'  # Letterlike
+    r'\u2190-\u21FF'  # Arrows
+    r'\u2300-\u23FF'  # Misc Technical
+    r'\u2460-\u24FF'  # Enclosed Alphanumerics
+    r'\u25A0-\u25FF'  # Geometric Shapes
+    r'\u2600-\u27BF'  # Misc Symbols + Dingbats
+    r'\u2900-\u297F'  # Supplemental Arrows-B
+    r'\u2B00-\u2BFF'  # Misc Symbols and Arrows
+    r'\u3030\u303D\u3297\u3299'
     r'\U0001F000-\U0001FFFF'
     r']'
-)
-_LEADING_EMOJI_RE = re.compile(
-    r'^' + _EMOJI_CHAR_CLASS + r'(?:[️‍\U0001F3FB-\U0001F3FF]|' + _EMOJI_CHAR_CLASS + r')*' + r'\s*'
+    r'(?:'
+    r'[\uFE0F\u200D\U0001F3FB-\U0001F3FF]'
+    r'|'
+    r'['
+    r'\u2100-\u214F\u2190-\u21FF\u2300-\u23FF\u2460-\u24FF'
+    r'\u25A0-\u25FF\u2600-\u27BF\u2900-\u297F\u2B00-\u2BFF'
+    r'\u3030\u303D\u3297\u3299\U0001F000-\U0001FFFF'
+    r']'
+    r')*'
+    r'\s*'
 )
 
 
