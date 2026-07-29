@@ -1,0 +1,3272 @@
+import asyncio
+import html
+from collections.abc import Callable
+from datetime import UTC, datetime
+from typing import Any
+
+import structlog
+from aiogram import Bot, Dispatcher, F, types
+from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
+from aiogram.filters import Command, StateFilter
+from aiogram.fsm.context import FSMContext
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.config import settings
+from app.database.crud.campaign import (
+    get_campaign_by_id,
+    get_campaign_by_start_parameter,
+)
+from app.database.crud.subscription import decrement_subscription_server_counts
+from app.database.crud.user import (
+    create_user,
+    find_phantom_user_by_username,
+    get_user_by_referral_code,
+    get_user_by_telegram_id,
+)
+from app.database.crud.user_message import get_random_active_message
+from app.database.models import GuestPurchase, GuestPurchaseStatus, PinnedMessage, SubscriptionStatus, UserStatus
+from app.keyboards.inline import (
+    get_back_keyboard,
+    get_language_selection_keyboard,
+    get_main_menu_keyboard_async,
+    get_onboarding_consent_declined_text,
+    get_onboarding_consent_keyboard,
+    get_onboarding_consent_text,
+    get_post_registration_keyboard,
+    get_privacy_policy_keyboard,
+)
+from app.localization.loader import DEFAULT_LANGUAGE
+from app.localization.texts import get_privacy_policy, get_texts
+from app.middlewares.channel_checker import (
+    delete_pending_payload_from_redis,
+    get_pending_payload_from_redis,
+)
+from app.services.admin_notification_service import AdminNotificationService
+from app.services.campaign_service import AdvertisingCampaignService
+from app.services.channel_subscription_service import channel_subscription_service
+from app.services.coupon_service import (
+    COUPON_DEEP_LINK_PREFIX,
+    CouponRedemptionError,
+    is_coupon_token,
+    redeem_coupon,
+)
+from app.services.guest_purchase_service import GIFT_TOKEN_MIN_PREFIX_LENGTH
+from app.services.main_menu_button_service import MainMenuButtonService
+from app.services.phantom_service import claim_phantom, merge_phantom_into_user
+from app.services.pinned_message_service import (
+    deliver_pinned_message_to_user,
+    get_active_pinned_message,
+)
+from app.services.privacy_policy_service import PrivacyPolicyService
+from app.services.referral_service import (
+    process_referral_registration,
+    save_pending_campaign,
+    save_pending_referral,
+)
+from app.services.subscription_service import SubscriptionService
+from app.services.support_settings_service import SupportSettingsService
+from app.services.web_auth_service import WEB_AUTH_TOKEN_MIN_LENGTH, link_web_auth_token
+from app.states import RegistrationStates
+from app.utils.long_messages import answer_long_text, edit_long_text, send_long_text
+from app.utils.rich_menu import try_answer_rich_main_menu, try_send_rich_main_menu
+from app.utils.user_utils import generate_unique_referral_code
+
+
+logger = structlog.get_logger(__name__)
+
+
+_SUBID_DELIMITER = '_subid_'
+
+
+def _split_start_param_subid(param: str | None) -> tuple[str | None, str | None]:
+    """Extract subid from ``{campaign}_subid_{subid}`` Telegram deeplink format.
+
+    Used to carry Keitaro/affiliate click IDs through /start where space is tight
+    (64 chars, no `?query=`). The campaign portion is returned to let normal
+    AdvertisingCampaign lookup proceed; the subid is stashed in FSM state to be
+    persisted post-registration via :data:`yandex_client_id.upsert_subid`.
+
+    Returns ``(param, None)`` when no delimiter, when either side is empty, or
+    when the subid would overflow the YandexClientIdMap.subid column (255).
+    """
+    if not param or _SUBID_DELIMITER not in param:
+        return param, None
+    head, _, tail = param.partition(_SUBID_DELIMITER)
+    if not head or not tail or len(tail) > 255:
+        return param, None
+    return head, tail
+
+
+async def _persist_pending_subid_after_registration(
+    db: AsyncSession,
+    state: FSMContext,
+    user,
+) -> None:
+    """Drain ``pending_subid`` from FSM state into ``yandex_client_id_map``.
+
+    Mirrors the lifecycle of ``pending_gift_token`` / ``pending_campaign``: the
+    subid is captured at /start (when no user row exists yet), held in state,
+    and committed once the user record is created.
+    """
+    data = await state.get_data() or {}
+    pending_subid = data.get('pending_subid')
+    if not pending_subid:
+        return
+    try:
+        from app.database.crud.yandex_client_id import upsert_subid
+
+        await upsert_subid(db, user.id, pending_subid, source='telegram')
+    except Exception as e:
+        logger.error(
+            'Failed to persist pending subid after registration',
+            user_id=getattr(user, 'id', None),
+            subid=pending_subid,
+            error=str(e),
+            exc_info=True,
+        )
+
+
+async def _activate_pending_gift_after_registration(
+    db: AsyncSession,
+    state: FSMContext,
+    user: 'User',
+    answer_func: Callable[..., Any],
+) -> None:
+    """Extract pending_gift_token from FSM state and activate it for the newly registered user.
+
+    Must be called BEFORE state.clear() to preserve the token.
+    """
+    gift_token: str | None = None
+    try:
+        fresh_state = await state.get_data()
+        gift_token = fresh_state.get('pending_gift_token')
+        if not gift_token:
+            return
+
+        from sqlalchemy import select
+        from sqlalchemy.orm import selectinload
+
+        from app.services.guest_purchase_service import (
+            GIFT_TOKEN_MIN_PREFIX_LENGTH,
+            activate_purchase as svc_activate,
+        )
+
+        # Support both full token and prefix-based lookup (Telegram truncates the token by
+        # the GIFT_/giftclaim_ prefix length). Require a long minimum prefix so a short,
+        # guessable value can't claim an arbitrary gift via startswith().
+        if len(gift_token) >= 64:
+            token_filter = GuestPurchase.token == gift_token
+        elif len(gift_token) >= GIFT_TOKEN_MIN_PREFIX_LENGTH:
+            token_filter = GuestPurchase.token.startswith(gift_token)
+        else:
+            logger.warning('Gift deep link token too short for prefix lookup', token_length=len(gift_token))
+            return
+
+        gift_result = await db.execute(
+            select(GuestPurchase)
+            .options(selectinload(GuestPurchase.tariff))
+            .where(token_filter, GuestPurchase.is_gift.is_(True))
+            .with_for_update()
+        )
+        gift_purchase = gift_result.scalars().first()
+
+        if not gift_purchase or not gift_purchase.is_gift:
+            logger.warning('Gift not found for deep link token', token_prefix=gift_token[:5])
+            return
+
+        # Prevent self-activation: buyer cannot activate their own gift
+        if gift_purchase.buyer_user_id is not None and gift_purchase.buyer_user_id == user.id:
+            await answer_func(
+                '⚠️ Нельзя активировать свой собственный подарок.\nОтправьте код другу!',
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        if gift_purchase.status == GuestPurchaseStatus.DELIVERED.value:
+            await answer_func(
+                'ℹ️ Этот подарок уже был активирован.',
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        activatable_statuses = {
+            GuestPurchaseStatus.PENDING_ACTIVATION.value,
+            GuestPurchaseStatus.PAID.value,
+        }
+        if gift_purchase.status not in activatable_statuses:
+            await answer_func(
+                '❌ Этот подарок невозможно активировать.',
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        if gift_purchase.user_id is not None and gift_purchase.user_id != user.id:
+            logger.warning('Gift belongs to another user', token_prefix=gift_token[:5])
+            return
+
+        if gift_purchase.user_id is None:
+            gift_purchase.user_id = user.id
+        # Transition PAID → PENDING_ACTIVATION so activate_purchase() accepts it
+        if gift_purchase.status == GuestPurchaseStatus.PAID.value:
+            gift_purchase.status = GuestPurchaseStatus.PENDING_ACTIVATION.value
+        await db.flush()
+        await svc_activate(db, gift_purchase.token, skip_notification=True)
+        tariff_name = html.escape(gift_purchase.tariff.name) if gift_purchase.tariff else ''
+        await answer_func(
+            f'🎁 <b>Подарок активирован!</b>\n'
+            f'{tariff_name} — {gift_purchase.period_days} дн.\n\n'
+            f'Ваша подписка обновлена.',
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception:
+        logger.exception(
+            'Failed to auto-activate gift after registration',
+            token_prefix=(gift_token or '')[:5],
+        )
+        try:
+            await answer_func(
+                '❌ Произошла ошибка при активации подарка. Попробуйте активировать через личный кабинет.',
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
+
+
+_COUPON_ERROR_TEXTS = {
+    'invalid': '❌ Купон не найден или уже использован.',
+    'expired': '⌛ Срок действия купона истёк.',
+    'already_redeemed_by_you': 'ℹ️ Вы уже активировали этот купон.',
+    'internal': '❌ Произошла ошибка при активации купона. Попробуйте позже или обратитесь в поддержку.',
+}
+
+
+async def _redeem_pending_coupon(
+    db: AsyncSession,
+    state: FSMContext,
+    user: 'User',
+    answer_func: Callable[..., Any],
+) -> None:
+    """Extract pending_coupon_token from FSM state and redeem it for ``user``.
+
+    Must be called BEFORE state.clear() to preserve the token.
+    """
+    coupon_token: str | None = None
+    try:
+        fresh_state = await state.get_data()
+        coupon_token = fresh_state.get('pending_coupon_token')
+        if not coupon_token:
+            return
+
+        try:
+            result = await redeem_coupon(db, coupon_token, user)
+        except CouponRedemptionError as error:
+            await answer_func(
+                _COUPON_ERROR_TEXTS.get(error.code, _COUPON_ERROR_TEXTS['invalid']),
+                parse_mode=ParseMode.HTML,
+            )
+            return
+    except Exception:
+        logger.exception(
+            'Failed to redeem coupon deep link',
+            token_prefix=(coupon_token or '')[:5],
+        )
+        try:
+            await answer_func(_COUPON_ERROR_TEXTS['internal'], parse_mode=ParseMode.HTML)
+        except Exception:
+            pass
+        return
+
+    # Redemption is committed at this point — a failed confirmation send must
+    # not claim the activation failed (the coupon IS consumed).
+    try:
+        tariff_name = html.escape(result.tariff_name)
+        await answer_func(
+            f'🎟 <b>Купон активирован!</b>\n{tariff_name} — {result.period_days} дн.\n\nВаша подписка обновлена.',
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception:
+        logger.exception(
+            'Coupon redeemed but the confirmation message failed to send',
+            token_prefix=(coupon_token or '')[:5],
+            user_id=user.id,
+        )
+
+
+async def _send_cabinet_reply_keyboard(message_or_bot, chat_id: int | None, language: str, texts=None) -> None:
+    """Attach the bottom «Кабинет» reply keyboard without a noisy prompt."""
+    try:
+        from app.keyboards.reply import get_main_reply_keyboard
+
+        keyboard = get_main_reply_keyboard(language)
+        # Zero-width space keeps the message valid while staying invisible.
+        text = '\u200b'
+        if hasattr(message_or_bot, 'answer'):
+            await message_or_bot.answer(text, reply_markup=keyboard)
+        elif chat_id is not None:
+            await message_or_bot.send_message(chat_id=chat_id, text=text, reply_markup=keyboard)
+    except Exception:
+        pass
+
+
+async def _delete_message_later(bot, chat_id: int, message_id: int, delay: int = 30) -> None:
+    try:
+        await asyncio.sleep(delay)
+        await bot.delete_message(chat_id, message_id)
+    except Exception as error:  # pragma: no cover - best-effort cleanup
+        logger.debug('Не удалось удалить эфемерное сообщение', message_id=message_id, error=str(error))
+
+
+async def _activate_pending_trial(
+    db: AsyncSession,
+    state: FSMContext,
+    user: 'User',
+    answer_func: Callable[..., Any],
+) -> None:
+    """Активирует БЕСПЛАТНЫЙ триал по диплинку /start trial (rich-меню).
+
+    Вызывается перед показом главного меню, чтобы меню сразу отрисовало новую
+    подписку. Все гейты повторяют cabinet POST /trial и activate_trial бота:
+    триал включён, не отключён для auth_type юзера, не использован ранее.
+    Платный триал (TRIAL_PAYMENT_ENABLED + цена) этим путём не активируется —
+    rich-меню для него ведёт на оплату в миниапп. Must be called BEFORE
+    state.clear().
+    """
+    try:
+        fresh_state = await state.get_data()
+        if not fresh_state.get('pending_trial'):
+            return
+        await state.update_data(pending_trial=None)
+
+        if settings.TRIAL_DURATION_DAYS <= 0 or settings.TRIAL_DISABLED_FOR == 'all':
+            return
+        if settings.is_trial_disabled_for_user(getattr(user, 'auth_type', None)):
+            return
+        if settings.is_trial_paid_activation_enabled():
+            return
+        if user.is_trial_already_used():
+            return
+
+        # Параметры триала: из триального тарифа (is_trial_available / TRIAL_TARIFF_ID),
+        # иначе — из настроек; сквады — из тарифа, иначе случайный триальный сквад.
+        from app.database.crud.server_squad import get_effective_tariff_squad_uuids, get_random_trial_squad_uuid
+        from app.database.crud.subscription import create_trial_subscription
+        from app.database.crud.tariff import get_tariff_by_id, get_trial_tariff
+
+        trial_traffic_limit = settings.TRIAL_TRAFFIC_LIMIT_GB
+        trial_device_limit = settings.TRIAL_DEVICE_LIMIT
+        trial_squads: list[str] = []
+        tariff_id_for_trial = None
+
+        trial_tariff = await get_trial_tariff(db)
+        if not trial_tariff:
+            trial_tariff_id = settings.get_trial_tariff_id()
+            if trial_tariff_id > 0:
+                trial_tariff = await get_tariff_by_id(db, trial_tariff_id)
+        if trial_tariff:
+            trial_traffic_limit = trial_tariff.traffic_limit_gb
+            trial_device_limit = trial_tariff.device_limit
+            trial_squads = await get_effective_tariff_squad_uuids(db, trial_tariff.allowed_squads)
+            tariff_id_for_trial = trial_tariff.id
+        if not trial_squads:
+            trial_squad_uuid = await get_random_trial_squad_uuid(db)
+            trial_squads = [trial_squad_uuid] if trial_squad_uuid else []
+
+        subscription = await create_trial_subscription(
+            db=db,
+            user_id=user.id,
+            duration_days=settings.TRIAL_DURATION_DAYS,
+            traffic_limit_gb=trial_traffic_limit,
+            device_limit=trial_device_limit,
+            connected_squads=trial_squads or None,
+            tariff_id=tariff_id_for_trial,
+        )
+        logger.info('Триал активирован по диплинку rich-меню', user_id=user.id, subscription_id=subscription.id)
+
+        subscription_service = SubscriptionService()
+        panel_user = None
+        try:
+            if subscription_service.is_configured:
+                panel_user = await subscription_service.create_remnawave_user(db, subscription)
+                await db.refresh(subscription)
+        except Exception as error:
+            logger.error('Не удалось создать Remnawave-пользователя для триала по диплинку', error=error)
+        if subscription_service.is_configured and panel_user is None:
+            # create_remnawave_user проглатывает ошибки и возвращает None — без
+            # ретрая юзер не появился бы в панели (паттерн cabinet POST /trial).
+            from app.services.remnawave_retry_queue import remnawave_retry_queue
+
+            remnawave_retry_queue.enqueue(subscription_id=subscription.id, user_id=user.id, action='create')
+            logger.warning(
+                'Триал по диплинку без Remnawave-пользователя — поставлен в очередь ретраев',
+                user_id=user.id,
+                subscription_id=subscription.id,
+            )
+    except Exception:
+        logger.exception('Не удалось активировать триал по диплинку', user_id=getattr(user, 'id', None))
+        return
+
+    try:
+        texts = get_texts(user.language)
+        confirmation = await answer_func(
+            texts.t('MAIN_MENU_RICH_TRIAL_ACTIVATED', '🎉 <b>Тестовая подписка активирована!</b>'),
+            parse_mode=ParseMode.HTML,
+        )
+        # Подтверждение эфемерное: новая подписка и так видна в меню ниже.
+        if confirmation is not None and getattr(confirmation, 'bot', None) is not None:
+            asyncio.create_task(
+                _delete_message_later(confirmation.bot, confirmation.chat.id, confirmation.message_id, delay=30)
+            )
+    except Exception:
+        logger.exception('Триал активирован, но подтверждение не отправилось', user_id=user.id)
+
+
+async def _claim_phantom_user(
+    db: AsyncSession,
+    phantom: 'User',
+    *,
+    telegram_id: int,
+    username: str | None,
+    first_name: str | None,
+    last_name: str | None,
+    language: str,
+    referrer_id: int | None,
+) -> tuple[bool, 'User | None']:
+    """Claim a phantom user by backfilling Telegram profile data.
+
+    Returns (success, user). On IntegrityError falls back to existing user lookup.
+
+    Note: Phantom users created when Bot.get_chat() fails at purchase time are matched
+    by username only. Since Telegram usernames are changeable and reassignable, this is
+    inherently vulnerable to username change attacks. When Bot.get_chat() succeeds at
+    purchase time, telegram_id is stored on the user and the phantom path is not used.
+    """
+    from app.utils.validators import sanitize_telegram_name
+
+    phantom.telegram_id = telegram_id
+    phantom.username = username
+    phantom.first_name = sanitize_telegram_name(first_name)
+    phantom.last_name = sanitize_telegram_name(last_name)
+    phantom.language = language
+    phantom.status = UserStatus.ACTIVE.value
+    if referrer_id and referrer_id != phantom.id:
+        phantom.referred_by_id = referrer_id
+    if not phantom.referral_code:
+        phantom.referral_code = await generate_unique_referral_code(db, telegram_id)
+    phantom.updated_at = datetime.now(UTC)
+    phantom.last_activity = datetime.now(UTC)
+    try:
+        await db.commit()
+    except IntegrityError:
+        await db.rollback()
+        logger.warning(
+            'IntegrityError claiming phantom user, falling back to existing user lookup',
+            phantom_user_id=phantom.id,
+            telegram_id=telegram_id,
+        )
+        existing = await get_user_by_telegram_id(db, telegram_id)
+        return False, existing
+    await db.refresh(phantom, ['subscriptions'])
+    # SECURITY NOTE: Phantom matched by username only (telegram_id was unknown at purchase time).
+    # Telegram usernames are changeable/reassignable, so the claimer may not be the intended
+    # recipient. This is logged at WARNING for admin audit. A confirmation flow would be needed
+    # to fully prevent username spoofing attacks on phantom claims.
+    logger.warning(
+        'Phantom user claimed by username match (verify intended recipient)',
+        phantom_user_id=phantom.id,
+        telegram_id=telegram_id,
+        username=username,
+        has_subscription=phantom.subscription is not None,
+    )
+
+    # Sync Remnawave panel with updated user data (telegram_id, username, etc.)
+    phantom_subs = getattr(phantom, 'subscriptions', None) or []
+    for phantom_sub in phantom_subs:
+        try:
+            subscription_service = SubscriptionService()
+            await subscription_service.update_remnawave_user(db, phantom_sub)
+        except Exception as exc:
+            logger.warning(
+                'Failed to update Remnawave panel after phantom claim',
+                phantom_user_id=phantom.id,
+                subscription_id=phantom_sub.id,
+                error=str(exc),
+            )
+            from app.services.remnawave_retry_queue import remnawave_retry_queue
+
+            if hasattr(phantom_sub, 'id') and hasattr(phantom_sub, 'user_id'):
+                remnawave_retry_queue.enqueue(
+                    subscription_id=phantom_sub.id,
+                    user_id=phantom_sub.user_id,
+                    action='update',
+                )
+
+    return True, phantom
+
+
+async def _merge_phantom_into_active_user(
+    db: AsyncSession,
+    phantom: 'User',
+    active_user: 'User',
+) -> None:
+    """Merge a phantom user (created by guest landing purchase) into an existing active user.
+
+    Transfers GuestPurchase records and handles subscription conflict.
+    The phantom is soft-deleted (status=DELETED, username cleared) to preserve
+    audit trail and avoid CASCADE deletion of payment/transaction records.
+    """
+    from sqlalchemy import update
+
+    logger.warning(
+        'Merging phantom user into active user (audit: username-only match)',
+        phantom_id=phantom.id,
+        active_user_id=active_user.id,
+        active_user_telegram_id=active_user.telegram_id,
+        phantom_username=phantom.username,
+    )
+
+    # Transfer GuestPurchase.user_id references
+    await db.execute(update(GuestPurchase).where(GuestPurchase.user_id == phantom.id).values(user_id=active_user.id))
+
+    # Transfer GuestPurchase.buyer_user_id references
+    await db.execute(
+        update(GuestPurchase).where(GuestPurchase.buyer_user_id == phantom.id).values(buyer_user_id=active_user.id)
+    )
+
+    # Transfer balance
+    if phantom.balance_kopeks and phantom.balance_kopeks > 0:
+        active_user.balance_kopeks = (active_user.balance_kopeks or 0) + phantom.balance_kopeks
+        logger.info('Transferred balance from phantom', amount_kopeks=phantom.balance_kopeks)
+
+    # Handle subscriptions
+    await db.refresh(phantom, ['subscriptions'])
+    await db.refresh(active_user, ['subscriptions'])
+
+    phantom_subs = getattr(phantom, 'subscriptions', None) or []
+    active_user_subs = getattr(active_user, 'subscriptions', None) or []
+
+    if phantom_subs and not active_user_subs:
+        # Transfer ALL subscriptions from phantom to active user
+        for sub in phantom_subs:
+            sub.user_id = active_user.id
+        # Transfer remnawave_uuid (clear first to avoid unique constraint violation on flush)
+        if settings.is_multi_tariff_enabled():
+            # In multi-tariff, transfer user-level UUID only if no subscription-level UUIDs exist
+            if phantom.remnawave_uuid and not active_user.remnawave_uuid:
+                phantom_subs = getattr(phantom, 'subscriptions', []) or []
+                has_sub_uuids = any(getattr(s, 'remnawave_uuid', None) for s in phantom_subs)
+                if not has_sub_uuids:
+                    uuid_to_transfer = phantom.remnawave_uuid
+                    phantom.remnawave_uuid = None
+                    await db.flush()
+                    active_user.remnawave_uuid = uuid_to_transfer
+        elif phantom.remnawave_uuid and not active_user.remnawave_uuid:
+            uuid_to_transfer = phantom.remnawave_uuid
+            phantom.remnawave_uuid = None
+            await db.flush()
+            active_user.remnawave_uuid = uuid_to_transfer
+        await db.flush()
+        logger.info(
+            'Transferred subscriptions from phantom to active user',
+            subscription_ids=[sub.id for sub in phantom_subs],
+        )
+    elif phantom_subs:
+        # Both have subscriptions — disable phantom's Remnawave user and free server slots
+        logger.warning(
+            'Both phantom and active user have subscriptions, disabling phantom',
+            phantom_subscription_ids=[sub.id for sub in phantom_subs],
+            active_subscription_ids=[sub.id for sub in active_user_subs],
+        )
+        if phantom.remnawave_uuid:
+            try:
+                subscription_service = SubscriptionService()
+                await subscription_service.disable_remnawave_user(phantom.remnawave_uuid)
+            except Exception as exc:
+                logger.warning('Failed to disable phantom Remnawave user', error=str(exc))
+        for sub in phantom_subs:
+            await decrement_subscription_server_counts(db, sub)
+
+    # Soft-delete phantom: clear unique identifiers to prevent future matches
+    # and constraint violations. Preserve record for audit trail.
+    phantom.status = UserStatus.DELETED.value
+    phantom.username = None
+    phantom.remnawave_uuid = None
+    phantom.referral_code = None
+    await db.flush()
+
+    logger.info('Phantom user merged and soft-deleted', phantom_id=phantom.id, active_user_id=active_user.id)
+
+
+def _calculate_subscription_flags(subscription):
+    if not subscription:
+        return False, False
+
+    actual_status = getattr(subscription, 'actual_status', None)
+    # 'limited' subscriptions are still active (traffic exhausted, but subscription not expired)
+    has_active_subscription = actual_status in {'active', 'trial', 'limited'}
+    subscription_is_active = bool(getattr(subscription, 'is_active', False)) or actual_status == 'limited'
+
+    return has_active_subscription, subscription_is_active
+
+
+async def _send_pinned_message(
+    bot: Bot,
+    db: AsyncSession,
+    user,
+    pinned_message: PinnedMessage | None = None,
+) -> None:
+    try:
+        await deliver_pinned_message_to_user(bot, db, user, pinned_message)
+    except Exception as error:
+        logger.error(
+            'Не удалось отправить закрепленное сообщение пользователю',
+            getattr=getattr(user, 'telegram_id', 'unknown'),
+            error=error,
+        )
+
+
+async def _apply_campaign_bonus_if_needed(
+    db: AsyncSession,
+    user,
+    state_data: dict,
+    texts,
+    *,
+    bot=None,
+):
+    campaign_id = state_data.get('campaign_id') if state_data else None
+    if not campaign_id:
+        return None
+
+    campaign = await get_campaign_by_id(db, campaign_id)
+    if not campaign or not campaign.is_active:
+        return None
+
+    service = AdvertisingCampaignService()
+    result = await service.apply_campaign_bonus(db, user, campaign)
+    if not result.success:
+        return None
+
+    # Bot-flow successfully applied the campaign — clear the Redis pending entry
+    # (set in cmd_start as a fallback for the cabinet WebApp path) so it isn't
+    # re-evaluated on a subsequent cabinet login.
+    try:
+        from app.services.referral_service import clear_pending_campaign
+
+        if getattr(user, 'telegram_id', None):
+            await clear_pending_campaign(user.telegram_id)
+    except Exception:
+        pass
+
+    # Отправить админу уведомление о РЕГИСТРАЦИИ ровно один раз — когда запись в
+    # advertising_campaign_registrations реально создана (is_new_registration=True).
+    # При повторном вызове record_campaign_registration возвращает существующую
+    # запись с is_new_registration=False — тогда повторное уведомление не идёт,
+    # и количество сообщений в чате == количеству регистраций в кабинете.
+    if result.is_new_registration and bot is not None and getattr(user, 'telegram_id', None):
+        try:
+            notification_service = AdminNotificationService(bot)
+            await notification_service.send_campaign_registration_notification(
+                db,
+                telegram_user_id=user.telegram_id,
+                telegram_user_name=getattr(user, 'full_name', None)
+                or getattr(user, 'username', None)
+                or str(user.telegram_id),
+                telegram_username=getattr(user, 'username', None),
+                campaign=campaign,
+                user=user,
+                bonus_type=result.bonus_type or 'none',
+                balance_kopeks=result.balance_kopeks or 0,
+                subscription_days=result.subscription_days,
+                subscription_traffic_gb=result.subscription_traffic_gb,
+                subscription_device_limit=result.subscription_device_limit,
+                tariff_name=result.tariff_name,
+            )
+        except Exception as notify_error:
+            logger.error(
+                'Ошибка отправки админ уведомления о регистрации по кампании',
+                campaign_id=campaign.id,
+                user_id=getattr(user, 'id', None),
+                error=str(notify_error),
+                exc_info=True,
+            )
+
+    if result.bonus_type == 'balance':
+        amount_text = texts.format_price(result.balance_kopeks)
+        return texts.CAMPAIGN_BONUS_BALANCE.format(
+            amount=amount_text,
+            name=html.escape(campaign.name),
+        )
+
+    if result.bonus_type == 'subscription':
+        traffic_text = texts.format_traffic(result.subscription_traffic_gb or 0)
+        return texts.CAMPAIGN_BONUS_SUBSCRIPTION.format(
+            name=html.escape(campaign.name),
+            days=result.subscription_days,
+            traffic=traffic_text,
+            devices=result.subscription_device_limit,
+        )
+
+    if result.bonus_type == 'none':
+        # Ссылка без награды - не показываем сообщение
+        return None
+
+    if result.bonus_type == 'tariff':
+        traffic_text = texts.format_traffic(result.subscription_traffic_gb or 0)
+        return texts.t(
+            'CAMPAIGN_BONUS_TARIFF',
+            "🎁 Вам выдан тариф '{tariff_name}' на {days} дней!\n📊 Трафик: {traffic}\n📱 Устройств: {devices}",
+        ).format(
+            tariff_name=result.tariff_name or 'Подарочный',
+            days=result.tariff_duration_days,
+            traffic=traffic_text,
+            devices=result.subscription_device_limit,
+        )
+
+    return None
+
+
+async def handle_potential_referral_code(message: types.Message, state: FSMContext, db: AsyncSession):
+    current_state = await state.get_state()
+    logger.info(
+        '🔍 REFERRAL/PROMO CHECK: Проверка сообщения в состоянии',
+        message_text=message.text,
+        current_state=current_state,
+    )
+
+    if current_state not in [
+        RegistrationStates.waiting_for_rules_accept.state,
+        RegistrationStates.waiting_for_privacy_policy_accept.state,
+        RegistrationStates.waiting_for_referral_code.state,
+        None,
+    ]:
+        return False
+
+    user = await get_user_by_telegram_id(db, message.from_user.id)
+    if user and user.status == UserStatus.ACTIVE.value:
+        return False
+
+    data = await state.get_data() or {}
+    language = data.get('language') or (getattr(user, 'language', None) if user else None) or DEFAULT_LANGUAGE
+    texts = get_texts(language)
+
+    if not message.text:
+        return False
+
+    from app.utils.promo_rate_limiter import promo_limiter, validate_promo_format
+
+    potential_code = message.text.strip()
+    if len(potential_code) < 3 or len(potential_code) > 50:
+        return False
+
+    # Валидация формата (только буквы, цифры, дефис, подчёркивание)
+    if not validate_promo_format(potential_code):
+        return False
+
+    # Rate-limit на перебор промокодов
+    if promo_limiter.is_blocked(message.from_user.id):
+        cooldown = promo_limiter.get_block_cooldown(message.from_user.id)
+        await message.answer(
+            texts.t(
+                'PROMO_RATE_LIMITED',
+                '⏳ Слишком много попыток. Попробуйте через {cooldown} сек.',
+            ).format(cooldown=cooldown)
+        )
+        return True
+
+    # Сначала проверяем реферальный код
+    referrer = await get_user_by_referral_code(db, potential_code)
+    if referrer:
+        data['referral_code'] = potential_code
+        data['referrer_id'] = referrer.id
+        await state.set_data(data)
+
+        await message.answer(texts.t('REFERRAL_CODE_ACCEPTED', '✅ Реферальный код принят!'))
+        logger.info(
+            '✅ Реферальный код применен для пользователя',
+            potential_code=potential_code,
+            from_user_id=message.from_user.id,
+        )
+
+        if current_state != RegistrationStates.waiting_for_referral_code.state:
+            language = data.get('language', DEFAULT_LANGUAGE)
+
+            await _send_onboarding_consent(message, language)
+            await state.set_state(RegistrationStates.waiting_for_rules_accept)
+            logger.info('📋 Согласие отправлено после ввода реферального кода')
+        else:
+            await complete_registration(message, state, db)
+
+        return True
+
+    # Если реферальный код не найден, проверяем промокод
+    from app.database.crud.promocode import check_promocode_validity
+
+    promocode_check = await check_promocode_validity(db, potential_code)
+
+    if promocode_check['valid']:
+        # Промокод валиден - сохраняем его в state для активации после создания пользователя
+        data['promocode'] = potential_code
+        await state.set_data(data)
+
+        await message.answer(
+            texts.t(
+                'PROMOCODE_ACCEPTED_WILL_ACTIVATE',
+                '✅ Промокод принят! Он будет активирован после завершения регистрации.',
+            )
+        )
+        logger.info(
+            '✅ Промокод сохранен для активации для пользователя',
+            potential_code=potential_code,
+            from_user_id=message.from_user.id,
+        )
+
+        if current_state != RegistrationStates.waiting_for_referral_code.state:
+            language = data.get('language', DEFAULT_LANGUAGE)
+
+            await _send_onboarding_consent(message, language)
+            await state.set_state(RegistrationStates.waiting_for_rules_accept)
+            logger.info('📋 Согласие отправлено после принятия промокода')
+        else:
+            await complete_registration(message, state, db)
+
+        return True
+
+    # Ни реферальный код, ни промокод не найдены — записываем неудачную попытку
+    promo_limiter.record_failed_attempt(message.from_user.id)
+    promo_limiter.cleanup()
+
+    await message.answer(
+        texts.t(
+            'REFERRAL_OR_PROMO_CODE_INVALID_HELP',
+            '❌ Неверный реферальный код или промокод.\n\n'
+            '💡 Если у вас есть реферальный код или промокод, убедитесь что он введен правильно.\n'
+            '⏭️ Для продолжения регистрации без кода используйте команду /start',
+        )
+    )
+    return True
+
+
+def _get_language_prompt_text() -> str:
+    return '🌐 Выберите язык / Choose your language:'
+
+
+async def _send_onboarding_consent(
+    target_message: types.Message,
+    language: str = DEFAULT_LANGUAGE,
+    *,
+    text: str | None = None,
+) -> None:
+    from app.utils.message_patch import _cache_logo_file_id, caption_exceeds_telegram_limit, get_logo_media
+
+    consent_text = text or get_onboarding_consent_text(language)
+    keyboard = get_onboarding_consent_keyboard(language)
+    send_kwargs = {
+        'reply_markup': keyboard,
+        'parse_mode': ParseMode.HTML,
+    }
+
+    if settings.ENABLE_LOGO_MODE and not caption_exceeds_telegram_limit(consent_text):
+        logo = get_logo_media()
+        if logo is not None:
+            result = await target_message.answer_photo(photo=logo, caption=consent_text, **send_kwargs)
+            _cache_logo_file_id(result)
+            return
+
+    await target_message.answer(consent_text, disable_web_page_preview=True, **send_kwargs)
+
+
+async def _send_onboarding_consent_to_chat(
+    bot: Bot,
+    chat_id: int,
+    language: str = DEFAULT_LANGUAGE,
+    *,
+    text: str | None = None,
+) -> None:
+    from app.utils.message_patch import _cache_logo_file_id, caption_exceeds_telegram_limit, get_logo_media
+
+    consent_text = text or get_onboarding_consent_text(language)
+    keyboard = get_onboarding_consent_keyboard(language)
+    send_kwargs = {
+        'reply_markup': keyboard,
+        'parse_mode': ParseMode.HTML,
+    }
+
+    if settings.ENABLE_LOGO_MODE and not caption_exceeds_telegram_limit(consent_text):
+        logo = get_logo_media()
+        if logo is not None:
+            result = await bot.send_photo(chat_id=chat_id, photo=logo, caption=consent_text, **send_kwargs)
+            _cache_logo_file_id(result)
+            return
+
+    await bot.send_message(chat_id=chat_id, text=consent_text, disable_web_page_preview=True, **send_kwargs)
+
+
+async def _edit_onboarding_consent_message(
+    message: types.Message,
+    text: str,
+    language: str = DEFAULT_LANGUAGE,
+) -> None:
+    keyboard = get_onboarding_consent_keyboard(language)
+    edit_kwargs = {
+        'reply_markup': keyboard,
+        'parse_mode': ParseMode.HTML,
+    }
+
+    if message.photo:
+        await message.edit_caption(caption=text, **edit_kwargs)
+        return
+
+    await message.edit_text(text, disable_web_page_preview=True, **edit_kwargs)
+
+
+async def _prompt_language_selection(message: types.Message, state: FSMContext) -> None:
+    logger.info('🌐 LANGUAGE: Запрос выбора языка для пользователя', from_user_id=message.from_user.id)
+
+    await state.set_state(RegistrationStates.waiting_for_language)
+    await message.answer(
+        _get_language_prompt_text(),
+        reply_markup=get_language_selection_keyboard(),
+    )
+
+
+async def _continue_registration_after_language(
+    *,
+    message: types.Message | None,
+    callback: types.CallbackQuery | None,
+    state: FSMContext,
+    db: AsyncSession,
+) -> None:
+    data = await state.get_data() or {}
+    language = data.get('language', DEFAULT_LANGUAGE)
+    texts = get_texts(language)
+
+    target_message = callback.message if callback else message
+    if not target_message:
+        logger.warning('⚠️ LANGUAGE: Нет доступного сообщения для продолжения регистрации')
+        return
+
+    async def _complete_registration_wrapper():
+        if callback:
+            await complete_registration_from_callback(callback, state, db)
+        else:
+            await complete_registration(message, state, db)
+
+    if settings.SKIP_RULES_ACCEPT:
+        logger.info('⚙️ LANGUAGE: SKIP_RULES_ACCEPT включен - пропускаем правила')
+
+        if data.get('referral_code'):
+            referrer = await get_user_by_referral_code(db, data['referral_code'])
+            if referrer:
+                data['referrer_id'] = referrer.id
+                await state.set_data(data)
+                logger.info('✅ LANGUAGE: Реферер найден', referrer_id=referrer.id)
+
+        if settings.SKIP_REFERRAL_CODE or data.get('referral_code') or data.get('referrer_id'):
+            await _complete_registration_wrapper()
+        else:
+            try:
+                await target_message.answer(
+                    texts.t(
+                        'REFERRAL_CODE_QUESTION',
+                        "У вас есть реферальный код? Введите его или нажмите 'Пропустить'",
+                    ),
+                    reply_markup=get_referral_code_keyboard(language),
+                )
+                await state.set_state(RegistrationStates.waiting_for_referral_code)
+                logger.info('🔍 LANGUAGE: Ожидание ввода реферального кода')
+            except Exception as error:
+                logger.error('Ошибка при показе вопроса о реферальном коде после выбора языка', error=error)
+                await _complete_registration_wrapper()
+        return
+
+    try:
+        await _send_onboarding_consent(target_message, language)
+    except TelegramForbiddenError:
+        logger.warning(
+            '⚠️ Пользователь заблокировал бота, пропускаем отправку согласия',
+            from_user_id=callback.from_user.id if callback else message.from_user.id,
+        )
+        return
+    await state.set_state(RegistrationStates.waiting_for_rules_accept)
+    logger.info('📋 LANGUAGE: Согласие отправлено после выбора языка')
+
+
+async def cmd_start(message: types.Message, state: FSMContext, db: AsyncSession, db_user=None):
+    logger.info('🚀 START: Обработка /start от', from_user_id=message.from_user.id)
+
+    data = await state.get_data() or {}
+
+    # ИСПРАВЛЕНИЕ БАГА: используем .get() вместо .pop() для campaign_notification_sent
+    # pending_start_payload обрабатывается отдельно ниже
+    campaign_notification_sent = data.get('campaign_notification_sent', False)
+    state_needs_update = False
+
+    # Получаем payload из state или Redis
+    pending_start_payload = data.get('pending_start_payload', None)
+
+    # Если в FSM state нет payload, пробуем получить из Redis (резервный механизм)
+    if not pending_start_payload:
+        redis_payload = await get_pending_payload_from_redis(message.from_user.id)
+        if redis_payload:
+            pending_start_payload = redis_payload
+            data['pending_start_payload'] = redis_payload
+            state_needs_update = True
+            logger.info(
+                '📦 START: Payload восстановлен из Redis (fallback)', pending_start_payload=pending_start_payload
+            )
+            # НЕ удаляем Redis payload здесь - удаление только после успешной регистрации
+
+    referral_code = None
+    campaign = None
+    start_args = message.text.split()
+    start_parameter = None
+
+    msg_start_arg = start_args[1] if len(start_args) > 1 else None
+
+    if pending_start_payload and msg_start_arg and pending_start_payload != msg_start_arg:
+        # Одновременно есть аргумент из сообщения и pending payload.
+        # Payload был сохранён при блокировке каналом — это источник
+        # первого касания. Если он является активной кампанией —
+        # он побеждает над свежим аргументом из ссылки в атрибуции.
+        #
+        # Оптимизация: middleware уже проверил payload через БД и выставил
+        # FSM-флаг 'pending_payload_is_campaign'. Используем его, чтобы
+        # не делать повторный запрос в БД на каждом /start.
+        payload_is_campaign = data.get('pending_payload_is_campaign', False)
+        if not payload_is_campaign:
+            pending_first_touch_campaign = await get_campaign_by_start_parameter(
+                db, pending_start_payload, only_active=True
+            )
+            payload_is_campaign = bool(pending_first_touch_campaign)
+            if payload_is_campaign:
+                await state.update_data(pending_payload_is_campaign=True)
+        if payload_is_campaign:
+            start_parameter = pending_start_payload
+            logger.info(
+                '📦 START: pending_start_payload — кампания первого касания, приоритет над новым аргументом',
+                pending_start_payload=pending_start_payload,
+                message_arg=msg_start_arg,
+            )
+        else:
+            start_parameter = msg_start_arg
+    elif msg_start_arg:
+        start_parameter = msg_start_arg
+    elif pending_start_payload:
+        start_parameter = pending_start_payload
+        logger.info('📦 START: Используем сохраненный payload', pending_start_payload=pending_start_payload)
+
+    if state_needs_update:
+        await state.set_data(data)
+
+    # Handle gift code deep links: /start GIFT_{token} (or giftclaim_{token} alias)
+    if start_parameter and (start_parameter.startswith('GIFT_') or start_parameter.startswith('giftclaim_')):
+        gift_token = (
+            start_parameter.removeprefix('giftclaim_')
+            if start_parameter.startswith('giftclaim_')
+            else start_parameter[5:]  # Strip "GIFT_" prefix
+        )
+        # Reject tokens too short to be a legitimately-truncated gift token — a short prefix
+        # would match (and claim) an arbitrary gift via the startswith lookup downstream.
+        if len(gift_token) >= GIFT_TOKEN_MIN_PREFIX_LENGTH:
+            logger.info(
+                'Gift code deep link detected',
+                token_prefix=gift_token[:5],
+                telegram_id=message.from_user.id,
+            )
+            # For new users, gift is auto-activated via
+            # _activate_pending_gift_after_registration() before state.clear().
+            await state.update_data(pending_gift_token=gift_token)
+            start_parameter = None  # Don't treat as campaign or referral
+
+    # Handle coupon deep links: /start coupon_{token} — one-time wholesale coupons
+    if start_parameter and start_parameter.startswith(COUPON_DEEP_LINK_PREFIX):
+        coupon_token = start_parameter.removeprefix(COUPON_DEEP_LINK_PREFIX).lower()
+        # The payload fits Telegram's 64-char start param untruncated, so the
+        # lookup is exact-match. Swallow the parameter only for coupons that
+        # actually exist — a campaign start_parameter may legitimately begin
+        # with 'coupon_' (even coupon_<32 hex>) and must fall through to the
+        # campaign lookup below.
+        if is_coupon_token(coupon_token):
+            from app.database.crud.coupon import get_coupon_by_token
+
+            if await get_coupon_by_token(db, coupon_token) is not None:
+                logger.info(
+                    'Coupon deep link detected',
+                    token_prefix=coupon_token[:5],
+                    telegram_id=message.from_user.id,
+                )
+                # Redeemed via _redeem_pending_coupon(): immediately below for
+                # registered users, after registration for new ones.
+                await state.update_data(pending_coupon_token=coupon_token)
+                start_parameter = None  # Don't treat as campaign or referral
+
+    # Handle web auth deep links: /start webauth_{token}
+    if start_parameter and start_parameter.startswith('webauth_'):
+        web_auth_token = start_parameter.removeprefix('webauth_')
+        if len(web_auth_token) >= WEB_AUTH_TOKEN_MIN_LENGTH:
+            user = db_user or await get_user_by_telegram_id(db, message.from_user.id)
+            if user and user.status != UserStatus.DELETED.value:
+                texts = get_texts(user.language)
+                keyboard = types.InlineKeyboardMarkup(
+                    inline_keyboard=[
+                        [
+                            types.InlineKeyboardButton(
+                                text=texts.t('WEB_AUTH_CONFIRM_YES', '✅ Да, войти'),
+                                callback_data=f'webauth_confirm:{web_auth_token}',
+                            ),
+                            types.InlineKeyboardButton(
+                                text=texts.t('WEB_AUTH_CONFIRM_NO', '❌ Нет'),
+                                callback_data='webauth_deny',
+                            ),
+                        ],
+                    ]
+                )
+                await message.answer(
+                    texts.t(
+                        'WEB_AUTH_CONFIRM_PROMPT',
+                        '🔐 Подтвердите вход в личный кабинет. Если вы не запрашивали вход — нажмите «Нет».',
+                    ),
+                    reply_markup=keyboard,
+                )
+            else:
+                logger.warning('Web auth attempt from unregistered user', telegram_id=message.from_user.id)
+                await message.answer('❌ Сначала зарегистрируйтесь в боте, затем попробуйте войти в кабинет.')
+            return
+        start_parameter = None  # Invalid token, ignore
+
+    # Handle contests deep link: /start contests — the channel announcement's
+    # "🎲 Играть" button opens the bot here (a callback button can't open a
+    # private chat / show a personal menu from a channel post).
+    if start_parameter == 'contests':
+        user = db_user or await get_user_by_telegram_id(db, message.from_user.id)
+        if user and user.status != UserStatus.DELETED.value:
+            from app.handlers.contests import open_contests_menu_message
+
+            await open_contests_menu_message(message, user, db)
+            return
+        # Unregistered → fall through to normal /start (contests need a subscription anyway).
+        start_parameter = None
+
+    # Диплинк «активировать триал» из rich-меню: /start trial.
+    # Зарегистрированному юзеру бесплатный триал выдаётся ниже
+    # (_activate_pending_trial) перед показом меню — меню сразу отрисует новую
+    # подписку. Новый юзер получает предложение триала после регистрации штатно.
+    # Платный триал (TRIAL_PAYMENT_ENABLED) этим путём не активируется — только
+    # оплата в миниаппе.
+    if start_parameter == 'trial':
+        await state.update_data(pending_trial=True)
+        start_parameter = None
+
+    # Keitaro/affiliate click ID rides on /start as `{campaign}_subid_{click_id}`
+    # (64 chars total). Pull the click_id into FSM state and continue campaign
+    # lookup with the bare campaign portion.
+    if start_parameter:
+        campaign_part, subid_from_link = _split_start_param_subid(start_parameter)
+        if subid_from_link:
+            start_parameter = campaign_part
+            await state.update_data(pending_subid=subid_from_link)
+            logger.info(
+                'Captured subid from /start deeplink',
+                telegram_id=message.from_user.id,
+                campaign=campaign_part,
+            )
+
+    if start_parameter:
+        campaign = await get_campaign_by_start_parameter(
+            db,
+            start_parameter,
+            only_active=True,
+        )
+
+        if campaign:
+            logger.info(
+                '📣 Найдена рекламная кампания',
+                campaign_id=campaign.id,
+                start_parameter=campaign.start_parameter,
+            )
+            await state.update_data(campaign_id=campaign.id)
+            # Persist campaign to Redis immediately so it survives if user opens
+            # miniapp/cabinet (via Telegram menu button) before completing the
+            # bot registration flow. Mirrors the pending_referral mechanism.
+            # Only for new users — existing users already had attribution applied.
+            if not db_user:
+                try:
+                    await save_pending_campaign(
+                        message.from_user.id,
+                        campaign.start_parameter,
+                        campaign.id,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        'Failed to persist pending campaign',
+                        campaign_id=campaign.id,
+                        error=exc,
+                    )
+            if campaign.partner_user_id:
+                await state.update_data(referrer_id=campaign.partner_user_id)
+                logger.info(
+                    '👤 Кампания привязана к партнёру, реферер будет установлен',
+                    campaign_id=campaign.id,
+                    campaign_name=campaign.name,
+                    partner_user_id=campaign.partner_user_id,
+                )
+            else:
+                logger.debug(
+                    'Кампания без партнёра, реферер не устанавливается',
+                    campaign_id=campaign.id,
+                    campaign_name=campaign.name,
+                )
+        else:
+            referral_code = start_parameter
+            logger.info('🔎 Найден реферальный код', referral_code=referral_code)
+
+    if referral_code:
+        await state.update_data(referral_code=referral_code)
+        try:
+            referrer = await get_user_by_referral_code(db, referral_code)
+        except Exception as exc:
+            logger.warning('Failed to resolve referral code at /start', referral_code=referral_code, error=exc)
+            referrer = None
+
+        if referrer and referrer.telegram_id != message.from_user.id:
+            if not db_user:
+                # New user — save to Redis so the cabinet/miniapp
+                # auth route can pick it up if the user opens the
+                # WebApp before completing the bot FSM.
+                try:
+                    await save_pending_referral(message.from_user.id, referral_code, referrer.id)
+                except Exception as exc:
+                    logger.warning('Failed to persist pending referral', referral_code=referral_code, error=exc)
+            elif db_user.referred_by_id is None:
+                # RACE FIX: the miniapp may have created the user row
+                # between the /start link click and this handler firing
+                # (e.g. user tapped the WebApp menu button immediately
+                # after pressing the bot's Start button, and the
+                # cabinet's auth endpoint ran first). The Redis fallback
+                # the cabinet checks was not populated yet, so the user
+                # was created without a referrer. Attach it now —
+                # idempotent and self-referral-safe (see
+                # `attach_referrer_if_missing`).
+                from app.services.referral_service import attach_referrer_if_missing
+
+                try:
+                    await attach_referrer_if_missing(
+                        db,
+                        db_user,
+                        referral_code=referral_code,
+                        bot=message.bot,
+                        source='bot_start_retroactive',
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        'Failed to retroactively attach referrer at /start',
+                        referral_code=referral_code,
+                        user_id=db_user.id,
+                        error=exc,
+                    )
+
+    user = db_user or await get_user_by_telegram_id(db, message.from_user.id)
+
+    # Visit notification шлётся только для НОВОГО юзера (user is None) — это первый
+    # touch top-of-funnel. Для существующих юзеров (которые ещё не зарегистрированы
+    # в кампании) уведомление о ПЕРЕХОДЕ больше не идёт: вместо него админу прилетит
+    # отдельное «РЕГИСТРАЦИЯ ПО РК» позже, в _apply_campaign_bonus_if_needed, ровно
+    # при создании записи в advertising_campaign_registrations. Это даёт паритет
+    # между числом сообщений в чате и числом регистраций в кабинете.
+    if campaign and not campaign_notification_sent and user is None:
+        try:
+            notification_service = AdminNotificationService(message.bot)
+            await notification_service.send_campaign_link_visit_notification(
+                db,
+                message.from_user,
+                campaign,
+                user,
+            )
+        except Exception as notify_error:
+            logger.error(
+                'Ошибка отправки админ уведомления о переходе по кампании',
+                campaign_id=campaign.id,
+                notify_error=notify_error,
+            )
+
+    if user and user.status != UserStatus.DELETED.value:
+        logger.info('✅ Активный пользователь найден', telegram_id=user.telegram_id)
+
+        # Check for phantom user created by guest landing purchase and merge
+        if message.from_user.username:
+            phantom = await find_phantom_user_by_username(db, message.from_user.username)
+            if phantom and phantom.id != user.id:
+                try:
+                    await merge_phantom_into_user(db, phantom, user)
+                    await db.commit()
+                    await db.refresh(user, ['subscriptions'])
+                except Exception:
+                    await db.rollback()
+                    await db.refresh(user, ['subscriptions'])
+                    logger.exception(
+                        'Failed to merge phantom user',
+                        phantom_id=phantom.id,
+                        active_user_id=user.id,
+                    )
+
+        profile_updated = False
+
+        if user.username != message.from_user.username:
+            old_username = user.username
+            user.username = message.from_user.username
+            logger.info('📝 Username обновлен', old_username=old_username, username=user.username)
+            profile_updated = True
+
+        if user.first_name != message.from_user.first_name:
+            old_first_name = user.first_name
+            user.first_name = message.from_user.first_name
+            logger.info('📝 Имя обновлено', old_first_name=old_first_name, first_name=user.first_name)
+            profile_updated = True
+
+        if user.last_name != message.from_user.last_name:
+            old_last_name = user.last_name
+            user.last_name = message.from_user.last_name
+            logger.info('📝 Фамилия обновлена', old_last_name=old_last_name, last_name=user.last_name)
+            profile_updated = True
+
+        user.last_activity = datetime.now(UTC)
+
+        if profile_updated:
+            user.updated_at = datetime.now(UTC)
+            await db.commit()
+            await db.refresh(user)
+            logger.info('💾 Профиль пользователя обновлен', telegram_id=user.telegram_id)
+        else:
+            await db.commit()
+
+        texts = get_texts(user.language)
+
+        if referral_code and not user.referred_by_id:
+            await message.answer(
+                texts.t(
+                    'ALREADY_REGISTERED_REFERRAL',
+                    'ℹ️ Вы уже зарегистрированы в системе. Реферальная ссылка не может быть применена.',
+                )
+            )
+
+        if campaign and not campaign.is_none_bonus:
+            try:
+                await message.answer(
+                    texts.t(
+                        'CAMPAIGN_EXISTING_USERL',
+                        'ℹ️ Эта рекламная ссылка доступна только новым пользователям.',
+                    )
+                )
+            except Exception as e:
+                logger.error('Ошибка отправки уведомления о рекламной кампании', error=e)
+
+        # Auto-activate pending gift/coupon/trial if deep link contained GIFT_/coupon_/trial
+        if user:
+            await _activate_pending_gift_after_registration(db, state, user, message.answer)
+            await _redeem_pending_coupon(db, state, user, message.answer)
+            await _activate_pending_trial(db, state, user, message.answer)
+            await _persist_pending_subid_after_registration(db, state, user)
+            await state.update_data(
+                pending_gift_token=None, pending_coupon_token=None, pending_subid=None, pending_trial=None
+            )
+            # Refresh user to pick up newly created subscriptions
+            await db.refresh(user, attribute_names=['subscriptions'])
+
+        user_subs_for_flags = getattr(user, 'subscriptions', None) or []
+        first_sub_for_flags = next(
+            (s for s in user_subs_for_flags if s.is_active), user_subs_for_flags[0] if user_subs_for_flags else None
+        )
+        has_active_subscription, subscription_is_active = _calculate_subscription_flags(first_sub_for_flags)
+
+        pinned_message = await get_active_pinned_message(db)
+
+        if pinned_message and pinned_message.send_before_menu:
+            await _send_pinned_message(message.bot, db, user, pinned_message)
+
+        is_admin = settings.is_admin(user.telegram_id)
+        is_moderator = (not is_admin) and SupportSettingsService.is_moderator(user.telegram_id)
+
+        custom_buttons = []
+        if not settings.is_text_main_menu_mode():
+            custom_buttons = await MainMenuButtonService.get_buttons_for_user(
+                db,
+                is_admin=is_admin,
+                has_active_subscription=has_active_subscription,
+                subscription_is_active=subscription_is_active,
+            )
+
+        user_subs = getattr(user, 'subscriptions', None) or []
+        first_sub = next((s for s in user_subs if s.is_active), user_subs[0] if user_subs else None)
+        keyboard = await get_main_menu_keyboard_async(
+            db=db,
+            user=user,
+            language=user.language,
+            is_admin=is_admin,
+            has_had_paid_subscription=user.has_had_paid_subscription,
+            has_active_subscription=has_active_subscription,
+            subscription_is_active=subscription_is_active,
+            balance_kopeks=user.balance_kopeks,
+            subscription=first_sub,
+            is_moderator=is_moderator,
+            custom_buttons=custom_buttons,
+        )
+        await _send_cabinet_reply_keyboard(message, None, user.language, texts)
+        if not await try_answer_rich_main_menu(message, user, texts, db, keyboard):
+            menu_text = await get_main_menu_text(user, texts, db)
+            await message.answer(menu_text, reply_markup=keyboard, parse_mode='HTML')
+
+        if pinned_message and not pinned_message.send_before_menu:
+            await _send_pinned_message(message.bot, db, user, pinned_message)
+        await state.clear()
+        return
+
+    if user and user.status == UserStatus.DELETED.value:
+        logger.info('🔄 Удаленный пользователь начинает повторную регистрацию', telegram_id=user.telegram_id)
+
+        try:
+            from sqlalchemy import delete, update as sa_update
+
+            from app.database.models import (
+                CloudPaymentsPayment,
+                CryptoBotPayment,
+                FreekassaPayment,
+                HeleketPayment,
+                KassaAiPayment,
+                MulenPayPayment,
+                Pal24Payment,
+                PlategaPayment,
+                PromoCodeUse,
+                ReferralEarning,
+                SubscriptionServer,
+                Transaction,
+                WataPayment,
+                YooKassaPayment,
+            )
+
+            user_subs = getattr(user, 'subscriptions', None) or []
+            for sub in user_subs:
+                await decrement_subscription_server_counts(db, sub)
+                await db.execute(delete(SubscriptionServer).where(SubscriptionServer.subscription_id == sub.id))
+                logger.info('Deleted SubscriptionServer records', subscription_id=sub.id)
+
+            for sub in user_subs:
+                await db.delete(sub)
+                logger.info('Deleted user subscription', subscription_id=sub.id)
+
+            await db.execute(delete(PromoCodeUse).where(PromoCodeUse.user_id == user.id))
+
+            await db.execute(
+                sa_update(ReferralEarning)
+                .where(ReferralEarning.user_id == user.id)
+                .values(referral_transaction_id=None)
+            )
+            await db.execute(
+                sa_update(ReferralEarning)
+                .where(ReferralEarning.referral_id == user.id)
+                .values(referral_transaction_id=None)
+            )
+            await db.execute(delete(ReferralEarning).where(ReferralEarning.user_id == user.id))
+            await db.execute(delete(ReferralEarning).where(ReferralEarning.referral_id == user.id))
+
+            # Обнуляем transaction_id во всех таблицах платежей перед удалением транзакций
+            payment_models = [
+                YooKassaPayment,
+                CryptoBotPayment,
+                HeleketPayment,
+                MulenPayPayment,
+                Pal24Payment,
+                WataPayment,
+                PlategaPayment,
+                CloudPaymentsPayment,
+                FreekassaPayment,
+                KassaAiPayment,
+            ]
+            for payment_model in payment_models:
+                await db.execute(
+                    sa_update(payment_model).where(payment_model.user_id == user.id).values(transaction_id=None)
+                )
+
+            await db.execute(delete(Transaction).where(Transaction.user_id == user.id))
+
+            if user.balance_kopeks > 0:
+                logger.warning(
+                    '⚠️ DELETED-восстановление: обнуляем ненулевой баланс',
+                    telegram_id=user.telegram_id,
+                    balance_kopeks=user.balance_kopeks,
+                )
+
+            # Keep status=DELETED so complete_registration properly handles
+            # referral assignment and status change (not the "already active" branch)
+            user.balance_kopeks = 0
+            user.remnawave_uuid = None
+            user.has_had_paid_subscription = False
+            user.referred_by_id = None
+
+            user.username = message.from_user.username
+            user.first_name = message.from_user.first_name
+            user.last_name = message.from_user.last_name
+            user.updated_at = datetime.now(UTC)
+            user.last_activity = datetime.now(UTC)
+
+            from app.utils.user_utils import generate_unique_referral_code
+
+            user.referral_code = await generate_unique_referral_code(db, user.telegram_id)
+
+            await db.commit()
+
+            logger.info('✅ Пользователь подготовлен к восстановлению', telegram_id=user.telegram_id)
+
+        except Exception as e:
+            logger.error('❌ Ошибка подготовки к восстановлению', error=e)
+            await db.rollback()
+    else:
+        logger.info('🆕 Новый пользователь, начинаем регистрацию')
+
+    data = await state.get_data() or {}
+    if not data.get('language'):
+        if settings.is_language_selection_enabled():
+            await _prompt_language_selection(message, state)
+            return
+
+        default_language = (
+            (settings.DEFAULT_LANGUAGE or DEFAULT_LANGUAGE)
+            if isinstance(settings.DEFAULT_LANGUAGE, str)
+            else DEFAULT_LANGUAGE
+        )
+        normalized_default = default_language.split('-')[0].lower()
+        data['language'] = normalized_default
+        await state.set_data(data)
+        logger.info(
+            '🌐 LANGUAGE: выбор языка отключен, устанавливаем язык по умолчанию',
+            normalized_default=normalized_default,
+        )
+
+    await _continue_registration_after_language(
+        message=message,
+        callback=None,
+        state=state,
+        db=db,
+    )
+
+
+async def process_language_selection(
+    callback: types.CallbackQuery,
+    state: FSMContext,
+    db: AsyncSession,
+):
+    logger.info(
+        '🌐 LANGUAGE: Пользователь выбрал язык', from_user_id=callback.from_user.id, callback_data=callback.data
+    )
+
+    if not settings.is_language_selection_enabled():
+        data = await state.get_data() or {}
+        default_language = (
+            (settings.DEFAULT_LANGUAGE or DEFAULT_LANGUAGE)
+            if isinstance(settings.DEFAULT_LANGUAGE, str)
+            else DEFAULT_LANGUAGE
+        )
+        normalized_default = default_language.split('-')[0].lower()
+        data['language'] = normalized_default
+        await state.set_data(data)
+
+        texts = get_texts(normalized_default)
+
+        try:
+            await callback.message.edit_text(
+                texts.t(
+                    'LANGUAGE_SELECTION_DISABLED',
+                    '⚙️ Выбор языка временно недоступен. Используем язык по умолчанию.',
+                )
+            )
+        except Exception:
+            await callback.message.answer(
+                texts.t(
+                    'LANGUAGE_SELECTION_DISABLED',
+                    '⚙️ Выбор языка временно недоступен. Используем язык по умолчанию.',
+                )
+            )
+
+        await callback.answer()
+
+        await _continue_registration_after_language(
+            message=None,
+            callback=callback,
+            state=state,
+            db=db,
+        )
+        return
+
+    selected_raw = (callback.data or '').split(':', 1)[-1]
+    normalized_selected = selected_raw.strip().lower()
+
+    available_map = {
+        lang.strip().lower(): lang.strip()
+        for lang in settings.get_available_languages()
+        if isinstance(lang, str) and lang.strip()
+    }
+
+    if normalized_selected not in available_map:
+        logger.warning(
+            '⚠️ LANGUAGE: Выбран недоступный язык пользователем',
+            normalized_selected=normalized_selected,
+            from_user_id=callback.from_user.id,
+        )
+        await callback.answer('❌ Unsupported language', show_alert=True)
+        return
+
+    resolved_language = available_map[normalized_selected].lower()
+
+    data = await state.get_data() or {}
+    data['language'] = resolved_language
+    await state.set_data(data)
+
+    texts = get_texts(resolved_language)
+
+    try:
+        await callback.message.edit_text(
+            texts.t('LANGUAGE_SELECTED', '🌐 Язык интерфейса обновлен.'),
+        )
+    except Exception as error:
+        logger.warning('⚠️ LANGUAGE: Не удалось обновить сообщение выбора языка', error=error)
+        await callback.message.answer(
+            texts.t('LANGUAGE_SELECTED', '🌐 Язык интерфейса обновлен.'),
+        )
+
+    await callback.answer()
+
+    await _continue_registration_after_language(
+        message=None,
+        callback=callback,
+        state=state,
+        db=db,
+    )
+
+
+async def _show_privacy_policy_after_rules(
+    callback: types.CallbackQuery,
+    state: FSMContext,
+    db: AsyncSession,
+    language: str,
+) -> bool:
+    """
+    Показывает политику конфиденциальности после принятия правил.
+    Возвращает True, если политика была показана, False если её нет или произошла ошибка.
+    """
+    policy = await PrivacyPolicyService.get_policy(db, language, fallback=True)
+
+    if not policy or not policy.is_enabled:
+        logger.info('⚠️ Политика конфиденциальности не включена, пропускаем её показ')
+        return False
+
+    if not policy.content or not policy.content.strip():
+        privacy_policy_text = get_privacy_policy(language)
+        if not privacy_policy_text or not privacy_policy_text.strip():
+            logger.info('⚠️ Политика конфиденциальности включена, но дефолтный текст пустой, пропускаем показ')
+            return False
+        logger.info(
+            '🔒 Используется дефолтный текст политики конфиденциальности из локализации для языка', language=language
+        )
+    else:
+        privacy_policy_text = policy.content
+        logger.info('🔒 Используется политика конфиденциальности из БД для языка', language=language)
+
+    try:
+        await edit_long_text(
+            callback.message,
+            privacy_policy_text,
+            reply_markup=get_privacy_policy_keyboard(language),
+            parse_mode='HTML',
+        )
+        await state.set_state(RegistrationStates.waiting_for_privacy_policy_accept)
+        logger.info('🔒 Политика конфиденциальности отправлена пользователю', from_user_id=callback.from_user.id)
+        return True
+    except Exception as e:
+        logger.error('Ошибка при показе политики конфиденциальности', error=e, exc_info=True)
+        try:
+            await answer_long_text(
+                callback.message,
+                privacy_policy_text,
+                reply_markup=get_privacy_policy_keyboard(language),
+                parse_mode='HTML',
+            )
+            await state.set_state(RegistrationStates.waiting_for_privacy_policy_accept)
+            logger.info(
+                '🔒 Политика конфиденциальности отправлена новым сообщением пользователю',
+                from_user_id=callback.from_user.id,
+            )
+            return True
+        except Exception as e2:
+            logger.error('Критическая ошибка при отправке политики конфиденциальности', e2=e2, exc_info=True)
+            return False
+
+
+async def _continue_registration_after_rules(
+    callback: types.CallbackQuery,
+    state: FSMContext,
+    db: AsyncSession,
+    language: str,
+) -> None:
+    """
+    Продолжает регистрацию после принятия правил (реферальный код или завершение).
+    """
+    data = await state.get_data() or {}
+    texts = get_texts(language)
+
+    if data.get('referral_code'):
+        logger.info('🎫 Найден реферальный код из deep link', data=data['referral_code'])
+
+        referrer = await get_user_by_referral_code(db, data['referral_code'])
+        if referrer:
+            data['referrer_id'] = referrer.id
+            await state.set_data(data)
+            logger.info('✅ Реферер найден', referrer_id=referrer.id)
+
+        await complete_registration_from_callback(callback, state, db)
+    elif settings.SKIP_REFERRAL_CODE or data.get('referrer_id'):
+        logger.info('⚙️ Пропускаем запрос реферального кода')
+        await complete_registration_from_callback(callback, state, db)
+    else:
+        try:
+            await callback.message.edit_text(
+                texts.t(
+                    'REFERRAL_CODE_QUESTION',
+                    "У вас есть реферальный код? Введите его или нажмите 'Пропустить'",
+                ),
+                reply_markup=get_referral_code_keyboard(language),
+            )
+            await state.set_state(RegistrationStates.waiting_for_referral_code)
+            logger.info('🔍 Ожидание ввода реферального кода')
+        except Exception as e:
+            logger.error('Ошибка при показе вопроса о реферальном коде', error=e)
+            await complete_registration_from_callback(callback, state, db)
+
+
+async def process_rules_accept(callback: types.CallbackQuery, state: FSMContext, db: AsyncSession):
+    """
+    Обрабатывает принятие или отклонение правил пользователем.
+    """
+    logger.info('📋 RULES: Начало обработки правил')
+    logger.info('📊 Callback data', callback_data=callback.data)
+    logger.info('👤 User', from_user_id=callback.from_user.id)
+
+    current_state = await state.get_state()
+    logger.info('📊 Текущее состояние', current_state=current_state)
+
+    language = DEFAULT_LANGUAGE
+    texts = get_texts(language)
+
+    try:
+        await callback.answer()
+
+        data = await state.get_data() or {}
+        language = data.get('language', language)
+        texts = get_texts(language)
+
+        if callback.data == 'rules_accept':
+            logger.info('✅ Согласие принято пользователем', from_user_id=callback.from_user.id)
+            await _continue_registration_after_rules(callback, state, db, language)
+
+        else:
+            logger.info('❌ Согласие отклонено пользователем', from_user_id=callback.from_user.id)
+
+            consent_declined_text = get_onboarding_consent_declined_text(language)
+
+            try:
+                await _edit_onboarding_consent_message(callback.message, consent_declined_text, language)
+            except TelegramBadRequest as e:
+                if 'message is not modified' in str(e):
+                    pass  # Сообщение уже содержит нужный текст
+                else:
+                    logger.error('Ошибка при показе сообщения об отклонении согласия', error=e)
+
+        logger.info('✅ Правила обработаны для пользователя', from_user_id=callback.from_user.id)
+
+    except Exception as e:
+        logger.error('❌ Ошибка обработки правил', error=e, exc_info=True)
+        await callback.answer(
+            texts.t('ERROR_TRY_AGAIN', '❌ Произошла ошибка. Попробуйте еще раз.'),
+            show_alert=True,
+        )
+
+        try:
+            data = await state.get_data() or {}
+            language = data.get('language', language)
+            texts = get_texts(language)
+            await _send_onboarding_consent(callback.message, language)
+            await state.set_state(RegistrationStates.waiting_for_rules_accept)
+        except Exception:
+            pass
+
+
+async def process_privacy_policy_accept(callback: types.CallbackQuery, state: FSMContext, db: AsyncSession):
+    logger.info('🔒 PRIVACY POLICY: Начало обработки политики конфиденциальности')
+    logger.info('📊 Callback data', callback_data=callback.data)
+    logger.info('👤 User', from_user_id=callback.from_user.id)
+
+    current_state = await state.get_state()
+    logger.info('📊 Текущее состояние', current_state=current_state)
+
+    language = DEFAULT_LANGUAGE
+    texts = get_texts(language)
+
+    try:
+        await callback.answer()
+
+        data = await state.get_data() or {}
+        language = data.get('language', language)
+        texts = get_texts(language)
+
+        if callback.data == 'privacy_policy_accept':
+            logger.info('✅ Политика конфиденциальности принята пользователем', from_user_id=callback.from_user.id)
+
+            try:
+                await callback.message.delete()
+                logger.info('🗑️ Сообщение с политикой конфиденциальности удалено')
+            except Exception as e:
+                logger.warning('⚠️ Не удалось удалить сообщение с политикой конфиденциальности', error=e)
+                try:
+                    await callback.message.edit_text(
+                        texts.t(
+                            'PRIVACY_POLICY_ACCEPTED_PROCESSING',
+                            '✅ Политика конфиденциальности принята! Продолжаем регистрацию...',
+                        ),
+                        reply_markup=None,
+                    )
+                except Exception:
+                    pass
+
+            if data.get('referral_code'):
+                logger.info('🎫 Найден реферальный код из deep link', data=data['referral_code'])
+
+                referrer = await get_user_by_referral_code(db, data['referral_code'])
+                if referrer:
+                    data['referrer_id'] = referrer.id
+                    await state.set_data(data)
+                    logger.info('✅ Реферер найден', referrer_id=referrer.id)
+
+                await complete_registration_from_callback(callback, state, db)
+            elif settings.SKIP_REFERRAL_CODE or data.get('referrer_id'):
+                logger.info('⚙️ Пропускаем запрос реферального кода')
+                await complete_registration_from_callback(callback, state, db)
+            else:
+                try:
+                    await state.set_data(data)
+                    await state.set_state(RegistrationStates.waiting_for_referral_code)
+
+                    await callback.bot.send_message(
+                        chat_id=callback.from_user.id,
+                        text=texts.t(
+                            'REFERRAL_CODE_QUESTION',
+                            "У вас есть реферальный код? Введите его или нажмите 'Пропустить'",
+                        ),
+                        reply_markup=get_referral_code_keyboard(language),
+                    )
+                    logger.info('🔍 Ожидание ввода реферального кода')
+                except Exception as e:
+                    logger.error('Ошибка при показе вопроса о реферальном коде', error=e)
+                    await complete_registration_from_callback(callback, state, db)
+
+        else:
+            logger.info('❌ Политика конфиденциальности отклонена пользователем', from_user_id=callback.from_user.id)
+
+            privacy_policy_required_text = texts.t(
+                'PRIVACY_POLICY_REQUIRED',
+                'Для использования бота необходимо принять политику конфиденциальности.',
+            )
+
+            try:
+                await callback.message.edit_text(
+                    privacy_policy_required_text, reply_markup=get_privacy_policy_keyboard(language)
+                )
+            except TelegramBadRequest as e:
+                if 'message is not modified' not in str(e):
+                    logger.warning('Ошибка при показе сообщения об отклонении политики', error=e)
+            except Exception as e:
+                logger.warning('Ошибка при показе сообщения об отклонении политики', error=e)
+
+        logger.info('✅ Политика конфиденциальности обработана для пользователя', from_user_id=callback.from_user.id)
+
+    except Exception as e:
+        logger.error('❌ Ошибка обработки политики конфиденциальности', error=e, exc_info=True)
+        await callback.answer(
+            texts.t('ERROR_TRY_AGAIN', '❌ Произошла ошибка. Попробуйте еще раз.'),
+            show_alert=True,
+        )
+
+        try:
+            data = await state.get_data() or {}
+            language = data.get('language', language)
+            texts = get_texts(language)
+            await callback.message.answer(
+                texts.t(
+                    'ERROR_PRIVACY_POLICY_RETRY',
+                    'Произошла ошибка. Попробуйте принять политику конфиденциальности еще раз:',
+                ),
+                reply_markup=get_privacy_policy_keyboard(language),
+            )
+            await state.set_state(RegistrationStates.waiting_for_privacy_policy_accept)
+        except Exception:
+            pass
+
+
+async def process_referral_code_input(message: types.Message, state: FSMContext, db: AsyncSession):
+    logger.info('🎫 REFERRAL/PROMO: Обработка кода', message_text=message.text)
+
+    data = await state.get_data() or {}
+    language = data.get('language', DEFAULT_LANGUAGE)
+    texts = get_texts(language)
+
+    if not message.text:
+        await message.answer(texts.t('REFERRAL_OR_PROMO_CODE_INVALID', '❌ Неверный реферальный код или промокод'))
+        return
+
+    from app.utils.promo_rate_limiter import promo_limiter, validate_promo_format
+
+    code = message.text.strip()
+
+    # Валидация формата
+    if not validate_promo_format(code):
+        await message.answer(texts.t('REFERRAL_OR_PROMO_CODE_INVALID', '❌ Неверный реферальный код или промокод'))
+        return
+
+    # Rate-limit на перебор
+    if promo_limiter.is_blocked(message.from_user.id):
+        cooldown = promo_limiter.get_block_cooldown(message.from_user.id)
+        await message.answer(
+            texts.t(
+                'PROMO_RATE_LIMITED',
+                '⏳ Слишком много попыток. Попробуйте через {cooldown} сек.',
+            ).format(cooldown=cooldown)
+        )
+        return
+
+    # Сначала проверяем, является ли это реферальным кодом
+    referrer = await get_user_by_referral_code(db, code)
+    if referrer:
+        data['referrer_id'] = referrer.id
+        await state.set_data(data)
+        await message.answer(texts.t('REFERRAL_CODE_ACCEPTED', '✅ Реферальный код принят!'))
+        logger.info('✅ Реферальный код применен', code=code)
+        await complete_registration(message, state, db)
+        return
+
+    # Если реферальный код не найден, проверяем промокод
+    from app.database.crud.promocode import check_promocode_validity
+
+    promocode_check = await check_promocode_validity(db, code)
+
+    if promocode_check['valid']:
+        # Промокод валиден - сохраняем его в state для активации после создания пользователя
+        data['promocode'] = code
+        await state.set_data(data)
+        await message.answer(
+            texts.t(
+                'PROMOCODE_ACCEPTED_WILL_ACTIVATE',
+                '✅ Промокод принят! Он будет активирован после завершения регистрации.',
+            )
+        )
+        logger.info('✅ Промокод сохранен для активации', code=code)
+        await complete_registration(message, state, db)
+        return
+
+    # Ни реферальный код, ни промокод не найдены — записываем неудачу
+    promo_limiter.record_failed_attempt(message.from_user.id)
+    promo_limiter.cleanup()
+
+    await message.answer(texts.t('REFERRAL_OR_PROMO_CODE_INVALID', '❌ Неверный реферальный код или промокод'))
+    logger.info('❌ Неверный код (ни реферальный, ни промокод)', code=code)
+    return
+
+
+async def process_referral_code_skip(callback: types.CallbackQuery, state: FSMContext, db: AsyncSession):
+    logger.info('⭐️ SKIP: Пропуск реферального кода от пользователя', from_user_id=callback.from_user.id)
+    await callback.answer()
+
+    data = await state.get_data() or {}
+    language = data.get('language', DEFAULT_LANGUAGE)
+    texts = get_texts(language)
+
+    try:
+        await callback.message.delete()
+        logger.info('🗑️ Сообщение с вопросом о реферальном коде удалено')
+    except Exception as e:
+        logger.warning('⚠️ Не удалось удалить сообщение с вопросом о реферальном коде', error=e)
+        try:
+            await callback.message.edit_text(
+                texts.t('REGISTRATION_COMPLETING', '✅ Завершаем регистрацию...'), reply_markup=None
+            )
+        except Exception:
+            pass
+
+    await complete_registration_from_callback(callback, state, db)
+
+
+async def complete_registration_from_callback(callback: types.CallbackQuery, state: FSMContext, db: AsyncSession):
+    logger.info('🎯 COMPLETE: Завершение регистрации для пользователя', from_user_id=callback.from_user.id)
+
+    existing_user = await get_user_by_telegram_id(db, callback.from_user.id)
+
+    if existing_user and existing_user.status == UserStatus.ACTIVE.value:
+        logger.warning('⚠️ Пользователь уже активен! Показываем главное меню.', from_user_id=callback.from_user.id)
+        texts = get_texts(existing_user.language)
+
+        data = await state.get_data() or {}
+        if data.get('referral_code') and not existing_user.referred_by_id:
+            await callback.message.answer(
+                texts.t(
+                    'ALREADY_REGISTERED_REFERRAL',
+                    'ℹ️ Вы уже зарегистрированы в системе. Реферальная ссылка не может быть применена.',
+                )
+            )
+
+        await db.refresh(existing_user, ['subscriptions'])
+
+        existing_user_subs = getattr(existing_user, 'subscriptions', None) or []
+        first_existing_sub = next(
+            (s for s in existing_user_subs if s.is_active), existing_user_subs[0] if existing_user_subs else None
+        )
+        has_active_subscription, subscription_is_active = _calculate_subscription_flags(first_existing_sub)
+
+        is_admin = settings.is_admin(existing_user.telegram_id)
+        is_moderator = (not is_admin) and SupportSettingsService.is_moderator(existing_user.telegram_id)
+
+        custom_buttons = []
+        if not settings.is_text_main_menu_mode():
+            custom_buttons = await MainMenuButtonService.get_buttons_for_user(
+                db,
+                is_admin=is_admin,
+                has_active_subscription=has_active_subscription,
+                subscription_is_active=subscription_is_active,
+            )
+
+        pinned_message = await get_active_pinned_message(db)
+        try:
+            keyboard = await get_main_menu_keyboard_async(
+                db=db,
+                user=existing_user,
+                language=existing_user.language,
+                is_admin=is_admin,
+                has_had_paid_subscription=existing_user.has_had_paid_subscription,
+                has_active_subscription=has_active_subscription,
+                subscription_is_active=subscription_is_active,
+                balance_kopeks=existing_user.balance_kopeks,
+                subscription=first_existing_sub,
+                is_moderator=is_moderator,
+                custom_buttons=custom_buttons,
+            )
+            if pinned_message and pinned_message.send_before_menu:
+                await _send_pinned_message(callback.bot, db, existing_user, pinned_message)
+            await _send_cabinet_reply_keyboard(callback.message, None, existing_user.language, texts)
+            if not await try_answer_rich_main_menu(callback.message, existing_user, texts, db, keyboard):
+                menu_text = await get_main_menu_text(existing_user, texts, db)
+                await callback.message.answer(menu_text, reply_markup=keyboard, parse_mode='HTML')
+            if pinned_message and not pinned_message.send_before_menu:
+                await _send_pinned_message(callback.bot, db, existing_user, pinned_message)
+        except Exception as e:
+            logger.error('Ошибка при показе главного меню существующему пользователю', error=e)
+            await callback.message.answer(
+                texts.t(
+                    'WELCOME_FALLBACK',
+                    'Добро пожаловать, {user_name}!',
+                ).format(user_name=html.escape(existing_user.full_name or ''))
+            )
+
+        await state.clear()
+        return
+
+    data = await state.get_data() or {}
+    language = data.get('language', DEFAULT_LANGUAGE)
+    texts = get_texts(language)
+
+    referrer_id = data.get('referrer_id')
+    if not referrer_id and data.get('referral_code'):
+        referrer = await get_user_by_referral_code(db, data['referral_code'])
+        if referrer:
+            referrer_id = referrer.id
+
+    if existing_user and existing_user.status == UserStatus.DELETED.value:
+        logger.info('🔄 Восстанавливаем удаленного пользователя', from_user_id=callback.from_user.id)
+
+        # Prevent self-referral when partner re-registers via own campaign link
+        safe_referrer_id = referrer_id if referrer_id != existing_user.id else None
+
+        if existing_user.balance_kopeks > 0:
+            logger.warning(
+                '⚠️ DELETED-восстановление: обнуляем ненулевой баланс',
+                telegram_id=existing_user.telegram_id,
+                balance_kopeks=existing_user.balance_kopeks,
+            )
+
+        existing_user.username = callback.from_user.username
+        existing_user.first_name = callback.from_user.first_name
+        existing_user.last_name = callback.from_user.last_name
+        existing_user.language = language
+        existing_user.referred_by_id = safe_referrer_id
+        existing_user.status = UserStatus.ACTIVE.value
+        existing_user.balance_kopeks = 0
+        existing_user.has_had_paid_subscription = False
+
+        existing_user.updated_at = datetime.now(UTC)
+        existing_user.last_activity = datetime.now(UTC)
+
+        await db.commit()
+        await db.refresh(existing_user, ['subscriptions'])
+
+        user = existing_user
+        logger.info('✅ Пользователь восстановлен', from_user_id=callback.from_user.id)
+
+    elif not existing_user:
+        # Check for phantom user created by guest purchase (gift by @username)
+        phantom = (
+            await find_phantom_user_by_username(db, callback.from_user.username)
+            if callback.from_user.username
+            else None
+        )
+        if phantom:
+            claimed, user = await claim_phantom(
+                db,
+                phantom,
+                telegram_id=callback.from_user.id,
+                username=callback.from_user.username,
+                first_name=callback.from_user.first_name,
+                last_name=callback.from_user.last_name,
+                language=language,
+                referrer_id=referrer_id,
+            )
+            if not claimed and user:
+                # Phantom claim failed (IntegrityError — user with this telegram_id already exists).
+                # Merge phantom's data into the existing user via full account merge service.
+                if phantom.id != user.id:
+                    try:
+                        await db.refresh(phantom, ['subscriptions'])
+                        await _merge_phantom_into_active_user(db, phantom, user)
+                        await db.commit()
+                    except Exception:
+                        await db.rollback()
+                        logger.exception(
+                            'Failed to merge phantom into existing user during registration',
+                            phantom_id=phantom.id,
+                            active_user_id=user.id,
+                        )
+                await db.refresh(user, ['subscriptions'])
+            elif not claimed:
+                logger.critical(
+                    'Phantom claim failed with no fallback user, proceeding to normal registration',
+                    telegram_id=callback.from_user.id,
+                    phantom_user_id=phantom.id,
+                )
+                phantom = None
+
+        if not phantom:
+            logger.info('🆕 Создаем нового пользователя', from_user_id=callback.from_user.id)
+
+            referral_code = await generate_unique_referral_code(db, callback.from_user.id)
+
+            user = await create_user(
+                db=db,
+                telegram_id=callback.from_user.id,
+                username=callback.from_user.username,
+                first_name=callback.from_user.first_name,
+                last_name=callback.from_user.last_name,
+                language=language,
+                referred_by_id=referrer_id,
+                referral_code=referral_code,
+            )
+            await db.refresh(user, ['subscriptions'])
+    else:
+        logger.info('🔄 Обновляем существующего пользователя', from_user_id=callback.from_user.id)
+        existing_user.status = UserStatus.ACTIVE.value
+        existing_user.language = language
+        if referrer_id and referrer_id != existing_user.id and not existing_user.referred_by_id:
+            existing_user.referred_by_id = referrer_id
+
+        existing_user.updated_at = datetime.now(UTC)
+        existing_user.last_activity = datetime.now(UTC)
+
+        await db.commit()
+        await db.refresh(existing_user, ['subscriptions'])
+        user = existing_user
+
+    if referrer_id and referrer_id != user.id:
+        try:
+            await process_referral_registration(db, user.id, referrer_id, callback.bot)
+            logger.info('✅ Реферальная регистрация обработана для', user_id=user.id)
+        except Exception as e:
+            logger.error('Ошибка при обработке реферальной регистрации', error=e)
+
+    campaign_message = await _apply_campaign_bonus_if_needed(db, user, data, texts, bot=callback.bot)
+
+    try:
+        await db.refresh(user)
+    except Exception as refresh_error:
+        logger.error(
+            'Ошибка обновления данных пользователя после бонуса кампании',
+            telegram_id=user.telegram_id,
+            refresh_error=refresh_error,
+        )
+
+    try:
+        await db.refresh(user, ['subscriptions'])
+    except Exception as refresh_subscription_error:
+        logger.error(
+            'Ошибка обновления подписки пользователя после бонуса кампании',
+            telegram_id=user.telegram_id,
+            refresh_subscription_error=refresh_subscription_error,
+        )
+
+    # ИСПРАВЛЕНИЕ БАГА: Очищаем Redis payload после успешной регистрации
+    await delete_pending_payload_from_redis(callback.from_user.id)
+    logger.info(
+        '🗑️ COMPLETE_FROM_CALLBACK: Redis payload удален после успешной регистрации пользователя',
+        telegram_id=user.telegram_id,
+    )
+
+    # Auto-activate pending gift/coupon for newly registered user (before state.clear() wipes the tokens)
+    await _activate_pending_gift_after_registration(db, state, user, callback.message.answer)
+    await _redeem_pending_coupon(db, state, user, callback.message.answer)
+    await _persist_pending_subid_after_registration(db, state, user)
+    # Gift/coupon may have just created a subscription — reload it, otherwise the
+    # stale empty list below offers the trial on top of the granted subscription
+    try:
+        await db.refresh(user, ['subscriptions'])
+    except Exception as refresh_error:
+        logger.error(
+            'Ошибка обновления подписок после активации подарка/купона',
+            telegram_id=user.telegram_id,
+            refresh_error=refresh_error,
+        )
+
+    await state.clear()
+
+    if campaign_message:
+        try:
+            await callback.message.answer(campaign_message)
+        except Exception as e:
+            logger.error('Ошибка отправки сообщения о бонусе кампании', error=e)
+
+    from app.database.crud.welcome_text import get_welcome_text_for_user
+
+    offer_text = await get_welcome_text_for_user(db, callback.from_user)
+    pinned_message = await get_active_pinned_message(db)
+
+    if offer_text:
+        try:
+            if pinned_message and pinned_message.send_before_menu:
+                await _send_pinned_message(callback.bot, db, user, pinned_message)
+            await callback.message.answer(
+                offer_text,
+                reply_markup=get_post_registration_keyboard(user.language),
+                parse_mode='HTML',
+            )
+            logger.info('✅ Приветственное сообщение отправлено пользователю', telegram_id=user.telegram_id)
+            if pinned_message and not pinned_message.send_before_menu:
+                await _send_pinned_message(callback.bot, db, user, pinned_message)
+        except TelegramBadRequest as e:
+            if 'parse entities' in str(e).lower() or "can't parse" in str(e).lower():
+                logger.warning('HTML parse error в приветственном сообщении, повтор без parse_mode', error=e)
+                try:
+                    await callback.message.answer(
+                        offer_text,
+                        reply_markup=get_post_registration_keyboard(user.language),
+                        parse_mode=None,
+                    )
+                    if pinned_message and not pinned_message.send_before_menu:
+                        await _send_pinned_message(callback.bot, db, user, pinned_message)
+                except Exception as fallback_err:
+                    logger.error('Ошибка при повторной отправке приветственного сообщения', fallback_err=fallback_err)
+            else:
+                logger.error('Ошибка при отправке приветственного сообщения', error=e)
+        except Exception as e:
+            logger.error('Ошибка при отправке приветственного сообщения', error=e)
+    else:
+        logger.info(
+            'ℹ️ Приветственные сообщения отключены, показываем главное меню для пользователя',
+            telegram_id=user.telegram_id,
+        )
+
+        user_subs_menu = getattr(user, 'subscriptions', None) or []
+        first_sub_menu = next((s for s in user_subs_menu if s.is_active), user_subs_menu[0] if user_subs_menu else None)
+        has_active_subscription, subscription_is_active = _calculate_subscription_flags(first_sub_menu)
+
+        is_admin = settings.is_admin(user.telegram_id)
+        is_moderator = (not is_admin) and SupportSettingsService.is_moderator(user.telegram_id)
+
+        custom_buttons = []
+        if not settings.is_text_main_menu_mode():
+            custom_buttons = await MainMenuButtonService.get_buttons_for_user(
+                db,
+                is_admin=is_admin,
+                has_active_subscription=has_active_subscription,
+                subscription_is_active=subscription_is_active,
+            )
+
+        try:
+            keyboard = await get_main_menu_keyboard_async(
+                db=db,
+                user=user,
+                language=user.language,
+                is_admin=is_admin,
+                has_had_paid_subscription=user.has_had_paid_subscription,
+                has_active_subscription=has_active_subscription,
+                subscription_is_active=subscription_is_active,
+                balance_kopeks=user.balance_kopeks,
+                subscription=first_sub_menu,
+                is_moderator=is_moderator,
+                custom_buttons=custom_buttons,
+            )
+            if pinned_message and pinned_message.send_before_menu:
+                await _send_pinned_message(callback.bot, db, user, pinned_message)
+            await _send_cabinet_reply_keyboard(callback.message, None, user.language, texts)
+            if not await try_answer_rich_main_menu(callback.message, user, texts, db, keyboard):
+                menu_text = await get_main_menu_text(user, texts, db)
+                await callback.message.answer(menu_text, reply_markup=keyboard, parse_mode='HTML')
+            if pinned_message and not pinned_message.send_before_menu:
+                await _send_pinned_message(callback.bot, db, user, pinned_message)
+            logger.info('✅ Главное меню показано пользователю', telegram_id=user.telegram_id)
+        except Exception as e:
+            logger.error('Ошибка при показе главного меню', error=e)
+            await callback.message.answer(
+                texts.t(
+                    'WELCOME_FALLBACK',
+                    'Добро пожаловать, {user_name}!',
+                ).format(user_name=html.escape(user.full_name or ''))
+            )
+
+    logger.info('✅ Регистрация завершена для пользователя', telegram_id=user.telegram_id)
+
+
+async def complete_registration(message: types.Message, state: FSMContext, db: AsyncSession):
+    logger.info('🎯 COMPLETE: Завершение регистрации для пользователя', from_user_id=message.from_user.id)
+
+    existing_user = await get_user_by_telegram_id(db, message.from_user.id)
+
+    if existing_user and existing_user.status == UserStatus.ACTIVE.value:
+        logger.warning('⚠️ Пользователь уже активен! Показываем главное меню.', from_user_id=message.from_user.id)
+        texts = get_texts(existing_user.language)
+
+        data = await state.get_data() or {}
+        if data.get('referral_code') and not existing_user.referred_by_id:
+            await message.answer(
+                texts.t(
+                    'ALREADY_REGISTERED_REFERRAL',
+                    'ℹ️ Вы уже зарегистрированы в системе. Реферальная ссылка не может быть применена.',
+                )
+            )
+
+        await db.refresh(existing_user, ['subscriptions'])
+
+        existing_user_subs = getattr(existing_user, 'subscriptions', None) or []
+        first_existing_sub = next(
+            (s for s in existing_user_subs if s.is_active), existing_user_subs[0] if existing_user_subs else None
+        )
+        has_active_subscription, subscription_is_active = _calculate_subscription_flags(first_existing_sub)
+
+        is_admin = settings.is_admin(existing_user.telegram_id)
+        is_moderator = (not is_admin) and SupportSettingsService.is_moderator(existing_user.telegram_id)
+
+        custom_buttons = []
+        if not settings.is_text_main_menu_mode():
+            custom_buttons = await MainMenuButtonService.get_buttons_for_user(
+                db,
+                is_admin=is_admin,
+                has_active_subscription=has_active_subscription,
+                subscription_is_active=subscription_is_active,
+            )
+
+        pinned_message = await get_active_pinned_message(db)
+        try:
+            keyboard = await get_main_menu_keyboard_async(
+                db=db,
+                user=existing_user,
+                language=existing_user.language,
+                is_admin=is_admin,
+                has_had_paid_subscription=existing_user.has_had_paid_subscription,
+                has_active_subscription=has_active_subscription,
+                subscription_is_active=subscription_is_active,
+                balance_kopeks=existing_user.balance_kopeks,
+                subscription=first_existing_sub,
+                is_moderator=is_moderator,
+                custom_buttons=custom_buttons,
+            )
+            if pinned_message and pinned_message.send_before_menu:
+                await _send_pinned_message(message.bot, db, existing_user, pinned_message)
+            await _send_cabinet_reply_keyboard(message, None, existing_user.language, texts)
+            if not await try_answer_rich_main_menu(message, existing_user, texts, db, keyboard):
+                menu_text = await get_main_menu_text(existing_user, texts, db)
+                await message.answer(menu_text, reply_markup=keyboard, parse_mode='HTML')
+            if pinned_message and not pinned_message.send_before_menu:
+                await _send_pinned_message(message.bot, db, existing_user, pinned_message)
+        except Exception as e:
+            logger.error('Ошибка при показе главного меню существующему пользователю', error=e)
+            await message.answer(
+                texts.t(
+                    'WELCOME_FALLBACK',
+                    'Добро пожаловать, {user_name}!',
+                ).format(user_name=html.escape(existing_user.full_name or ''))
+            )
+
+        await state.clear()
+        return
+
+    data = await state.get_data() or {}
+    language = data.get('language', DEFAULT_LANGUAGE)
+    texts = get_texts(language)
+
+    referrer_id = data.get('referrer_id')
+    if not referrer_id and data.get('referral_code'):
+        referrer = await get_user_by_referral_code(db, data['referral_code'])
+        if referrer:
+            referrer_id = referrer.id
+
+    if existing_user and existing_user.status == UserStatus.DELETED.value:
+        logger.info('🔄 Восстанавливаем удаленного пользователя', from_user_id=message.from_user.id)
+
+        # Prevent self-referral when partner re-registers via own campaign link
+        safe_referrer_id = referrer_id if referrer_id != existing_user.id else None
+
+        if existing_user.balance_kopeks > 0:
+            logger.warning(
+                '⚠️ DELETED-восстановление: обнуляем ненулевой баланс',
+                telegram_id=existing_user.telegram_id,
+                balance_kopeks=existing_user.balance_kopeks,
+            )
+
+        existing_user.username = message.from_user.username
+        existing_user.first_name = message.from_user.first_name
+        existing_user.last_name = message.from_user.last_name
+        existing_user.language = language
+        existing_user.referred_by_id = safe_referrer_id
+        existing_user.status = UserStatus.ACTIVE.value
+        existing_user.balance_kopeks = 0
+        existing_user.has_had_paid_subscription = False
+
+        existing_user.updated_at = datetime.now(UTC)
+        existing_user.last_activity = datetime.now(UTC)
+
+        await db.commit()
+        await db.refresh(existing_user, ['subscriptions'])
+
+        user = existing_user
+        logger.info('✅ Пользователь восстановлен', from_user_id=message.from_user.id)
+
+    elif not existing_user:
+        # Check for phantom user created by guest purchase (gift by @username)
+        phantom = (
+            await find_phantom_user_by_username(db, message.from_user.username) if message.from_user.username else None
+        )
+        if phantom:
+            claimed, user = await claim_phantom(
+                db,
+                phantom,
+                telegram_id=message.from_user.id,
+                username=message.from_user.username,
+                first_name=message.from_user.first_name,
+                last_name=message.from_user.last_name,
+                language=language,
+                referrer_id=referrer_id,
+            )
+            if not claimed and user:
+                # Phantom claim failed (IntegrityError — user with this telegram_id already exists).
+                # Merge phantom's data into the existing user via full account merge service.
+                if phantom.id != user.id:
+                    try:
+                        await db.refresh(phantom, ['subscriptions'])
+                        await _merge_phantom_into_active_user(db, phantom, user)
+                        await db.commit()
+                    except Exception:
+                        await db.rollback()
+                        logger.exception(
+                            'Failed to merge phantom into existing user during registration',
+                            phantom_id=phantom.id,
+                            active_user_id=user.id,
+                        )
+                await db.refresh(user, ['subscriptions'])
+            elif not claimed:
+                logger.critical(
+                    'Phantom claim failed with no fallback user, proceeding to normal registration',
+                    telegram_id=message.from_user.id,
+                    phantom_user_id=phantom.id,
+                )
+                phantom = None
+
+        if not phantom:
+            logger.info('🆕 Создаем нового пользователя', from_user_id=message.from_user.id)
+
+            referral_code = await generate_unique_referral_code(db, message.from_user.id)
+
+            user = await create_user(
+                db=db,
+                telegram_id=message.from_user.id,
+                username=message.from_user.username,
+                first_name=message.from_user.first_name,
+                last_name=message.from_user.last_name,
+                language=language,
+                referred_by_id=referrer_id,
+                referral_code=referral_code,
+            )
+            await db.refresh(user, ['subscriptions'])
+    else:
+        logger.info('🔄 Обновляем существующего пользователя', from_user_id=message.from_user.id)
+        existing_user.status = UserStatus.ACTIVE.value
+        existing_user.language = language
+        if referrer_id and referrer_id != existing_user.id and not existing_user.referred_by_id:
+            existing_user.referred_by_id = referrer_id
+
+        existing_user.updated_at = datetime.now(UTC)
+        existing_user.last_activity = datetime.now(UTC)
+
+        await db.commit()
+        await db.refresh(existing_user, ['subscriptions'])
+        user = existing_user
+
+    if referrer_id and referrer_id != user.id:
+        try:
+            await process_referral_registration(db, user.id, referrer_id, message.bot)
+            logger.info('✅ Реферальная регистрация обработана для', user_id=user.id)
+        except Exception as e:
+            logger.error('Ошибка при обработке реферальной регистрации', error=e)
+
+    # Активируем промокод если был сохранен в state
+    promocode_to_activate = data.get('promocode')
+    if promocode_to_activate:
+        try:
+            from app.handlers.promocode import activate_promocode_for_registration
+
+            promocode_result = await activate_promocode_for_registration(
+                db, user.id, promocode_to_activate, message.bot
+            )
+
+            if promocode_result['success']:
+                await message.answer(
+                    texts.t('PROMOCODE_ACTIVATED_AT_REGISTRATION', '✅ Промокод активирован!\n\n{description}').format(
+                        description=promocode_result['description']
+                    )
+                )
+                logger.info(
+                    '✅ Промокод активирован для пользователя',
+                    promocode_to_activate=promocode_to_activate,
+                    user_id=user.id,
+                )
+            else:
+                logger.warning(
+                    '⚠️ Не удалось активировать промокод',
+                    promocode_to_activate=promocode_to_activate,
+                    error=promocode_result.get('error'),
+                )
+        except Exception as e:
+            logger.error('❌ Ошибка при активации промокода', promocode_to_activate=promocode_to_activate, error=e)
+
+    campaign_message = await _apply_campaign_bonus_if_needed(db, user, data, texts, bot=message.bot)
+
+    try:
+        await db.refresh(user)
+    except Exception as refresh_error:
+        logger.error(
+            'Ошибка обновления данных пользователя после бонуса кампании',
+            telegram_id=user.telegram_id,
+            refresh_error=refresh_error,
+        )
+
+    try:
+        await db.refresh(user, ['subscriptions'])
+    except Exception as refresh_subscription_error:
+        logger.error(
+            'Ошибка обновления подписки пользователя после бонуса кампании',
+            telegram_id=user.telegram_id,
+            refresh_subscription_error=refresh_subscription_error,
+        )
+
+    # ИСПРАВЛЕНИЕ БАГА: Очищаем Redis payload после успешной регистрации
+    await delete_pending_payload_from_redis(message.from_user.id)
+    logger.info(
+        '🗑️ COMPLETE: Redis payload удален после успешной регистрации пользователя', telegram_id=user.telegram_id
+    )
+
+    # Auto-activate pending gift/coupon for newly registered user (before state.clear() wipes the tokens)
+    await _activate_pending_gift_after_registration(db, state, user, message.answer)
+    await _redeem_pending_coupon(db, state, user, message.answer)
+    await _persist_pending_subid_after_registration(db, state, user)
+    # Gift/coupon may have just created a subscription — reload it, otherwise the
+    # stale empty list below offers the trial on top of the granted subscription
+    try:
+        await db.refresh(user, ['subscriptions'])
+    except Exception as refresh_error:
+        logger.error(
+            'Ошибка обновления подписок после активации подарка/купона',
+            telegram_id=user.telegram_id,
+            refresh_error=refresh_error,
+        )
+
+    await state.clear()
+
+    if campaign_message:
+        try:
+            await message.answer(campaign_message)
+        except Exception as e:
+            logger.error('Ошибка отправки сообщения о бонусе кампании', error=e)
+
+    from app.database.crud.welcome_text import get_welcome_text_for_user
+
+    offer_text = await get_welcome_text_for_user(db, message.from_user)
+    pinned_message = await get_active_pinned_message(db)
+
+    if offer_text:
+        try:
+            # Если у пользователя уже есть подписка (например, от промокода), не предлагаем триал
+            _subs = getattr(user, 'subscriptions', None) or []
+            user_has_subscription = any(s.is_active for s in _subs)
+            if user_has_subscription:
+                keyboard = get_back_keyboard(user.language, callback_data='back_to_menu')
+            else:
+                keyboard = get_post_registration_keyboard(user.language)
+
+            if pinned_message and pinned_message.send_before_menu:
+                await _send_pinned_message(message.bot, db, user, pinned_message)
+            await _send_cabinet_reply_keyboard(message, None, user.language, texts)
+            await message.answer(
+                offer_text,
+                reply_markup=keyboard,
+                parse_mode='HTML',
+            )
+            logger.info('✅ Приветственное сообщение отправлено пользователю', telegram_id=user.telegram_id)
+            if pinned_message and not pinned_message.send_before_menu:
+                await _send_pinned_message(message.bot, db, user, pinned_message)
+        except TelegramBadRequest as e:
+            if 'parse entities' in str(e).lower() or "can't parse" in str(e).lower():
+                logger.warning('HTML parse error в приветственном сообщении, повтор без parse_mode', error=e)
+                try:
+                    await message.answer(
+                        offer_text,
+                        reply_markup=keyboard,
+                        parse_mode=None,
+                    )
+                    if pinned_message and not pinned_message.send_before_menu:
+                        await _send_pinned_message(message.bot, db, user, pinned_message)
+                except Exception as fallback_err:
+                    logger.error('Ошибка при повторной отправке приветственного сообщения', fallback_err=fallback_err)
+            else:
+                logger.error('Ошибка при отправке приветственного сообщения', error=e)
+        except Exception as e:
+            logger.error('Ошибка при отправке приветственного сообщения', error=e)
+    else:
+        logger.info(
+            'ℹ️ Приветственные сообщения отключены, показываем главное меню для пользователя',
+            telegram_id=user.telegram_id,
+        )
+
+        user_subs_menu = getattr(user, 'subscriptions', None) or []
+        first_sub_menu = next((s for s in user_subs_menu if s.is_active), user_subs_menu[0] if user_subs_menu else None)
+        has_active_subscription, subscription_is_active = _calculate_subscription_flags(first_sub_menu)
+
+        is_admin = settings.is_admin(user.telegram_id)
+        is_moderator = (not is_admin) and SupportSettingsService.is_moderator(user.telegram_id)
+
+        custom_buttons = []
+        if not settings.is_text_main_menu_mode():
+            custom_buttons = await MainMenuButtonService.get_buttons_for_user(
+                db,
+                is_admin=is_admin,
+                has_active_subscription=has_active_subscription,
+                subscription_is_active=subscription_is_active,
+            )
+
+        try:
+            keyboard = await get_main_menu_keyboard_async(
+                db=db,
+                user=user,
+                language=user.language,
+                is_admin=is_admin,
+                has_had_paid_subscription=user.has_had_paid_subscription,
+                has_active_subscription=has_active_subscription,
+                subscription_is_active=subscription_is_active,
+                balance_kopeks=user.balance_kopeks,
+                subscription=first_sub_menu,
+                is_moderator=is_moderator,
+                custom_buttons=custom_buttons,
+            )
+            if pinned_message and pinned_message.send_before_menu:
+                await _send_pinned_message(message.bot, db, user, pinned_message)
+            await _send_cabinet_reply_keyboard(message, None, user.language, texts)
+            if not await try_answer_rich_main_menu(message, user, texts, db, keyboard):
+                menu_text = await get_main_menu_text(user, texts, db)
+                await message.answer(menu_text, reply_markup=keyboard, parse_mode='HTML')
+            logger.info('✅ Главное меню показано пользователю', telegram_id=user.telegram_id)
+            if pinned_message and not pinned_message.send_before_menu:
+                await _send_pinned_message(message.bot, db, user, pinned_message)
+        except Exception as e:
+            logger.error('Ошибка при показе главного меню', error=e)
+            await message.answer(
+                texts.t(
+                    'WELCOME_FALLBACK',
+                    'Добро пожаловать, {user_name}!',
+                ).format(user_name=html.escape(user.full_name or ''))
+            )
+
+    logger.info('✅ Регистрация завершена для пользователя', telegram_id=user.telegram_id)
+
+
+def _get_subscription_status_simple(texts):
+    return texts.t('SUBSCRIPTION_NONE', 'Нет активной подписки')
+
+
+def _insert_random_message(base_text: str, random_message: str, action_prompt: str) -> str:
+    if not random_message:
+        return base_text
+
+    prompt = action_prompt or ''
+    if prompt and prompt in base_text:
+        parts = base_text.split(prompt, 1)
+        if len(parts) == 2:
+            return f'{parts[0]}\n{random_message}\n\n{prompt}{parts[1]}'
+        return base_text.replace(prompt, f'\n{random_message}\n\n{prompt}', 1)
+
+    return f'{base_text}\n\n{random_message}'
+
+
+def get_referral_code_keyboard(language: str):
+    from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+
+    texts = get_texts(language)
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=texts.t('REFERRAL_CODE_SKIP', '⭐️ Пропустить'), callback_data='referral_skip')]
+        ]
+    )
+
+
+async def get_main_menu_text(user, texts, db: AsyncSession):
+    # Single source of truth: delegate to the menu handler's builder so /start
+    # renders the SAME subscription block as "back to menu" — including the
+    # multi-tariff format (🟢 <tariff> — до …). Previously this had its own
+    # stale formatter, so /start showed the legacy "💎 Активна" status until the
+    # user navigated away and back. See app/handlers/menu.py get_main_menu_text.
+    from app.handlers.menu import get_main_menu_text as build_menu_text
+
+    return await build_menu_text(user, texts, db)
+
+
+async def get_main_menu_text_simple(user_name, texts, db: AsyncSession):
+    base_text = texts.MAIN_MENU.format(
+        user_name=html.escape(user_name or ''), subscription_status=_get_subscription_status_simple(texts)
+    )
+
+    action_prompt = texts.t('MAIN_MENU_ACTION_PROMPT', 'Выберите действие:')
+
+    try:
+        random_message = await get_random_active_message(db)
+        if random_message:
+            return _insert_random_message(base_text, random_message, action_prompt)
+
+    except Exception as e:
+        logger.error('Ошибка получения случайного сообщения', error=e)
+
+    return base_text
+
+
+async def required_sub_channel_check(
+    query: types.CallbackQuery, bot: Bot, state: FSMContext, db: AsyncSession, db_user=None
+):
+    from app.utils.message_patch import _cache_logo_file_id, caption_exceeds_telegram_limit, get_logo_media
+
+    language = DEFAULT_LANGUAGE
+    texts = get_texts(language)
+
+    try:
+        state_data = await state.get_data() or {}
+
+        # Получаем payload БЕЗ удаления - удалим только после успешной проверки подписки
+        pending_start_payload = state_data.get('pending_start_payload')
+
+        # Если в FSM state нет payload, пробуем получить из Redis (резервный механизм)
+        if not pending_start_payload:
+            redis_payload = await get_pending_payload_from_redis(query.from_user.id)
+            if redis_payload:
+                pending_start_payload = redis_payload
+                state_data['pending_start_payload'] = redis_payload
+                logger.info(
+                    '📦 CHANNEL CHECK: Payload восстановлен из Redis (fallback)',
+                    pending_start_payload=pending_start_payload,
+                )
+
+        if pending_start_payload:
+            logger.info('📦 CHANNEL CHECK: Найден сохраненный payload', pending_start_payload=pending_start_payload)
+
+        user = db_user
+        if not user:
+            user = await get_user_by_telegram_id(db, query.from_user.id)
+
+        if user and getattr(user, 'language', None):
+            language = user.language
+        elif state_data.get('language'):
+            language = state_data['language']
+
+        texts = get_texts(language)
+
+        # Ensure bot is set on service
+        if not channel_subscription_service.bot:
+            channel_subscription_service.bot = bot
+
+        # Invalidate cache for fresh check (user just clicked "I subscribed")
+        await channel_subscription_service.invalidate_user_cache(query.from_user.id)
+
+        is_subscribed = await channel_subscription_service.is_user_subscribed_to_all(query.from_user.id)
+        if not is_subscribed:
+            # НЕ удаляем payload - пользователь может попробовать снова после подписки
+            logger.info(
+                'CHANNEL CHECK: Подписка не подтверждена, payload сохранён для следующей попытки',
+                pending_start_payload=pending_start_payload,
+            )
+            return await query.answer(
+                texts.t('CHANNEL_SUBSCRIBE_REQUIRED_ALERT', 'Please subscribe to all required channels first!'),
+                show_alert=True,
+            )
+
+        # Подписка подтверждена - теперь удаляем payload и обрабатываем его
+        if pending_start_payload:
+            # Удаляем из FSM state
+            state_data.pop('pending_start_payload', None)
+
+            # Очищаем Redis после успешной проверки подписки
+            await delete_pending_payload_from_redis(query.from_user.id)
+
+            # Обрабатываем payload только если ещё не обработан
+            # (проверяем по наличию referral_code или campaign_id в state)
+            if not state_data.get('referral_code') and not state_data.get('campaign_id'):
+                campaign = await get_campaign_by_start_parameter(
+                    db,
+                    pending_start_payload,
+                    only_active=True,
+                )
+
+                if campaign:
+                    state_data['campaign_id'] = campaign.id
+                    if campaign.partner_user_id:
+                        state_data['referrer_id'] = campaign.partner_user_id
+                    logger.info(
+                        '📣 CHANNEL CHECK: Кампания восстановлена из payload',
+                        campaign_id=campaign.id,
+                        partner_user_id=campaign.partner_user_id,
+                    )
+                    # Mirror save in Redis so cabinet WebApp auth can pick it up
+                    # if user opens miniapp before completing registration.
+                    try:
+                        await save_pending_campaign(
+                            query.from_user.id,
+                            campaign.start_parameter,
+                            campaign.id,
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            'Failed to persist pending campaign after channel check',
+                            campaign_id=campaign.id,
+                            error=exc,
+                        )
+                else:
+                    state_data['referral_code'] = pending_start_payload
+                    logger.info(
+                        '🎯 CHANNEL CHECK: Payload интерпретирован как реферальный код',
+                        pending_start_payload=pending_start_payload,
+                    )
+            else:
+                logger.info(
+                    '✅ CHANNEL CHECK: Реферальный код уже сохранен в state',
+                    state_data=state_data.get('referral_code') or f'campaign_id={state_data.get("campaign_id")}',
+                )
+
+            await state.set_data(state_data)
+
+        _subs = getattr(user, 'subscriptions', None) or [] if user else []
+        _restored = False
+        for subscription in _subs:
+            if subscription.is_trial and subscription.status == SubscriptionStatus.DISABLED.value:
+                subscription.status = SubscriptionStatus.ACTIVE.value
+                subscription.updated_at = datetime.now(UTC)
+                _restored = True
+        if _restored:
+            await db.commit()
+            logger.info(
+                '✅ Триальная подписка пользователя восстановлена после подтверждения подписки на канал',
+                telegram_id=user.telegram_id,
+            )
+            try:
+                subscription_service = SubscriptionService()
+                for sub in _subs:
+                    if sub.is_trial and sub.status == SubscriptionStatus.ACTIVE.value:
+                        remnawave_uuid = getattr(sub, 'remnawave_uuid', None) or user.remnawave_uuid
+                        if remnawave_uuid:
+                            await subscription_service.update_remnawave_user(db, sub)
+                        else:
+                            await subscription_service.create_remnawave_user(db, sub)
+            except Exception as api_error:
+                logger.error(
+                    '❌ Ошибка обновления RemnaWave при восстановлении подписки пользователя',
+                    telegram_id=user.telegram_id if user else query.from_user.id,
+                    api_error=api_error,
+                )
+                from app.services.remnawave_retry_queue import remnawave_retry_queue
+
+                for sub in _subs:
+                    if sub.is_trial and sub.status == SubscriptionStatus.ACTIVE.value:
+                        if hasattr(sub, 'id') and hasattr(sub, 'user_id'):
+                            remnawave_retry_queue.enqueue(
+                                subscription_id=sub.id,
+                                user_id=sub.user_id,
+                                action='update'
+                                if (getattr(sub, 'remnawave_uuid', None) or user.remnawave_uuid)
+                                else 'create',
+                            )
+
+        await query.answer(
+            texts.t('CHANNEL_SUBSCRIBE_THANKS', '✅ Спасибо за подписку'),
+            show_alert=True,
+        )
+
+        try:
+            await query.message.delete()
+        except Exception as e:
+            logger.warning('Не удалось удалить сообщение', error=e)
+
+        # ИСПРАВЛЕНИЕ БАГА: Очищаем Redis payload ТОЛЬКО после успешной проверки подписки
+        # и перед показом главного меню или завершением регистрации
+        if pending_start_payload:
+            await delete_pending_payload_from_redis(query.from_user.id)
+            logger.info('🗑️ CHANNEL CHECK: Redis payload удален после успешной проверки подписки')
+
+        if user and user.status != UserStatus.DELETED.value:
+            # Uses primary subscription (multi-tariff compatible via property)
+            has_active_subscription, subscription_is_active = _calculate_subscription_flags(user.subscription)
+
+            is_admin = settings.is_admin(user.telegram_id)
+            is_moderator = (not is_admin) and SupportSettingsService.is_moderator(user.telegram_id)
+
+            custom_buttons = await MainMenuButtonService.get_buttons_for_user(
+                db,
+                is_admin=is_admin,
+                has_active_subscription=has_active_subscription,
+                subscription_is_active=subscription_is_active,
+            )
+
+            keyboard = await get_main_menu_keyboard_async(
+                db=db,
+                user=user,
+                language=user.language,
+                is_admin=is_admin,
+                has_had_paid_subscription=user.has_had_paid_subscription,
+                has_active_subscription=has_active_subscription,
+                subscription_is_active=subscription_is_active,
+                balance_kopeks=user.balance_kopeks,
+                subscription=user.subscription,  # Uses primary subscription (multi-tariff compatible via property)
+                is_moderator=is_moderator,
+                custom_buttons=custom_buttons,
+            )
+
+            pinned_message = await get_active_pinned_message(db)
+            if pinned_message and pinned_message.send_before_menu:
+                await _send_pinned_message(bot, db, user, pinned_message)
+
+            if not await try_send_rich_main_menu(bot, query.from_user.id, user, texts, db, keyboard):
+                menu_text = await get_main_menu_text(user, texts, db)
+                if settings.ENABLE_LOGO_MODE and not caption_exceeds_telegram_limit(menu_text):
+                    _result = await bot.send_photo(
+                        chat_id=query.from_user.id,
+                        photo=get_logo_media(),
+                        caption=menu_text,
+                        reply_markup=keyboard,
+                        parse_mode='HTML',
+                    )
+                    _cache_logo_file_id(_result)
+                else:
+                    await bot.send_message(
+                        chat_id=query.from_user.id,
+                        text=menu_text,
+                        reply_markup=keyboard,
+                        parse_mode='HTML',
+                    )
+            if pinned_message and not pinned_message.send_before_menu:
+                await _send_pinned_message(bot, db, user, pinned_message)
+        else:
+            state_data['language'] = language
+            await state.set_data(state_data)
+
+            if settings.SKIP_RULES_ACCEPT:
+                if settings.SKIP_REFERRAL_CODE or state_data.get('referral_code') or state_data.get('referrer_id'):
+                    from app.utils.user_utils import generate_unique_referral_code
+
+                    # Проверяем реферальный код из ссылки или партнёра кампании
+                    referrer_id = state_data.get('referrer_id')
+                    if not referrer_id:
+                        ref_code_from_link = state_data.get('referral_code')
+                        if ref_code_from_link:
+                            referrer = await get_user_by_referral_code(db, ref_code_from_link)
+                            if referrer:
+                                referrer_id = referrer.id
+                                logger.info('✅ CHANNEL CHECK: Реферер найден из ссылки', referrer_id=referrer.id)
+
+                    # Check for phantom user created by guest purchase (gift by @username)
+                    phantom = (
+                        await find_phantom_user_by_username(db, query.from_user.username)
+                        if query.from_user.username
+                        else None
+                    )
+                    if phantom:
+                        claimed, user = await claim_phantom(
+                            db,
+                            phantom,
+                            telegram_id=query.from_user.id,
+                            username=query.from_user.username,
+                            first_name=query.from_user.first_name,
+                            last_name=query.from_user.last_name,
+                            language=language,
+                            referrer_id=referrer_id,
+                        )
+                        if not claimed and user:
+                            # Phantom claim failed (IntegrityError — user with this telegram_id already exists).
+                            # Merge phantom's data into the existing user via full account merge service.
+                            if phantom.id != user.id:
+                                try:
+                                    await db.refresh(phantom, ['subscriptions'])
+                                    await _merge_phantom_into_active_user(db, phantom, user)
+                                    await db.commit()
+                                except Exception:
+                                    await db.rollback()
+                                    logger.exception(
+                                        'Failed to merge phantom into existing user during registration',
+                                        phantom_id=phantom.id,
+                                        active_user_id=user.id,
+                                    )
+                            await db.refresh(user, ['subscriptions'])
+                        elif not claimed:
+                            logger.critical(
+                                'Phantom claim failed with no fallback user, proceeding to normal registration',
+                                telegram_id=query.from_user.id,
+                                phantom_user_id=phantom.id,
+                            )
+                            phantom = None
+
+                    if not phantom:
+                        referral_code = await generate_unique_referral_code(db, query.from_user.id)
+
+                        user = await create_user(
+                            db=db,
+                            telegram_id=query.from_user.id,
+                            username=query.from_user.username,
+                            first_name=query.from_user.first_name,
+                            last_name=query.from_user.last_name,
+                            language=language,
+                            referral_code=referral_code,
+                            referred_by_id=referrer_id,
+                        )
+                        await db.refresh(user, ['subscriptions'])
+
+                    # ИСПРАВЛЕНИЕ БАГА: Очищаем pending_start_payload из state после создания пользователя
+                    state_data.pop('pending_start_payload', None)
+                    await state.set_data(state_data)
+                    logger.info('✅ CHANNEL CHECK: pending_start_payload удален из state после создания пользователя')
+
+                    # Обрабатываем реферальную регистрацию
+                    if referrer_id and referrer_id != user.id:
+                        try:
+                            await process_referral_registration(db, user.id, referrer_id, bot)
+                            logger.info('✅ CHANNEL CHECK: Реферальная регистрация обработана для', user_id=user.id)
+                        except Exception as e:
+                            logger.error('Ошибка при обработке реферальной регистрации', error=e)
+
+                    # Применяем бонус рекламной кампании (record_campaign_registration)
+                    campaign_message = await _apply_campaign_bonus_if_needed(db, user, state_data, texts, bot=bot)
+                    try:
+                        await db.refresh(user)
+                    except Exception as refresh_error:
+                        logger.error(
+                            'Ошибка обновления данных пользователя после бонуса кампании',
+                            telegram_id=user.telegram_id,
+                            refresh_error=refresh_error,
+                        )
+                    try:
+                        await db.refresh(user, ['subscriptions'])
+                    except Exception as refresh_sub_error:
+                        logger.error(
+                            'Ошибка обновления подписки после бонуса кампании',
+                            telegram_id=user.telegram_id,
+                            refresh_sub_error=refresh_sub_error,
+                        )
+                    if campaign_message:
+                        try:
+                            await bot.send_message(
+                                chat_id=query.from_user.id,
+                                text=campaign_message,
+                            )
+                        except Exception as e:
+                            logger.error('Ошибка отправки сообщения о бонусе кампании', error=e)
+
+                    # Показываем главное меню после создания пользователя
+                    # Uses primary subscription (multi-tariff compatible via property)
+                    has_active_subscription, subscription_is_active = _calculate_subscription_flags(user.subscription)
+
+                    is_admin = settings.is_admin(user.telegram_id)
+                    is_moderator = (not is_admin) and SupportSettingsService.is_moderator(user.telegram_id)
+
+                    custom_buttons = await MainMenuButtonService.get_buttons_for_user(
+                        db,
+                        is_admin=is_admin,
+                        has_active_subscription=has_active_subscription,
+                        subscription_is_active=subscription_is_active,
+                    )
+
+                    keyboard = await get_main_menu_keyboard_async(
+                        db=db,
+                        user=user,
+                        language=user.language,
+                        is_admin=is_admin,
+                        has_had_paid_subscription=user.has_had_paid_subscription,
+                        has_active_subscription=has_active_subscription,
+                        subscription_is_active=subscription_is_active,
+                        balance_kopeks=user.balance_kopeks,
+                        subscription=user.subscription,  # Uses primary subscription (multi-tariff compatible via property)
+                        is_moderator=is_moderator,
+                        custom_buttons=custom_buttons,
+                    )
+
+                    pinned_message = await get_active_pinned_message(db)
+                    if pinned_message and pinned_message.send_before_menu:
+                        await _send_pinned_message(bot, db, user, pinned_message)
+
+                    if not await try_send_rich_main_menu(bot, query.from_user.id, user, texts, db, keyboard):
+                        menu_text = await get_main_menu_text(user, texts, db)
+                        if settings.ENABLE_LOGO_MODE and not caption_exceeds_telegram_limit(menu_text):
+                            _result = await bot.send_photo(
+                                chat_id=query.from_user.id,
+                                photo=get_logo_media(),
+                                caption=menu_text,
+                                reply_markup=keyboard,
+                                parse_mode='HTML',
+                            )
+                            _cache_logo_file_id(_result)
+                        else:
+                            await bot.send_message(
+                                chat_id=query.from_user.id,
+                                text=menu_text,
+                                reply_markup=keyboard,
+                                parse_mode='HTML',
+                            )
+                    if pinned_message and not pinned_message.send_before_menu:
+                        await _send_pinned_message(bot, db, user, pinned_message)
+                else:
+                    await bot.send_message(
+                        chat_id=query.from_user.id,
+                        text=texts.t(
+                            'REFERRAL_CODE_QUESTION',
+                            "У вас есть реферальный код? Введите его или нажмите 'Пропустить'",
+                        ),
+                        reply_markup=get_referral_code_keyboard(language),
+                    )
+                    await state.set_state(RegistrationStates.waiting_for_referral_code)
+            else:
+                await _send_onboarding_consent_to_chat(bot, query.from_user.id, language)
+                await state.set_state(RegistrationStates.waiting_for_rules_accept)
+
+    except TelegramBadRequest as e:
+        error_msg = str(e).lower()
+        if 'query is too old' in error_msg or 'query id is invalid' in error_msg:
+            logger.debug('Устаревший callback в required_sub_channel_check, игнорируем')
+        else:
+            logger.error('Ошибка Telegram API в required_sub_channel_check', error=e)
+            try:
+                await query.answer(f'{texts.ERROR}!', show_alert=True)
+            except Exception:
+                pass
+    except Exception as e:
+        logger.error('Ошибка в required_sub_channel_check', error=e)
+        try:
+            await query.answer(f'{texts.ERROR}!', show_alert=True)
+        except Exception:
+            pass
+
+
+async def process_webauth_confirm(
+    callback: types.CallbackQuery,
+    db: AsyncSession,
+):
+    """Handle web auth confirmation or denial."""
+    await callback.answer()
+
+    if not isinstance(callback.message, types.Message):
+        return
+
+    if callback.data == 'webauth_deny':
+        await callback.message.edit_text('❌ Вход отменён.')
+        return
+
+    # Extract token from callback_data: "webauth_confirm:{token}"
+    token = callback.data.split(':', 1)[1] if ':' in callback.data else ''
+    if len(token) < WEB_AUTH_TOKEN_MIN_LENGTH:
+        await callback.message.edit_text('❌ Ошибка: неверный токен.')
+        return
+
+    user = await get_user_by_telegram_id(db, callback.from_user.id)
+    if not user or user.status != UserStatus.ACTIVE.value:
+        await callback.message.edit_text('❌ Учётная запись неактивна.')
+        return
+
+    linked = await link_web_auth_token(token, callback.from_user.id, user.id)
+    texts = get_texts(user.language)
+    if linked:
+        await callback.message.edit_text(
+            texts.t('WEB_AUTH_SUCCESS', '✅ Авторизация в кабинете подтверждена! Вернитесь в браузер.'),
+        )
+    else:
+        await callback.message.edit_text(
+            texts.t('WEB_AUTH_EXPIRED', '❌ Ссылка для входа истекла. Попробуйте снова.'),
+        )
+
+
+def register_handlers(dp: Dispatcher):
+    logger.debug('=== НАЧАЛО регистрации обработчиков start.py ===')
+
+    dp.message.register(cmd_start, Command('start'))
+    logger.debug('Зарегистрирован cmd_start')
+
+    dp.callback_query.register(
+        process_rules_accept,
+        F.data.in_(['rules_accept', 'rules_decline']),
+        StateFilter(RegistrationStates.waiting_for_rules_accept),
+    )
+    logger.debug('Зарегистрирован process_rules_accept')
+
+    dp.callback_query.register(
+        process_privacy_policy_accept,
+        F.data.in_(['privacy_policy_accept', 'privacy_policy_decline']),
+        StateFilter(RegistrationStates.waiting_for_privacy_policy_accept),
+    )
+    logger.debug('Зарегистрирован process_privacy_policy_accept')
+
+    dp.callback_query.register(
+        process_language_selection,
+        F.data.startswith('language_select:'),
+        StateFilter(RegistrationStates.waiting_for_language),
+    )
+    logger.debug('Зарегистрирован process_language_selection')
+
+    dp.callback_query.register(
+        process_referral_code_skip, F.data == 'referral_skip', StateFilter(RegistrationStates.waiting_for_referral_code)
+    )
+    logger.debug('Зарегистрирован process_referral_code_skip')
+
+    dp.message.register(process_referral_code_input, StateFilter(RegistrationStates.waiting_for_referral_code))
+    logger.debug('Зарегистрирован process_referral_code_input')
+
+    dp.message.register(
+        handle_potential_referral_code,
+        StateFilter(RegistrationStates.waiting_for_rules_accept, RegistrationStates.waiting_for_referral_code),
+    )
+    logger.debug('Зарегистрирован handle_potential_referral_code')
+
+    dp.callback_query.register(required_sub_channel_check, F.data.in_(['sub_channel_check']))
+    logger.debug('Зарегистрирован required_sub_channel_check')
+
+    dp.callback_query.register(
+        process_webauth_confirm,
+        F.data.startswith('webauth_confirm:') | F.data.in_(['webauth_deny']),
+    )
+    logger.debug('Зарегистрирован process_webauth_confirm')
+
+    logger.debug('=== КОНЕЦ регистрации обработчиков start.py ===')
