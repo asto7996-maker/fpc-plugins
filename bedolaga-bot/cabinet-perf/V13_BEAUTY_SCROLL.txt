@@ -1,0 +1,18 @@
+v13: restore beauty + fix REAL scroll jank
+
+Root cause (not "too many glows"):
+Previous loops called cancelAnimationFrame on every touchmove and/or
+toggled html.is-scrolling. That runs main-thread JS on every finger move
+and fights compositor scrolling — felt like lag for 30 iterations of
+"optimize by removing beauty".
+
+v13:
+- Baseline visuals restored from v7 (glows, motion import, starfield, CSS)
+- Animation loop: keep RAF alive; SKIP paints while scrolling; scroll/wheel
+  listeners only — NO touchmove handler, NO classList, NO pause polling
+- Bottom nav still portaled to document.body (pinned)
+- Twemoji SVG on country names still avoided (flags stay native via ge())
+- Removed content-visibility:auto from Subscription (scroll pop-in/jank)
+- Mild query staleTime 30s only (not a visual change)
+
+Entry: /assets/v13/

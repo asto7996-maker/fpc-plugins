@@ -26,20 +26,20 @@
       #boot{position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;background:#0a0f1a;z-index:99999;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif}
       #boot .spin{width:28px;height:28px;border:3px solid rgba(255,255,255,.15);border-top-color:#5b9fff;border-radius:50%;animation:b .8s linear infinite}
       #boot p{margin:0;font-size:14px;opacity:.85}
-      #boot.hide{opacity:0;pointer-events:none;transition:opacity .2s}
+      #boot.hide{opacity:0;pointer-events:none;transition:opacity .25s}
       @keyframes b{to{transform:rotate(360deg)}}
     </style>
-    <script type="module" crossorigin src="/assets/v12/index-a89cf6b8.js"></script>
-    <link rel="modulepreload" crossorigin href="/assets/v12/vendor-react-B5aZ5G0Y.js">
-    <link rel="modulepreload" crossorigin href="/assets/v12/vendor-query-qJWxXJpd.js">
-    <link rel="modulepreload" crossorigin href="/assets/v12/vendor-utils-rksnccus.js">
-    <link rel="modulepreload" crossorigin href="/assets/v12/vendor-telegram-BljK9Sw_.js">
-    <link rel="modulepreload" crossorigin href="/assets/v12/vendor-twemoji-D9HvikB8.js">
-    <link rel="modulepreload" crossorigin href="/assets/v12/vendor-i18n-BxdFJVG3.js">
-    <link rel="modulepreload" crossorigin href="/assets/v12/vendor-motion-yrvsEvRj.js">
-    <link rel="modulepreload" crossorigin href="/assets/v12/vendor-radix-CmBkAP5K.js">
-    <link rel="modulepreload" crossorigin href="/assets/v12/vendor-cmdk-CTFjeOaw.js">
-    <link rel="stylesheet" crossorigin href="/assets/v12/index-ffaf3eb8.css">
+    <script type="module" crossorigin src="/assets/v13/index-a89cf6b8.js"></script>
+    <link rel="modulepreload" crossorigin href="/assets/v13/vendor-react-B5aZ5G0Y.js">
+    <link rel="modulepreload" crossorigin href="/assets/v13/vendor-query-qJWxXJpd.js">
+    <link rel="modulepreload" crossorigin href="/assets/v13/vendor-utils-rksnccus.js">
+    <link rel="modulepreload" crossorigin href="/assets/v13/vendor-telegram-BljK9Sw_.js">
+    <link rel="modulepreload" crossorigin href="/assets/v13/vendor-twemoji-D9HvikB8.js">
+    <link rel="modulepreload" crossorigin href="/assets/v13/vendor-i18n-BxdFJVG3.js">
+    <link rel="modulepreload" crossorigin href="/assets/v13/vendor-motion-yrvsEvRj.js">
+    <link rel="modulepreload" crossorigin href="/assets/v13/vendor-radix-CmBkAP5K.js">
+    <link rel="modulepreload" crossorigin href="/assets/v13/vendor-cmdk-CTFjeOaw.js">
+    <link rel="stylesheet" crossorigin href="/assets/v13/index-ffaf3eb8.css">
   </head>
   <body>
     <div id="boot" aria-live="polite"><div class="spin"></div><p>Загрузка…</p></div>
@@ -53,18 +53,18 @@
           n++;
           if (root && root.childElementCount > 0) {
             boot.classList.add('hide');
-            setTimeout(function () { if (boot && boot.parentNode) boot.parentNode.removeChild(boot); }, 200);
+            setTimeout(function () { if (boot && boot.parentNode) boot.parentNode.removeChild(boot); }, 250);
             clearInterval(iv);
             return;
           }
           if (n > 48) {
             clearInterval(iv);
             try {
-              var k = 'paskod_boot_retry_v12';
+              var k = 'paskod_boot_retry_v13';
               if (!sessionStorage.getItem(k)) {
                 sessionStorage.setItem(k, '1');
                 var u = new URL(location.href);
-                u.searchParams.set('_v', '12');
+                u.searchParams.set('_v', '13');
                 location.replace(u.toString());
               } else if (boot) {
                 boot.innerHTML = '<p style="max-width:260px;text-align:center;line-height:1.4">Не удалось загрузить. Полностью закройте мини-приложение и откройте снова.</p>';
