@@ -9,10 +9,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Callable, Optional
 
 from aiogram import Dispatcher, F, Router
-from aiogram.filters import Command, CommandObject
+from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
@@ -26,6 +27,7 @@ import config
 from database import Database
 from formatting import extract_caption_html, safe_preview, validate_telegram_html
 from links import parse_post_link
+from scheduling import humanize_duration, parse_duration
 from userbot_auth import AuthCredentials
 
 logger = logging.getLogger(__name__)
@@ -136,6 +138,33 @@ async def _deny(uid: Optional[int], reply: Callable) -> bool:
     return True
 
 
+async def _replace(c: CallbackQuery, text: str, kb: InlineKeyboardMarkup) -> None:
+    """Обновить сообщение с меню, а если нельзя — прислать новое."""
+    try:
+        await c.message.edit_text(text, reply_markup=kb, parse_mode="HTML")  # type: ignore
+    except Exception:
+        try:
+            await c.message.answer(text, reply_markup=kb, parse_mode="HTML")  # type: ignore
+        except Exception:
+            logger.debug("не удалось обновить меню", exc_info=True)
+
+
+def _start_autopost(db: Database) -> None:
+    """Включить автопост и попросить планировщик не ждать старый интервал."""
+    db.set_running(True)
+    db.clear_last_error()
+    db.run_asap()
+
+
+def _start_hint(db: Database) -> str:
+    s = db.get_settings()
+    return (
+        f"Первый цикл — в течение нескольких секунд, дальше каждые "
+        f"<b>{humanize_duration(s.interval_seconds)}</b> "
+        f"по <b>{s.posts_per_cycle}</b> публикаций."
+    )
+
+
 async def _deny_cb(c: CallbackQuery) -> bool:
     if is_admin(c.from_user.id if c.from_user else None):
         return False
@@ -150,7 +179,7 @@ def _remember_admin(uid: Optional[int]) -> None:
 
 # ----- keyboards -----
 
-def menu_kb(running: bool) -> InlineKeyboardMarkup:
+def menu_kb(running: bool, *, catchup: bool = False, notify: bool = False) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -178,9 +207,28 @@ def menu_kb(running: bool) -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="⏱ Интервал", callback_data="a:interval"),
                 InlineKeyboardButton(text="📦 Лимит", callback_data="a:limit"),
             ],
+            [
+                InlineKeyboardButton(
+                    text=f"🚀 Догон: {'вкл' if catchup else 'выкл'}",
+                    callback_data="a:catchup",
+                ),
+                InlineKeyboardButton(
+                    text=f"🔔 Отчёты: {'вкл' if notify else 'выкл'}",
+                    callback_data="a:notify",
+                ),
+            ],
             [InlineKeyboardButton(text="📝 Rewrite подписей", callback_data="a:rewrite")],
         ]
     )
+
+
+def main_kb(db: Optional[Database] = None) -> InlineKeyboardMarkup:
+    """Меню с актуальными состояниями тумблеров."""
+    database = db or _db
+    if database is None:
+        return menu_kb(False)
+    s = database.get_settings()
+    return menu_kb(s.is_running, catchup=s.catchup_enabled, notify=s.notify_cycles)
 
 
 def cancel_kb() -> InlineKeyboardMarkup:
@@ -189,27 +237,93 @@ def cancel_kb() -> InlineKeyboardMarkup:
     )
 
 
+def interval_kb() -> InlineKeyboardMarkup:
+    """Быстрый выбор интервала — без угадывания единиц измерения."""
+    presets = [
+        ("30 сек", 30),
+        ("1 мин", 60),
+        ("5 мин", 300),
+        ("15 мин", 900),
+        ("30 мин", 1800),
+        ("1 ч", 3600),
+        ("2 ч", 7200),
+        ("6 ч", 21600),
+        ("12 ч", 43200),
+        ("24 ч", 86400),
+    ]
+    rows = []
+    for i in range(0, len(presets), 3):
+        rows.append(
+            [
+                InlineKeyboardButton(text=title, callback_data=f"a:iv:{secs}")
+                for title, secs in presets[i : i + 3]
+            ]
+        )
+    rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data="a:cancel")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _next_run_line(db: Database, s) -> str:
+    if not s.is_running:
+        return "⏭ Следующий цикл: <i>на паузе</i>"
+    if _busy():
+        return "⏭ Следующий цикл: <i>идёт прямо сейчас</i>"
+    left = db.get_next_run() - time.time()
+    if left <= 0:
+        return "⏭ Следующий цикл: <b>вот-вот</b>"
+    return f"⏭ Следующий цикл через <b>{humanize_duration(left)}</b>"
+
+
 def status_text(db: Database) -> str:
     s = db.get_settings()
     st = "🟢 Работает" if s.is_running else "🔴 На паузе"
     engine = "🟢 USERBOT готов" if _has_userbot() else "🔴 нужен вход (api_id / api_hash)"
     busy = "⏳ публикация…" if _busy() else "idle"
-    return (
-        "<b>✨ Channel Reposter</b>\n"
-        "<i>Чистый юзербот · без Bot API заливки</i>\n\n"
-        f"Движок: {engine}\n"
-        f"Автопост: <b>{st}</b> · <code>{busy}</code>\n\n"
-        f"📥 Источник: <code>{s.source_channel or '—'}</code>\n"
-        f"📤 Назначение: <code>{s.target_channel or '—'}</code>\n"
-        f"📍 Progress: <code>{s.progress_id}</code> → next <code>{s.progress_id + 1 if s.progress_id >= 0 else '—'}</code>\n"
-        f"⏱ Интервал: <b>{s.interval_hours}</b> ч. · за цикл: <b>{s.posts_per_cycle}</b>\n"
-        f"✅ Скопировано: <b>{db.history_count()}</b>\n"
-        f"🔗 Старт: <code>{s.start_link or 'не задан'}</code>\n\n"
-        f"<b>Описание</b>\n<code>{safe_preview(s.caption_template, 220)}</code>\n\n"
+    backlog = db.backlog()
+    err_text, err_at = db.get_last_error()
+    last_pub = db.get_last_published_at()
+
+    lines = [
+        "<b>✨ Channel Reposter</b>",
+        "<i>Чистый юзербот · без Bot API заливки</i>",
+        "",
+        f"Движок: {engine}",
+        f"Автопост: <b>{st}</b> · <code>{busy}</code>",
+        _next_run_line(db, s),
+        "",
+        f"📥 Источник: <code>{s.source_channel or '—'}</code>",
+        f"📤 Назначение: <code>{s.target_channel or '—'}</code>",
+        f"📍 Progress: <code>{s.progress_id}</code> → next "
+        f"<code>{s.progress_id + 1 if s.progress_id >= 0 else '—'}</code>",
+        f"📚 В очереди: <b>{backlog}</b> ID"
+        + (f" (последний в источнике <code>{db.get_latest_source_id()}</code>)" if backlog else ""),
+        f"⏱ Интервал: <b>{humanize_duration(s.interval_seconds)}</b> · "
+        f"за цикл: <b>{s.posts_per_cycle}</b>",
+        f"🚀 Догон: <b>{'вкл' if s.catchup_enabled else 'выкл'}</b>"
+        + (
+            f" (каждые {humanize_duration(s.catchup_seconds)}, пока есть очередь)"
+            if s.catchup_enabled
+            else ""
+        ),
+        f"✅ Скопировано: <b>{db.history_count()}</b> · ошибок: <b>{db.error_count()}</b>",
+    ]
+    if last_pub:
+        lines.append(
+            f"🕒 Последняя публикация: <b>{humanize_duration(time.time() - last_pub)}</b> назад"
+        )
+    lines.append(f"🔗 Старт: <code>{s.start_link or 'не задан'}</code>")
+    if err_text:
+        ago = humanize_duration(time.time() - err_at) if err_at else "—"
+        lines.append(f"⚠️ Последняя ошибка ({ago} назад): <code>{safe_preview(err_text, 160)}</code>")
+    lines += [
+        "",
+        f"<b>Описание</b>\n<code>{safe_preview(s.caption_template, 220)}</code>",
+        "",
         "<i>Порядок: от старых постов к новым.\n"
         "«📜 С начала» — с первого поста (история сбрасывается).\n"
-        "«🔗 Старт-ссылка» — со следующего после указанного поста.</i>"
-    )
+        "«🔗 Старт-ссылка» — со следующего после указанного поста.</i>",
+    ]
+    return "\n".join(lines)
 
 
 # ----- commands -----
@@ -228,9 +342,10 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
         "1️⃣ «🔐 Вход» — api_id, api_hash, телефон, код\n"
         "2️⃣ Источник + назначение\n"
         "3️⃣ Ссылка на пост или «С начала»\n"
-        "4️⃣ Описание → ▶️ Старт\n\n"
+        "4️⃣ Описание → ⏱ Интервал → ▶️ Старт\n\n"
+        "Команды: /status /run /pause /run_now /test /reconnect /login\n\n"
         + status_text(db),
-        reply_markup=menu_kb(db.get_settings().is_running),
+        reply_markup=main_kb(db),
         parse_mode="HTML",
     )
 
@@ -242,7 +357,7 @@ async def cmd_status(message: Message) -> None:
     db = _require_db()
     await message.answer(
         status_text(db),
-        reply_markup=menu_kb(db.get_settings().is_running),
+        reply_markup=main_kb(db),
         parse_mode="HTML",
     )
 
@@ -289,8 +404,12 @@ async def cmd_run(message: Message) -> None:
     if not _has_userbot():
         await message.answer("❌ Сначала «🔐 Вход» (api_id / api_hash).")
         return
-    db.set_running(True)
-    await message.answer("▶️ Автопостинг запущен.", reply_markup=menu_kb(True), parse_mode="HTML")
+    _start_autopost(db)
+    await message.answer(
+        f"▶️ Автопостинг запущен.\n{_start_hint(db)}",
+        reply_markup=main_kb(db),
+        parse_mode="HTML",
+    )
 
 
 @router.message(Command("pause"))
@@ -298,7 +417,32 @@ async def cmd_pause(message: Message) -> None:
     if await _deny(message.from_user.id if message.from_user else None, message.answer):
         return
     _require_db().set_running(False)
-    await message.answer("⏸ Пауза.", reply_markup=menu_kb(False), parse_mode="HTML")
+    await message.answer("⏸ Пауза.", reply_markup=main_kb(), parse_mode="HTML")
+
+
+@router.message(Command("reconnect"))
+async def cmd_reconnect(message: Message) -> None:
+    """Переподнять юзербота из сохранённой сессии (без кода)."""
+    if await _deny(message.from_user.id if message.from_user else None, message.answer):
+        return
+    if _bridge is None or _bridge.auth is None:
+        await message.answer("❌ Юзербот не инициализирован.")
+        return
+    await message.answer("♻️ Переподключаю юзербота…")
+    try:
+        ok = await _bridge.call(_bridge.auth.ensure_started(), timeout=120)
+    except Exception as e:
+        await message.answer(f"❌ {e}")
+        return
+    if ok and _bridge.auth.client is not None:
+        from poster import ChannelPoster
+
+        _bridge.poster = ChannelPoster(_bridge.auth.client, _require_db())
+        await message.answer("✅ Юзербот на связи.", reply_markup=main_kb())
+    else:
+        await message.answer(
+            "❌ Не удалось. Нужен «🔐 Вход» заново.", reply_markup=main_kb()
+        )
 
 
 # ----- callbacks (answer FIRST) -----
@@ -310,7 +454,7 @@ async def cb_status(c: CallbackQuery) -> None:
     await _ack(c)
     db = _require_db()
     text = status_text(db)
-    kb = menu_kb(db.get_settings().is_running)
+    kb = main_kb(db)
     try:
         await c.message.edit_text(text, reply_markup=kb, parse_mode="HTML")  # type: ignore
     except Exception:
@@ -329,27 +473,60 @@ async def cb_start(c: CallbackQuery) -> None:
     if not s.source_channel or not s.target_channel or s.progress_id < 0:
         await _ack(c, "Каналы + стартовая точка", show_alert=True)
         return
-    db.set_running(True)
+    _start_autopost(db)
     await _ack(c, "Старт")
-    text = "▶️ Запущено.\n\n" + status_text(db)
-    try:
-        await c.message.edit_text(text, reply_markup=menu_kb(True), parse_mode="HTML")  # type: ignore
-    except Exception:
-        await c.message.answer(text, reply_markup=menu_kb(True), parse_mode="HTML")  # type: ignore
+    text = f"▶️ Запущено.\n{_start_hint(db)}\n\n" + status_text(db)
+    await _replace(c, text, main_kb(db))
 
 
 @router.callback_query(F.data == "a:pause")
 async def cb_pause(c: CallbackQuery) -> None:
     if await _deny_cb(c):
         return
-    _require_db().set_running(False)
-    await _ack(c, "Пауза")
     db = _require_db()
-    text = "⏸ Пауза.\n\n" + status_text(db)
-    try:
-        await c.message.edit_text(text, reply_markup=menu_kb(False), parse_mode="HTML")  # type: ignore
-    except Exception:
-        await c.message.answer(text, reply_markup=menu_kb(False), parse_mode="HTML")  # type: ignore
+    db.set_running(False)
+    await _ack(c, "Пауза")
+    await _replace(c, "⏸ Пауза.\n\n" + status_text(db), main_kb(db))
+
+
+@router.callback_query(F.data == "a:catchup")
+async def cb_catchup(c: CallbackQuery) -> None:
+    """Догон: пока есть очередь — публикуем чаще пользовательского интервала."""
+    if await _deny_cb(c):
+        return
+    db = _require_db()
+    s = db.get_settings()
+    new_state = not s.catchup_enabled
+    db.set_catchup(new_state)
+    if new_state:
+        db.run_asap()
+    await _ack(c, "Догон включён" if new_state else "Догон выключен")
+    hint = (
+        "🚀 <b>Догон включён</b>\n"
+        f"Пока в источнике есть необработанные посты, цикл идёт каждые "
+        f"<b>{humanize_duration(s.catchup_seconds)}</b>, а не раз в "
+        f"{humanize_duration(s.interval_seconds)}.\n"
+        "Как только очередь закончится — вернётся обычный интервал."
+        if new_state
+        else "🚀 <b>Догон выключен</b> — соблюдается только обычный интервал."
+    )
+    await _replace(c, hint + "\n\n" + status_text(db), main_kb(db))
+
+
+@router.callback_query(F.data == "a:notify")
+async def cb_notify(c: CallbackQuery) -> None:
+    if await _deny_cb(c):
+        return
+    db = _require_db()
+    new_state = not db.get_settings().notify_cycles
+    db.set_notify_cycles(new_state)
+    await _ack(c, "Отчёты включены" if new_state else "Отчёты выключены")
+    text = (
+        "🔔 Буду присылать отчёт после каждого успешного цикла."
+        if new_state
+        else "🔕 Отчёты о циклах выключены (об ошибках сообщу всё равно)."
+    )
+    await _replace(c, text + "\n\n" + status_text(db), main_kb(db))
 
 
 @router.callback_query(F.data == "a:login")
@@ -384,13 +561,78 @@ async def cb_interval(c: CallbackQuery, state: FSMContext) -> None:
         return
     await _ack(c)
     await state.set_state(S.interval)
+    s = _require_db().get_settings()
     await c.message.answer(  # type: ignore
-        "⏱ Интервал между циклами в <b>часах</b>.\n"
-        "Примеры: <code>0.002</code> ≈ 7 сек · <code>0.05</code> ≈ 3 мин\n"
-        "<i>Не ставьте целые часы вроде 9 — бот будет долго молчать.</i>",
-        reply_markup=cancel_kb(),
+        f"⏱ <b>Интервал между циклами</b>\n"
+        f"Сейчас: <b>{humanize_duration(s.interval_seconds)}</b>\n\n"
+        "Выберите кнопкой или напишите своё:\n"
+        "<code>30с</code> · <code>15мин</code> · <code>2ч</code> · "
+        "<code>1д</code> · <code>1ч 30мин</code>\n"
+        "<i>Число без буквы = минуты.</i>",
+        reply_markup=interval_kb(),
         parse_mode="HTML",
     )
+
+
+@router.callback_query(F.data.startswith("a:iv:"))
+async def cb_interval_preset(c: CallbackQuery, state: FSMContext) -> None:
+    if await _deny_cb(c):
+        return
+    await state.clear()
+    db = _require_db()
+    try:
+        seconds = float((c.data or "").split(":")[-1])
+        db.set_interval_seconds(seconds)
+    except (ValueError, TypeError):
+        await _ack(c, "Не понял значение", show_alert=True)
+        return
+    db.run_asap()
+    await _ack(c, f"Интервал: {humanize_duration(seconds)}")
+    await _replace(
+        c,
+        f"✅ Интервал: <b>{humanize_duration(seconds)}</b>\n"
+        f"{_interval_note(db, seconds)}\n\n" + status_text(db),
+        main_kb(db),
+    )
+
+
+@router.callback_query(F.data.startswith("a:cu:"))
+async def cb_catchup_preset(c: CallbackQuery) -> None:
+    if await _deny_cb(c):
+        return
+    db = _require_db()
+    try:
+        seconds = float((c.data or "").split(":")[-1])
+    except (ValueError, TypeError):
+        await _ack(c, "Не понял значение", show_alert=True)
+        return
+    db.set_catchup_seconds(seconds)
+    db.set_catchup(True)
+    db.run_asap()
+    await _ack(c, f"Догон: {humanize_duration(seconds)}")
+    await _replace(
+        c,
+        f"🚀 Догон включён с интервалом <b>{humanize_duration(seconds)}</b>.\n\n"
+        + status_text(db),
+        main_kb(db),
+    )
+
+
+def _interval_note(db: Database, seconds: float) -> str:
+    s = db.get_settings()
+    note = (
+        f"Каждый цикл — до <b>{s.posts_per_cycle}</b> публикаций, "
+        f"значит примерно <b>{s.posts_per_cycle}</b> постов за "
+        f"{humanize_duration(seconds)}."
+    )
+    if seconds < 60:
+        note += "\n⚠️ Меньше минуты — Telegram может ограничить аккаунт (flood)."
+    if s.catchup_enabled:
+        note += (
+            f"\n🚀 Догон включён: пока есть очередь, цикл идёт каждые "
+            f"{humanize_duration(s.catchup_seconds)}."
+        )
+    return note
 
 
 @router.callback_query(F.data == "a:limit")
@@ -441,7 +683,7 @@ async def cb_oldest(c: CallbackQuery) -> None:
                 f"Progress=<code>{found - 1}</code> → next <code>{found}</code>\n"
                 f"История сброшена — пойдёт полная перезаливка с шаблоном.\n"
                 f"Нажмите ▶️ Старт.",
-                reply_markup=menu_kb(_require_db().get_settings().is_running),
+                reply_markup=main_kb(),
                 parse_mode="HTML",
             )
         except Exception as e:
@@ -522,7 +764,7 @@ async def cb_cancel(c: CallbackQuery, state: FSMContext) -> None:
     await _ack(c)
     await state.clear()
     db = _require_db()
-    await c.message.answer("Отменено.", reply_markup=menu_kb(db.get_settings().is_running))  # type: ignore
+    await c.message.answer("Отменено.", reply_markup=main_kb(db))  # type: ignore
 
 
 # ----- FSM: login -----
@@ -580,7 +822,7 @@ async def on_phone(message: Message, state: FSMContext) -> None:
         )
     except Exception as e:
         await state.clear()
-        await message.answer(f"❌ {e}", reply_markup=menu_kb(_require_db().get_settings().is_running))
+        await message.answer(f"❌ {e}", reply_markup=main_kb())
 
 
 @router.message(S.code)
@@ -614,14 +856,17 @@ async def on_password(message: Message, state: FSMContext) -> None:
 
 async def _after_login_ok(message: Message, state: FSMContext) -> None:
     await state.clear()
-    # Поднимаем poster на готовом клиенте
+    db = _require_db()
+    # Поднимаем poster на готовом клиенте: планировщик подхватит его сам,
+    # перезапуск бота после входа не нужен.
     if _bridge and _bridge.auth and _bridge.auth.client:
         from poster import ChannelPoster
 
-        _bridge.poster = ChannelPoster(_bridge.auth.client, _require_db())
+        _bridge.poster = ChannelPoster(_bridge.auth.client, db)
+        db.run_asap()
     await message.answer(
         "✅ Юзербот авторизован.\nМожно задавать каналы и жать ▶️ Старт.",
-        reply_markup=menu_kb(_require_db().get_settings().is_running),
+        reply_markup=main_kb(db),
         parse_mode="HTML",
     )
 
@@ -644,7 +889,7 @@ async def on_caption(message: Message, state: FSMContext) -> None:
     await state.clear()
     await message.answer(
         f"✅ Описание сохранено.\n<code>{safe_preview(text, 400)}</code>",
-        reply_markup=menu_kb(_require_db().get_settings().is_running),
+        reply_markup=main_kb(),
         parse_mode="HTML",
     )
 
@@ -653,31 +898,18 @@ async def on_caption(message: Message, state: FSMContext) -> None:
 async def on_interval(message: Message, state: FSMContext) -> None:
     if await _deny(message.from_user.id if message.from_user else None, message.answer):
         return
+    db = _require_db()
     try:
-        h = float((message.text or "").strip().replace(",", "."))
-        if h <= 0:
-            raise ValueError("нужно число > 0")
-        # Частая ошибка: вводят минуты/часы как «9» → 9 часов простоя
-        if h > 1:
-            await message.answer(
-                f"⚠️ <code>{h}</code> ч. — это {h:g} часов паузы.\n"
-                "Для быстрой перезаливки укажите долю часа, например:\n"
-                "• <code>0.002</code> ≈ 7 сек\n"
-                "• <code>0.05</code> ≈ 3 мин\n"
-                "• <code>0.25</code> ≈ 15 мин",
-                parse_mode="HTML",
-                reply_markup=cancel_kb(),
-            )
-            return
-        _require_db().set_interval_hours(h)
+        seconds = parse_duration(message.text or "")
+        db.set_interval_seconds(seconds)
     except ValueError as e:
-        await message.answer(f"❌ {e}")
+        await message.answer(f"❌ {e}", reply_markup=interval_kb())
         return
     await state.clear()
-    secs = h * 3600
+    db.run_asap()
     await message.answer(
-        f"✅ Интервал: <b>{h}</b> ч. (≈ <b>{secs:.0f}</b> сек между циклами)",
-        reply_markup=menu_kb(_require_db().get_settings().is_running),
+        f"✅ Интервал: <b>{humanize_duration(seconds)}</b>\n{_interval_note(db, seconds)}",
+        reply_markup=main_kb(db),
         parse_mode="HTML",
     )
 
@@ -700,7 +932,7 @@ async def on_limit(message: Message, state: FSMContext) -> None:
     await message.answer(
         f"✅ Лимит: <b>{n}</b> публикаций за цикл\n"
         f"<i>Альбом считается как 1 публикация (не по числу фото/видео).</i>",
-        reply_markup=menu_kb(_require_db().get_settings().is_running),
+        reply_markup=main_kb(),
         parse_mode="HTML",
     )
 
@@ -729,7 +961,7 @@ async def on_source(message: Message, state: FSMContext) -> None:
     await state.clear()
     await message.answer(
         f"✅ Источник: <code>{raw}</code>",
-        reply_markup=menu_kb(_require_db().get_settings().is_running),
+        reply_markup=main_kb(),
         parse_mode="HTML",
     )
 
@@ -749,7 +981,7 @@ async def on_target(message: Message, state: FSMContext) -> None:
     await state.clear()
     await message.answer(
         f"✅ Назначение: <code>{raw}</code>",
-        reply_markup=menu_kb(_require_db().get_settings().is_running),
+        reply_markup=main_kb(),
         parse_mode="HTML",
     )
 
@@ -785,11 +1017,12 @@ async def _apply_link(message: Message, link: str) -> None:
             db.set_source_channel(src)
             db.set_start_link(link)
             db.set_progress_id(mid)
+            db.run_asap()
             await message.answer(
                 f"✅ Ссылка сохранена (юзербот ещё не онлайн).\n"
                 f"Источник <code>{src}</code> · next <code>{mid + 1}</code>",
                 parse_mode="HTML",
-                reply_markup=menu_kb(db.get_settings().is_running),
+                reply_markup=main_kb(db),
             )
             return
         except Exception as e:
@@ -804,7 +1037,7 @@ async def _apply_link(message: Message, link: str) -> None:
             f"Фоновый цикл остановлен, история после этой точки сброшена.\n"
             f"Нажмите ▶️ Старт или ⚡ Цикл сейчас.",
             parse_mode="HTML",
-            reply_markup=menu_kb(_require_db().get_settings().is_running),
+            reply_markup=main_kb(),
         )
     except Exception as e:
         await message.answer(f"❌ {e}")
@@ -825,37 +1058,52 @@ async def _do_run_now(answer) -> None:
     if _cycle_task and not _cycle_task.done():
         await answer("⏳ Цикл уже идёт…")
         return
-    was = s.is_running
-    db.set_running(True)
     await answer("⚡ Цикл в фоне. Кнопки свободны.")
 
     async def _job():
         try:
-            n = await _call_poster("run_cycle", timeout=None)
-            if n == 0:
-                s2 = db.get_settings()
-                await answer(
-                    f"✅ Опубликовано: <b>0</b>\n"
-                    f"<i>Progress <code>{s2.progress_id}</code> → next "
-                    f"<code>{s2.progress_id + 1}</code>. "
-                    f"Если ждали старт-ссылку — задайте её снова после остановки цикла.</i>",
-                    reply_markup=menu_kb(db.get_settings().is_running),
-                    parse_mode="HTML",
-                )
-            else:
-                await answer(
-                    f"✅ Опубликовано: <b>{n}</b>",
-                    reply_markup=menu_kb(db.get_settings().is_running),
-                    parse_mode="HTML",
-                )
+            # force=True — ручной цикл работает и на паузе, флаги не трогаем
+            result = await _call_poster("run_cycle", timeout=None, force=True)
+            await answer(_cycle_report(db, result), reply_markup=main_kb(db), parse_mode="HTML")
         except Exception as e:
             logger.exception("run_now")
             await answer(f"❌ {e}")
-        finally:
-            if not was:
-                db.set_running(False)
 
     _cycle_task = _spawn(_job())
+
+
+def _cycle_report(db: Database, result) -> str:
+    """Человеческий отчёт о цикле для панели."""
+    published = getattr(result, "published", int(result or 0))
+    reason = getattr(result, "reason", "")
+    if published:
+        text = f"✅ Опубликовано: <b>{published}</b>"
+        backlog = getattr(result, "backlog", db.backlog())
+        if backlog:
+            text += f"\nОсталось в очереди: <b>{backlog}</b>"
+        return text
+
+    s = db.get_settings()
+    hints = {
+        "up_to_date": "Новых постов в источнике нет — всё уже перезалито.",
+        "source_empty": "Источник пуст или недоступен аккаунту юзербота.",
+        "no_start": "Не задана стартовая точка: «🔗 Старт-ссылка» или «📜 С начала».",
+        "paused": "Автопостинг на паузе.",
+        "aborted": "Цикл был прерван (например, новой командой).",
+        "flood": (
+            "Telegram просит подождать "
+            f"{humanize_duration(getattr(result, 'flood_seconds', 0))} (flood)."
+        ),
+        "fatal": getattr(result, "fatal_text", "") or "критическая ошибка",
+        "error": getattr(result, "error", "") or "ошибка цикла",
+    }
+    hint = hints.get(reason, "Публиковать было нечего.")
+    return (
+        f"⚠️ Опубликовано: <b>0</b>\n{hint}\n"
+        f"<i>Progress <code>{s.progress_id}</code> → next "
+        f"<code>{s.progress_id + 1}</code>, последний ID источника "
+        f"<code>{db.get_latest_source_id() or '—'}</code></i>"
+    )
 
 
 async def _run_test(message: Message) -> None:
@@ -887,6 +1135,32 @@ async def _run_test(message: Message) -> None:
     lines.append(f"Progress: <code>{s.progress_id}</code> → <code>{s.progress_id + 1 if s.progress_id >= 0 else '—'}</code>")
     lines.append(f"Юзербот: {'✅ онлайн' if _has_userbot() else '❌ нет сессии'}")
     lines.append(f"Занятость: {'⏳ цикл' if _busy() else 'idle'}")
+    lines.append(f"Автопост: {'🟢 включён' if s.is_running else '🔴 на паузе'}")
+    lines.append(_next_run_line(db, s).replace("⏭ ", "Расписание: "))
+    lines.append(
+        f"Интервал: <b>{humanize_duration(s.interval_seconds)}</b> · "
+        f"за цикл: <b>{s.posts_per_cycle}</b> · "
+        f"догон: {'вкл' if s.catchup_enabled else 'выкл'}"
+    )
+    lines.append(f"Очередь: <b>{db.backlog()}</b> ID")
+
+    age = db.scheduler_age()
+    if age is None:
+        lines.append("Планировщик: ⚠️ ещё не отчитывался")
+    elif age < 30:
+        lines.append(f"Планировщик: ✅ жив ({age:.0f} сек назад)")
+    else:
+        lines.append(
+            f"Планировщик: ❌ молчит {humanize_duration(age)} — перезапустите бота"
+        )
+
+    err_text, err_at = db.get_last_error()
+    if err_text:
+        ago = humanize_duration(time.time() - err_at) if err_at else "—"
+        lines.append(f"Последняя ошибка ({ago} назад): <code>{safe_preview(err_text, 200)}</code>")
+    recent = db.last_errors(3)
+    if recent:
+        lines.append("Проблемные посты: " + ", ".join(f"<code>{mid}</code>" for mid, _ in recent))
 
     if _has_userbot() and dst:
         if _busy():
@@ -945,7 +1219,7 @@ async def _run_test(message: Message) -> None:
     if not _has_userbot():
         await message.answer(
             "Сделайте «🔐 Вход» (api_id / api_hash / телефон / код).",
-            reply_markup=menu_kb(s.is_running),
+            reply_markup=main_kb(),
         )
         return
     if _cycle_task and not _cycle_task.done():
@@ -953,24 +1227,16 @@ async def _run_test(message: Message) -> None:
         return
 
     await message.answer("⏳ Тестовая публикация 1 поста…")
-    was = s.is_running
-    old = s.posts_per_cycle
-    db.set_running(True)
-    db.set_posts_per_cycle(1)
 
     async def _job():
         try:
-            n = await _call_poster("run_cycle", timeout=None)
+            # Разовый лимит вместо правки настроек: сбой не испортит конфиг
+            result = await _call_poster("run_cycle", 1, timeout=None, force=True)
             await message.answer(
-                f"{'✅' if n else '⚠️'} Опубликовано: <b>{n}</b>",
-                reply_markup=menu_kb(was),
-                parse_mode="HTML",
+                _cycle_report(db, result), reply_markup=main_kb(db), parse_mode="HTML"
             )
         except Exception as e:
-            await message.answer(f"❌ {e}", reply_markup=menu_kb(was))
-        finally:
-            db.set_posts_per_cycle(old)
-            db.set_running(was)
+            await message.answer(f"❌ {e}", reply_markup=main_kb(db))
 
     _cycle_task = _spawn(_job())
 
@@ -994,7 +1260,7 @@ async def _run_rewrite(message: Message, channel: str, limit: Optional[int]) -> 
                 f"{'⏹' if result.get('cancelled') else '✅'} "
                 f"scan={result.get('scanned')} upd={result.get('updated')} "
                 f"skip={result.get('skipped')} err={result.get('errors')}",
-                reply_markup=menu_kb(_require_db().get_settings().is_running),
+                reply_markup=main_kb(),
             )
         except Exception as e:
             await message.answer(f"❌ {e}")

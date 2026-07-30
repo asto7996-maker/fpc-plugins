@@ -6,6 +6,7 @@ poster.py — чистый USERBOT-перезалив через Pyrogram.
   • в назначении — админ с правом постить.
 
 Копирует без метки «Forwarded from», альбомы целиком, HTML-подпись.
+Порядок публикации — от старых постов к новым.
 """
 
 from __future__ import annotations
@@ -14,6 +15,7 @@ import asyncio
 import logging
 import random
 import time
+from dataclasses import dataclass, field
 from typing import Optional
 
 from pyrogram import Client, enums
@@ -38,6 +40,61 @@ from database import Database
 from links import normalize_channel, parse_post_link
 
 logger = logging.getLogger(__name__)
+
+# Итоги цикла
+REASON_OK = "ok"
+REASON_PAUSED = "paused"
+REASON_NO_START = "no_start"
+REASON_SOURCE_EMPTY = "source_empty"
+REASON_UP_TO_DATE = "up_to_date"
+REASON_ABORTED = "aborted"
+REASON_FLOOD = "flood"
+REASON_FATAL = "fatal"
+REASON_ERROR = "error"
+
+# Долгий FloodWait не «пересиживаем» внутри цикла — отдаём планировщику
+FLOOD_INLINE_LIMIT = 90
+# Предохранитель от бесконечного цикла при странных ответах API
+MAX_STEPS_PER_CYCLE = 600
+# Сетевые сбои внутри одного поста
+NETWORK_RETRIES = 2
+
+_NETWORK_ERRORS = (
+    OSError,
+    ConnectionError,
+    asyncio.TimeoutError,
+    TimeoutError,
+)
+
+
+@dataclass
+class CycleResult:
+    """Что произошло за один цикл публикации."""
+
+    published: int = 0
+    reason: str = REASON_OK
+    error: str = ""
+    fatal_text: str = ""
+    flood_seconds: float = 0.0
+    latest_id: int = 0
+    progress_id: int = 0
+    needs_reconnect: bool = False
+    errors: int = 0
+    details: list[str] = field(default_factory=list)
+
+    @property
+    def fatal(self) -> bool:
+        return self.reason == REASON_FATAL
+
+    @property
+    def backlog(self) -> int:
+        return max(0, self.latest_id - self.progress_id)
+
+    def __int__(self) -> int:  # обратная совместимость со «сколько опубликовано»
+        return self.published
+
+    def __bool__(self) -> bool:
+        return self.published > 0
 
 
 def _chat_ref(value: str | int) -> str | int:
@@ -142,6 +199,10 @@ class ChannelPoster:
         self._abort_cycle = False
         self._busy_since = 0.0
         self._cycle_gen = 0
+        self.last_result: Optional[CycleResult] = None
+        # Быстрый путь поиска новых ID: None — ещё не проверяли, False — не работает
+        self._history_window_ok: Optional[bool] = None
+        self._history_window_trusted = 0
 
     async def _materialize_message(self, msg: Message) -> Optional[Message]:
         """
@@ -217,6 +278,16 @@ class ChannelPoster:
         """Прервать текущий цикл как можно скорее."""
         self._abort_cycle = True
 
+    @property
+    def is_busy(self) -> bool:
+        return self._busy
+
+    @property
+    def busy_seconds(self) -> float:
+        if not self._busy or self._busy_since <= 0:
+            return 0.0
+        return max(0.0, time.monotonic() - self._busy_since)
+
     async def wait_until_idle(self, timeout: float = 120.0) -> bool:
         """Дождаться окончания цикла. True = свободен."""
         loop = asyncio.get_running_loop()
@@ -242,6 +313,7 @@ class ChannelPoster:
         self.db.set_source_channel(src)
         self.db.set_start_link(link)
         self.db.set_progress_id(message_id)
+        self.db.run_asap()
         self._seen_grouped.clear()
         self._abort_cycle = False
         logger.info(
@@ -265,38 +337,14 @@ class ChannelPoster:
         source = await _resolve_chat(
             self.client, settings.source_channel or config.SOURCE_CHANNEL
         )
-        found = 0
-        empty = 0
-        for mid in range(1, 20001):
-            try:
-                msg = await self.client.get_messages(source, mid)
-            except FloodWait as e:
-                await asyncio.sleep(min(int(e.value), 30) + 1)
-                continue
-            except MessageIdInvalid:
-                empty += 1
-                if empty > 30 and found == 0:
-                    break
-                continue
-            except RPCError:
-                empty += 1
-                continue
-
-            if msg is None or getattr(msg, "empty", False):
-                empty += 1
-                if empty > 30 and found == 0:
-                    break
-                continue
-
-            found = mid
-            break
-
+        found = await self._find_oldest_message_id(source)
         if found <= 0:
             raise RuntimeError("Не удалось найти первый пост в источнике")
 
         cleared = self.db.clear_history()
         self.db.set_progress_id(found - 1)
         self.db.set_start_link(f"oldest:{found}")
+        self.db.run_asap()
         self._seen_grouped.clear()
         self._abort_cycle = False
         logger.info(
@@ -306,6 +354,54 @@ class ChannelPoster:
             cleared,
         )
         return found
+
+    async def _find_oldest_message_id(self, source: int | str) -> int:
+        """
+        ID самого старого доступного поста.
+
+        Быстрый путь — история с offset_id=1 (Telegram отдаёт самые старые).
+        Если API не поддержал такой запрос — редкий линейный поиск по ID.
+        """
+        try:
+            ids = await self._history_ids_after(source, after_id=0, want=5)
+            if ids:
+                older = await self._first_id_older_than(source, ids[0])
+                if older <= 0:
+                    return ids[0]
+                logger.warning(
+                    "oldest fast path вернул %s, но есть более старый %s",
+                    ids[0],
+                    older,
+                )
+        except Exception as e:
+            logger.warning("oldest fast path failed: %s", e)
+
+        logger.info("oldest: линейный поиск по ID (медленный путь)")
+        empty = 0
+        for mid in range(1, 20001):
+            try:
+                msg = await self.client.get_messages(source, mid)
+            except FloodWait as e:
+                await asyncio.sleep(min(int(e.value), 30) + 1)
+                continue
+            except MessageIdInvalid:
+                empty += 1
+                if empty > 200:
+                    break
+                continue
+            except RPCError:
+                empty += 1
+                if empty > 200:
+                    break
+                continue
+
+            if msg is None or getattr(msg, "empty", False):
+                empty += 1
+                if empty > 200:
+                    break
+                continue
+            return mid
+        return 0
 
     def cancel_rewrite(self) -> None:
         self._rewrite_cancel = True
@@ -324,7 +420,19 @@ class ChannelPoster:
         self._busy = False
         self._busy_since = 0.0
 
-    async def run_cycle(self) -> int:
+    async def run_cycle(
+        self,
+        limit: Optional[int] = None,
+        *,
+        force: bool = False,
+    ) -> CycleResult:
+        """
+        Один цикл публикации.
+
+        Args:
+            limit: разовый лимит публикаций (иначе берётся из настроек).
+            force: игнорировать «пауза» — для ручного «Цикл сейчас» и теста.
+        """
         # Если уже идёт цикл — прерываем и ждём, не возвращаем тихо 0
         if self._busy:
             logger.info("cycle waiting: busy")
@@ -340,27 +448,133 @@ class ChannelPoster:
         self._busy = True
         self._busy_since = time.monotonic()
         try:
-            return await self._run_cycle_inner(my_gen)
+            result = await self._run_cycle_inner(my_gen, limit=limit, force=force)
+        except FloodWait as e:
+            result = CycleResult(
+                reason=REASON_FLOOD,
+                flood_seconds=float(getattr(e, "value", 0) or 0),
+                error=str(e),
+            )
+        except _NETWORK_ERRORS as e:
+            result = CycleResult(
+                reason=REASON_ERROR, error=f"сеть: {e}", needs_reconnect=True
+            )
         finally:
             # Снимаем busy только если это всё ещё «наш» цикл
             if my_gen == self._cycle_gen:
                 self._busy = False
                 self._busy_since = 0.0
                 self._abort_cycle = False
+        self.last_result = result
+        return result
 
     async def _latest_message_id(self, source: int | str) -> int:
         """ID последнего поста в канале (0 если пусто)."""
         try:
             async for msg in self.client.get_chat_history(source, limit=1):
                 return int(msg.id)
+        except FloodWait:
+            raise
         except Exception as e:
             logger.warning("latest_message_id failed: %s", e)
         return 0
 
-    async def _run_cycle_inner(self, my_gen: int) -> int:
+    async def _history_ids_after(
+        self, source: int | str, after_id: int, want: int
+    ) -> list[int]:
+        """
+        Реальные ID сообщений источника с id > after_id, по возрастанию.
+
+        Пропуски (удалённые посты, сервисные ID) не тратят запросы: Telegram
+        сам отдаёт только существующие сообщения.
+        """
+        want = max(1, min(int(want), 100))
+        found: set[int] = set()
+        # offset_id + отрицательный offset = «окно» сообщений новее after_id
+        async for msg in self.client.get_chat_history(
+            source,
+            limit=want,
+            offset_id=max(1, after_id + 1),
+            offset=-want,
+        ):
+            mid = int(getattr(msg, "id", 0) or 0)
+            if mid > after_id:
+                found.add(mid)
+        return sorted(found)
+
+    async def _first_id_older_than(self, source: int | str, message_id: int) -> int:
+        """ID ближайшего поста СТАРШЕ указанного (0 — старше ничего нет)."""
+        async for msg in self.client.get_chat_history(
+            source, limit=1, offset_id=int(message_id)
+        ):
+            return int(getattr(msg, "id", 0) or 0)
+        return 0
+
+    def _crawl_ids(self, after_id: int, want: int, latest: int) -> list[int]:
+        """Резервный путь: последовательный перебор ID (ничего не пропускает)."""
+        span = min(max(want * 5, 20), 200)
+        end = min(after_id + span, latest)
+        return list(range(after_id + 1, end + 1))
+
+    async def _next_ids(
+        self, source: int | str, after_id: int, want: int, latest: int
+    ) -> list[int]:
+        """
+        Кандидаты на публикацию (по возрастанию ID).
+
+        Быстрый путь — окно истории Telegram: дыры из удалённых постов не
+        стоят ни одного запроса. Он используется только если проверка
+        подтвердила, что между after_id и окном нет пропущенных постов, —
+        иначе честный перебор ID, чтобы ни один пост не потерялся.
+        """
+        if self._history_window_ok is False:
+            return self._crawl_ids(after_id, want, latest)
+
+        try:
+            ids = await self._history_ids_after(source, after_id, want)
+        except FloodWait:
+            raise
+        except Exception as e:
+            logger.warning("history window failed (%s) → перебор ID", e)
+            self._history_window_ok = False
+            return self._crawl_ids(after_id, want, latest)
+
+        if not ids:
+            # Пустое окно, хотя посты впереди есть — уходим в перебор
+            if after_id < latest:
+                return self._crawl_ids(after_id, want, latest)
+            return []
+
+        if self._history_window_trusted < 2:
+            try:
+                older = await self._first_id_older_than(source, ids[0])
+            except FloodWait:
+                raise
+            except Exception as e:
+                logger.warning("history window check failed (%s) → перебор ID", e)
+                self._history_window_ok = False
+                return self._crawl_ids(after_id, want, latest)
+            if older > after_id:
+                logger.warning(
+                    "history window пропустил посты (%s..%s) → перебор ID",
+                    after_id + 1,
+                    ids[0] - 1,
+                )
+                self._history_window_ok = False
+                return self._crawl_ids(after_id, want, latest)
+            self._history_window_trusted += 1
+        return ids
+
+    async def _run_cycle_inner(
+        self,
+        my_gen: int,
+        *,
+        limit: Optional[int] = None,
+        force: bool = False,
+    ) -> CycleResult:
         settings = self.db.get_settings()
-        if not settings.is_running:
-            return 0
+        if not settings.is_running and not force:
+            return CycleResult(reason=REASON_PAUSED, progress_id=settings.progress_id)
 
         source = await _resolve_chat(
             self.client, settings.source_channel or config.SOURCE_CHANNEL
@@ -370,12 +584,17 @@ class ChannelPoster:
         )
         if settings.progress_id < 0:
             logger.warning("progress_id не задан")
-            return 0
+            return CycleResult(reason=REASON_NO_START)
 
         latest = await self._latest_message_id(source)
         if latest <= 0:
             logger.warning("Источник пуст или недоступен")
-            return 0
+            return CycleResult(
+                reason=REASON_SOURCE_EMPTY,
+                error="источник пуст или недоступен",
+                progress_id=settings.progress_id,
+            )
+        self.db.set_latest_source_id(latest)
 
         # Progress ускакал вперёд по ещё несуществующим ID (дыра у «конца» канала)
         if settings.progress_id > latest:
@@ -391,32 +610,35 @@ class ChannelPoster:
             self.db.set_progress_id(rewind)
             settings = self.db.get_settings()
 
-        if settings.progress_id >= latest:
-            logger.info(
-                "Нет новых постов: progress=%s latest=%s",
-                settings.progress_id,
-                latest,
+        progress = settings.progress_id
+        if progress >= latest:
+            logger.info("Нет новых постов: progress=%s latest=%s", progress, latest)
+            return CycleResult(
+                reason=REASON_UP_TO_DATE, latest_id=latest, progress_id=progress
             )
-            return 0
 
-        limit = max(1, int(settings.posts_per_cycle))
+        limit_value = max(1, int(limit if limit else settings.posts_per_cycle))
         caption = settings.caption_template or ""
-        next_id = settings.progress_id + 1
         published = 0
-        empty_streak = 0
+        errors = 0
+        steps = 0
+        pending: list[int] = []
+        result = CycleResult(latest_id=latest, progress_id=progress)
         self._seen_grouped.clear()
 
         logger.info(
-            "USERBOT cycle gen=%s %s → %s after=%s latest=%s limit=%s",
+            "USERBOT cycle gen=%s %s → %s after=%s latest=%s limit=%s%s",
             my_gen,
             source,
             target,
-            settings.progress_id,
+            progress,
             latest,
-            limit,
+            limit_value,
+            " (force)" if force else "",
         )
 
-        while published < limit and empty_streak < 50:
+        while published < limit_value and steps < MAX_STEPS_PER_CYCLE:
+            steps += 1
             if self._abort_cycle or my_gen != self._cycle_gen:
                 logger.info(
                     "cycle aborted gen=%s/%s published=%s",
@@ -424,96 +646,168 @@ class ChannelPoster:
                     self._cycle_gen,
                     published,
                 )
+                result.reason = REASON_ABORTED
+                break
+
+            live = self.db.get_settings()
+            if not live.is_running and not force:
+                result.reason = REASON_PAUSED
                 break
             # Лимит можно уменьшить на лету — подхватываем каждый шаг
-            limit = max(1, int(self.db.get_settings().posts_per_cycle))
-            if published >= limit:
-                break
-            if not self.db.get_settings().is_running:
-                break
-            if next_id > latest:
-                # Обновим «кончик» — вдруг за время цикла появились новые посты
-                latest = await self._latest_message_id(source)
-                if next_id > latest:
+            if limit is None:
+                limit_value = max(1, int(live.posts_per_cycle))
+                if published >= limit_value:
+                    break
+
+            if not pending:
+                if progress >= latest:
+                    fresh = await self._latest_message_id(source)
+                    if fresh > latest:
+                        latest = fresh
+                        self.db.set_latest_source_id(latest)
+                        result.latest_id = latest
+                    else:
+                        logger.info(
+                            "Дошли до конца источника (progress=%s latest=%s)",
+                            progress,
+                            latest,
+                        )
+                        break
+                pending = await self._next_ids(
+                    source, progress, want=limit_value - published + 3, latest=latest
+                )
+                if not pending:
                     logger.info(
-                        "Дошли до конца источника (next=%s latest=%s)",
-                        next_id,
-                        latest,
+                        "Нет доступных постов после %s (latest=%s)", progress, latest
                     )
                     break
-            if self.db.was_processed(next_id):
-                self.db.set_progress_id(next_id)
-                next_id += 1
+
+            message_id = pending.pop(0)
+            if message_id <= progress:
+                continue
+            if self.db.was_processed(message_id):
+                progress = max(progress, message_id)
+                self.db.set_progress_id(progress)
                 continue
 
             try:
-                result = await self._process(source, target, next_id, caption)
+                status = await self._process_with_retry(
+                    source, target, message_id, caption
+                )
             except FloodWait as e:
-                wait = min(int(e.value), 60)
-                logger.warning("FloodWait %ss", wait)
+                wait = float(getattr(e, "value", 0) or 0)
+                if wait > FLOOD_INLINE_LIMIT:
+                    logger.warning("FloodWait %.0fs — отдаём планировщику", wait)
+                    result.reason = REASON_FLOOD
+                    result.flood_seconds = wait
+                    break
+                logger.warning("FloodWait %.0fs", wait)
                 await asyncio.sleep(wait + 1)
                 if self._abort_cycle or my_gen != self._cycle_gen:
+                    result.reason = REASON_ABORTED
                     break
+                pending.insert(0, message_id)
                 continue
             except ChatWriteForbidden:
                 logger.error("Нет прав писать в назначение (нужен админ юзербота)")
+                result.reason = REASON_FATAL
+                result.fatal_text = (
+                    "нет прав публиковать в канале-назначении "
+                    "(добавьте юзербота админом с правом «Публикация сообщений»)"
+                )
                 break
             except (ChannelPrivate, ChannelInvalid) as e:
                 logger.error("Источник недоступен: %s", e)
+                result.reason = REASON_FATAL
+                result.fatal_text = f"источник недоступен: {e}"
+                break
+            except _NETWORK_ERRORS as e:
+                logger.error("Сеть недоступна: %s", e)
+                result.reason = REASON_ERROR
+                result.error = f"сеть: {e}"
+                result.needs_reconnect = True
                 break
             except RPCError as e:
                 err = str(e).upper()
                 if "WRITE_FORBIDDEN" in err or "CHAT_WRITE" in err:
                     logger.error("Write forbidden: %s", e)
+                    result.reason = REASON_FATAL
+                    result.fatal_text = f"нет прав публикации: {e}"
                     break
-                logger.error("RPC %s: %s", next_id, e)
-                self.db.add_history(next_id, status="error", error=str(e))
-                self.db.set_progress_id(next_id)
-                next_id += 1
-                empty_streak += 1
+                logger.error("RPC %s: %s", message_id, e)
+                self.db.add_history(message_id, status="error", error=str(e))
+                errors += 1
+                result.error = str(e)
+                progress = max(progress, message_id)
+                self.db.set_progress_id(progress)
                 continue
 
-            if result == "empty":
-                # Пустой ID — это дыра только если ПОСЛЕ него уже есть посты.
-                # Если next_id за «кончиком» канала — не двигаем progress в будущее.
-                if next_id > latest:
-                    latest = await self._latest_message_id(source)
-                if next_id > latest:
-                    logger.info(
-                        "Ждём новые посты (пусто id=%s, latest=%s), progress не трогаем",
-                        next_id,
-                        latest,
-                    )
-                    break
-                empty_streak += 1
-                self.db.set_progress_id(next_id)
-                next_id += 1
+            if status == "empty":
+                # Пустой ID — дыра в нумерации; после «кончика» канала не двигаемся
+                if message_id >= latest:
+                    fresh = await self._latest_message_id(source)
+                    if fresh > latest:
+                        latest = fresh
+                        self.db.set_latest_source_id(latest)
+                        result.latest_id = latest
+                    else:
+                        logger.info(
+                            "Ждём новые посты (пусто id=%s, latest=%s)",
+                            message_id,
+                            latest,
+                        )
+                        break
+                progress = max(progress, message_id)
+                self.db.set_progress_id(progress)
                 continue
-            if result == "skip":
-                empty_streak = 0
-                cur = max(self.db.get_progress_id(), next_id)
-                self.db.set_progress_id(cur)
-                next_id = cur + 1
-                continue
-            if result == "fatal":
-                logger.error("Fatal — ставлю автопост на паузу")
-                self.db.set_running(False)
-                break
 
-            empty_streak = 0
+            if status == "skip":
+                progress = max(self.db.get_progress_id(), message_id, progress)
+                self.db.set_progress_id(progress)
+                continue
+
             published += 1
-            cur = max(self.db.get_progress_id(), next_id)
-            self.db.set_progress_id(cur)
-            next_id = cur + 1
-            if published < limit:
+            progress = max(self.db.get_progress_id(), message_id, progress)
+            self.db.set_progress_id(progress)
+            if published < limit_value:
                 await asyncio.sleep(
                     random.uniform(config.POST_DELAY_MIN, config.POST_DELAY_MAX)
                 )
 
-        logger.info("USERBOT done gen=%s published=%s limit=%s", my_gen, published, limit)
-        return published
+        result.published = published
+        result.errors = errors
+        result.progress_id = progress
+        if result.reason == REASON_OK and published == 0:
+            result.reason = REASON_UP_TO_DATE if progress >= latest else REASON_OK
+        logger.info(
+            "USERBOT done gen=%s published=%s limit=%s reason=%s progress=%s latest=%s",
+            my_gen,
+            published,
+            limit_value,
+            result.reason,
+            progress,
+            latest,
+        )
+        return result
 
     # ------------------------------------------------------------------ process
+
+    async def _process_with_retry(
+        self, source, target, message_id: int, caption: str
+    ) -> str:
+        """_process с повтором при разовых сетевых сбоях."""
+        attempt = 0
+        while True:
+            try:
+                return await self._process(source, target, message_id, caption)
+            except _NETWORK_ERRORS as e:
+                attempt += 1
+                if attempt > NETWORK_RETRIES:
+                    raise
+                logger.warning(
+                    "сетевой сбой на %s (%s), попытка %s", message_id, e, attempt
+                )
+                await asyncio.sleep(2.0 * attempt)
 
     async def _process(
         self, source, target, message_id: int, caption: str
@@ -531,6 +825,10 @@ class ChannelPoster:
         if msg.media_group_id:
             gid = str(msg.media_group_id)
             if gid in self._seen_grouped:
+                return "skip"
+            if self.db.was_group_processed(gid):
+                self._seen_grouped.add(gid)
+                logger.info("album %s уже публиковался — пропуск", gid)
                 return "skip"
             return await self._publish_album(source, target, msg, caption)
 
@@ -644,11 +942,13 @@ class ChannelPoster:
         except FloodWait:
             raise
         except ChatWriteForbidden:
-            return "fatal"
+            raise
+        except _NETWORK_ERRORS:
+            raise
         except (RPCError, ValueError) as e:
             err = str(e).upper()
             if "WRITE_FORBIDDEN" in err or "CHAT_WRITE" in err:
-                return "fatal"
+                raise
             logger.error("publish %s: %s", msg.id, e)
             self.db.add_history(msg.id, status="error", error=str(e))
             return "skip"
@@ -661,6 +961,12 @@ class ChannelPoster:
         self._seen_grouped.add(gid)
         try:
             album = await self.client.get_media_group(source, anchor.id)
+        except FloodWait:
+            self._seen_grouped.discard(gid)
+            raise
+        except _NETWORK_ERRORS:
+            self._seen_grouped.discard(gid)
+            raise
         except Exception as e:
             self.db.add_history(anchor.id, grouped_id=gid, status="error", error=str(e))
             return "skip"
@@ -705,11 +1011,14 @@ class ChannelPoster:
             self._seen_grouped.discard(gid)
             raise
         except ChatWriteForbidden:
-            return "fatal"
+            raise
+        except _NETWORK_ERRORS:
+            self._seen_grouped.discard(gid)
+            raise
         except (RPCError, ValueError) as e:
             err = str(e).upper()
             if "WRITE_FORBIDDEN" in err or "CHAT_WRITE" in err:
-                return "fatal"
+                raise
             logger.error("album %s: %s", gid, e)
             self.db.add_history(anchor.id, grouped_id=gid, status="error", error=str(e))
             return "skip"

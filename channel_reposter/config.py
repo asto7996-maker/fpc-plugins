@@ -48,7 +48,22 @@ DATABASE_PATH: Path = Path(
 if not DATABASE_PATH.is_absolute():
     DATABASE_PATH = _BASE_DIR / DATABASE_PATH
 
-DEFAULT_INTERVAL_HOURS: float = float(_optional("DEFAULT_INTERVAL_HOURS", "1") or "1")
+def _float(name: str, default: float) -> float:
+    try:
+        raw = _optional(name)
+        return float(raw) if raw else float(default)
+    except ValueError:
+        return float(default)
+
+
+# Интервал между циклами по умолчанию (можно в секундах или часах)
+DEFAULT_INTERVAL_SECONDS: float = (
+    _float("DEFAULT_INTERVAL_SECONDS", 0.0)
+    or _float("DEFAULT_INTERVAL_HOURS", 0.0) * 3600.0
+    or 3600.0
+)
+# Интервал в режиме «догон», когда накопилась очередь непереложенных постов
+DEFAULT_CATCHUP_SECONDS: float = _float("DEFAULT_CATCHUP_SECONDS", 60.0)
 DEFAULT_POSTS_PER_CYCLE: int = int(_optional("DEFAULT_POSTS_PER_CYCLE", "3") or "3")
-POST_DELAY_MIN: float = float(_optional("POST_DELAY_MIN", "2") or "2")
-POST_DELAY_MAX: float = float(_optional("POST_DELAY_MAX", "4") or "4")
+POST_DELAY_MIN: float = _float("POST_DELAY_MIN", 2.0)
+POST_DELAY_MAX: float = max(POST_DELAY_MIN, _float("POST_DELAY_MAX", 4.0))

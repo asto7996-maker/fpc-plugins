@@ -14,6 +14,7 @@ userbot_auth.py — авторизация Pyrogram-юзербота.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass
 from pathlib import Path
@@ -107,6 +108,28 @@ class UserbotAuth:
                 pass
         self.client = None
         self._authorized = False
+
+    async def is_alive(self, timeout: float = 20.0) -> bool:
+        """Живая ли сессия: лёгкий запрос get_me с таймаутом."""
+        if self.client is None or not self._authorized:
+            return False
+        try:
+            await asyncio.wait_for(self.client.get_me(), timeout=timeout)
+            return True
+        except Exception as e:
+            logger.warning("Проверка связи юзербота не прошла: %s", e)
+            return False
+
+    async def ensure_started(self) -> bool:
+        """
+        Гарантировать живого юзербота: при обрыве связи поднять заново
+        из сохранённой сессии (код при этом не нужен).
+        """
+        if await self.is_alive():
+            return True
+        logger.warning("Переподключаю юзербота…")
+        await self._close_client()
+        return await self.try_start_existing()
 
     async def try_start_existing(self) -> bool:
         creds = self.load_credentials()
