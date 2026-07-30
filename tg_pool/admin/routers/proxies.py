@@ -64,7 +64,7 @@ def build_proxies_router(settings: Settings) -> Router:
             )
             return
         async with session_scope() as session:
-            proxy = await AccountService(session).create_proxy(
+            proxy = await AccountService(session).get_or_create_proxy(
                 ip=parsed.ip,
                 port=parsed.port,
                 protocol=parsed.protocol,
@@ -74,7 +74,7 @@ def build_proxies_router(settings: Settings) -> Router:
             pid = proxy.id
         await state.clear()
         await message.answer(
-            f"✅ Прокси <b>#{pid}</b> сохранён\n"
+            f"✅ Прокси <b>#{pid}</b> готов\n"
             f"<code>{parsed.protocol.value}://{parsed.ip}:{parsed.port}</code>",
             parse_mode="HTML",
             reply_markup=proxies_kb(),

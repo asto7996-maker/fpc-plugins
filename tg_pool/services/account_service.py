@@ -215,6 +215,40 @@ class AccountService:
         await self.session.flush()
         return proxy
 
+    async def get_or_create_proxy(
+        self,
+        *,
+        ip: str,
+        port: int,
+        protocol: ProxyProtocol = ProxyProtocol.socks5,
+        username: Optional[str] = None,
+        password: Optional[str] = None,
+    ) -> Proxy:
+        """Reuse existing (ip, port, username) row — unique constraint safe."""
+        stmt = select(Proxy).where(
+            Proxy.ip == ip,
+            Proxy.port == int(port),
+        )
+        if username is None:
+            stmt = stmt.where(Proxy.username.is_(None))
+        else:
+            stmt = stmt.where(Proxy.username == username)
+        existing = (await self.session.execute(stmt)).scalar_one_or_none()
+        if existing is not None:
+            # Refresh credentials / protocol if operator re-sent the line
+            existing.password = password
+            existing.protocol = protocol
+            existing.is_alive = True
+            await self.session.flush()
+            return existing
+        return await self.create_proxy(
+            ip=ip,
+            port=port,
+            protocol=protocol,
+            username=username,
+            password=password,
+        )
+
     async def bind_proxy(self, account_id: int, proxy_id: int) -> Account:
         account = await self.get_account(account_id)
         if account is None:

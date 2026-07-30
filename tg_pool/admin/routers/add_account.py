@@ -120,7 +120,7 @@ def build_add_account_router(settings: Settings) -> Router:
                         parse_mode="HTML",
                     )
                     return
-                proxy = await svc.create_proxy(
+                proxy = await svc.get_or_create_proxy(
                     ip=parsed.ip,
                     port=parsed.port,
                     protocol=parsed.protocol,
@@ -172,58 +172,88 @@ def build_add_account_router(settings: Settings) -> Router:
         await _begin_tdata(callback.message, state)  # type: ignore[arg-type]
         await callback.answer()
 
+    @router.message(ImportTDataStates.proxy, F.document)
+    async def tdata_proxy_got_file(message: Message) -> None:
+        await message.answer(
+            "Сначала отправьте прокси текстом "
+            "(<code>user:password@ip:port</code>), потом ZIP.",
+            parse_mode="HTML",
+        )
+
     @router.message(ImportTDataStates.proxy)
     async def tdata_proxy(message: Message, state: FSMContext) -> None:
         raw = (message.text or "").strip()
+        if not raw:
+            await message.answer(
+                "Отправьте прокси текстом:\n"
+                "<code>user:password@ip:port</code>",
+                parse_mode="HTML",
+            )
+            return
+
         proxy_id: Optional[int] = None
         proxy_dict: Optional[dict[str, Any]] = None
 
-        async with session_scope() as session:
-            svc = AccountService(session)
-            if raw.lower() == "none":
-                pass
-            elif raw.isdigit():
-                proxy = await session.get(Proxy, int(raw))
-                if proxy is None:
-                    await message.answer(f"Proxy #{raw} не найден.")
-                    return
-                proxy_id = proxy.id
-                proxy_dict = {
-                    "protocol": proxy.protocol.value,
-                    "ip": proxy.ip,
-                    "port": proxy.port,
-                    "username": proxy.username,
-                    "password": proxy.password,
-                }
-            else:
-                try:
-                    parsed = parse_proxy_line(raw)
-                except ProxyParseError:
-                    await message.answer(
-                        "Формат: <code>user:pass@ip:port</code> | "
-                        "socks5://… | id | none",
-                        parse_mode="HTML",
+        try:
+            async with session_scope() as session:
+                svc = AccountService(session)
+                if raw.lower() == "none":
+                    pass
+                elif raw.isdigit():
+                    proxy = await session.get(Proxy, int(raw))
+                    if proxy is None:
+                        await message.answer(f"Proxy #{raw} не найден.")
+                        return
+                    proxy_id = proxy.id
+                    proxy_dict = {
+                        "protocol": proxy.protocol.value,
+                        "ip": proxy.ip,
+                        "port": proxy.port,
+                        "username": proxy.username,
+                        "password": proxy.password,
+                    }
+                else:
+                    try:
+                        parsed = parse_proxy_line(raw)
+                    except ProxyParseError:
+                        await message.answer(
+                            "Формат: <code>user:pass@ip:port</code> | "
+                            "socks5://… | id | none",
+                            parse_mode="HTML",
+                        )
+                        return
+                    proxy = await svc.get_or_create_proxy(
+                        ip=parsed.ip,
+                        port=parsed.port,
+                        protocol=parsed.protocol,
+                        username=parsed.username,
+                        password=parsed.password,
                     )
-                    return
-                proxy = await svc.create_proxy(
-                    ip=parsed.ip,
-                    port=parsed.port,
-                    protocol=parsed.protocol,
-                    username=parsed.username,
-                    password=parsed.password,
-                )
-                proxy_id = proxy.id
-                proxy_dict = {
-                    "protocol": proxy.protocol.value,
-                    "ip": proxy.ip,
-                    "port": proxy.port,
-                    "username": proxy.username,
-                    "password": proxy.password,
-                }
+                    proxy_id = proxy.id
+                    proxy_dict = {
+                        "protocol": proxy.protocol.value,
+                        "ip": proxy.ip,
+                        "port": proxy.port,
+                        "username": proxy.username,
+                        "password": proxy.password,
+                    }
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("tdata_proxy failed")
+            await message.answer(
+                f"❌ Не удалось сохранить прокси: <code>{type(exc).__name__}</code>",
+                parse_mode="HTML",
+            )
+            return
 
         await state.update_data(proxy_id=proxy_id, proxy_dict=proxy_dict)
         await state.set_state(ImportTDataStates.passcode)
+        label = (
+            f"#{proxy_id} <code>{proxy_dict['ip']}:{proxy_dict['port']}</code>"
+            if proxy_dict
+            else "none"
+        )
         await message.answer(
+            f"✅ Прокси: {label}\n\n"
             "Локальный passcode TData или <code>none</code>:",
             parse_mode="HTML",
         )

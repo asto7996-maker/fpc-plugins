@@ -8,6 +8,59 @@ from tg_pool.db.models import ProxyProtocol
 from tg_pool.services.proxy_parse import ProxyParseError, parse_proxy_line
 
 
+class GetOrCreateProxyTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self) -> None:
+        import tempfile
+        from pathlib import Path
+
+        from tg_pool.config import CREATOR_TELEGRAM_ID, Settings
+        from tg_pool.db.session import create_all, dispose_engine, init_engine
+
+        self.tmp = tempfile.TemporaryDirectory()
+        db_path = Path(self.tmp.name) / "proxy.db"
+        settings = Settings(
+            database_url=f"sqlite+aiosqlite:///{db_path}",
+            redis_url="redis://localhost:6379/0",
+            admin_bot_token="",
+            admin_ids=(),
+            creator_id=CREATOR_TELEGRAM_ID,
+            log_level="WARNING",
+            telegram_api_id=1,
+            telegram_api_hash="h",
+            daily_action_limit=20,
+            jitter_min_sec=0.01,
+            jitter_max_sec=0.02,
+            flood_alert_threshold_sec=300,
+            spambot_username="SpamBot",
+            spambot_timeout_sec=5,
+            tdata_max_zip_bytes=50 * 1024 * 1024,
+            gemini_api_key="",
+        )
+        init_engine(settings)
+        await create_all()
+
+    async def asyncTearDown(self) -> None:
+        from tg_pool.db.session import dispose_engine
+
+        await dispose_engine()
+        self.tmp.cleanup()
+
+    async def test_reuses_same_endpoint(self) -> None:
+        from tg_pool.db.session import session_scope
+        from tg_pool.services.account_service import AccountService
+
+        async with session_scope() as session:
+            svc = AccountService(session)
+            a = await svc.get_or_create_proxy(
+                ip="1.2.3.4", port=1080, username="u", password="p1"
+            )
+            b = await svc.get_or_create_proxy(
+                ip="1.2.3.4", port=1080, username="u", password="p2"
+            )
+            self.assertEqual(a.id, b.id)
+            self.assertEqual(b.password, "p2")
+
+
 class ProxyParseTests(unittest.TestCase):
     def test_user_pass_at_ip_port(self) -> None:
         p = parse_proxy_line("alice:s3cret@1.2.3.4:1080")
