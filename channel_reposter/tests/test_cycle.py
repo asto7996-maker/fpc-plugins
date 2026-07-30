@@ -127,6 +127,27 @@ class BasicCycleTests(CycleTestCase):
         self.assertEqual(result.published, 1)
         self.assertEqual(client.published[0]["caption"], "<b>шаблон</b>")
 
+    def test_text_post_keeps_its_text_with_template(self) -> None:
+        """Шаблон дописывается к тексту, а не затирает пост."""
+        self.db.set_caption("<b>подпись</b>")
+        client = FakeClient([text_message(1, "важный текст")])
+        result, _ = self.run_cycle(client, limit=1)
+        self.assertEqual(result.published, 1)
+        self.assertEqual(
+            client.published[0]["text"], "важный текст\n\n<b>подпись</b>"
+        )
+
+    def test_text_post_html_is_escaped(self) -> None:
+        client = FakeClient([text_message(1, "5 < 7 & 8 > 2")])
+        self.run_cycle(client, limit=1)
+        self.assertEqual(client.published[0]["text"], "5 &lt; 7 &amp; 8 &gt; 2")
+
+    def test_template_not_duplicated(self) -> None:
+        self.db.set_caption("подпись")
+        client = FakeClient([text_message(1, "текст и подпись")])
+        self.run_cycle(client, limit=1)
+        self.assertEqual(client.published[0]["text"], "текст и подпись")
+
 
 class GapTests(CycleTestCase):
     def test_gaps_do_not_cost_requests(self) -> None:
@@ -265,6 +286,21 @@ class FailureTests(CycleTestCase):
         result, _ = self.run_cycle(client, limit=1)
         self.assertEqual(result.published, 0)
         self.assertIn("источник", result.error)
+
+    def test_unexpected_error_becomes_result(self) -> None:
+        """Любая неожиданная ошибка — это причина в отчёте, а не молчание."""
+        from database import SETTING_SOURCE_CHANNEL
+
+        self.db.set(SETTING_SOURCE_CHANNEL, "")
+        original = poster_module.config.SOURCE_CHANNEL
+        poster_module.config.SOURCE_CHANNEL = ""
+        self.addCleanup(setattr, poster_module.config, "SOURCE_CHANNEL", original)
+
+        client = FakeClient([text_message(1)])
+        result, _ = self.run_cycle(client, limit=1)
+        self.assertEqual(result.reason, "error")
+        self.assertTrue(result.error)
+        self.assertEqual(client.published, [])
 
 
 if __name__ == "__main__":

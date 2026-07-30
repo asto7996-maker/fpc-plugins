@@ -146,14 +146,21 @@ class EndToEndSchedulingTests(unittest.TestCase):
     def test_stops_at_tip_and_resumes_on_new_post(self) -> None:
         self.client.messages = {1: text_message(1, "post 1")}
 
+        async def wait_for(check, timeout: float = 3.0) -> bool:
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                if check():
+                    return True
+                await asyncio.sleep(0.01)
+            return False
+
         async def scenario() -> None:
             BRIDGE.admin_loop = asyncio.get_running_loop()
             task = asyncio.create_task(main_module._worker_scheduler())
-            await asyncio.sleep(0.3)
-            self.assertEqual(len(self.client.published), 1)
+            self.assertTrue(await wait_for(lambda: len(self.client.published) == 1))
             # В источнике появился новый пост — бот должен его подхватить сам
             self.client.messages[2] = text_message(2, "post 2")
-            await asyncio.sleep(0.4)
+            self.assertTrue(await wait_for(lambda: len(self.client.published) == 2))
             task.cancel()
             try:
                 await task

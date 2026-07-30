@@ -12,6 +12,7 @@ poster.py — чистый USERBOT-перезалив через Pyrogram.
 from __future__ import annotations
 
 import asyncio
+import html
 import logging
 import random
 import time
@@ -175,6 +176,35 @@ def _build_input_media(msg: Message, caption: Optional[str] = None):
     if msg.voice:
         return InputMediaDocument(media=msg.voice.file_id, caption=caption, parse_mode=parse_mode)
     return None
+
+
+def _source_text_html(msg: Message) -> str:
+    """Текст поста в HTML: жирный/ссылки из entities сохраняются."""
+    raw = msg.text if msg.text is not None else msg.caption
+    if raw is None:
+        return ""
+    rich = getattr(raw, "html", None)
+    if isinstance(rich, str) and rich.strip():
+        return rich
+    return html.escape(str(raw))
+
+
+def _merge_text(body: str, template: str) -> str:
+    """
+    Текстовый пост + шаблон.
+
+    Шаблон дописывается снизу, а не затирает пост: иначе перезалив
+    текстовых постов терял бы содержимое.
+    """
+    body = (body or "").strip()
+    template = (template or "").strip()
+    if not template:
+        return body
+    if not body:
+        return template
+    if template in body:
+        return body
+    return f"{body}\n\n{template}"
 
 
 def _attach_caption(item, caption: Optional[str]):
@@ -457,6 +487,12 @@ class ChannelPoster:
         except _NETWORK_ERRORS as e:
             result = CycleResult(
                 reason=REASON_ERROR, error=f"сеть: {e}", needs_reconnect=True
+            )
+        except Exception as e:
+            # Панель и логи должны показывать причину, а не «тишину»
+            logger.exception("Цикл упал")
+            result = CycleResult(
+                reason=REASON_ERROR, error=str(e) or type(e).__name__
             )
         finally:
             # Снимаем busy только если это всё ещё «наш» цикл
@@ -861,7 +897,7 @@ class ChannelPoster:
                     else:
                         raise
             elif msg.text or msg.caption:
-                text = caption if caption else (msg.text or msg.caption or "")
+                text = _merge_text(_source_text_html(msg), caption)
                 if not text:
                     return "skip"
                 try:

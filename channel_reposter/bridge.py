@@ -11,7 +11,6 @@ import asyncio
 import logging
 import threading
 from concurrent.futures import Future
-from pathlib import Path
 from typing import Any, Callable, Optional
 
 logger = logging.getLogger(__name__)

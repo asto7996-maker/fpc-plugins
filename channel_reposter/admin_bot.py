@@ -1268,6 +1268,22 @@ async def _run_rewrite(message: Message, channel: str, limit: Optional[int]) -> 
     _rewrite_task = _spawn(job())
 
 
+@router.message()
+async def on_unknown(message: Message) -> None:
+    """Любое непонятое сообщение — не молчание, а меню с подсказкой."""
+    if await _deny(message.from_user.id if message.from_user else None, message.answer):
+        return
+    _remember_admin(message.from_user.id if message.from_user else None)
+    db = _require_db()
+    await message.answer(
+        "Не понял команду. Управление — кнопками ниже.\n"
+        "Подсказка: /status — статус, /run_now — цикл сейчас, /test — диагностика.\n\n"
+        + status_text(db),
+        reply_markup=main_kb(db),
+        parse_mode="HTML",
+    )
+
+
 def setup_dispatcher(dp: Dispatcher) -> None:
     dp.include_router(router)
 

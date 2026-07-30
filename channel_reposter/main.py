@@ -89,6 +89,36 @@ def _notify_admin(db: Database, text: str) -> None:
     BRIDGE.notify(int(raw), text, parse_mode="HTML")
 
 
+def _sync_poster(db: Database, poster: ChannelPoster) -> ChannelPoster:
+    """Держать движок на актуальном клиенте юзербота (после повторного входа)."""
+    auth = BRIDGE.auth
+    client = getattr(auth, "client", None)
+    if client is not None and client is not poster.client:
+        poster = ChannelPoster(client=client, db=db)
+        BRIDGE.poster = poster
+        logger.info("Клиент юзербота обновлён — движок пересоздан")
+    return poster
+
+
+async def _reconnect_userbot(db: Database) -> bool:
+    """Поднять юзербота заново из сохранённой сессии после обрыва связи."""
+    auth = BRIDGE.auth
+    if auth is None:
+        return False
+    logger.warning("Проверяю связь с юзерботом после сбоя цикла")
+    try:
+        ok = await auth.ensure_started()
+    except Exception:
+        logger.exception("reconnect")
+        return False
+    if not ok or auth.client is None:
+        db.set_last_error("нет связи с юзерботом — нужен «🔐 Вход»")
+        return False
+    BRIDGE.poster = ChannelPoster(client=auth.client, db=db)
+    logger.info("Юзербот снова на связи")
+    return True
+
+
 def _schedule_next(db: Database, plan: NextRun) -> float:
     """Записать время следующего цикла (переживает рестарт бота)."""
     at = time.time() + plan.delay
@@ -172,20 +202,8 @@ async def _worker_scheduler() -> None:
                 await asyncio.sleep(TICK)
                 continue
 
-            # Периодическая проверка связи, чтобы «тихая» смерть сессии
-            # не превращалась в бесконечное молчание бота
-            if BRIDGE.auth is not None and now - last_health > HEALTH_EVERY:
-                last_health = now
-                if not await BRIDGE.auth.ensure_started():
-                    logger.error("Юзербот не отвечает — повтор через минуту")
-                    db.set_last_error("нет связи с юзерботом")
-                    db.set_next_run(now + 60, "reconnect")
-                    await asyncio.sleep(TICK)
-                    continue
-                if BRIDGE.auth.client is not poster.client:
-                    poster = ChannelPoster(client=BRIDGE.auth.client, db=db)
-                    BRIDGE.poster = poster
-                    logger.info("Юзербот переподключён, движок пересоздан")
+            # Клиент могли пересоздать (повторный вход) — берём актуальный
+            poster = _sync_poster(db, poster)
 
             result = await poster.run_cycle()
             db.mark_cycle(result.published)
@@ -242,8 +260,14 @@ async def _worker_scheduler() -> None:
                 if result.reason != POST_REASON_ABORTED:
                     db.clear_last_error()
 
-            if result.needs_reconnect and BRIDGE.auth is not None:
-                last_health = 0.0
+            # Лечим связь только когда цикл действительно упал по сети:
+            # проверка «на всякий случай» не должна мешать публикации
+            if (result.needs_reconnect or error_streak >= 2) and (
+                now - last_health > HEALTH_EVERY or result.needs_reconnect
+            ):
+                last_health = now
+                if await _reconnect_userbot(db):
+                    poster = BRIDGE.poster or poster
 
             plan = plan_next_delay(
                 published=result.published,
