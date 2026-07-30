@@ -19,6 +19,13 @@ def _load_env_files() -> None:
     load_dotenv(BASE_DIR / ".env", override=False)
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
 @dataclass(frozen=True)
 class Settings:
     """Runtime settings for the brand monitoring system."""
@@ -33,6 +40,22 @@ class Settings:
     backoff_max_retries: int
     reconnect_max_attempts: int
     log_level: str
+    # Rate limits
+    max_replies_per_hour: int
+    max_replies_per_day: int
+    min_action_pause_sec: float
+    max_action_pause_sec: float
+    pre_reply_delay_min: float
+    pre_reply_delay_max: float
+    flood_wait_extra_sec: float
+    # Message filters
+    min_message_length: int
+    max_message_length: int
+    # Reply randomization
+    emoji_chance: float
+    typo_enabled: bool
+    case_randomize: bool
+    zwsp_enabled: bool
 
 
 def get_settings() -> Settings:
@@ -58,4 +81,17 @@ def get_settings() -> Settings:
         backoff_max_retries=int(os.getenv("BACKOFF_MAX_RETRIES", "8")),
         reconnect_max_attempts=int(os.getenv("RECONNECT_MAX_ATTEMPTS", "5")),
         log_level=os.getenv("LOG_LEVEL", "INFO"),
+        max_replies_per_hour=int(os.getenv("MAX_REPLIES_PER_HOUR", "4")),
+        max_replies_per_day=int(os.getenv("MAX_REPLIES_PER_DAY", "18")),
+        min_action_pause_sec=float(os.getenv("MIN_ACTION_PAUSE_SEC", "600")),
+        max_action_pause_sec=float(os.getenv("MAX_ACTION_PAUSE_SEC", "1500")),
+        pre_reply_delay_min=float(os.getenv("PRE_REPLY_DELAY_MIN", "45")),
+        pre_reply_delay_max=float(os.getenv("PRE_REPLY_DELAY_MAX", "90")),
+        flood_wait_extra_sec=float(os.getenv("FLOOD_WAIT_EXTRA_SEC", "60")),
+        min_message_length=int(os.getenv("MIN_MESSAGE_LENGTH", "10")),
+        max_message_length=int(os.getenv("MAX_MESSAGE_LENGTH", "500")),
+        emoji_chance=float(os.getenv("EMOJI_CHANCE", "0.30")),
+        typo_enabled=_env_bool("TYPO_ENABLED", False),
+        case_randomize=_env_bool("CASE_RANDOMIZE", False),
+        zwsp_enabled=_env_bool("ZWSP_ENABLED", True),
     )

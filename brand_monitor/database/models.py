@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, time
+from datetime import datetime, time, timezone
 from typing import Optional
 
 
@@ -21,9 +21,15 @@ class Agent:
     proxy_password: Optional[str]
     work_window_start: str  # HH:MM
     work_window_end: str  # HH:MM
-    status: str  # active | inactive | error
+    status: str  # active | inactive | cooldown | banned | paused
     display_name: Optional[str] = None
     last_error: Optional[str] = None
+    device_model: Optional[str] = None
+    system_version: Optional[str] = None
+    app_version: Optional[str] = None
+    lang_code: Optional[str] = None
+    cooldown_until: Optional[str] = None
+    last_action_at: Optional[str] = None
 
     def parse_work_window(self) -> tuple[time, time]:
         start = datetime.strptime(self.work_window_start, "%H:%M").time()
@@ -41,6 +47,24 @@ class Agent:
         if start <= end:
             return start <= current <= end
         return current >= start or current <= end
+
+    def is_in_cooldown(self, now: Optional[datetime] = None) -> bool:
+        if not self.cooldown_until:
+            return False
+        now = now or datetime.now(timezone.utc)
+        try:
+            until = datetime.fromisoformat(self.cooldown_until)
+        except ValueError:
+            return False
+        if until.tzinfo is None:
+            until = until.replace(tzinfo=timezone.utc)
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+        return now < until
+
+    @property
+    def has_fingerprint(self) -> bool:
+        return bool(self.device_model and self.system_version and self.app_version)
 
     @property
     def proxy_tuple(self) -> Optional[tuple]:
@@ -97,3 +121,14 @@ class InteractionLog:
     keyword_id: Optional[int]
     knowledge_base_id: Optional[int]
     timestamp: str
+    status: str = "sent"
+    trigger_keyword: Optional[str] = None
+    reply_text: Optional[str] = None
+    source_text: Optional[str] = None
+
+
+@dataclass
+class StopWord:
+    id: int
+    word: str
+    is_active: bool = True

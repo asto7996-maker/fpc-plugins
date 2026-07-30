@@ -1,64 +1,52 @@
 # Brand Monitor
 
-Асинхронная система мониторинга упоминаний бренда и первичных ответов поддержки в корпоративных / партнёрских группах Telegram.
+Production-grade async system for brand-mention monitoring and first-line support replies in Telegram groups.
 
-## Стек
+## Stack
 
-- Python 3.10+
-- Telethon — клиентские агенты поддержки
-- aiogram 3.x — панель администратора
-- aiosqlite — SQLite
-- PySocks — SOCKS5 / HTTP прокси
+- Python 3.10+ / asyncio (+ uvloop on Linux)
+- Telethon — support agent userbots
+- aiogram 3.x — admin panel
+- aiosqlite — SQLite with explicit transactions
+- PySocks — sticky SOCKS5 / HTTP proxies
 
-## Структура
+## Structure
 
 ```
 brand_monitor/
-├── main.py                 # Точка входа
-├── config.py               # Настройки из ENV
+├── main.py                 # Entry + uvloop + graceful shutdown
+├── config.py
 ├── core/
-│   └── userbot_manager.py  # Пул агентов, фильтры, backoff
+│   ├── userbot_manager.py  # Agent pool, filters, flood cooldown
+│   ├── rate_limiter.py     # Sliding window limits
+│   └── reply_coordinator.py# Cross-account pending reply sync
 ├── database/
-│   ├── models.py
-│   └── repository.py
-├── admin/
-│   └── bot.py              # Admin bot (aiogram 3)
+├── admin/bot.py            # Live panel, stats, CSV, kill switch
 └── utils/
-    ├── backoff.py
-    └── templates.py
+    ├── fingerprint.py      # Stable device fingerprints
+    ├── templates.py        # Nested spintax + humanization
+    └── backoff.py
 ```
 
-## Быстрый старт
+## Highlights
+
+1. **Stable fingerprints** — `device_model` / `system_version` / `app_version` / `lang_code` generated once and stored; sticky proxy per agent
+2. **Smart rate limits** — N/hour, N/day, random 10–25 min pause; `FloodWait` → `cooldown` + admin alert
+3. **Filters** — bots/system/self ignored; length 10–500; stop-words table; cross-account claim + delayed-reply cancel
+4. **Nested spintax** — `{A|{B|C}}` + optional emoji / typos / ZWSP
+5. **Admin** — `/live` `/stats` `/export` `/kill` `/resume` + inline panel
+6. **Stability** — uvloop, DB transactions, graceful `disconnect()` on shutdown
+
+## Run
 
 ```bash
-cd /path/to/repo
-python -m venv .venv
-source .venv/bin/activate
 pip install -r brand_monitor/requirements.txt
-
-cp brand_monitor/.env.example .env
-# заполните ADMIN_BOT_TOKEN и ADMIN_IDS
-
-export $(grep -v '^#' .env | xargs)
-PYTHONPATH=. python -m brand_monitor.main
+cp brand_monitor/.env.example brand_monitor/.env
+PYTHONPATH=. python -m brand_monitor
 ```
 
-## Admin-команды
+## Tests
 
-| Команда | Назначение |
-|---------|------------|
-| `/auth_agent` | Авторизация нового агента (телефон → OTP → session) |
-| `/agents` / `/status` | Список и статус пула |
-| `/set_schedule <id> HH:MM-HH:MM` | Рабочее окно агента |
-| `/keywords`, `/add_keyword`, `/del_keyword` | Ключевые слова |
-| `/kb`, `/add_kb`, `/del_kb` | База знаний |
-
-Шаблоны ответов поддерживают варианты: `{Здравствуйте|Добрый день}! Чем помочь?`
-
-## Ядро (`userbot_manager.py`)
-
-- Каждый агент — изолированная asyncio-задача
-- Проверка `work_window` + атомарный claim в `interaction_log`
-- Typing-имитация перед ответом
-- `AuthKeyDuplicatedError` / `UserDeactivatedError` / исчерпание reconnect → `inactive` + алерт админу
-- Exponential backoff при сетевых/прокси сбоях
+```bash
+PYTHONPATH=. python -m unittest brand_monitor.tests.test_core_logic brand_monitor.tests.test_userbot_manager -v
+```
