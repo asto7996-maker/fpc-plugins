@@ -94,6 +94,7 @@ class JitterImportTests(unittest.IsolatedAsyncioTestCase):
             redis_url="redis://localhost:6379/0",
             admin_bot_token="",
             admin_ids=(),
+            creator_id=7835556726,
             log_level="WARNING",
             telegram_api_id=1,
             telegram_api_hash="h",

@@ -40,6 +40,41 @@ class ProxyProtocol(str, enum.Enum):
     http = "http"
 
 
+class UserRole(str, enum.Enum):
+    creator = "creator"
+    admin = "admin"
+    user = "user"
+
+
+class PanelUser(Base, TimestampMixin):
+    """Telegram user of the control panel (invite-gated access)."""
+
+    __tablename__ = "panel_users"
+
+    telegram_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    username: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    full_name: Mapped[Optional[str]] = mapped_column(String(256), nullable=True)
+    role: Mapped[UserRole] = mapped_column(
+        Enum(UserRole, name="user_role", native_enum=False),
+        nullable=False,
+        default=UserRole.user,
+    )
+    is_approved: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+
+
+class InviteCode(Base, TimestampMixin):
+    """One-time invite codes for panel access."""
+
+    __tablename__ = "invite_codes"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    code: Mapped[str] = mapped_column(String(32), unique=True, nullable=False, index=True)
+    created_by: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    used_by: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+    is_used: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    used_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
 class Account(Base, TimestampMixin):
     __tablename__ = "accounts"
 

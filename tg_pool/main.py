@@ -4,7 +4,7 @@ Application entrypoint.
 Starts:
 * PostgreSQL schema init
 * Redis task worker + APScheduler
-* aiogram admin bot polling
+* aiogram admin bot polling (+ command menu, invite access)
 """
 
 from __future__ import annotations
@@ -17,11 +17,12 @@ import sys
 from aiogram import Bot
 from redis.asyncio import from_url as redis_from_url
 
-from tg_pool.admin.bot import build_dispatcher
+from tg_pool.admin.bot import build_dispatcher, setup_bot_commands
 from tg_pool.config import get_settings
-from tg_pool.db.session import create_all, dispose_engine, init_engine
+from tg_pool.db.session import create_all, dispose_engine, init_engine, session_scope
 from tg_pool.queue.broker import RedisTaskBroker
 from tg_pool.queue.scheduler import PoolScheduler
+from tg_pool.services.access_service import AccessService
 from tg_pool.services.alerts import AlertService
 from tg_pool.services.task_router import TaskRouter
 
@@ -62,9 +63,16 @@ async def amain() -> None:
     if settings.admin_bot_token:
         bot = Bot(token=settings.admin_bot_token)
         alerts.bind_bot(bot)
-        dp = build_dispatcher(settings, broker)
+        async with session_scope() as session:
+            await AccessService(session, creator_id=settings.creator_id).ensure_user(
+                settings.creator_id,
+                username=None,
+                full_name="Creator",
+            )
+        await setup_bot_commands(bot)
+        dp = build_dispatcher(settings, broker, bot=bot)
         polling_task = asyncio.create_task(dp.start_polling(bot), name="admin-polling")
-        logger.info("Admin bot polling started")
+        logger.info("Admin bot polling started (creator_id=%s)", settings.creator_id)
     else:
         logger.warning("ADMIN_BOT_TOKEN empty — admin UI disabled, worker-only mode")
 
@@ -88,7 +96,7 @@ async def amain() -> None:
                 return_when=asyncio.FIRST_COMPLETED,
             )
             if polling_task in done and stop_wait not in done:
-                await polling_task  # surface error
+                await polling_task
         else:
             await stop_event.wait()
     finally:
