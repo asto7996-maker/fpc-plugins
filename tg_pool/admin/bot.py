@@ -18,6 +18,7 @@ from tg_pool.admin.routers.add_account import build_add_account_router
 from tg_pool.admin.routers.drafts import build_drafts_router
 from tg_pool.admin.routers.menu import build_menu_router
 from tg_pool.admin.routers.proxies import build_proxies_router
+from tg_pool.admin.routers.selftest import build_selftest_router
 from tg_pool.admin.routers.start import build_start_router
 from tg_pool.config import Settings
 from tg_pool.taskqueue.broker import RedisTaskBroker
@@ -33,6 +34,7 @@ BOT_COMMANDS = [
     BotCommand(command="menu", description="Главное меню управления"),
     BotCommand(command="profile", description="Профиль и статус доступа"),
     BotCommand(command="admin", description="Панель суперадминистратора"),
+    BotCommand(command="selftest", description="Self-test / health-check (creator)"),
     BotCommand(command="help", description="Справка и инструкция"),
 ]
 
@@ -71,6 +73,7 @@ def build_dispatcher(
 
     # Order matters: global nav / callbacks before FSM catch-alls (TData archive).
     dp.include_router(build_start_router(settings))
+    dp.include_router(build_selftest_router(settings, listeners=listeners))
     dp.include_router(build_menu_router(settings))
     dp.include_router(build_proxies_router(settings))
     dp.include_router(build_accounts_router(settings, broker, listeners=listeners))

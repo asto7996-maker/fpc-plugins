@@ -187,6 +187,22 @@ async def amain() -> None:
     else:
         logger.warning("ADMIN_BOT_TOKEN empty — admin UI disabled, worker-only mode")
 
+    # Startup self-test (critical nodes) before/around listener attach
+    try:
+        from tg_pool.health import run_startup_self_test
+
+        await run_startup_self_test(
+            settings=settings,
+            bot=bot,
+            alerts=alerts,
+            listeners=listeners,
+            deep_proxies=True,
+            live_agents=False,
+            notify=True,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Startup self-test crashed: %s", exc)
+
     try:
         await listeners.start()
     except Exception as exc:  # noqa: BLE001

@@ -22,6 +22,12 @@ class AlertService:
     def bind_bot(self, bot: Bot) -> None:
         self.bot = bot
 
+    def _targets(self) -> tuple[int, ...]:
+        ids = set(self.settings.admin_ids)
+        if self.settings.creator_id:
+            ids.add(self.settings.creator_id)
+        return tuple(sorted(ids))
+
     async def send(self, account_id: int, phone: str, level: str, message: str) -> None:
         icon = {"critical": "🚨", "warning": "⚠️", "info": "ℹ️"}.get(level, "📢")
         text = (
@@ -29,12 +35,21 @@ class AlertService:
             f"phone: <code>{phone}</code>\n"
             f"{message}"
         )
+        await self._fanout(text)
+
+    async def send_system(self, *, level: str, title: str, body: str) -> None:
+        """System-wide alert (self-test / health), not tied to an account."""
+        icon = {"critical": "🚨", "warning": "⚠️", "info": "ℹ️"}.get(level, "📢")
+        text = f"{icon} <b>[{level.upper()}] {title}</b>\n\n{body}"
+        await self._fanout(text)
+
+    async def _fanout(self, text: str) -> None:
         if self.bot is None:
-            logger.warning("AlertService has no bot bound: %s", text)
+            logger.warning("AlertService has no bot bound: %s", text[:200])
             return
-        targets = self.settings.admin_ids
+        targets = self._targets()
         if not targets:
-            logger.warning("ADMIN_IDS empty — alert dropped")
+            logger.warning("No alert targets (ADMIN_IDS/creator empty)")
             return
         for admin_id in targets:
             try:
