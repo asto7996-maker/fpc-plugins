@@ -41,6 +41,8 @@ START_DELAY = 3.0
 STUCK_AFTER = 300.0
 # Как часто проверять живость сессии юзербота
 HEALTH_EVERY = 300.0
+# Не спамить админа сообщениями про flood
+FLOOD_NOTICE_EVERY = 600.0
 
 logging.basicConfig(
     level=logging.INFO,
@@ -113,6 +115,7 @@ async def _worker_scheduler() -> None:
     idle_streak = 0
     error_streak = 0
     last_health = 0.0
+    last_flood_notice = 0.0
     warned_no_userbot = False
     fatal_notified = ""
 
@@ -149,6 +152,13 @@ async def _worker_scheduler() -> None:
                         "Автопост включён, но юзербот не авторизован — нужен «🔐 Вход»"
                     )
                     warned_no_userbot = True
+                    db.set_last_error("юзербот не авторизован — нужен «🔐 Вход»")
+                    _notify_admin(
+                        db,
+                        "⚠️ Автопостинг включён, но юзербот не авторизован.\n"
+                        "Нажмите «🔐 Вход» (api_id / api_hash) — публикация "
+                        "начнётся сама, перезапуск не нужен.",
+                    )
                 await asyncio.sleep(TICK)
                 continue
             warned_no_userbot = False
@@ -179,6 +189,8 @@ async def _worker_scheduler() -> None:
 
             result = await poster.run_cycle()
             db.mark_cycle(result.published)
+            # Настройки могли измениться за время цикла — планируем по свежим
+            settings = db.get_settings()
 
             if result.published:
                 idle_streak = 0
@@ -204,12 +216,14 @@ async def _worker_scheduler() -> None:
                 db.set_last_error(
                     f"Telegram просит подождать {result.flood_seconds:.0f} сек"
                 )
-                _notify_admin(
-                    db,
-                    "⏳ Telegram ограничил аккаунт (flood).\n"
-                    f"Пауза: <b>{humanize_duration(result.flood_seconds)}</b>. "
-                    "Публикация продолжится сама.",
-                )
+                if now - last_flood_notice > FLOOD_NOTICE_EVERY:
+                    last_flood_notice = now
+                    _notify_admin(
+                        db,
+                        "⏳ Telegram ограничил аккаунт (flood).\n"
+                        f"Пауза: <b>{humanize_duration(result.flood_seconds)}</b>. "
+                        "Публикация продолжится сама.",
+                    )
             elif result.reason == POST_REASON_FATAL:
                 db.set_running(False)
                 db.set_last_error(result.fatal_text or "критическая ошибка")

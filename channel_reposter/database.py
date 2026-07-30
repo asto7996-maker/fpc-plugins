@@ -51,6 +51,8 @@ STATE_SCHEDULER_TICK = "scheduler_tick_at"
 
 DEFAULT_INTERVAL_SECONDS = 3600.0
 DEFAULT_CATCHUP_SECONDS = 60.0
+# Ниже этого интервала Telegram начинает ограничивать аккаунт
+MIN_INTERVAL_SECONDS = 5.0
 
 _BUSY_TIMEOUT_MS = 15000
 _SQLITE_TIMEOUT = 30.0
@@ -234,7 +236,7 @@ class Database:
         except (TypeError, ValueError):
             hours = 0.0
         if hours > 0:
-            seconds = max(5.0, hours * 3600.0)
+            seconds = max(MIN_INTERVAL_SECONDS, hours * 3600.0)
             self.set(SETTING_INTERVAL_SECONDS, seconds)
             logger.info(
                 "Миграция интервала: %.4f ч → %.0f сек", hours, seconds
@@ -253,7 +255,8 @@ class Database:
         return Settings(
             caption_template=self.get(SETTING_CAPTION, "") or "",
             interval_seconds=max(
-                5.0, self.get_float(SETTING_INTERVAL_SECONDS, DEFAULT_INTERVAL_SECONDS)
+                MIN_INTERVAL_SECONDS,
+                self.get_float(SETTING_INTERVAL_SECONDS, DEFAULT_INTERVAL_SECONDS),
             ),
             posts_per_cycle=max(1, self.get_int(SETTING_POSTS_PER_CYCLE, 5)),
             is_running=self.get_bool(SETTING_IS_RUNNING, False),
@@ -263,7 +266,8 @@ class Database:
             start_link=self.get(SETTING_START_LINK, "") or "",
             catchup_enabled=self.get_bool(SETTING_CATCHUP, False),
             catchup_seconds=max(
-                5.0, self.get_float(SETTING_CATCHUP_SECONDS, DEFAULT_CATCHUP_SECONDS)
+                MIN_INTERVAL_SECONDS,
+                self.get_float(SETTING_CATCHUP_SECONDS, DEFAULT_CATCHUP_SECONDS),
             ),
             notify_cycles=self.get_bool(SETTING_NOTIFY_CYCLES, False),
         )
@@ -274,7 +278,7 @@ class Database:
     def set_interval_seconds(self, seconds: float) -> None:
         if seconds <= 0:
             raise ValueError("Интервал должен быть больше 0")
-        self.set(SETTING_INTERVAL_SECONDS, max(5.0, float(seconds)))
+        self.set(SETTING_INTERVAL_SECONDS, max(MIN_INTERVAL_SECONDS, float(seconds)))
 
     def set_interval_hours(self, hours: float) -> None:
         if hours <= 0:
@@ -285,7 +289,7 @@ class Database:
         self.set(SETTING_CATCHUP, "1" if enabled else "0")
 
     def set_catchup_seconds(self, seconds: float) -> None:
-        self.set(SETTING_CATCHUP_SECONDS, max(5.0, float(seconds)))
+        self.set(SETTING_CATCHUP_SECONDS, max(MIN_INTERVAL_SECONDS, float(seconds)))
 
     def set_notify_cycles(self, enabled: bool) -> None:
         self.set(SETTING_NOTIFY_CYCLES, "1" if enabled else "0")

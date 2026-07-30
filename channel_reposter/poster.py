@@ -15,7 +15,7 @@ import asyncio
 import logging
 import random
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 from pyrogram import Client, enums
@@ -80,7 +80,6 @@ class CycleResult:
     progress_id: int = 0
     needs_reconnect: bool = False
     errors: int = 0
-    details: list[str] = field(default_factory=list)
 
     @property
     def fatal(self) -> bool:
