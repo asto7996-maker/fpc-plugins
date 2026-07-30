@@ -103,6 +103,7 @@ class JitterImportTests(unittest.IsolatedAsyncioTestCase):
             flood_alert_threshold_sec=300,
             spambot_username="SpamBot",
             spambot_timeout_sec=5,
+            tdata_max_zip_bytes=50 * 1024 * 1024,
         )
         wrapper = SessionWrapper(acc, settings=settings)
         delay = await wrapper.jitter()

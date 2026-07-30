@@ -68,6 +68,15 @@ PYTHONPATH=. python -m tg_pool
 
 В боте: `/menu` → Add proxy → Add account (StringSession) → Activate → SpamBot / Ping.
 
+### Импорт TData (ZIP)
+
+1. `/menu` → **📦 Import TData ZIP** (или `/import_tdata`)
+2. Укажите sticky-прокси (`socks5://…` / id / `none`)
+3. Passcode TData или `none`
+4. Пришлите ZIP с папкой `tdata`
+
+Бот через `opentele` конвертирует сессию в `StringSession`, сохраняет organic Desktop fingerprint (`device_model` / `system_version` / `app_version`), проверяет аккаунт через прокси и пишет в БД со статусом `active`. Временные файлы удаляются в `finally`.
+
 ## Модули
 
 ```

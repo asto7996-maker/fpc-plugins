@@ -5,6 +5,7 @@ Capabilities
 ------------
 * Inline account list with live statuses
 * Add account (StringSession + optional proxy bind)
+* Import account from Telegram Desktop TData ZIP (opentele)
 * Add proxy
 * Enqueue SpamBot / ping tasks
 * AlertService integration (bound from main)
@@ -14,6 +15,8 @@ from __future__ import annotations
 
 import logging
 import re
+import tempfile
+from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
 
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
@@ -23,9 +26,19 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import CallbackQuery, Message, TelegramObject
 
-from tg_pool.admin.keyboards import account_actions_kb, accounts_kb, main_menu_kb
+from tg_pool.admin.keyboards import (
+    account_actions_kb,
+    accounts_kb,
+    main_menu_kb,
+    tdata_success_kb,
+)
+from tg_pool.clients.tdata_converter import (
+    TDataConversionError,
+    cleanup_tree,
+    convert_tdata_zip,
+)
 from tg_pool.config import Settings
-from tg_pool.db.models import AccountStatus, ProxyProtocol
+from tg_pool.db.models import AccountStatus, Proxy, ProxyProtocol
 from tg_pool.db.session import session_scope
 from tg_pool.queue.broker import PoolTask, RedisTaskBroker
 from tg_pool.services.account_service import AccountService
@@ -48,6 +61,12 @@ class AddAccountStates(StatesGroup):
 
 class AddProxyStates(StatesGroup):
     raw = State()
+
+
+class ImportTDataStates(StatesGroup):
+    proxy = State()
+    passcode = State()
+    archive = State()
 
 
 class AdminAccessMiddleware(BaseMiddleware):
@@ -84,7 +103,8 @@ def build_dispatcher(
     async def cmd_start(message: Message) -> None:
         await message.answer(
             "<b>TG Account Pool — Admin</b>\n"
-            "Управление юзерботами, прокси и очередью задач.",
+            "Управление юзерботами, прокси и очередью задач.\n"
+            "Импорт: 📦 <b>Import TData ZIP</b> или /import_tdata",
             parse_mode="HTML",
             reply_markup=main_menu_kb(),
         )
@@ -298,6 +318,184 @@ def build_dispatcher(
             parse_mode="HTML",
             reply_markup=main_menu_kb(),
         )
+
+    # ---- import TData ZIP ------------------------------------------------
+    async def _begin_tdata_import(message: Message, state: FSMContext) -> None:
+        await state.set_state(ImportTDataStates.proxy)
+        await message.answer(
+            "<b>Import TData</b>\n"
+            "Сначала укажите <b>постоянный</b> прокси для этой сессии:\n"
+            "• ID прокси из БД\n"
+            "• <code>socks5://user:pass@ip:port</code>\n"
+            "• <code>none</code> (не рекомендуется — высокий риск AuthKeyDuplicated)\n\n"
+            "Затем пришлите ZIP с папкой <code>tdata</code>.",
+            parse_mode="HTML",
+        )
+
+    @router.message(Command("import_tdata"))
+    async def cmd_import_tdata(message: Message, state: FSMContext) -> None:
+        await _begin_tdata_import(message, state)
+
+    @router.callback_query(F.data == "menu:add_tdata")
+    async def cb_add_tdata(callback: CallbackQuery, state: FSMContext) -> None:
+        await _begin_tdata_import(callback.message, state)  # type: ignore[arg-type]
+        await callback.answer()
+
+    @router.message(ImportTDataStates.proxy)
+    async def tdata_proxy(message: Message, state: FSMContext) -> None:
+        raw = (message.text or "").strip()
+        proxy_id: Optional[int] = None
+        proxy_dict: Optional[dict[str, Any]] = None
+
+        async with session_scope() as session:
+            svc = AccountService(session)
+            if raw.lower() == "none":
+                proxy_id = None
+                proxy_dict = None
+            elif raw.isdigit():
+                proxy = await session.get(Proxy, int(raw))
+                if proxy is None:
+                    await message.answer(f"Proxy #{raw} не найден.")
+                    return
+                proxy_id = proxy.id
+                proxy_dict = {
+                    "protocol": proxy.protocol.value,
+                    "ip": proxy.ip,
+                    "port": proxy.port,
+                    "username": proxy.username,
+                    "password": proxy.password,
+                }
+            else:
+                m = PROXY_RE.match(raw)
+                if not m:
+                    await message.answer(
+                        "Формат: socks5://user:pass@ip:port | <id> | none"
+                    )
+                    return
+                proxy = await svc.create_proxy(
+                    ip=m.group("ip"),
+                    port=int(m.group("port")),
+                    protocol=ProxyProtocol(m.group("proto").lower()),
+                    username=m.group("user"),
+                    password=m.group("password"),
+                )
+                proxy_id = proxy.id
+                proxy_dict = {
+                    "protocol": proxy.protocol.value,
+                    "ip": proxy.ip,
+                    "port": proxy.port,
+                    "username": proxy.username,
+                    "password": proxy.password,
+                }
+
+        await state.update_data(proxy_id=proxy_id, proxy_dict=proxy_dict)
+        await state.set_state(ImportTDataStates.passcode)
+        await message.answer(
+            "Локальный passcode TData (если есть) или отправьте <code>none</code>:",
+            parse_mode="HTML",
+        )
+
+    @router.message(ImportTDataStates.passcode)
+    async def tdata_passcode(message: Message, state: FSMContext) -> None:
+        raw = (message.text or "").strip()
+        passcode = None if raw.lower() in {"none", "-", ""} else raw
+        await state.update_data(passcode=passcode)
+        await state.set_state(ImportTDataStates.archive)
+        max_mb = settings.tdata_max_zip_bytes // (1024 * 1024)
+        await message.answer(
+            f"Пришлите <b>ZIP</b>-архив с папкой <code>tdata</code> "
+            f"(макс. {max_mb} МБ).",
+            parse_mode="HTML",
+        )
+
+    @router.message(ImportTDataStates.archive, F.document)
+    async def tdata_archive(message: Message, state: FSMContext, bot: Bot) -> None:
+        """
+        Receive ZIP → extract to temp dir → opentele convert → persist StringSession.
+
+        Temp files are always wiped in `finally`, even on FloodWait / ban / checksum errors.
+        """
+        doc = message.document
+        assert doc is not None
+
+        file_name = (doc.file_name or "").lower()
+        if not file_name.endswith(".zip"):
+            await message.answer("❌ Нужен файл с расширением <code>.zip</code>.", parse_mode="HTML")
+            return
+        if doc.file_size and doc.file_size > settings.tdata_max_zip_bytes:
+            await message.answer(
+                f"❌ ZIP слишком большой ({doc.file_size} bytes). "
+                f"Лимит: {settings.tdata_max_zip_bytes}."
+            )
+            return
+
+        data = await state.get_data()
+        proxy_id = data.get("proxy_id")
+        proxy_dict = data.get("proxy_dict")
+        passcode = data.get("passcode")
+
+        status_msg = await message.answer("⏳ Загружаю и конвертирую TData…")
+        tmp_root = Path(tempfile.mkdtemp(prefix="tg_pool_tdata_"))
+        zip_path = tmp_root / "upload.zip"
+
+        try:
+            # aiogram downloads the file into our temp path
+            await bot.download(doc, destination=zip_path)
+            if not zip_path.exists() or zip_path.stat().st_size == 0:
+                raise TDataConversionError("Не удалось скачать ZIP из Telegram.")
+
+            converted = await convert_tdata_zip(
+                zip_path,
+                work_dir=tmp_root,
+                proxy=proxy_dict,
+                passcode=passcode,
+                max_bytes=settings.tdata_max_zip_bytes,
+            )
+
+            async with session_scope() as session:
+                account = await AccountService(session).upsert_from_tdata(
+                    phone_number=converted.phone_number,
+                    session_string=converted.session_string,
+                    api_id=converted.api_id,
+                    api_hash=converted.api_hash,
+                    device_model=converted.device_model,
+                    system_version=converted.system_version,
+                    app_version=converted.app_version,
+                    lang_code=converted.lang_code,
+                    proxy_id=proxy_id,
+                    display_name=converted.display_name,
+                    telegram_user_id=converted.user_id,
+                    status=AccountStatus.active,
+                )
+                account_id = account.id
+
+            uname = f"@{converted.username}" if converted.username else converted.display_name
+            await status_msg.edit_text(
+                f"✅ Аккаунт {uname} ({converted.phone_number}) успешно добавлен из TData!\n"
+                f"id=#{account_id} · device=<code>{converted.device_model}</code> / "
+                f"<code>{converted.system_version}</code> / <code>{converted.app_version}</code>\n"
+                f"status: <b>active</b>",
+                parse_mode="HTML",
+                reply_markup=tdata_success_kb(account_id),
+            )
+            await state.clear()
+        except TDataConversionError as exc:
+            logger.warning("TData import failed: %s", exc)
+            await status_msg.edit_text(f"❌ Ошибка импорта TData:\n<code>{exc}</code>", parse_mode="HTML")
+            # Keep FSM on archive state so admin can re-upload another ZIP
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Unexpected TData import error")
+            await status_msg.edit_text(
+                f"❌ Непредвиденная ошибка:\n<code>{type(exc).__name__}: {exc}</code>",
+                parse_mode="HTML",
+            )
+        finally:
+            # CRITICAL: wipe tdata artifacts — only StringSession remains in DB
+            cleanup_tree(tmp_root)
+
+    @router.message(ImportTDataStates.archive)
+    async def tdata_archive_not_document(message: Message) -> None:
+        await message.answer("Пришлите именно ZIP-документ (как файл), не текстом.")
 
     # ---- add proxy FSM ---------------------------------------------------
     @router.callback_query(F.data == "menu:add_proxy")

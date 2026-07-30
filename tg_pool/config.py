@@ -43,6 +43,9 @@ class Settings:
     spambot_username: str
     spambot_timeout_sec: float
 
+    # TData ZIP import
+    tdata_max_zip_bytes: int
+
 
 def get_settings() -> Settings:
     admin_ids = tuple(
@@ -67,4 +70,7 @@ def get_settings() -> Settings:
         flood_alert_threshold_sec=int(os.getenv("FLOOD_ALERT_THRESHOLD_SEC", "300")),
         spambot_username=os.getenv("SPAMBOT_USERNAME", "SpamBot"),
         spambot_timeout_sec=float(os.getenv("SPAMBOT_TIMEOUT_SEC", "30")),
+        tdata_max_zip_bytes=int(
+            os.getenv("TDATA_MAX_ZIP_BYTES", str(50 * 1024 * 1024))
+        ),
     )

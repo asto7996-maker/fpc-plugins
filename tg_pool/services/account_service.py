@@ -87,19 +87,29 @@ class AccountService:
         api_hash: str,
         proxy_id: Optional[int] = None,
         status: AccountStatus = AccountStatus.paused,
+        device_model: Optional[str] = None,
+        system_version: Optional[str] = None,
+        app_version: Optional[str] = None,
+        lang_code: Optional[str] = None,
+        display_name: Optional[str] = None,
+        telegram_user_id: Optional[int] = None,
     ) -> Account:
+        # Prefer organic fingerprints from TData/opentele when provided;
+        # otherwise generate a stable random mobile profile.
         fp = generate_fingerprint()
         account = Account(
             phone_number=phone_number,
             session_string=session_string,
             api_id=api_id,
             api_hash=api_hash,
-            device_model=fp.device_model,
-            system_version=fp.system_version,
-            app_version=fp.app_version,
-            lang_code=fp.lang_code,
+            device_model=device_model or fp.device_model,
+            system_version=system_version or fp.system_version,
+            app_version=app_version or fp.app_version,
+            lang_code=lang_code or fp.lang_code,
             proxy_id=proxy_id,
             status=status,
+            display_name=display_name,
+            telegram_user_id=telegram_user_id,
             actions_day_key=datetime.now(timezone.utc).strftime("%Y-%m-%d"),
         )
         self.session.add(account)
@@ -114,9 +124,76 @@ class AccountService:
             "Created account #%s phone=%s device=%s",
             account.id,
             phone_number,
-            fp.device_model,
+            account.device_model,
         )
         return account
+
+    async def upsert_from_tdata(
+        self,
+        *,
+        phone_number: str,
+        session_string: str,
+        api_id: int,
+        api_hash: str,
+        device_model: str,
+        system_version: str,
+        app_version: str,
+        lang_code: str,
+        proxy_id: Optional[int],
+        display_name: Optional[str],
+        telegram_user_id: Optional[int],
+        status: AccountStatus = AccountStatus.active,
+    ) -> Account:
+        """Insert or refresh an account imported from TData ZIP."""
+        existing = (
+            await self.session.execute(
+                select(Account).where(Account.phone_number == phone_number)
+            )
+        ).scalar_one_or_none()
+
+        if existing is None and telegram_user_id is not None:
+            existing = (
+                await self.session.execute(
+                    select(Account).where(Account.telegram_user_id == telegram_user_id)
+                )
+            ).scalar_one_or_none()
+
+        if existing is None:
+            return await self.create_account(
+                phone_number=phone_number,
+                session_string=session_string,
+                api_id=api_id,
+                api_hash=api_hash,
+                proxy_id=proxy_id,
+                status=status,
+                device_model=device_model,
+                system_version=system_version,
+                app_version=app_version,
+                lang_code=lang_code,
+                display_name=display_name,
+                telegram_user_id=telegram_user_id,
+            )
+
+        existing.session_string = session_string
+        existing.api_id = api_id
+        existing.api_hash = api_hash
+        existing.device_model = device_model
+        existing.system_version = system_version
+        existing.app_version = app_version
+        existing.lang_code = lang_code
+        existing.status = status
+        existing.display_name = display_name
+        existing.telegram_user_id = telegram_user_id
+        existing.last_error = None
+        existing.flood_until = None
+        existing.is_spambot_restricted = False
+        if proxy_id is not None:
+            existing.proxy_id = proxy_id
+            proxy = await self.session.get(Proxy, proxy_id)
+            if proxy is not None:
+                proxy.assigned_account_id = existing.id
+        await self.session.flush()
+        return existing
 
     async def create_proxy(
         self,

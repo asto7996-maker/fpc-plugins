@@ -23,6 +23,12 @@ def main_menu_kb() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="➕ Add account", callback_data="menu:add_account"),
             ],
             [
+                InlineKeyboardButton(
+                    text="📦 Import TData ZIP",
+                    callback_data="menu:add_tdata",
+                ),
+            ],
+            [
                 InlineKeyboardButton(text="🛡 Proxies", callback_data="menu:proxies"),
                 InlineKeyboardButton(text="➕ Add proxy", callback_data="menu:add_proxy"),
             ],
@@ -32,6 +38,24 @@ def main_menu_kb() -> InlineKeyboardMarkup:
                     callback_data="menu:spambot_all",
                 ),
             ],
+        ]
+    )
+
+
+def tdata_success_kb(account_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="👤 Open account",
+                    callback_data=f"acc:{account_id}",
+                ),
+                InlineKeyboardButton(
+                    text="🧪 SpamBot",
+                    callback_data=f"accact:{account_id}:spambot",
+                ),
+            ],
+            [InlineKeyboardButton(text="🏠 Menu", callback_data="menu:home")],
         ]
     )
 
