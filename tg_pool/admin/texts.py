@@ -72,8 +72,8 @@ def help_text() -> str:
         "• /help — эта справка\n"
         "• /import_tdata — импорт TData ZIP\n\n"
         "<b>Как добавить аккаунт</b>\n"
-        "1) Добавьте SOCKS5/HTTP прокси\n"
-        "2) Импортируйте TData ZIP или StringSession\n"
+        "1) ➕ Добавить → 📦 TData ZIP (просто киньте архив)\n"
+        "2) Прокси бот найдёт сам из публичных списков\n"
         "3) Следите за статусом FloodWait / SpamBot\n\n"
         "<b>Gemini Draft Engine</b>\n"
         "• Включите Assistant на аккаунте\n"
@@ -180,14 +180,16 @@ def pending_drafts_text(drafts: Sequence[PendingDraft]) -> str:
 
 def proxies_text(proxies: Sequence[Proxy]) -> str:
     if not proxies:
-        return "🌐 <b>Прокси</b>\n\n<blockquote>Список пуст.</blockquote>"
-    lines = ["🌐 <b>Прокси</b>", ""]
-    for p in proxies:
+        return "<blockquote>Пул пуст — нажмите «🔍 Найти рабочие прокси».</blockquote>"
+    lines = ["<b>Текущий пул</b>", ""]
+    for p in proxies[:40]:
         lines.append(
             f"• <b>#{p.id}</b> <code>{p.protocol.value}://{h(p.ip)}:{p.port}</code>\n"
             f"  account={p.assigned_account_id or '—'} · "
             f"{'🟢 alive' if p.is_alive else '🔴 dead'}"
         )
+    if len(proxies) > 40:
+        lines.append(f"\n…и ещё {len(proxies) - 40}")
     return "\n".join(lines)
 
 

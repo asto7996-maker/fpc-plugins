@@ -5,8 +5,6 @@ from __future__ import annotations
 import logging
 import tempfile
 from pathlib import Path
-from typing import Any, Optional
-
 from aiogram import Bot, F, Router
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
@@ -24,7 +22,7 @@ from tg_pool.config import Settings
 from tg_pool.db.models import AccountStatus, Proxy
 from tg_pool.db.session import session_scope
 from tg_pool.services.account_service import AccountService
-from tg_pool.services.proxy_parse import ProxyParseError, parse_proxy_line
+from tg_pool.services.proxy_finder import ensure_working_proxy
 
 logger = logging.getLogger(__name__)
 
@@ -91,45 +89,12 @@ def build_add_account_router(settings: Settings) -> Router:
             api_id_s, api_hash = raw.split(":", 1)
             api_id, api_hash = int(api_id_s), api_hash.strip()
         await state.update_data(api_id=api_id, api_hash=api_hash)
-        await state.set_state(AddAccountStates.proxy)
-        await message.answer(
-            "Прокси: ID / <code>user:pass@ip:port</code> / "
-            "<code>socks5://…</code> / <code>none</code>",
-            parse_mode="HTML",
-        )
-
-    @router.message(AddAccountStates.proxy)
-    async def add_proxy_bind(message: Message, state: FSMContext) -> None:
-        raw = (message.text or "").strip()
         data = await state.get_data()
-        proxy_id: Optional[int] = None
-
+        wait = await message.answer("🔍 Подбираю рабочий прокси…")
         async with session_scope() as session:
-            svc = AccountService(session)
-            if raw.lower() == "none":
-                proxy_id = None
-            elif raw.isdigit():
-                proxy_id = int(raw)
-            else:
-                try:
-                    parsed = parse_proxy_line(raw)
-                except ProxyParseError:
-                    await message.answer(
-                        "❌ Формат: <code>user:pass@ip:port</code> | "
-                        "<code>socks5://…</code> | id | none",
-                        parse_mode="HTML",
-                    )
-                    return
-                proxy = await svc.get_or_create_proxy(
-                    ip=parsed.ip,
-                    port=parsed.port,
-                    protocol=parsed.protocol,
-                    username=parsed.username,
-                    password=parsed.password,
-                )
-                proxy_id = proxy.id
-
-            account = await svc.create_account(
+            proxy = await ensure_working_proxy(session)
+            proxy_id = proxy.id if proxy else None
+            account = await AccountService(session).create_account(
                 phone_number=data["phone"],
                 session_string=data["session_string"],
                 api_id=data["api_id"],
@@ -139,36 +104,34 @@ def build_add_account_router(settings: Settings) -> Router:
             )
             account_id = account.id
             device = account.device_model
-
-        await state.clear()
-        await message.answer(
-            f"✅ Аккаунт <b>#{account_id}</b> создан\n"
-            f"fingerprint: <code>{device}</code>\n"
-            f"Статус: <b>paused</b> — активируйте в списке.",
-            parse_mode="HTML",
-            reply_markup=main_menu_kb(),
-        )
-
-    # ---- TData ZIP flow (one-shot: ZIP only, random proxy from pool) -----
-    async def _begin_tdata(message: Message, state: FSMContext) -> None:
-        async with session_scope() as session:
-            proxy = await AccountService(session).pick_random_proxy()
-        if proxy is None:
-            await message.answer(
-                "📦 <b>Import TData</b>\n\n"
-                "❌ В пуле нет прокси. Сначала добавьте хотя бы один в "
-                "🌐 Прокси, затем снова загрузите TData.",
-                parse_mode="HTML",
+            proxy_label = (
+                f"{proxy.protocol.value}://{proxy.ip}:{proxy.port}" if proxy else "—"
             )
-            await state.clear()
-            return
+        await state.clear()
+        try:
+            await wait.edit_text(
+                f"✅ Аккаунт <b>#{account_id}</b> создан\n"
+                f"fingerprint: <code>{device}</code>\n"
+                f"proxy: <code>{proxy_label}</code>\n"
+                f"Статус: <b>paused</b> — активируйте в списке.",
+                parse_mode="HTML",
+                reply_markup=main_menu_kb(),
+            )
+        except Exception:  # noqa: BLE001
+            await message.answer(
+                f"✅ Аккаунт <b>#{account_id}</b> создан",
+                parse_mode="HTML",
+                reply_markup=main_menu_kb(),
+            )
 
+    # ---- TData ZIP flow (ZIP only; auto-find working public proxy) -----
+    async def _begin_tdata(message: Message, state: FSMContext) -> None:
         await state.set_state(ImportTDataStates.archive)
         max_mb = settings.tdata_max_zip_bytes // (1024 * 1024)
         await message.answer(
             "📦 <b>Import TData</b>\n\n"
             "<blockquote>Просто пришлите ZIP с папкой <code>tdata</code>.\n"
-            "Прокси подставится случайно из уже добавленных.</blockquote>\n\n"
+            "Рабочий прокси бот найдёт сам из публичных списков.</blockquote>\n\n"
             f"Макс. размер: <b>{max_mb} МБ</b>",
             parse_mode="HTML",
         )
@@ -212,74 +175,116 @@ def build_add_account_router(settings: Settings) -> Router:
             await message.answer("❌ ZIP слишком большой.")
             return
 
-        # Auto-pick a random already-added proxy
-        async with session_scope() as session:
-            proxy = await AccountService(session).pick_random_proxy()
-            if proxy is None:
-                await message.answer(
-                    "❌ Нет доступных прокси в пуле. Добавьте прокси и повторите.",
-                )
-                return
-            proxy_id = proxy.id
-            proxy_dict = {
-                "protocol": proxy.protocol.value,
-                "ip": proxy.ip,
-                "port": proxy.port,
-                "username": proxy.username,
-                "password": proxy.password,
-            }
-            proxy_label = f"#{proxy_id} {proxy.ip}:{proxy.port}"
-
         status_msg = await message.answer(
-            f"⏳ Прокси: <code>{proxy_label}</code>\n"
-            "Конвертирую TData через <b>opentele</b>…",
+            "🔍 Ищу рабочий прокси (проверка Telegram DC)…",
             parse_mode="HTML",
         )
         tmp_root = Path(tempfile.mkdtemp(prefix="tg_pool_tdata_"))
         zip_path = tmp_root / "upload.zip"
+        tried_proxy_ids: set[int] = set()
 
         try:
             await bot.download(doc, destination=zip_path)
-            converted = await convert_tdata_zip(
-                zip_path,
-                work_dir=tmp_root,
-                proxy=proxy_dict,
-                passcode=None,
-                max_bytes=settings.tdata_max_zip_bytes,
-            )
-            async with session_scope() as session:
-                account = await AccountService(session).upsert_from_tdata(
-                    phone_number=converted.phone_number,
-                    session_string=converted.session_string,
-                    api_id=converted.api_id,
-                    api_hash=converted.api_hash,
-                    device_model=converted.device_model,
-                    system_version=converted.system_version,
-                    app_version=converted.app_version,
-                    lang_code=converted.lang_code,
-                    proxy_id=proxy_id,
-                    display_name=converted.display_name,
-                    telegram_user_id=converted.user_id,
-                    status=AccountStatus.active,
-                )
-                account_id = account.id
 
-            uname = f"@{converted.username}" if converted.username else converted.display_name
+            last_err: Exception | None = None
+            for attempt in range(1, 4):
+                async with session_scope() as session:
+                    proxy = await ensure_working_proxy(session)
+                    if proxy is None:
+                        await status_msg.edit_text(
+                            "❌ Не удалось найти рабочий прокси до Telegram.\n"
+                            "Попробуйте позже или нажмите 🌐 Прокси → 🔍 Найти.",
+                        )
+                        return
+                    if proxy.id in tried_proxy_ids:
+                        proxy.is_alive = False
+                        await session.flush()
+                        # force another public scan on next loop
+                        continue
+                    tried_proxy_ids.add(proxy.id)
+                    proxy_id = proxy.id
+                    proxy_dict = {
+                        "protocol": proxy.protocol.value,
+                        "ip": proxy.ip,
+                        "port": proxy.port,
+                        "username": proxy.username,
+                        "password": proxy.password,
+                    }
+                    proxy_label = (
+                        f"#{proxy_id} {proxy.protocol.value}://{proxy.ip}:{proxy.port}"
+                    )
+
+                await status_msg.edit_text(
+                    f"✅ Прокси: <code>{proxy_label}</code> (попытка {attempt}/3)\n"
+                    "⏳ Конвертирую TData…",
+                    parse_mode="HTML",
+                )
+                try:
+                    converted = await convert_tdata_zip(
+                        zip_path,
+                        work_dir=tmp_root,
+                        proxy=proxy_dict,
+                        passcode=None,
+                        max_bytes=settings.tdata_max_zip_bytes,
+                    )
+                    async with session_scope() as session:
+                        account = await AccountService(session).upsert_from_tdata(
+                            phone_number=converted.phone_number,
+                            session_string=converted.session_string,
+                            api_id=converted.api_id,
+                            api_hash=converted.api_hash,
+                            device_model=converted.device_model,
+                            system_version=converted.system_version,
+                            app_version=converted.app_version,
+                            lang_code=converted.lang_code,
+                            proxy_id=proxy_id,
+                            display_name=converted.display_name,
+                            telegram_user_id=converted.user_id,
+                            status=AccountStatus.active,
+                        )
+                        account_id = account.id
+
+                    uname = (
+                        f"@{converted.username}"
+                        if converted.username
+                        else converted.display_name
+                    )
+                    await status_msg.edit_text(
+                        f"✅ Аккаунт <b>{uname}</b> (<code>{converted.phone_number}</code>) "
+                        f"успешно добавлен из TData!\n\n"
+                        f"id=<b>#{account_id}</b>\n"
+                        f"proxy: <code>{proxy_label}</code>\n"
+                        f"device: <code>{converted.device_model}</code> / "
+                        f"<code>{converted.system_version}</code>\n"
+                        f"status: <b>active</b>",
+                        parse_mode="HTML",
+                        reply_markup=tdata_success_kb(account_id),
+                    )
+                    await state.clear()
+                    return
+                except TDataConversionError as exc:
+                    last_err = exc
+                    msg = str(exc).lower()
+                    if "прокси" in msg or "proxy" in msg or "connection" in msg:
+                        async with session_scope() as session:
+                            dead = await session.get(Proxy, proxy_id)
+                            if dead is not None:
+                                dead.is_alive = False
+                        await status_msg.edit_text(
+                            f"⚠️ Прокси не подошёл: <code>{exc}</code>\n"
+                            "Пробую другой…",
+                            parse_mode="HTML",
+                        )
+                        continue
+                    await status_msg.edit_text(
+                        f"❌ <b>Ошибка импорта TData</b>\n<blockquote>{exc}</blockquote>",
+                        parse_mode="HTML",
+                    )
+                    return
+
             await status_msg.edit_text(
-                f"✅ Аккаунт <b>{uname}</b> (<code>{converted.phone_number}</code>) "
-                f"успешно добавлен из TData!\n\n"
-                f"id=<b>#{account_id}</b>\n"
-                f"proxy: <code>{proxy_label}</code>\n"
-                f"device: <code>{converted.device_model}</code> / "
-                f"<code>{converted.system_version}</code>\n"
-                f"status: <b>active</b>",
-                parse_mode="HTML",
-                reply_markup=tdata_success_kb(account_id),
-            )
-            await state.clear()
-        except TDataConversionError as exc:
-            await status_msg.edit_text(
-                f"❌ <b>Ошибка импорта TData</b>\n<blockquote>{exc}</blockquote>",
+                "❌ Не удалось импортировать: все подобранные прокси не подключились.\n"
+                f"<blockquote>{last_err}</blockquote>",
                 parse_mode="HTML",
             )
         except Exception as exc:  # noqa: BLE001

@@ -134,7 +134,8 @@ def drafts_settings_kb(settings) -> InlineKeyboardMarkup:
 def proxies_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [_btn("➕ Добавить прокси", "proxy:add")],
+            [_btn("🔍 Найти рабочие прокси", "proxy:refresh")],
+            [_btn("🗑 Очистить пул", "proxy:wipe")],
             nav_row(_btn("🏠 Меню", "menu:home")),
         ]
     )

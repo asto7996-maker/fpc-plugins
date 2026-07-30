@@ -23,7 +23,6 @@ from tg_pool.db.session import session_scope
 _REPLY_HOME = {"🏠 Меню", "Меню"}
 _REPLY_ACCOUNTS = {"🚀 Аккаунты", "Аккаунты"}
 _REPLY_ADD = {"➕ Добавить", "Добавить"}
-_REPLY_PROXIES = {"🌐 Прокси", "Прокси"}
 _REPLY_GEMINI = {"🤖 Gemini", "Gemini"}
 _REPLY_STATS = {"📊 Статистика", "Статистика"}
 _REPLY_PROFILE = {"👤 Профиль", "Профиль"}
@@ -92,21 +91,6 @@ def build_menu_router(settings: Settings) -> Router:
             "➕ <b>Добавить аккаунт</b>\n\nВыберите способ импорта:",
             parse_mode="HTML",
             reply_markup=add_account_kb(),
-        )
-
-    @router.message(F.text.in_(_REPLY_PROXIES))
-    async def reply_proxies(message: Message) -> None:
-        from tg_pool.admin.keyboards import proxies_kb
-        from tg_pool.admin.texts import proxies_text
-
-        async with session_scope() as session:
-            proxies = list(
-                (await session.execute(select(Proxy).order_by(Proxy.id))).scalars().all()
-            )
-        await message.answer(
-            proxies_text(proxies),
-            parse_mode="HTML",
-            reply_markup=proxies_kb(),
         )
 
     @router.message(F.text.in_(_REPLY_STATS))
