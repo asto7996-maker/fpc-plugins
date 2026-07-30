@@ -55,6 +55,8 @@ REASON_ERROR = "error"
 
 # Долгий FloodWait не «пересиживаем» внутри цикла — отдаём планировщику
 FLOOD_INLINE_LIMIT = 90
+# Суммарный лимит ожидания flood внутри одного цикла
+FLOOD_BUDGET = 300
 # Предохранитель от бесконечного цикла при странных ответах API
 MAX_STEPS_PER_CYCLE = 600
 # Сетевые сбои внутри одного поста
@@ -657,6 +659,7 @@ class ChannelPoster:
         published = 0
         errors = 0
         steps = 0
+        flood_slept = 0.0
         pending: list[int] = []
         result = CycleResult(latest_id=latest, progress_id=progress)
         self._seen_grouped.clear()
@@ -731,12 +734,15 @@ class ChannelPoster:
                 )
             except FloodWait as e:
                 wait = float(getattr(e, "value", 0) or 0)
-                if wait > FLOOD_INLINE_LIMIT:
+                # Короткие ожидания пересиживаем, длинные (и сумму долгих
+                # коротких) отдаём планировщику — цикл не должен висеть
+                if wait > FLOOD_INLINE_LIMIT or flood_slept + wait > FLOOD_BUDGET:
                     logger.warning("FloodWait %.0fs — отдаём планировщику", wait)
                     result.reason = REASON_FLOOD
                     result.flood_seconds = wait
                     break
                 logger.warning("FloodWait %.0fs", wait)
+                flood_slept += wait
                 await asyncio.sleep(wait + 1)
                 if self._abort_cycle or my_gen != self._cycle_gen:
                     result.reason = REASON_ABORTED
@@ -867,7 +873,7 @@ class ChannelPoster:
                 return "skip"
             return await self._publish_album(source, target, msg, caption)
 
-        if _is_media(msg) or (msg.text or msg.caption):
+        if _is_media(msg) or msg.sticker or (msg.text or msg.caption):
             return await self._publish_single(target, msg, caption)
 
         if _is_unsupported_media(msg):
@@ -877,7 +883,15 @@ class ChannelPoster:
 
     async def _publish_single(self, target, msg: Message, caption: str) -> str:
         try:
-            if _is_media(msg):
+            if msg.sticker:
+                # У стикера не бывает подписи — копируем как есть, чтобы
+                # не терять контент источника
+                sent = await self.client.copy_message(
+                    chat_id=target,
+                    from_chat_id=msg.chat.id,
+                    message_id=msg.id,
+                )
+            elif _is_media(msg):
                 try:
                     sent = await self.client.copy_message(
                         chat_id=target,

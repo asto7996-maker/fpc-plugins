@@ -13,7 +13,7 @@ from __future__ import annotations
 from typing import Any, Iterable, Optional
 
 from pyrogram.enums import ChatType
-from pyrogram.types import Chat, Message, Photo
+from pyrogram.types import Chat, Message, Photo, Sticker
 
 SOURCE_ID = -1001000000001
 TARGET_ID = -1001000000002
@@ -49,6 +49,18 @@ def photo_message(
         caption=caption,
         media_group_id=group,
     )
+
+
+def sticker_message(message_id: int, chat_id: int = SOURCE_ID) -> Message:
+    sticker = Sticker(
+        file_id=f"sticker_{message_id}",
+        file_unique_id=f"su_{message_id}",
+        width=512,
+        height=512,
+        is_animated=False,
+        is_video=False,
+    )
+    return Message(id=message_id, chat=make_chat(chat_id), sticker=sticker)
 
 
 class FakeClient:
@@ -142,11 +154,17 @@ class FakeClient:
         parse_mode: Any = None,
     ):
         self._raise_if_needed()
-        self.published.append(
-            {"kind": "copy", "source_id": message_id, "caption": caption}
-        )
         source = self.messages[message_id]
-        return self._new_target_message(photo=source.photo, caption=caption)
+        self.published.append(
+            {
+                "kind": "sticker" if source.sticker else "copy",
+                "source_id": message_id,
+                "caption": caption,
+            }
+        )
+        return self._new_target_message(
+            photo=source.photo, sticker=source.sticker, caption=caption
+        )
 
     async def copy_media_group(
         self,

@@ -343,7 +343,8 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
         "2️⃣ Источник + назначение\n"
         "3️⃣ Ссылка на пост или «С начала»\n"
         "4️⃣ Описание → ⏱ Интервал → ▶️ Старт\n\n"
-        "Команды: /status /run /pause /run_now /test /reconnect /login\n\n"
+        "Команды: /status /run /pause /run_now /test\n"
+        "/interval 2ч · /limit 5 · /reconnect · /login\n\n"
         + status_text(db),
         reply_markup=main_kb(db),
         parse_mode="HTML",
@@ -418,6 +419,65 @@ async def cmd_pause(message: Message) -> None:
         return
     _require_db().set_running(False)
     await message.answer("⏸ Пауза.", reply_markup=main_kb(), parse_mode="HTML")
+
+
+@router.message(Command("interval"))
+async def cmd_interval(message: Message, state: FSMContext) -> None:
+    """/interval 2ч — быстро, без кнопок."""
+    if await _deny(message.from_user.id if message.from_user else None, message.answer):
+        return
+    raw = (message.text or "").partition(" ")[2].strip()
+    db = _require_db()
+    if not raw:
+        await _ask_interval(message.answer, state)
+        return
+    try:
+        seconds = parse_duration(raw)
+        db.set_interval_seconds(seconds)
+    except ValueError as e:
+        await message.answer(f"❌ {e}", reply_markup=interval_kb())
+        return
+    await state.clear()
+    db.run_asap()
+    await message.answer(
+        f"✅ Интервал: <b>{humanize_duration(seconds)}</b>\n{_interval_note(db, seconds)}",
+        reply_markup=main_kb(db),
+        parse_mode="HTML",
+    )
+
+
+@router.message(Command("limit"))
+async def cmd_limit(message: Message, state: FSMContext) -> None:
+    """/limit 5 — публикаций за цикл."""
+    if await _deny(message.from_user.id if message.from_user else None, message.answer):
+        return
+    raw = (message.text or "").partition(" ")[2].strip()
+    if not raw:
+        await state.set_state(S.limit)
+        await message.answer(
+            "📦 Сколько <b>публикаций</b> за один цикл?\n"
+            "<i>Альбом = 1 публикация.</i>",
+            reply_markup=cancel_kb(),
+            parse_mode="HTML",
+        )
+        return
+    db = _require_db()
+    try:
+        count = int(raw)
+        if count < 1 or count > 100:
+            raise ValueError("нужно целое число от 1 до 100")
+        db.set_posts_per_cycle(count)
+    except ValueError as e:
+        await message.answer(f"❌ {e}")
+        return
+    await state.clear()
+    s = db.get_settings()
+    await message.answer(
+        f"✅ Лимит: <b>{count}</b> публикаций каждые "
+        f"<b>{humanize_duration(s.interval_seconds)}</b>",
+        reply_markup=main_kb(db),
+        parse_mode="HTML",
+    )
 
 
 @router.message(Command("reconnect"))
@@ -555,14 +615,10 @@ async def cb_caption(c: CallbackQuery, state: FSMContext) -> None:
     )
 
 
-@router.callback_query(F.data == "a:interval")
-async def cb_interval(c: CallbackQuery, state: FSMContext) -> None:
-    if await _deny_cb(c):
-        return
-    await _ack(c)
+async def _ask_interval(answer: Callable, state: FSMContext) -> None:
     await state.set_state(S.interval)
     s = _require_db().get_settings()
-    await c.message.answer(  # type: ignore
+    await answer(
         f"⏱ <b>Интервал между циклами</b>\n"
         f"Сейчас: <b>{humanize_duration(s.interval_seconds)}</b>\n\n"
         "Выберите кнопкой или напишите своё:\n"
@@ -572,6 +628,14 @@ async def cb_interval(c: CallbackQuery, state: FSMContext) -> None:
         reply_markup=interval_kb(),
         parse_mode="HTML",
     )
+
+
+@router.callback_query(F.data == "a:interval")
+async def cb_interval(c: CallbackQuery, state: FSMContext) -> None:
+    if await _deny_cb(c):
+        return
+    await _ack(c)
+    await _ask_interval(c.message.answer, state)  # type: ignore
 
 
 @router.callback_query(F.data.startswith("a:iv:"))

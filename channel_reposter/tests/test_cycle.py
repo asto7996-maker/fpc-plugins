@@ -24,6 +24,7 @@ from fake_client import (  # noqa: E402
     TARGET_ID,
     FakeClient,
     photo_message,
+    sticker_message,
     text_message,
 )
 from poster import (  # noqa: E402
@@ -142,6 +143,17 @@ class BasicCycleTests(CycleTestCase):
         self.run_cycle(client, limit=1)
         self.assertEqual(client.published[0]["text"], "5 &lt; 7 &amp; 8 &gt; 2")
 
+    def test_sticker_is_copied(self) -> None:
+        """Стикеры не теряются, хотя подписи у них не бывает."""
+        self.db.set_caption("<b>подпись</b>")
+        client = FakeClient([sticker_message(1), text_message(2, "далее")])
+        result, _ = self.run_cycle(client, limit=2)
+
+        self.assertEqual(result.published, 2)
+        self.assertEqual(client.published[0]["kind"], "sticker")
+        self.assertIsNone(client.published[0]["caption"])
+        self.assertEqual(self.db.get_progress_id(), 2)
+
     def test_template_not_duplicated(self) -> None:
         self.db.set_caption("подпись")
         client = FakeClient([text_message(1, "текст и подпись")])
@@ -248,6 +260,18 @@ class FailureTests(CycleTestCase):
         self.assertEqual(result.reason, REASON_FLOOD)
         self.assertEqual(result.flood_seconds, 900.0)
         self.assertEqual(client.published, [])
+
+    def test_flood_budget_hands_cycle_back(self) -> None:
+        """Череда коротких flood не должна держать цикл вечно."""
+        client = FakeClient([text_message(i) for i in range(1, 6)])
+        client.fail_always = FloodWait(value=1)
+        original = poster_module.FLOOD_BUDGET
+        poster_module.FLOOD_BUDGET = 1
+        self.addCleanup(setattr, poster_module, "FLOOD_BUDGET", original)
+
+        result, _ = self.run_cycle(client, limit=5)
+        self.assertEqual(result.reason, REASON_FLOOD)
+        self.assertEqual(result.published, 0)
 
     def test_short_flood_retries_same_post(self) -> None:
         client = FakeClient([text_message(1, "post 1")])
