@@ -1,0 +1,413 @@
+From 401dfa95b3e946707f1ea988e5cbd8077936cf07 Mon Sep 17 00:00:00 2001
+From: cursor <cursor@example.com>
+Date: Thu, 30 Jul 2026 13:29:13 +0000
+Subject: [PATCH] perf(subscription): stop per-frame repaints that make the
+ route stutter under the finger
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The Подписка route runs two `.hover-border-gradient` elements at once (the
+connect-device CTA and the purchase CTA). Their rotation animates
+`--border-angle`, a registered custom property feeding a conic-gradient, so
+Chromium cannot composite it: every frame repaints the element's whole
+background and re-rasters the scroll tiles underneath. Over 6s of synthetic
+touch scrolling at 6x CPU throttle that is ~2100ms of main-thread render work
+(Paint ~330ms, RasterTask ~1250ms, style recalc ~380ms); freezing the angle on
+touch/small screens brings it to ~30ms (0 / 0.2 / 10). The border keeps the
+accent sheen it shows in any single frame of the rotation, and desktop keeps
+the motion — the same trade the cabinet already makes for backdrop-blur below
+1024px. `animate-unlimited-flow` animates `background-position`, also
+paint-only, and gets the same treatment.
+
+Second source of hitching: the traffic-refresh (30s) and reissue (15min)
+cooldowns were decrementing counters held by the page component, so the whole
+2100-line route re-rendered once a second for the entire cooldown. They are
+now epoch-ms deadlines, with the per-second tick moved into the memoised leaf
+that displays it. Memoising the glass-colour object restores the memo on
+<CountdownTimer>, which a fresh object every render had been defeating.
+---
+ src/pages/Subscription.tsx | 248 ++++++++++++++++++++++---------------
+ src/styles/globals.css     |  24 ++++
+ 2 files changed, 173 insertions(+), 99 deletions(-)
+
+diff --git a/src/pages/Subscription.tsx b/src/pages/Subscription.tsx
+index 1528b21..257e375 100644
+--- a/src/pages/Subscription.tsx
++++ b/src/pages/Subscription.tsx
+@@ -56,6 +56,119 @@ import { TrafficTopupSheet } from '../components/subscription/sheets/TrafficTopu
+ import { ServerManagementSheet } from '../components/subscription/sheets/ServerManagementSheet';
+ import { DeleteSubscriptionSheet } from '../components/subscription/sheets/DeleteSubscriptionSheet';
+ 
++/** Remnawave rate-limits reissue; the button stays disabled this long. */
++const REVOKE_COOLDOWN_MS = 15 * 60 * 1000;
++/** Traffic counters are only re-read from the panel this often. */
++const TRAFFIC_CACHE_MS = 30 * 1000;
++
++/**
++ * Whole seconds left until `deadline` (epoch ms), ticking once a second.
++ *
++ * Cooldowns are held as a deadline rather than a decrementing counter so the
++ * ticking state can live in a leaf: the traffic cooldown runs for 30s and the
++ * reissue cooldown for 15 minutes, and a counter in the page component would
++ * re-render this whole route once a second for that entire window — a commit
++ * that lands mid-scroll and drops the frame.
++ */
++function useSecondsUntil(deadline: number | null): number {
++  const read = () => (deadline ? Math.max(0, Math.ceil((deadline - Date.now()) / 1000)) : 0);
++  const [left, setLeft] = useState(read);
++
++  useEffect(() => {
++    setLeft(read());
++    if (!deadline || read() <= 0) return;
++    const id = setInterval(() => {
++      const next = read();
++      setLeft(next);
++      if (next <= 0) clearInterval(id);
++    }, 1000);
++    return () => clearInterval(id);
++    // eslint-disable-next-line react-hooks/exhaustive-deps
++  }, [deadline]);
++
++  return left;
++}
++
++/** Isolated cooldown so the 1s tick doesn't re-render the whole page */
++const TrafficRefreshButton = memo(function TrafficRefreshButton({
++  cooldownUntil,
++  isPending,
++  onRefresh,
++}: {
++  cooldownUntil: number | null;
++  isPending: boolean;
++  onRefresh: () => void;
++}) {
++  const { t } = useTranslation();
++  const cooldown = useSecondsUntil(cooldownUntil);
++
++  return (
++    <button
++      onClick={onRefresh}
++      disabled={isPending || cooldown > 0}
++      className="flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-medium text-dark-50/30 transition-colors hover:bg-dark-50/[0.05] hover:text-dark-50/50 disabled:cursor-not-allowed disabled:opacity-50"
++    >
++      <RefreshIcon className="h-3 w-3" spinning={isPending} />
++      {cooldown > 0 ? `${cooldown}s` : t('common.refresh')}
++    </button>
++  );
++});
++
++/** Isolated cooldown so the 15-minute tick doesn't re-render the whole page */
++const RevokeButton = memo(function RevokeButton({
++  cooldownUntil,
++  isPending,
++  onRevoke,
++}: {
++  cooldownUntil: number | null;
++  isPending: boolean;
++  onRevoke: () => void;
++}) {
++  const { t } = useTranslation();
++  const cooldown = useSecondsUntil(cooldownUntil);
++
++  return (
++    <button
++      onClick={onRevoke}
++      disabled={isPending || cooldown > 0}
++      className="w-full rounded-xl border border-warning-500/30 bg-warning-500/10 p-4 text-left transition-colors hover:bg-warning-500/20 disabled:opacity-50"
++    >
++      <div className="flex items-center justify-between">
++        <div>
++          <div className="font-medium text-warning-400">{t('subscription.revoke.button')}</div>
++          <div className="mt-1 text-sm text-dark-400">
++            {cooldown > 0
++              ? t('subscription.revoke.cooldown', {
++                  minutes: Math.floor(cooldown / 60),
++                  seconds: cooldown % 60,
++                })
++              : t('subscription.revoke.description')}
++          </div>
++        </div>
++        <div className="text-warning-400">
++          {isPending ? (
++            <div className="h-5 w-5 animate-spin rounded-full border-2 border-warning-400/30 border-t-amber-400" />
++          ) : (
++            <svg
++              className="h-5 w-5"
++              fill="none"
++              viewBox="0 0 24 24"
++              stroke="currentColor"
++              strokeWidth={1.5}
++            >
++              <path
++                strokeLinecap="round"
++                strokeLinejoin="round"
++                d="M16.023 9.348h4.992v-.001M2.985 19.644v-4.992m0 0h4.992m-4.993 0 3.181 3.183a8.25 8.25 0 0 0 13.803-3.7M4.031 9.865a8.25 8.25 0 0 1 13.803-3.7l3.181 3.182"
++              />
++            </svg>
++          )}
++        </div>
++      </div>
++    </button>
++  );
++});
++
+ /** Isolated countdown so 1s interval doesn't re-render the whole page */
+ const CountdownTimer = memo(function CountdownTimer({
+   endDate,
+@@ -206,7 +319,9 @@ export default function Subscription() {
+   const { subscriptionId: subIdParam } = useParams<{ subscriptionId?: string }>();
+   const subscriptionId = subIdParam ? parseInt(subIdParam, 10) : undefined;
+   const { isDark } = useTheme();
+-  const g = getGlassColors(isDark);
++  // Stable identity keeps <CountdownTimer>'s memo effective — a fresh object
++  // every render made the memoised clock re-render with its parent.
++  const g = useMemo(() => getGlassColors(isDark), [isDark]);
+   const haptic = useHaptic();
+   const { openLink, platform } = usePlatform();
+   const { showToast } = useToast();
+@@ -230,11 +345,11 @@ export default function Subscription() {
+   const [showServerManagement, setShowServerManagement] = useState(false);
+   const [selectedServersToUpdate, setSelectedServersToUpdate] = useState<string[]>([]);
+ 
+-  // Traffic refresh state
+-  const [trafficRefreshCooldown, setTrafficRefreshCooldown] = useState(0);
+-
+-  // Revoke (reissue) cooldown state
+-  const [revokeCooldown, setRevokeCooldown] = useState(0);
++  // Cooldowns are epoch-ms deadlines, not counters: the per-second tick then
++  // belongs to the leaf that shows it (see useSecondsUntil) instead of
++  // re-rendering this route once a second.
++  const [trafficCooldownUntil, setTrafficCooldownUntil] = useState<number | null>(null);
++  const [revokeCooldownUntil, setRevokeCooldownUntil] = useState<number | null>(null);
+   const [trafficData, setTrafficData] = useState<{
+     traffic_used_gb: number;
+     traffic_used_percent: number;
+@@ -550,11 +665,9 @@ export default function Subscription() {
+         `traffic_refresh_ts_${subscriptionId ?? 'default'}`,
+         Date.now().toString(),
+       );
+-      if (data.rate_limited && data.retry_after_seconds) {
+-        setTrafficRefreshCooldown(data.retry_after_seconds);
+-      } else {
+-        setTrafficRefreshCooldown(30);
+-      }
++      const cooldownSeconds =
++        data.rate_limited && data.retry_after_seconds ? data.retry_after_seconds : 30;
++      setTrafficCooldownUntil(Date.now() + cooldownSeconds * 1000);
+       queryClient.invalidateQueries({ queryKey: ['subscription', subscriptionId] });
+     },
+     onError: (error: {
+@@ -562,7 +675,8 @@ export default function Subscription() {
+     }) => {
+       if (error.response?.status === 429) {
+         const retryAfter = error.response.headers?.get?.('Retry-After');
+-        setTrafficRefreshCooldown(retryAfter ? parseInt(retryAfter, 10) : 30);
++        const seconds = retryAfter ? parseInt(retryAfter, 10) : 30;
++        setTrafficCooldownUntil(Date.now() + seconds * 1000);
+       }
+     },
+   });
+@@ -570,34 +684,12 @@ export default function Subscription() {
+   // Track if we've already triggered auto-refresh this session
+   const hasAutoRefreshed = useRef(false);
+ 
+-  // Cooldown timer for traffic refresh
+-  useEffect(() => {
+-    if (trafficRefreshCooldown <= 0) return;
+-    const timer = setInterval(() => {
+-      setTrafficRefreshCooldown((prev) => Math.max(0, prev - 1));
+-    }, 1000);
+-    return () => clearInterval(timer);
+-  }, [trafficRefreshCooldown]);
+-
+   // Initialize revoke cooldown from localStorage on mount
+   useEffect(() => {
+     const ts = localStorage.getItem(`revoke_ts_${subscriptionId ?? 'default'}`);
+-    if (ts) {
+-      const elapsed = Math.floor((Date.now() - parseInt(ts, 10)) / 1000);
+-      const remaining = Math.max(0, 900 - elapsed);
+-      setRevokeCooldown(remaining);
+-    }
++    setRevokeCooldownUntil(ts ? parseInt(ts, 10) + REVOKE_COOLDOWN_MS : null);
+   }, [subscriptionId]);
+ 
+-  // Countdown timer for revoke cooldown
+-  useEffect(() => {
+-    if (revokeCooldown <= 0) return;
+-    const timer = setInterval(() => {
+-      setRevokeCooldown((prev) => Math.max(0, prev - 1));
+-    }, 1000);
+-    return () => clearInterval(timer);
+-  }, [revokeCooldown]);
+-
+   // Revoke (reissue) subscription mutation
+   const revokeMutation = useMutation({
+     mutationFn: () => subscriptionApi.revokeSubscription(subscriptionId),
+@@ -609,8 +701,9 @@ export default function Subscription() {
+       // re-reads the now-empty device list instead of showing the stale cache.
+       queryClient.invalidateQueries({ queryKey: ['devices', subscriptionId] });
+       haptic.notification('success');
+-      localStorage.setItem(`revoke_ts_${subscriptionId ?? 'default'}`, Date.now().toString());
+-      setRevokeCooldown(900);
++      const now = Date.now();
++      localStorage.setItem(`revoke_ts_${subscriptionId ?? 'default'}`, now.toString());
++      setRevokeCooldownUntil(now + REVOKE_COOLDOWN_MS);
+     },
+     onError: () => {
+       haptic.notification('error');
+@@ -625,14 +718,9 @@ export default function Subscription() {
+ 
+     const lastRefresh = localStorage.getItem(`traffic_refresh_ts_${subscriptionId ?? 'default'}`);
+     const now = Date.now();
+-    const cacheMs = 30 * 1000;
+ 
+-    if (lastRefresh && now - parseInt(lastRefresh, 10) < cacheMs) {
+-      const elapsed = now - parseInt(lastRefresh, 10);
+-      const remaining = Math.ceil((cacheMs - elapsed) / 1000);
+-      if (remaining > 0) {
+-        setTrafficRefreshCooldown(remaining);
+-      }
++    if (lastRefresh && now - parseInt(lastRefresh, 10) < TRAFFIC_CACHE_MS) {
++      setTrafficCooldownUntil(parseInt(lastRefresh, 10) + TRAFFIC_CACHE_MS);
+       return;
+     }
+ 
+@@ -647,7 +735,12 @@ export default function Subscription() {
+     }
+   };
+ 
+-  const handleRevoke = async () => {
++  // Stable identities so the memoised cooldown buttons stay memoised.
++  const handleRefreshTraffic = useCallback(() => {
++    refreshTrafficMutation.mutate();
++  }, [refreshTrafficMutation]);
++
++  const handleRevoke = useCallback(async () => {
+     const confirmed = await destructiveConfirm(
+       t('subscription.revoke.warning'),
+       t('subscription.revoke.confirmBtn'),
+@@ -655,7 +748,7 @@ export default function Subscription() {
+     );
+     if (!confirmed) return;
+     revokeMutation.mutate();
+-  };
++  }, [destructiveConfirm, revokeMutation, t]);
+ 
+   // In multi-tariff mode without a specific subscription ID, redirect to list
+   if (isMultiTariff && !subscriptionId && !isLoading) {
+@@ -936,19 +1029,11 @@ export default function Subscription() {
+                         ? formatTraffic(usedGb)
+                         : `${formatTraffic(usedGb)} / ${formatTraffic(subscription.traffic_limit_gb)}`}
+                     </span>
+-                    <button
+-                      onClick={() => refreshTrafficMutation.mutate()}
+-                      disabled={refreshTrafficMutation.isPending || trafficRefreshCooldown > 0}
+-                      className="flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-medium text-dark-50/30 transition-colors hover:bg-dark-50/[0.05] hover:text-dark-50/50 disabled:cursor-not-allowed disabled:opacity-50"
+-                    >
+-                      <RefreshIcon
+-                        className="h-3 w-3"
+-                        spinning={refreshTrafficMutation.isPending}
+-                      />
+-                      {trafficRefreshCooldown > 0
+-                        ? `${trafficRefreshCooldown}s`
+-                        : t('common.refresh')}
+-                    </button>
++                    <TrafficRefreshButton
++                      cooldownUntil={trafficCooldownUntil}
++                      isPending={refreshTrafficMutation.isPending}
++                      onRefresh={handleRefreshTraffic}
++                    />
+                   </div>
+                 </div>
+                 {subscription.traffic_reset_mode &&
+@@ -1790,46 +1875,11 @@ export default function Subscription() {
+               padding: '16px 20px',
+             }}
+           >
+-            <button
+-              onClick={handleRevoke}
+-              disabled={revokeMutation.isPending || revokeCooldown > 0}
+-              className="w-full rounded-xl border border-warning-500/30 bg-warning-500/10 p-4 text-left transition-colors hover:bg-warning-500/20 disabled:opacity-50"
+-            >
+-              <div className="flex items-center justify-between">
+-                <div>
+-                  <div className="font-medium text-warning-400">
+-                    {t('subscription.revoke.button')}
+-                  </div>
+-                  <div className="mt-1 text-sm text-dark-400">
+-                    {revokeCooldown > 0
+-                      ? t('subscription.revoke.cooldown', {
+-                          minutes: Math.floor(revokeCooldown / 60),
+-                          seconds: revokeCooldown % 60,
+-                        })
+-                      : t('subscription.revoke.description')}
+-                  </div>
+-                </div>
+-                <div className="text-warning-400">
+-                  {revokeMutation.isPending ? (
+-                    <div className="h-5 w-5 animate-spin rounded-full border-2 border-warning-400/30 border-t-amber-400" />
+-                  ) : (
+-                    <svg
+-                      className="h-5 w-5"
+-                      fill="none"
+-                      viewBox="0 0 24 24"
+-                      stroke="currentColor"
+-                      strokeWidth={1.5}
+-                    >
+-                      <path
+-                        strokeLinecap="round"
+-                        strokeLinejoin="round"
+-                        d="M16.023 9.348h4.992v-.001M2.985 19.644v-4.992m0 0h4.992m-4.993 0 3.181 3.183a8.25 8.25 0 0 0 13.803-3.7M4.031 9.865a8.25 8.25 0 0 1 13.803-3.7l3.181 3.182"
+-                      />
+-                    </svg>
+-                  )}
+-                </div>
+-              </div>
+-            </button>
++            <RevokeButton
++              cooldownUntil={revokeCooldownUntil}
++              isPending={revokeMutation.isPending}
++              onRevoke={handleRevoke}
++            />
+             {revokeMutation.error && (
+               <p className="mt-2 text-sm text-error-400">{getErrorMessage(revokeMutation.error)}</p>
+             )}
+diff --git a/src/styles/globals.css b/src/styles/globals.css
+index 1c5bde0..f6f07e9 100644
+--- a/src/styles/globals.css
++++ b/src/styles/globals.css
+@@ -63,6 +63,30 @@
+   }
+ }
+ 
++/* Touch / small screens: keep the gradient edge, drop the rotation.
++   `--border-angle` is a registered custom property feeding a conic-gradient,
++   so Chromium cannot composite the animation: every frame repaints the full
++   background of a card-sized element and re-rasters the scroll tiles under
++   it. On the Subscription route two of these run at once (connect-device CTA
++   + purchase CTA), which is what makes that page stutter under the finger in
++   the Telegram WebView. A fixed angle keeps the accent sheen at zero
++   per-frame cost — the same trade already made for backdrop-blur below
++   1024px. */
++@media (hover: none), (max-width: 1023px) {
++  .hover-border-gradient {
++    --border-angle: 135deg;
++    animation: none;
++  }
++}
++
++/* Same reason: `background-position` is a paint-only property, so the
++   unlimited-traffic bar repaints on every frame for its whole lifetime. */
++@media (hover: none), (max-width: 1023px) {
++  .animate-unlimited-flow {
++    animation: none;
++  }
++}
++
+ /* Global reduced-motion defence — collapses every animation and transition
+    to ~0ms so users with vestibular disorders, motion sensitivity, or just
+    the OS-level preference set get instant state changes. State-conveying
+-- 
+2.43.0
+

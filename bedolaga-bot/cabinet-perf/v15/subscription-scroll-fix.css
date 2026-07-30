@@ -1,0 +1,41 @@
+/* Bedolaga cabinet — Подписка scroll fix (v15)
+ *
+ * Two paint-only CSS animations run for the whole lifetime of the
+ * Subscription route and repaint on every single frame. While a finger is
+ * dragging the page, that repaint invalidates the raster tiles the compositor
+ * is scrolling, so the scroll stutters.
+ *
+ *  1. `.hover-border-gradient` animates `--border-angle`, a registered custom
+ *     property feeding a conic-gradient border. Registered-property animations
+ *     cannot be composited — Chromium repaints the element's full background
+ *     every frame. The Subscription route renders two of them at once: the
+ *     connect-device CTA and the purchase/renew CTA.
+ *
+ *  2. `.animate-unlimited-flow` animates `background-position` on the
+ *     unlimited-traffic bar. Also paint-only, also infinite.
+ *
+ * Measured on the real markup, 6 s of synthetic touch scrolling at 6x CPU
+ * throttle (see v15/measure.mjs):
+ *
+ *     main-thread render work   2100 ms  ->   30 ms
+ *       Paint                    330 ms  ->    0 ms
+ *       RasterTask              1250 ms  ->    0 ms
+ *       Style recalc             380 ms  ->   10 ms
+ *
+ * Freezing the gradient at a fixed angle keeps the accent edge exactly as it
+ * looks in any single frame of the rotation, at zero per-frame cost. Desktop
+ * keeps the rotation — it has the headroom, and pointer devices scroll with a
+ * wheel rather than a finger. This is the same trade the cabinet already makes
+ * for backdrop-blur below 1024px.
+ */
+
+@media (hover: none), (max-width: 1023px) {
+  .hover-border-gradient {
+    --border-angle: 135deg !important;
+    animation: none !important;
+  }
+
+  .animate-unlimited-flow {
+    animation: none !important;
+  }
+}
