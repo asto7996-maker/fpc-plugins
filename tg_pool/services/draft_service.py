@@ -5,7 +5,6 @@ Draft engine: settings CRUD, pending drafts, chat rate limits, send pipeline.
 from __future__ import annotations
 
 import logging
-import random
 import re
 from datetime import datetime, timezone
 from typing import Optional, Sequence
@@ -218,11 +217,14 @@ async def generate_and_store_draft(
         model=settings.gemini_model or DEFAULT_MODEL,
         promote_username=settings.promote_username,
     )
+    from tg_pool.core.humanize import humanize_text
+
     draft_text = await client.generate_draft(
         source_text=source_text,
         chat_title=chat_title,
         matched_trigger=matched_trigger,
     )
+    draft_text = await humanize_text(draft_text)
     svc = DraftService(session)
     return await svc.create_draft(
         account_id=account.id,
@@ -245,7 +247,13 @@ async def send_draft_via_userbot(
     alerts: Optional[AlertService] = None,
     reviewed_by: Optional[int] = None,
 ) -> None:
-    """Apply configured delay + typing, then send draft_text into the target chat."""
+    """
+    Human-emulation send: read latency → typing (refreshed) → pause → message.
+
+    Text is passed through ``humanize_text`` (lowercase start, zero emoji).
+    """
+    from tg_pool.core.humanize import BehavioralEmulationEngine, humanize_text
+
     account = await session.get(Account, draft.account_id)
     if account is None or not account.session_string:
         raise RuntimeError("Account missing for draft send")
@@ -259,31 +267,30 @@ async def send_draft_via_userbot(
     account = await svc.get_account(account.id)
     assert account is not None
 
-    delay = random.uniform(
-        float(settings.delay_min_sec),
-        float(max(settings.delay_min_sec, settings.delay_max_sec)),
+    # Spec: T_read ∈ [15, 45], T_pause ∈ [1.5, 3.5], typing ∝ len(text)
+    engine = BehavioralEmulationEngine(
+        read_min=15.0,
+        read_max=45.0,
+        pause_min=1.5,
+        pause_max=3.5,
     )
-    typing_for = random.uniform(
-        float(settings.typing_min_sec),
-        float(max(settings.typing_min_sec, settings.typing_max_sec)),
-    )
+    final_text = await humanize_text(draft.draft_text)
+    if not final_text:
+        raise RuntimeError("Draft text empty after humanize")
 
     wrapper = SessionWrapper(account, proxy=account.proxy)
     try:
         client = await wrapper.connect()
-        # Human-paced wait before acting (operator already approved)
-        import asyncio
-
-        await asyncio.sleep(delay)
-        try:
-            async with client.action(draft.chat_id, "typing"):
-                await asyncio.sleep(typing_for)
-        except Exception:  # noqa: BLE001
-            await asyncio.sleep(typing_for)
+        final_text = await engine.run_before_send(
+            client,
+            draft.chat_id,
+            final_text,
+        )
+        draft.draft_text = final_text
 
         await client.send_message(
             draft.chat_id,
-            draft.draft_text,
+            final_text,
             reply_to=draft.source_message_id,
         )
         draft_svc = DraftService(session)
@@ -291,6 +298,7 @@ async def send_draft_via_userbot(
             draft.id,
             DraftStatus.sent,
             reviewed_by=reviewed_by,
+            draft_text=final_text,
         )
         await svc.increment_actions(account.id)
 
@@ -302,7 +310,7 @@ async def send_draft_via_userbot(
                 (
                     f"[Аккаунт #{account.id}] Ответил в чате "
                     f"«{draft.chat_title or draft.chat_id}»:\n"
-                    f"«{draft.draft_text}»"
+                    f"«{final_text}»"
                 ),
             )
     except Exception as exc:  # noqa: BLE001
