@@ -1,0 +1,25 @@
+v14: fix phone-wide ~30 FPS on Subscription
+
+Symptom: opening Подписка drops entire phone (notification shade too) to ~30fps.
+That is shared-GPU saturation in Telegram Android WebView, not "ugly CSS".
+
+Sources:
+- Telegram docs: minimize animations by Android performanceClass (LOW/AVERAGE/HIGH)
+- Telegram bugs: Mini App WebView FPS much worse than Chrome for canvas RAF
+- web.dev: sustained main/GPU work makes the system throttle to steady 30Hz
+
+Cause in our app (v13):
+Particle/starfield canvas kept running on Subscription via su()/ru()/Vr while the
+heavy Subscription DOM was also on screen → WebView GPU busy every frame →
+system UI also ~30fps.
+
+v14:
+- Hard-unmount background on any path containing "subscription"
+- Destroy leftover canvases; html.route-subscription hides canvas
+- __paskodPauseAnim stops RAF completely (not skip-paint)
+- Parse Telegram-Android UA performanceClass: LOW disables BG entirely
+- AVERAGE forces reduced particle settings
+- Subscription page beauty kept (0 0 8px glows, cards)
+- Bottom nav still pinned
+
+Entry: /assets/v14/
