@@ -90,7 +90,30 @@ async def amain() -> None:
     try:
         await listeners.start()
     except Exception as exc:  # noqa: BLE001
-        logger.error("ListenerManager start failed: %s", exc)
+        # Admin bot must keep running even if no userbot sessions are ready
+        logger.error("ListenerManager start failed (admin UI still up): %s", exc)
+
+    # Push a bootstrap menu to the creator so the panel is never "silent"
+    if bot is not None:
+        try:
+            from tg_pool.admin.keyboards import main_menu_kb, reply_menu_kb
+            from tg_pool.admin.texts import main_menu_text
+
+            await bot.send_message(
+                settings.creator_id,
+                "✅ <b>Панель запущена</b>\n\n" + main_menu_text(),
+                parse_mode="HTML",
+                reply_markup=reply_menu_kb(is_creator=True),
+            )
+            await bot.send_message(
+                settings.creator_id,
+                "Выберите раздел:",
+                parse_mode="HTML",
+                reply_markup=main_menu_kb(is_creator=True),
+            )
+            logger.info("Bootstrap menu sent to creator %s", settings.creator_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not push bootstrap menu: %s", exc)
 
     loop = asyncio.get_running_loop()
 

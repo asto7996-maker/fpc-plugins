@@ -3,6 +3,8 @@ __pycache__/
 .venv/
 venv/
 .env
+data/
+*.db
 *.session
 .pytest_cache/
 .mypy_cache/

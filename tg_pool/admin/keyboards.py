@@ -1,8 +1,13 @@
-"""Inline keyboards for the control panel."""
+"""Inline + reply keyboards for the control panel."""
 
 from __future__ import annotations
 
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
+)
 
 from tg_pool.db.models import Account, AccountStatus
 
@@ -37,6 +42,24 @@ def main_menu_kb(*, is_creator: bool = False) -> InlineKeyboardMarkup:
         rows.append([_btn("🔑 Доступ / Admin", "menu:access")])
     rows.append([_btn("🔄 Обновить", "menu:home")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def reply_menu_kb(*, is_creator: bool = False) -> ReplyKeyboardMarkup:
+    """Persistent bottom keyboard so controls are always visible."""
+    rows = [
+        [KeyboardButton(text="🏠 Меню"), KeyboardButton(text="🚀 Аккаунты")],
+        [KeyboardButton(text="➕ Добавить"), KeyboardButton(text="🌐 Прокси")],
+        [KeyboardButton(text="🤖 Gemini"), KeyboardButton(text="📊 Статистика")],
+        [KeyboardButton(text="👤 Профиль"), KeyboardButton(text="📖 Справка")],
+    ]
+    if is_creator:
+        rows.append([KeyboardButton(text="🔑 Admin")])
+    return ReplyKeyboardMarkup(
+        keyboard=rows,
+        resize_keyboard=True,
+        is_persistent=True,
+        input_field_placeholder="Выберите раздел или команду…",
+    )
 
 
 def add_account_kb() -> InlineKeyboardMarkup:

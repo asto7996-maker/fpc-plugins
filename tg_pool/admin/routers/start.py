@@ -9,8 +9,7 @@ from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.types import Message
 
-from tg_pool.admin.keyboards import main_menu_kb
-from tg_pool.admin.routers.common import show_main_menu
+from tg_pool.admin.keyboards import main_menu_kb, reply_menu_kb
 from tg_pool.admin.states import InviteStates
 from tg_pool.admin.texts import (
     invite_redeemed_notify,
@@ -42,10 +41,17 @@ def build_start_router(settings: Settings) -> Router:
 
         if allowed:
             await state.clear()
+            creator = is_creator or user.telegram_id == settings.creator_id
+            # Persistent bottom keyboard first, then inline card
             await message.answer(
                 welcome_approved(user),
                 parse_mode="HTML",
-                reply_markup=main_menu_kb(is_creator=is_creator or user.telegram_id == settings.creator_id),
+                reply_markup=reply_menu_kb(is_creator=creator),
+            )
+            await message.answer(
+                "🏠 <b>Главное меню</b>\nВыберите раздел:",
+                parse_mode="HTML",
+                reply_markup=main_menu_kb(is_creator=creator),
             )
             return
 
@@ -79,12 +85,16 @@ def build_start_router(settings: Settings) -> Router:
             return
 
         await state.clear()
+        creator = user.telegram_id == settings.creator_id
         await message.answer(
             "✅ <b>Доступ открыт!</b>\n\n" + welcome_approved(user),
             parse_mode="HTML",
-            reply_markup=main_menu_kb(
-                is_creator=user.telegram_id == settings.creator_id
-            ),
+            reply_markup=reply_menu_kb(is_creator=creator),
+        )
+        await message.answer(
+            "🏠 <b>Главное меню</b>\nВыберите раздел:",
+            parse_mode="HTML",
+            reply_markup=main_menu_kb(is_creator=creator),
         )
 
         # Notify creator
