@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from typing import Optional, Sequence
 
 from sqlalchemy import select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -97,23 +98,8 @@ class AccountService:
         # Prefer organic fingerprints from TData/opentele when provided;
         # otherwise generate a stable random mobile profile.
         fp = generate_fingerprint()
-        account = Account(
-            phone_number=phone_number,
-            session_string=session_string,
-            api_id=api_id,
-            api_hash=api_hash,
-            device_model=device_model or fp.device_model,
-            system_version=system_version or fp.system_version,
-            app_version=app_version or fp.app_version,
-            lang_code=lang_code or fp.lang_code,
-            proxy_id=proxy_id,
-            status=status,
-            display_name=display_name,
-            telegram_user_id=telegram_user_id,
-            actions_day_key=datetime.now(timezone.utc).strftime("%Y-%m-%d"),
-        )
         if proxy_id is not None:
-            # Enforce 1:1 sticky binding — never steal another account's proxy
+            await self.heal_proxy_bindings()
             taken = (
                 await self.session.execute(
                     select(Account.id).where(Account.proxy_id == proxy_id)
@@ -128,21 +114,51 @@ class AccountService:
                     proxy_id,
                 )
                 proxy_id = None
-                account.proxy_id = None
 
+        def _build(pid: Optional[int]) -> Account:
+            return Account(
+                phone_number=phone_number,
+                session_string=session_string,
+                api_id=api_id,
+                api_hash=api_hash,
+                device_model=device_model or fp.device_model,
+                system_version=system_version or fp.system_version,
+                app_version=app_version or fp.app_version,
+                lang_code=lang_code or fp.lang_code,
+                proxy_id=pid,
+                status=status,
+                display_name=display_name,
+                telegram_user_id=telegram_user_id,
+                actions_day_key=datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+            )
+
+        account = _build(proxy_id)
         self.session.add(account)
-        await self.session.flush()
+        try:
+            await self.session.flush()
+        except IntegrityError:
+            if proxy_id is None:
+                raise
+            logger.warning(
+                "proxy_id=%s UNIQUE conflict — retry insert without proxy",
+                proxy_id,
+            )
+            await self.session.rollback()
+            account = _build(None)
+            self.session.add(account)
+            await self.session.flush()
 
-        if proxy_id is not None:
-            proxy = await self.session.get(Proxy, proxy_id)
+        if account.proxy_id is not None:
+            proxy = await self.session.get(Proxy, account.proxy_id)
             if proxy is not None:
                 proxy.assigned_account_id = account.id
 
         logger.info(
-            "Created account #%s phone=%s device=%s",
+            "Created account #%s phone=%s device=%s proxy=%s",
             account.id,
             phone_number,
             account.device_model,
+            account.proxy_id,
         )
         return account
 
@@ -206,10 +222,29 @@ class AccountService:
         existing.flood_until = None
         existing.is_spambot_restricted = False
         if proxy_id is not None:
-            existing.proxy_id = proxy_id
+            taken = (
+                await self.session.execute(
+                    select(Account.id).where(
+                        Account.proxy_id == proxy_id,
+                        Account.id != existing.id,
+                    )
+                )
+            ).scalar_one_or_none()
             proxy = await self.session.get(Proxy, proxy_id)
-            if proxy is not None:
-                proxy.assigned_account_id = existing.id
+            if taken is not None or (
+                proxy is not None
+                and proxy.assigned_account_id is not None
+                and proxy.assigned_account_id != existing.id
+            ):
+                logger.warning(
+                    "Proxy #%s already bound — keeping account #%s proxy unchanged",
+                    proxy_id,
+                    existing.id,
+                )
+            else:
+                existing.proxy_id = proxy_id
+                if proxy is not None:
+                    proxy.assigned_account_id = existing.id
         await self.session.flush()
         return existing
 
@@ -233,6 +268,45 @@ class AccountService:
         await self.session.flush()
         return proxy
 
+    async def used_proxy_ids(self) -> set[int]:
+        """Proxy IDs currently referenced by Account.proxy_id (source of truth)."""
+        rows = (
+            await self.session.execute(
+                select(Account.proxy_id).where(Account.proxy_id.is_not(None))
+            )
+        ).scalars().all()
+        return {int(x) for x in rows if x is not None}
+
+    async def heal_proxy_bindings(self) -> None:
+        """
+        Keep Proxy.assigned_account_id in sync with Account.proxy_id.
+
+        Drift used to make pick_random_proxy return an already-taken proxy and
+        blow up with UNIQUE(accounts.proxy_id).
+        """
+        accounts = list(
+            (
+                await self.session.execute(
+                    select(Account).where(Account.proxy_id.is_not(None))
+                )
+            ).scalars().all()
+        )
+        by_proxy: dict[int, int] = {}
+        for acc in accounts:
+            if acc.proxy_id is None:
+                continue
+            by_proxy[int(acc.proxy_id)] = int(acc.id)
+
+        proxies = list((await self.session.execute(select(Proxy))).scalars().all())
+        for proxy in proxies:
+            owner = by_proxy.get(int(proxy.id))
+            if owner is not None:
+                if proxy.assigned_account_id != owner:
+                    proxy.assigned_account_id = owner
+            elif proxy.assigned_account_id is not None:
+                proxy.assigned_account_id = None
+        await self.session.flush()
+
     async def pick_random_proxy(self, *, prefer_free: bool = True) -> Optional[Proxy]:
         """
         Pick a random alive proxy for account import.
@@ -241,6 +315,9 @@ class AccountService:
         account — Account.proxy_id is UNIQUE.
         """
         import random
+
+        await self.heal_proxy_bindings()
+        used = await self.used_proxy_ids()
 
         free = list(
             (
@@ -252,6 +329,7 @@ class AccountService:
                 )
             ).scalars().all()
         )
+        free = [p for p in free if int(p.id) not in used]
         if free:
             return random.choice(free)
         if prefer_free:
@@ -264,6 +342,7 @@ class AccountService:
                 )
             ).scalars().all()
         )
+        any_alive = [p for p in any_alive if int(p.id) not in used]
         if any_alive:
             return random.choice(any_alive)
         return None

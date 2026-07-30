@@ -33,10 +33,7 @@ def build_accounts_router(
         )
         await callback.answer()
 
-    @router.callback_query(F.data.startswith("acc:"))
-    async def cb_account_detail(callback: CallbackQuery) -> None:
-        assert callback.data is not None
-        account_id = int(callback.data.split(":")[1])
+    async def _show_account_detail(callback: CallbackQuery, account_id: int) -> None:
         async with session_scope() as session:
             acc = await AccountService(session).get_account(account_id)
         if acc is None:
@@ -48,6 +45,12 @@ def build_accounts_router(
             account_actions_kb(account_id),
         )
         await callback.answer()
+
+    @router.callback_query(F.data.startswith("acc:"))
+    async def cb_account_detail(callback: CallbackQuery) -> None:
+        assert callback.data is not None
+        account_id = int(callback.data.split(":")[1])
+        await _show_account_detail(callback, account_id)
 
     @router.callback_query(F.data.startswith("accact:"))
     async def cb_account_action(callback: CallbackQuery) -> None:
@@ -84,8 +87,8 @@ def build_accounts_router(
             await callback.answer("Неизвестное действие", show_alert=True)
             return
 
-        callback.data = f"acc:{account_id}"
-        await cb_account_detail(callback)
+        # aiogram CallbackQuery is frozen — do not mutate callback.data
+        await _show_account_detail(callback, account_id)
 
     _ = settings
     return router

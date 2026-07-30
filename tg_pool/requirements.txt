@@ -5,6 +5,7 @@ asyncpg>=0.29.0
 redis>=5.0.0
 APScheduler>=3.10.4
 PySocks>=1.7.1
+python-socks[asyncio]>=2.4.3
 python-dotenv>=1.0.0
 opentele>=1.15.1
 aiofiles>=23.2.1

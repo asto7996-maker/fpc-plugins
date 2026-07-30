@@ -288,11 +288,13 @@ async def ensure_working_proxy(*, prefer_free: bool = True) -> Optional[Proxy]:
     Never holds a DB transaction across network I/O. Callers should use
     `proxy.id` (and re-fetch inside their own session if needed).
     """
-    # 1) Short read of an existing candidate
+    # 1) Short read of an existing candidate (heal bindings first)
     existing_id: int | None = None
     cand: ProxyCandidate | None = None
     async with session_scope() as db:
-        existing = await AccountService(db).pick_random_proxy(prefer_free=prefer_free)
+        svc = AccountService(db)
+        await svc.heal_proxy_bindings()
+        existing = await svc.pick_random_proxy(prefer_free=prefer_free)
         if existing is not None:
             existing_id = int(existing.id)
             cand = ProxyCandidate(
@@ -322,9 +324,16 @@ async def ensure_working_proxy(*, prefer_free: bool = True) -> Optional[Proxy]:
     random.shuffle(socks_first)
 
     async with session_scope() as db:
+        svc = AccountService(db)
+        await svc.heal_proxy_bindings()
+        used = await svc.used_proxy_ids()
         saved = await _save_candidates(db, live)
         # Only unbound proxies — Account.proxy_id is UNIQUE
-        free = [p for p in saved if p.assigned_account_id is None]
+        free = [
+            p
+            for p in saved
+            if p.assigned_account_id is None and int(p.id) not in used
+        ]
         if not free:
             return None
         for c in socks_first:

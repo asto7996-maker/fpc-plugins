@@ -75,6 +75,34 @@ class GetOrCreateProxyTests(unittest.IsolatedAsyncioTestCase):
             assert picked is not None
             self.assertEqual(picked.ip, "9.9.9.9")
 
+    async def test_pick_skips_proxy_used_by_account(self) -> None:
+        """Account.proxy_id wins even if Proxy.assigned_account_id drifted to NULL."""
+        from tg_pool.db.models import AccountStatus
+        from tg_pool.db.session import session_scope
+        from tg_pool.services.account_service import AccountService
+
+        async with session_scope() as session:
+            svc = AccountService(session)
+            p1 = await svc.get_or_create_proxy(ip="1.1.1.1", port=1080)
+            p2 = await svc.get_or_create_proxy(ip="2.2.2.2", port=1080)
+            await svc.create_account(
+                phone_number="+10000000001",
+                session_string="x" * 40,
+                api_id=1,
+                api_hash="h",
+                proxy_id=p1.id,
+                status=AccountStatus.paused,
+            )
+            # Simulate drift: clear reverse pointer
+            p1.assigned_account_id = None
+            await session.flush()
+
+            picked = await svc.pick_random_proxy(prefer_free=True)
+            self.assertIsNotNone(picked)
+            assert picked is not None
+            self.assertEqual(picked.id, p2.id)
+            self.assertEqual(p1.assigned_account_id, 1)  # healed
+
 
 class ProxyParseTests(unittest.TestCase):
     def test_user_pass_at_ip_port(self) -> None:
