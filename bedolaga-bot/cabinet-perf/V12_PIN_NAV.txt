@@ -1,0 +1,9 @@
+v12: pin bottom nav + Subscription freeze reduction
+
+- Bottom nav rendered via createPortal(document.body) + #cabinet-bottom-nav
+  with position:fixed and max z-index (escapes Telegram/WebView containing blocks)
+- Starfield rewritten: few dots, fillRect, capped count
+- Subscription: staleTime 60s, no refetchOnMount, softer shadows, countdown 5s
+- Animation loop 20fps mobile; hard-pause on subscription routes
+
+Entry: /assets/v12/
