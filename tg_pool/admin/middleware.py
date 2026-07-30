@@ -15,7 +15,6 @@ from typing import Any, Awaitable, Callable, Optional
 
 from aiogram import BaseMiddleware, Bot
 from aiogram.fsm.context import FSMContext
-from aiogram.fsm.storage.base import StorageKey
 from aiogram.types import CallbackQuery, Message, TelegramObject, User
 
 from tg_pool.admin.states import InviteStates
