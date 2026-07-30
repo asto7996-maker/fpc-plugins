@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import re
 import tempfile
 from pathlib import Path
 from typing import Any, Optional
@@ -22,17 +21,12 @@ from tg_pool.clients.tdata_converter import (
     convert_tdata_zip,
 )
 from tg_pool.config import Settings
-from tg_pool.db.models import AccountStatus, Proxy, ProxyProtocol
+from tg_pool.db.models import AccountStatus, Proxy
 from tg_pool.db.session import session_scope
 from tg_pool.services.account_service import AccountService
+from tg_pool.services.proxy_parse import ProxyParseError, parse_proxy_line
 
 logger = logging.getLogger(__name__)
-
-PROXY_RE = re.compile(
-    r"^(?P<proto>socks5|http)://(?:(?P<user>[^:]+):(?P<password>[^@]+)@)?"
-    r"(?P<ip>[^:]+):(?P<port>\d+)$",
-    re.IGNORECASE,
-)
 
 
 def build_add_account_router(settings: Settings) -> Router:
@@ -99,7 +93,8 @@ def build_add_account_router(settings: Settings) -> Router:
         await state.update_data(api_id=api_id, api_hash=api_hash)
         await state.set_state(AddAccountStates.proxy)
         await message.answer(
-            "Прокси: ID / <code>socks5://…</code> / <code>none</code>",
+            "Прокси: ID / <code>user:pass@ip:port</code> / "
+            "<code>socks5://…</code> / <code>none</code>",
             parse_mode="HTML",
         )
 
@@ -116,16 +111,21 @@ def build_add_account_router(settings: Settings) -> Router:
             elif raw.isdigit():
                 proxy_id = int(raw)
             else:
-                m = PROXY_RE.match(raw)
-                if not m:
-                    await message.answer("❌ Неверный формат прокси.")
+                try:
+                    parsed = parse_proxy_line(raw)
+                except ProxyParseError:
+                    await message.answer(
+                        "❌ Формат: <code>user:pass@ip:port</code> | "
+                        "<code>socks5://…</code> | id | none",
+                        parse_mode="HTML",
+                    )
                     return
                 proxy = await svc.create_proxy(
-                    ip=m.group("ip"),
-                    port=int(m.group("port")),
-                    protocol=ProxyProtocol(m.group("proto").lower()),
-                    username=m.group("user"),
-                    password=m.group("password"),
+                    ip=parsed.ip,
+                    port=parsed.port,
+                    protocol=parsed.protocol,
+                    username=parsed.username,
+                    password=parsed.password,
                 )
                 proxy_id = proxy.id
 
@@ -157,6 +157,7 @@ def build_add_account_router(settings: Settings) -> Router:
             "<blockquote>Укажите постоянный прокси для сессии — "
             "ротация IP под живой auth key опасна.</blockquote>\n\n"
             "• ID прокси\n"
+            "• <code>user:password@ip:port</code>\n"
             "• <code>socks5://user:pass@ip:port</code>\n"
             "• <code>none</code>",
             parse_mode="HTML",
@@ -195,16 +196,21 @@ def build_add_account_router(settings: Settings) -> Router:
                     "password": proxy.password,
                 }
             else:
-                m = PROXY_RE.match(raw)
-                if not m:
-                    await message.answer("Формат: socks5://… | id | none")
+                try:
+                    parsed = parse_proxy_line(raw)
+                except ProxyParseError:
+                    await message.answer(
+                        "Формат: <code>user:pass@ip:port</code> | "
+                        "socks5://… | id | none",
+                        parse_mode="HTML",
+                    )
                     return
                 proxy = await svc.create_proxy(
-                    ip=m.group("ip"),
-                    port=int(m.group("port")),
-                    protocol=ProxyProtocol(m.group("proto").lower()),
-                    username=m.group("user"),
-                    password=m.group("password"),
+                    ip=parsed.ip,
+                    port=parsed.port,
+                    protocol=parsed.protocol,
+                    username=parsed.username,
+                    password=parsed.password,
                 )
                 proxy_id = proxy.id
                 proxy_dict = {
