@@ -60,6 +60,21 @@ class GetOrCreateProxyTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(a.id, b.id)
             self.assertEqual(b.password, "p2")
 
+    async def test_pick_random_proxy(self) -> None:
+        from tg_pool.db.session import session_scope
+        from tg_pool.services.account_service import AccountService
+
+        async with session_scope() as session:
+            svc = AccountService(session)
+            self.assertIsNone(await svc.pick_random_proxy())
+            await svc.get_or_create_proxy(
+                ip="9.9.9.9", port=1080, username="a", password="b"
+            )
+            picked = await svc.pick_random_proxy()
+            self.assertIsNotNone(picked)
+            assert picked is not None
+            self.assertEqual(picked.ip, "9.9.9.9")
+
 
 class ProxyParseTests(unittest.TestCase):
     def test_user_pass_at_ip_port(self) -> None:

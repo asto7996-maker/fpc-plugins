@@ -215,6 +215,38 @@ class AccountService:
         await self.session.flush()
         return proxy
 
+    async def pick_random_proxy(self, *, prefer_free: bool = True) -> Optional[Proxy]:
+        """
+        Pick a random alive proxy for TData import.
+
+        Prefers proxies not yet bound to an account; falls back to any alive proxy.
+        """
+        import random
+
+        free = list(
+            (
+                await self.session.execute(
+                    select(Proxy).where(
+                        Proxy.is_alive.is_(True),
+                        Proxy.assigned_account_id.is_(None),
+                    )
+                )
+            ).scalars().all()
+        )
+        if prefer_free and free:
+            return random.choice(free)
+
+        any_alive = list(
+            (
+                await self.session.execute(
+                    select(Proxy).where(Proxy.is_alive.is_(True))
+                )
+            ).scalars().all()
+        )
+        if any_alive:
+            return random.choice(any_alive)
+        return None
+
     async def get_or_create_proxy(
         self,
         *,

@@ -243,9 +243,12 @@ async def convert_tdata_to_session(
 
     try:
         # --- 2) Convert to Telethon using the CURRENT auth key ----------------
+        # IMPORTANT: opentele's FromTDesktop has a bug when `session` is already
+        # a Session instance (e.g. StringSession()): auth_session stays unbound.
+        # Pass None / str so it builds SQLiteSession|MemorySession internally.
         try:
             client = await tdesk.ToTelethon(
-                session=StringSession(),
+                session=None,
                 flag=UseCurrentSession,
                 api=api_data,
             )

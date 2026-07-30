@@ -21,9 +21,10 @@ class AddProxyStates(StatesGroup):
 
 
 class ImportTDataStates(StatesGroup):
+    archive = State()
+    # Legacy states kept so old in-flight FSMs don't crash hard
     proxy = State()
     passcode = State()
-    archive = State()
 
 
 class DraftEditStates(StatesGroup):

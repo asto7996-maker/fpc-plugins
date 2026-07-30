@@ -149,17 +149,27 @@ def build_add_account_router(settings: Settings) -> Router:
             reply_markup=main_menu_kb(),
         )
 
-    # ---- TData ZIP flow -------------------------------------------------
+    # ---- TData ZIP flow (one-shot: ZIP only, random proxy from pool) -----
     async def _begin_tdata(message: Message, state: FSMContext) -> None:
-        await state.set_state(ImportTDataStates.proxy)
+        async with session_scope() as session:
+            proxy = await AccountService(session).pick_random_proxy()
+        if proxy is None:
+            await message.answer(
+                "📦 <b>Import TData</b>\n\n"
+                "❌ В пуле нет прокси. Сначала добавьте хотя бы один в "
+                "🌐 Прокси, затем снова загрузите TData.",
+                parse_mode="HTML",
+            )
+            await state.clear()
+            return
+
+        await state.set_state(ImportTDataStates.archive)
+        max_mb = settings.tdata_max_zip_bytes // (1024 * 1024)
         await message.answer(
             "📦 <b>Import TData</b>\n\n"
-            "<blockquote>Укажите постоянный прокси для сессии — "
-            "ротация IP под живой auth key опасна.</blockquote>\n\n"
-            "• ID прокси\n"
-            "• <code>user:password@ip:port</code>\n"
-            "• <code>socks5://user:pass@ip:port</code>\n"
-            "• <code>none</code>",
+            "<blockquote>Просто пришлите ZIP с папкой <code>tdata</code>.\n"
+            "Прокси подставится случайно из уже добавленных.</blockquote>\n\n"
+            f"Макс. размер: <b>{max_mb} МБ</b>",
             parse_mode="HTML",
         )
 
@@ -172,101 +182,21 @@ def build_add_account_router(settings: Settings) -> Router:
         await _begin_tdata(callback.message, state)  # type: ignore[arg-type]
         await callback.answer()
 
+    # Recover users stuck in the old multi-step FSM
     @router.message(ImportTDataStates.proxy, F.document)
-    async def tdata_proxy_got_file(message: Message) -> None:
-        await message.answer(
-            "Сначала отправьте прокси текстом "
-            "(<code>user:password@ip:port</code>), потом ZIP.",
-            parse_mode="HTML",
-        )
+    @router.message(ImportTDataStates.passcode, F.document)
+    async def tdata_legacy_doc(message: Message, state: FSMContext, bot: Bot) -> None:
+        await state.set_state(ImportTDataStates.archive)
+        await tdata_archive(message, state, bot)
 
     @router.message(ImportTDataStates.proxy)
-    async def tdata_proxy(message: Message, state: FSMContext) -> None:
-        raw = (message.text or "").strip()
-        if not raw:
-            await message.answer(
-                "Отправьте прокси текстом:\n"
-                "<code>user:password@ip:port</code>",
-                parse_mode="HTML",
-            )
-            return
-
-        proxy_id: Optional[int] = None
-        proxy_dict: Optional[dict[str, Any]] = None
-
-        try:
-            async with session_scope() as session:
-                svc = AccountService(session)
-                if raw.lower() == "none":
-                    pass
-                elif raw.isdigit():
-                    proxy = await session.get(Proxy, int(raw))
-                    if proxy is None:
-                        await message.answer(f"Proxy #{raw} не найден.")
-                        return
-                    proxy_id = proxy.id
-                    proxy_dict = {
-                        "protocol": proxy.protocol.value,
-                        "ip": proxy.ip,
-                        "port": proxy.port,
-                        "username": proxy.username,
-                        "password": proxy.password,
-                    }
-                else:
-                    try:
-                        parsed = parse_proxy_line(raw)
-                    except ProxyParseError:
-                        await message.answer(
-                            "Формат: <code>user:pass@ip:port</code> | "
-                            "socks5://… | id | none",
-                            parse_mode="HTML",
-                        )
-                        return
-                    proxy = await svc.get_or_create_proxy(
-                        ip=parsed.ip,
-                        port=parsed.port,
-                        protocol=parsed.protocol,
-                        username=parsed.username,
-                        password=parsed.password,
-                    )
-                    proxy_id = proxy.id
-                    proxy_dict = {
-                        "protocol": proxy.protocol.value,
-                        "ip": proxy.ip,
-                        "port": proxy.port,
-                        "username": proxy.username,
-                        "password": proxy.password,
-                    }
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("tdata_proxy failed")
-            await message.answer(
-                f"❌ Не удалось сохранить прокси: <code>{type(exc).__name__}</code>",
-                parse_mode="HTML",
-            )
-            return
-
-        await state.update_data(proxy_id=proxy_id, proxy_dict=proxy_dict)
-        await state.set_state(ImportTDataStates.passcode)
-        label = (
-            f"#{proxy_id} <code>{proxy_dict['ip']}:{proxy_dict['port']}</code>"
-            if proxy_dict
-            else "none"
-        )
-        await message.answer(
-            f"✅ Прокси: {label}\n\n"
-            "Локальный passcode TData или <code>none</code>:",
-            parse_mode="HTML",
-        )
-
     @router.message(ImportTDataStates.passcode)
-    async def tdata_passcode(message: Message, state: FSMContext) -> None:
-        raw = (message.text or "").strip()
-        passcode = None if raw.lower() in {"none", "-", ""} else raw
-        await state.update_data(passcode=passcode)
+    async def tdata_legacy_text(message: Message, state: FSMContext) -> None:
         await state.set_state(ImportTDataStates.archive)
         max_mb = settings.tdata_max_zip_bytes // (1024 * 1024)
         await message.answer(
-            f"Пришлите <b>ZIP</b> с папкой <code>tdata</code> (макс. {max_mb} МБ).",
+            "Шаги прокси/passcode больше не нужны.\n"
+            f"Просто пришлите <b>ZIP</b> с <code>tdata</code> (макс. {max_mb} МБ).",
             parse_mode="HTML",
         )
 
@@ -282,8 +212,29 @@ def build_add_account_router(settings: Settings) -> Router:
             await message.answer("❌ ZIP слишком большой.")
             return
 
-        data = await state.get_data()
-        status_msg = await message.answer("⏳ Конвертирую TData через <b>opentele</b>…", parse_mode="HTML")
+        # Auto-pick a random already-added proxy
+        async with session_scope() as session:
+            proxy = await AccountService(session).pick_random_proxy()
+            if proxy is None:
+                await message.answer(
+                    "❌ Нет доступных прокси в пуле. Добавьте прокси и повторите.",
+                )
+                return
+            proxy_id = proxy.id
+            proxy_dict = {
+                "protocol": proxy.protocol.value,
+                "ip": proxy.ip,
+                "port": proxy.port,
+                "username": proxy.username,
+                "password": proxy.password,
+            }
+            proxy_label = f"#{proxy_id} {proxy.ip}:{proxy.port}"
+
+        status_msg = await message.answer(
+            f"⏳ Прокси: <code>{proxy_label}</code>\n"
+            "Конвертирую TData через <b>opentele</b>…",
+            parse_mode="HTML",
+        )
         tmp_root = Path(tempfile.mkdtemp(prefix="tg_pool_tdata_"))
         zip_path = tmp_root / "upload.zip"
 
@@ -292,8 +243,8 @@ def build_add_account_router(settings: Settings) -> Router:
             converted = await convert_tdata_zip(
                 zip_path,
                 work_dir=tmp_root,
-                proxy=data.get("proxy_dict"),
-                passcode=data.get("passcode"),
+                proxy=proxy_dict,
+                passcode=None,
                 max_bytes=settings.tdata_max_zip_bytes,
             )
             async with session_scope() as session:
@@ -306,7 +257,7 @@ def build_add_account_router(settings: Settings) -> Router:
                     system_version=converted.system_version,
                     app_version=converted.app_version,
                     lang_code=converted.lang_code,
-                    proxy_id=data.get("proxy_id"),
+                    proxy_id=proxy_id,
                     display_name=converted.display_name,
                     telegram_user_id=converted.user_id,
                     status=AccountStatus.active,
@@ -318,6 +269,7 @@ def build_add_account_router(settings: Settings) -> Router:
                 f"✅ Аккаунт <b>{uname}</b> (<code>{converted.phone_number}</code>) "
                 f"успешно добавлен из TData!\n\n"
                 f"id=<b>#{account_id}</b>\n"
+                f"proxy: <code>{proxy_label}</code>\n"
                 f"device: <code>{converted.device_model}</code> / "
                 f"<code>{converted.system_version}</code>\n"
                 f"status: <b>active</b>",
