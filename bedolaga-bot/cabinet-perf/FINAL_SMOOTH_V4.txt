@@ -1,0 +1,16 @@
+Final smooth v4
+
+Live: index-21876d32.js / index-8bc68721.css / Support-efa2965c.js
+Loop: useAnimationLoop-d49c1e0c.js
+
+PlatformProvider:
+- Support NO LONGER imports usePlatform; local safe me()
+- window.__paskodPlatform bridge from PlatformProvider
+- we() never throws; all historical index-*.js overwritten
+- JS Cache-Control: no-cache, must-revalidate
+
+Smoothness:
+- 90–144 FPS restored
+- Removed touchstart scroll-mark (was killing transitions on every tap)
+- is-scrolling only affects canvas, not all UI transitions
+- Slightly longer page tween for smoother feel

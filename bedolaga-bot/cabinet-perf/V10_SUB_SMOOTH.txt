@@ -1,0 +1,15 @@
+Subscription lag fix (v10)
+
+Cause: cabinet shell kept particle/canvas background running on /subscription*
+at 90–120fps; old useAnimationLoop also toggled html.is-scrolling (style thrash),
+so the whole Mini App stuttered while Subscription was open.
+
+Deployed: /assets/v10/
+- Disable background portal on any path containing "subscription"
+- Animation loop: mobile 36fps / desktop 60fps, pause on scroll/touch, no classList
+- Always reducedOnMobile particle settings + lower opacity on mobile
+- Shooting-stars: fewer stars/twinkles, slower spawn
+- Subscription: cheaper transitions + content-visibility
+- CSS: no backdrop-blur on mobile nav/canvas contain
+
+Fully close Mini App and reopen to pick v10.

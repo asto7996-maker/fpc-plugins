@@ -1,0 +1,23 @@
+v11 gold-standard Subscription / phone lag fix
+
+Root causes of phone-wide jank on Подписка:
+1) Twemoji SVG mode rewrote country names into many remote SVG images
+2) staleTime:0 + refetchOnMount:"always" API storm on every open
+3) Particle canvas / RAF could still compete with UI
+4) Blur box-shadows + parsing vendor-motion on Subscription chunk
+
+Deployed entry: /assets/v11/
+
+Mini App:
+- Pause flag __paskodPauseAnim + html.route-subscription; destroy canvases on sub routes
+- su()/ru() do not keep background alive on subscription paths
+- Animation loop: 24fps mobile / 45 desktop, hard-pause on sub routes, no classList
+- Subscription: native text instead of Twemoji SVG; staleTime 30s; no motion side-import
+- Softer status accents (1px outline instead of 8px blur glow)
+- Countdown interval 2s; content-visibility on heavy lists/cards
+- Stars ultra-light if somehow mounted
+
+Bot:
+- main menu tariff line reuses user.subscriptions when already loaded
+
+Fully close Mini App and reopen from the bot.

@@ -1,0 +1,6 @@
+Patches applied to cabinet index bundle:
+ - remove bottom-nav layoutId spring
+ - disable Button whileHover/whileTap
+ - page enter opacity-only
+ - background blur filter forced off
+ - pause RAF on scroll/touch

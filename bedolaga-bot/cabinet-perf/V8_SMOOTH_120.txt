@@ -1,0 +1,14 @@
+v8 smooth 120fps
+
+Entry: /assets/v8/index-8712de8e.js
+CSS: /assets/v8/index-1268f021.css
+Subscription: Subscription-04cd8830.js
+Loop: useAnimationLoop-474c214e.js (target 120-144, no html class thrash)
+Stars: shooting-stars-d69a7175.js
+
+Fixes:
+- Removed html.is-scrolling class toggle (style recalc freezes)
+- Removed whileHover y:-4 / transition-all thrash
+- Nav/buttons compositor-friendly transitions
+- Subscription: no transform transitions, contain/content-visibility
+- Particle/star density lowered; DPR capped

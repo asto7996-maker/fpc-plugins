@@ -1,0 +1,11 @@
+v7 platform + subscription smooth
+
+Entry: /assets/v7/index-a89cf6b8.js
+CSS: /assets/v7/index-ffaf3eb8.css
+Support: Support-5f88c360.js (no usePlatform import)
+Subscription: Subscription-5825f3b4.js (no usePlatform import)
+Card/IB also localized platform/haptics
+
+Telegram was caching old ESM modules that still threw.
+New /assets/v7/ path forces clean load.
+Boot interceptor + ErrorBoundary auto-bust on PlatformProvider.
