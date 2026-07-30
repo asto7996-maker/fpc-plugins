@@ -5,7 +5,15 @@ from __future__ import annotations
 from html import escape
 from typing import Optional, Sequence
 
-from tg_pool.db.models import Account, AccountStatus, InviteCode, PanelUser, Proxy
+from tg_pool.db.models import (
+    Account,
+    AccountStatus,
+    AutoReplySettings,
+    InviteCode,
+    PanelUser,
+    PendingDraft,
+    Proxy,
+)
 
 
 STATUS_LABEL = {
@@ -47,7 +55,8 @@ def welcome_approved(user: PanelUser) -> str:
 def main_menu_text() -> str:
     return (
         "🏠 <b>Главное меню</b>\n\n"
-        "<blockquote>Управление аккаунтами, прокси и доступом к панели.</blockquote>\n\n"
+        "<blockquote>Управление аккаунтами, прокси, Gemini-черновиками "
+        "и доступом к панели.</blockquote>\n\n"
         "Выберите раздел:"
     )
 
@@ -66,6 +75,11 @@ def help_text() -> str:
         "1) Добавьте SOCKS5/HTTP прокси\n"
         "2) Импортируйте TData ZIP или StringSession\n"
         "3) Следите за статусом FloodWait / SpamBot\n\n"
+        "<b>Gemini Draft Engine</b>\n"
+        "• Включите Assistant на аккаунте\n"
+        "• Настройте API key в «🤖 Gemini / Черновики»\n"
+        "• Одобряйте карточки: Отправить / Изменить / Отклонить\n"
+        "• Авто-режим по умолчанию выключен\n\n"
         "<i>Сессии всегда работают через закреплённый прокси "
         "и сохранённый fingerprint устройства.</i>"
     )
@@ -109,11 +123,13 @@ def account_detail_text(acc: Account) -> str:
         else "—"
     )
     label = STATUS_LABEL.get(acc.status, acc.status.value)
+    assistant = "🤖 ON" if acc.assistant_enabled else "OFF"
     return (
         f"👤 <b>Аккаунт #{acc.id}</b>\n\n"
         f"Телефон: <code>{h(acc.phone_number)}</code>\n"
         f"Username: <code>{h(acc.display_name or '—')}</code>\n"
         f"Статус: <b>{label}</b>\n"
+        f"Assistant: <b>{assistant}</b>\n"
         f"SpamBot: {'🚫 да' if acc.is_spambot_restricted else '✅ нет'}\n"
         f"Действий сегодня: <code>{acc.total_actions_today}</code>\n"
         f"Flood until: <code>{acc.flood_until or '—'}</code>\n\n"
@@ -123,6 +139,43 @@ def account_detail_text(acc: Account) -> str:
         f"Прокси: <code>{h(proxy_info)}</code>\n"
         f"Ошибка: <i>{h(acc.last_error or '—')}</i>"
     )
+
+
+def drafts_settings_text(
+    cfg: AutoReplySettings,
+    *,
+    pending_count: int,
+    assistant_accounts: int,
+) -> str:
+    key_set = "✅ задан" if (cfg.gemini_api_key or "").strip() else "❌ нет"
+    return (
+        "🤖 <b>Gemini Draft Engine</b>\n\n"
+        "<blockquote>Юзербот ловит триггеры → Gemini готовит черновик → "
+        "оператор одобряет отправку (или auto-approve).</blockquote>\n\n"
+        f"Мониторинг: <b>{'ON' if cfg.enabled else 'OFF'}</b>\n"
+        f"Авто-approve: <b>{'ON' if cfg.auto_approve_enabled else 'OFF'}</b>\n"
+        f"API key: {key_set}\n"
+        f"Модель: <code>{h(cfg.gemini_model)}</code>\n"
+        f"Продвигаем: <code>{h(cfg.promote_username)}</code>\n"
+        f"Delay: <code>{cfg.delay_min_sec:.0f}–{cfg.delay_max_sec:.0f}s</code>\n"
+        f"Typing: <code>{cfg.typing_min_sec:.0f}–{cfg.typing_max_sec:.0f}s</code>\n"
+        f"Лимит/чат/день: <code>{cfg.max_replies_per_chat_day}</code>\n"
+        f"Assistant-аккаунтов: <code>{assistant_accounts}</code>\n"
+        f"Pending черновиков: <code>{pending_count}</code>"
+    )
+
+
+def pending_drafts_text(drafts: Sequence[PendingDraft]) -> str:
+    if not drafts:
+        return "📥 <b>Pending черновики</b>\n\n<blockquote>Очередь пуста.</blockquote>"
+    lines = ["📥 <b>Pending черновики</b>", ""]
+    for d in drafts:
+        lines.append(
+            f"• <b>#{d.id}</b> {h(d.chat_title or d.chat_id)} · "
+            f"acc <code>#{d.account_id}</code>\n"
+            f"  <i>{h((d.draft_text or '')[:80])}</i>"
+        )
+    return "\n".join(lines)
 
 
 def proxies_text(proxies: Sequence[Proxy]) -> str:

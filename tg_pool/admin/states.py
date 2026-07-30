@@ -24,3 +24,12 @@ class ImportTDataStates(StatesGroup):
     proxy = State()
     passcode = State()
     archive = State()
+
+
+class DraftEditStates(StatesGroup):
+    waiting_text = State()
+
+
+class GeminiSettingsStates(StatesGroup):
+    waiting_api_key = State()
+    waiting_promote = State()

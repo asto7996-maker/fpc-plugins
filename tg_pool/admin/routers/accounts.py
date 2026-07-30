@@ -15,7 +15,11 @@ from tg_pool.queue.broker import PoolTask, RedisTaskBroker
 from tg_pool.services.account_service import AccountService
 
 
-def build_accounts_router(settings: Settings, broker: RedisTaskBroker) -> Router:
+def build_accounts_router(
+    settings: Settings,
+    broker: RedisTaskBroker,
+    listeners=None,
+) -> Router:
     router = Router(name="accounts")
 
     @router.callback_query(F.data == "menu:accounts")
@@ -59,12 +63,16 @@ def build_accounts_router(settings: Settings, broker: RedisTaskBroker) -> Router
                     last_error=None,
                     flood_until=None,
                 )
+            if listeners is not None:
+                await listeners.refresh_account(account_id)
             await callback.answer("▶️ Запущен")
         elif action == "pause":
             async with session_scope() as session:
                 await AccountService(session).set_status(
                     account_id, AccountStatus.paused
                 )
+            if listeners is not None:
+                await listeners.refresh_account(account_id)
             await callback.answer("⏸ На паузе")
         elif action == "spambot":
             await broker.enqueue(PoolTask(kind="spambot_check", account_id=account_id))
@@ -79,4 +87,5 @@ def build_accounts_router(settings: Settings, broker: RedisTaskBroker) -> Router
         callback.data = f"acc:{account_id}"
         await cb_account_detail(callback)
 
+    _ = settings
     return router

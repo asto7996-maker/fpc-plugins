@@ -5,6 +5,7 @@ Assemble aiogram 3 dispatcher: commands, middleware, routers.
 from __future__ import annotations
 
 import logging
+from typing import TYPE_CHECKING, Optional
 
 from aiogram import Bot, Dispatcher
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -14,11 +15,16 @@ from tg_pool.admin.middleware import AccessMiddleware
 from tg_pool.admin.routers.access import build_access_router
 from tg_pool.admin.routers.accounts import build_accounts_router
 from tg_pool.admin.routers.add_account import build_add_account_router
+from tg_pool.admin.routers.drafts import build_drafts_router
 from tg_pool.admin.routers.menu import build_menu_router
 from tg_pool.admin.routers.proxies import build_proxies_router
 from tg_pool.admin.routers.start import build_start_router
 from tg_pool.config import Settings
 from tg_pool.queue.broker import RedisTaskBroker
+
+if TYPE_CHECKING:
+    from tg_pool.services.draft_engine import DraftEngine
+    from tg_pool.services.listener_manager import ListenerManager
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +47,9 @@ def build_dispatcher(
     settings: Settings,
     broker: RedisTaskBroker,
     bot: Bot | None = None,
+    *,
+    draft_engine: Optional["DraftEngine"] = None,
+    listeners: Optional["ListenerManager"] = None,
 ) -> Dispatcher:
     """
     Wire routers + access middleware.
@@ -63,9 +72,12 @@ def build_dispatcher(
     # Order: start (invite) first, then feature routers
     dp.include_router(build_start_router(settings))
     dp.include_router(build_menu_router(settings))
-    dp.include_router(build_accounts_router(settings, broker))
+    dp.include_router(build_accounts_router(settings, broker, listeners=listeners))
     dp.include_router(build_add_account_router(settings))
     dp.include_router(build_proxies_router(settings))
     dp.include_router(build_access_router(settings))
+
+    if draft_engine is not None:
+        dp.include_router(build_drafts_router(settings, draft_engine, listeners))
 
     return dp

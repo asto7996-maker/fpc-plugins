@@ -44,6 +44,7 @@ class Settings:
     spambot_timeout_sec: float
 
     tdata_max_zip_bytes: int
+    gemini_api_key: str
 
 
 def get_settings() -> Settings:
@@ -76,4 +77,5 @@ def get_settings() -> Settings:
         tdata_max_zip_bytes=int(
             os.getenv("TDATA_MAX_ZIP_BYTES", str(50 * 1024 * 1024))
         ),
+        gemini_api_key=os.getenv("GEMINI_API_KEY", "").strip(),
     )

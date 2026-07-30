@@ -29,6 +29,7 @@ def _settings(db_path: Path) -> Settings:
         spambot_username="SpamBot",
         spambot_timeout_sec=5,
         tdata_max_zip_bytes=50 * 1024 * 1024,
+        gemini_api_key="",
     )
 
 

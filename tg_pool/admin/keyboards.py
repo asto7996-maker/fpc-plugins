@@ -30,6 +30,7 @@ def main_menu_kb(*, is_creator: bool = False) -> InlineKeyboardMarkup:
     rows = [
         [_btn("🚀 Мои Аккаунты", "menu:accounts"), _btn("➕ Добавить аккаунт", "menu:add")],
         [_btn("🌐 Прокси", "menu:proxies"), _btn("📊 Статистика", "menu:stats")],
+        [_btn("🤖 Gemini / Черновики", "menu:gemini")],
         [_btn("👤 Профиль", "menu:profile"), _btn("📖 Справка", "menu:help")],
     ]
     if is_creator:
@@ -68,7 +69,41 @@ def account_actions_kb(account_id: int) -> InlineKeyboardMarkup:
                 _btn("🧪 SpamBot", f"accact:{account_id}:spambot"),
                 _btn("🏓 Ping", f"accact:{account_id}:ping"),
             ],
+            [_btn("🤖 Assistant On/Off", f"drafts:assistant:{account_id}")],
             nav_row(_btn("📋 К списку", "menu:accounts")),
+        ]
+    )
+
+
+def draft_card_kb(draft_id: int, *, auto_on: bool = False) -> InlineKeyboardMarkup:
+    auto_label = "⚡️ Авто-режим: ON" if auto_on else "⚡️ Авто-режим: OFF"
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                _btn("🚀 Отправить сейчас", f"draft:send:{draft_id}"),
+                _btn("✏️ Изменить", f"draft:edit:{draft_id}"),
+            ],
+            [
+                _btn("❌ Отклонить", f"draft:reject:{draft_id}"),
+                _btn(auto_label, f"draft:auto:{draft_id}"),
+            ],
+            nav_row(_btn("🏠 Меню", "menu:home")),
+        ]
+    )
+
+
+def drafts_settings_kb(settings) -> InlineKeyboardMarkup:
+    mon = "🟢 Мониторинг: ON" if settings.enabled else "🔴 Мониторинг: OFF"
+    auto = "⚡️ Авто: ON" if settings.auto_approve_enabled else "⚡️ Авто: OFF"
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [_btn(mon, "drafts:toggle_enabled"), _btn(auto, "drafts:toggle_auto")],
+            [_btn("📥 Pending черновики", "drafts:pending")],
+            [
+                _btn("🔑 API key", "drafts:set_key"),
+                _btn("📣 Username", "drafts:set_promote"),
+            ],
+            nav_row(_btn("🏠 Меню", "menu:home")),
         ]
     )
 

@@ -4,6 +4,7 @@ Application entrypoint.
 Starts:
 * PostgreSQL schema init
 * Redis task worker + APScheduler
+* Gemini Draft Engine listeners (Telethon)
 * aiogram admin bot polling (+ command menu, invite access)
 """
 
@@ -24,6 +25,7 @@ from tg_pool.queue.broker import RedisTaskBroker
 from tg_pool.queue.scheduler import PoolScheduler
 from tg_pool.services.access_service import AccessService
 from tg_pool.services.alerts import AlertService
+from tg_pool.services.listener_manager import ListenerManager
 from tg_pool.services.task_router import TaskRouter
 
 
@@ -52,6 +54,8 @@ async def amain() -> None:
     alerts = AlertService(settings=settings)
     TaskRouter(broker, alerts, settings=settings)
 
+    listeners = ListenerManager(settings, redis, alert_service=alerts)
+
     scheduler = PoolScheduler(broker)
     scheduler.start()
     await broker.start_worker()
@@ -63,6 +67,7 @@ async def amain() -> None:
     if settings.admin_bot_token:
         bot = Bot(token=settings.admin_bot_token)
         alerts.bind_bot(bot)
+        listeners.bind_bot(bot)
         async with session_scope() as session:
             await AccessService(session, creator_id=settings.creator_id).ensure_user(
                 settings.creator_id,
@@ -70,11 +75,22 @@ async def amain() -> None:
                 full_name="Creator",
             )
         await setup_bot_commands(bot)
-        dp = build_dispatcher(settings, broker, bot=bot)
+        dp = build_dispatcher(
+            settings,
+            broker,
+            bot=bot,
+            draft_engine=listeners.engine,
+            listeners=listeners,
+        )
         polling_task = asyncio.create_task(dp.start_polling(bot), name="admin-polling")
         logger.info("Admin bot polling started (creator_id=%s)", settings.creator_id)
     else:
         logger.warning("ADMIN_BOT_TOKEN empty — admin UI disabled, worker-only mode")
+
+    try:
+        await listeners.start()
+    except Exception as exc:  # noqa: BLE001
+        logger.error("ListenerManager start failed: %s", exc)
 
     loop = asyncio.get_running_loop()
 
@@ -107,6 +123,7 @@ async def amain() -> None:
                 await polling_task
             except asyncio.CancelledError:
                 pass
+        await listeners.stop()
         scheduler.shutdown()
         await broker.stop_worker()
         await redis.aclose()

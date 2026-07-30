@@ -15,6 +15,9 @@ from sqlalchemy.ext.asyncio import (
 from tg_pool.config import Settings, get_settings
 from tg_pool.db.base import Base
 
+# Ensure all models are registered on Base.metadata before create_all()
+import tg_pool.db.models as _models  # noqa: F401
+
 
 _engine: AsyncEngine | None = None
 _session_factory: async_sessionmaker[AsyncSession] | None = None
@@ -62,6 +65,24 @@ async def create_all() -> None:
     engine = _engine or init_engine()
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        await conn.run_sync(_migrate_accounts_assistant_flag)
+
+
+def _migrate_accounts_assistant_flag(sync_conn) -> None:
+    """Add accounts.assistant_enabled if missing (SQLite/Postgres)."""
+    from sqlalchemy import inspect, text
+
+    insp = inspect(sync_conn)
+    if "accounts" not in insp.get_table_names():
+        return
+    cols = {c["name"] for c in insp.get_columns("accounts")}
+    if "assistant_enabled" not in cols:
+        sync_conn.execute(
+            text(
+                "ALTER TABLE accounts ADD COLUMN assistant_enabled BOOLEAN "
+                "NOT NULL DEFAULT 0"
+            )
+        )
 
 
 async def dispose_engine() -> None:

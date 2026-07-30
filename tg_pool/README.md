@@ -65,7 +65,20 @@ Admin Bot (aiogram)
 - ➕ Добавить аккаунт (TData / Session)
 - 🌐 Прокси
 - 📊 Статистика
+- 🤖 Gemini / Черновики (HITL draft engine)
 - 🔑 Доступ (только creator)
+
+## Gemini Draft Engine (Вариант 2)
+
+Human-in-the-loop ассистент: юзербот ловит триггеры в группах → Gemini готовит черновик → карточка в admin-боте → оператор одобряет.
+
+1. **Мониторинг** — `ListenerManager` (Telethon `NewMessage`) на аккаунтах с `assistant_enabled`
+2. **Генерация** — `GeminiDraftClient` + `PendingDraft` в PostgreSQL
+3. **Карточка оператора** — Отправить / Изменить / Отклонить / Авто-режим
+4. **Отправка** — delay + typing action, затем `send_message` через тот же userbot
+5. **`auto_approve_enabled`** (по умолчанию `False`) — пропуск ручного подтверждения
+
+Env: `GEMINI_API_KEY` (или ключ в настройках панели).
 
 ## Быстрый старт
 

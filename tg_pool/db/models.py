@@ -16,6 +16,7 @@ from sqlalchemy import (
     Boolean,
     DateTime,
     Enum,
+    Float,
     ForeignKey,
     Integer,
     String,
@@ -117,6 +118,8 @@ class Account(Base, TimestampMixin):
     last_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     display_name: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
     telegram_user_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+    # Per-account draft-engine participation (HITL Gemini assistant)
+    assistant_enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
     proxy: Mapped[Optional["Proxy"]] = relationship(
         "Proxy",
@@ -174,3 +177,78 @@ class Proxy(Base, TimestampMixin):
             self.username,
             self.password,
         )
+
+
+class DraftStatus(str, enum.Enum):
+    pending = "pending"
+    approved = "approved"
+    rejected = "rejected"
+    sent = "sent"
+    failed = "failed"
+    expired = "expired"
+
+
+class AutoReplySettings(Base, TimestampMixin):
+    """
+    Global settings for the Gemini draft assistant.
+
+    Singleton row (id=1). auto_approve_enabled defaults to False —
+    drafts go to operators for review unless explicitly enabled.
+    """
+
+    __tablename__ = "auto_reply_settings"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    auto_approve_enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    gemini_api_key: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    gemini_model: Mapped[str] = mapped_column(String(64), default="gemini-2.5-flash", nullable=False)
+    promote_username: Mapped[str] = mapped_column(
+        String(64), default="@PaskodVPN_bot", nullable=False
+    )
+    delay_min_sec: Mapped[float] = mapped_column(Float, default=120.0, nullable=False)
+    delay_max_sec: Mapped[float] = mapped_column(Float, default=480.0, nullable=False)
+    typing_min_sec: Mapped[float] = mapped_column(Float, default=3.0, nullable=False)
+    typing_max_sec: Mapped[float] = mapped_column(Float, default=8.0, nullable=False)
+    max_replies_per_chat_day: Mapped[int] = mapped_column(Integer, default=2, nullable=False)
+    dedupe_ttl_hours: Mapped[int] = mapped_column(Integer, default=6, nullable=False)
+    trigger_regex: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+        default=(
+            r"(?i)\b(vpn|впн|вэпээн|прокси|proxy|замедлен\w*|обход\w*|"
+            r"заблок\w*|не\s*работает\s*ют(уб|ube)|доступ\w*)\b"
+        ),
+    )
+
+
+class PendingDraft(Base, TimestampMixin):
+    """Operator-reviewable Gemini draft before sending via a userbot."""
+
+    __tablename__ = "pending_drafts"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    account_id: Mapped[int] = mapped_column(
+        ForeignKey("accounts.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    chat_id: Mapped[int] = mapped_column(BigInteger, nullable=False, index=True)
+    chat_title: Mapped[Optional[str]] = mapped_column(String(256), nullable=True)
+    source_message_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    source_user_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+    source_username: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    source_text: Mapped[str] = mapped_column(Text, nullable=False)
+    matched_trigger: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    draft_text: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[DraftStatus] = mapped_column(
+        Enum(DraftStatus, name="draft_status", native_enum=False),
+        nullable=False,
+        default=DraftStatus.pending,
+        index=True,
+    )
+    admin_message_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+    admin_chat_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+    error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    sent_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    reviewed_by: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
