@@ -12,7 +12,7 @@ from aiogram.types import CallbackQuery, Message
 
 from tg_pool.admin.keyboards import add_account_kb, main_menu_kb, tdata_success_kb
 from tg_pool.admin.nav import ALL_REPLY_NAV
-from tg_pool.admin.routers.common import safe_edit
+from tg_pool.admin.routers.common import safe_answer, safe_edit
 from tg_pool.admin.states import AddAccountStates, ImportTDataStates
 from tg_pool.clients.tdata_converter import (
     TDataConversionError,
@@ -32,14 +32,15 @@ def build_add_account_router(settings: Settings) -> Router:
     router = Router(name="add_account")
 
     @router.callback_query(F.data == "menu:add")
-    async def cb_add_menu(callback: CallbackQuery) -> None:
+    async def cb_add_menu(callback: CallbackQuery, state: FSMContext) -> None:
+        await state.clear()
         await safe_edit(
             callback,
             "➕ <b>Добавить аккаунт</b>\n\n"
             "<blockquote>Выберите способ импорта сессии.</blockquote>",
             add_account_kb(),
         )
-        await callback.answer()
+        await safe_answer(callback)
 
     # ---- StringSession flow ---------------------------------------------
     @router.callback_query(F.data == "add:session")
@@ -50,7 +51,7 @@ def build_add_account_router(settings: Settings) -> Router:
             "Номер телефона в формате <code>+79001234567</code>:",
             parse_mode="HTML",
         )
-        await callback.answer()
+        await safe_answer(callback)
 
     @router.message(AddAccountStates.phone)
     async def add_phone(message: Message, state: FSMContext) -> None:
@@ -143,8 +144,8 @@ def build_add_account_router(settings: Settings) -> Router:
 
     @router.callback_query(F.data == "add:tdata")
     async def cb_add_tdata(callback: CallbackQuery, state: FSMContext) -> None:
+        await safe_answer(callback)
         await _begin_tdata(callback.message, state)  # type: ignore[arg-type]
-        await callback.answer()
 
     # Recover users stuck in the old multi-step FSM
     @router.message(ImportTDataStates.proxy, F.document)
