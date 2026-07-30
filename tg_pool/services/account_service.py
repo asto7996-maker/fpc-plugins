@@ -112,6 +112,24 @@ class AccountService:
             telegram_user_id=telegram_user_id,
             actions_day_key=datetime.now(timezone.utc).strftime("%Y-%m-%d"),
         )
+        if proxy_id is not None:
+            # Enforce 1:1 sticky binding — never steal another account's proxy
+            taken = (
+                await self.session.execute(
+                    select(Account.id).where(Account.proxy_id == proxy_id)
+                )
+            ).scalar_one_or_none()
+            proxy = await self.session.get(Proxy, proxy_id)
+            if taken is not None or (
+                proxy is not None and proxy.assigned_account_id is not None
+            ):
+                logger.warning(
+                    "Proxy #%s already bound — creating account without proxy",
+                    proxy_id,
+                )
+                proxy_id = None
+                account.proxy_id = None
+
         self.session.add(account)
         await self.session.flush()
 
@@ -217,9 +235,10 @@ class AccountService:
 
     async def pick_random_proxy(self, *, prefer_free: bool = True) -> Optional[Proxy]:
         """
-        Pick a random alive proxy for TData import.
+        Pick a random alive proxy for account import.
 
-        Prefers proxies not yet bound to an account; falls back to any alive proxy.
+        When prefer_free=True (default), never return a proxy already bound to an
+        account — Account.proxy_id is UNIQUE.
         """
         import random
 
@@ -233,8 +252,10 @@ class AccountService:
                 )
             ).scalars().all()
         )
-        if prefer_free and free:
+        if free:
             return random.choice(free)
+        if prefer_free:
+            return None
 
         any_alive = list(
             (

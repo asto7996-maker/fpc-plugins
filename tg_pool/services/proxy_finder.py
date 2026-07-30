@@ -3,6 +3,9 @@ Auto-discover working proxies from public verified lists.
 
 Fetches SOCKS5/HTTP candidates from known sources, probes Telegram DC
 connectivity, and persists live proxies into the DB pool.
+
+Important: network I/O never holds an open DB session — that used to lock
+SQLite and make admin-bot reply buttons look dead.
 """
 
 from __future__ import annotations
@@ -19,11 +22,12 @@ from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from tg_pool.db.models import Proxy, ProxyProtocol
+from tg_pool.db.session import session_scope
 from tg_pool.services.account_service import AccountService
 
 logger = logging.getLogger(__name__)
 
-# Public, frequently updated proxy list endpoints
+# Public, frequently updated proxy list endpoints (SOCKS5 first — better for MTProto)
 PROXY_SOURCES: tuple[tuple[str, ProxyProtocol], ...] = (
     (
         "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=socks5"
@@ -65,6 +69,9 @@ _IP_PORT_RE = re.compile(
     r"^\s*(?:(?P<user>[^:\s]+):(?P<password>[^@\s]+)@)?"
     r"(?P<ip>(?:\d{1,3}\.){3}\d{1,3}):(?P<port>\d{2,5})\s*$"
 )
+
+# Global lock so overlapping proxy scans do not thrash the thread pool
+_scan_lock = asyncio.Lock()
 
 
 @dataclass(frozen=True)
@@ -112,8 +119,6 @@ def parse_proxy_candidates(text: str, protocol: ProxyProtocol) -> list[ProxyCand
 
 def check_proxy_tcp(candidate: ProxyCandidate, *, timeout: float = 6.0) -> bool:
     """Blocking TCP probe to Telegram DC via the proxy (run in a thread)."""
-    import socket
-
     import socks
 
     proxy_type = (
@@ -144,12 +149,12 @@ def check_proxy_tcp(candidate: ProxyCandidate, *, timeout: float = 6.0) -> bool:
 async def fetch_candidates(
     *,
     session: Optional[aiohttp.ClientSession] = None,
-    limit_per_source: int = 200,
+    limit_per_source: int = 120,
 ) -> list[ProxyCandidate]:
     """Download proxy lists and return a shuffled unique candidate pool."""
     owns = session is None
     if session is None:
-        timeout = aiohttp.ClientTimeout(total=20)
+        timeout = aiohttp.ClientTimeout(total=15)
         session = aiohttp.ClientSession(
             timeout=timeout,
             headers={"User-Agent": "tg_pool-proxy-finder/1.0"},
@@ -172,80 +177,68 @@ async def fetch_candidates(
         if owns:
             await session.close()
 
-    # Unique by endpoint+protocol
     uniq: dict[tuple[str, int, str], ProxyCandidate] = {}
     for c in candidates:
         uniq[(c.ip, c.port, c.protocol.value)] = c
     out = list(uniq.values())
     random.shuffle(out)
+    # Probe SOCKS5 first — HTTP CONNECT often passes TCP but fails MTProto
+    out.sort(key=lambda c: 0 if c.protocol == ProxyProtocol.socks5 else 1)
     return out
 
 
 async def find_working_proxies(
     *,
     needed: int = 5,
-    max_checks: int = 80,
-    concurrency: int = 25,
-    timeout: float = 4.0,
+    max_checks: int = 60,
+    concurrency: int = 12,
+    timeout: float = 3.5,
 ) -> list[ProxyCandidate]:
     """
     Fetch public lists and return up to `needed` proxies that can reach Telegram.
+
+    Does not touch the database.
     """
-    pool = await fetch_candidates()
-    if not pool:
-        return []
-    pool = pool[: max(1, max_checks)]
-    logger.info("Checking %s candidates for Telegram reachability…", len(pool))
+    async with _scan_lock:
+        pool = await fetch_candidates()
+        if not pool:
+            return []
+        pool = pool[: max(1, max_checks)]
+        logger.info("Checking %s candidates for Telegram reachability…", len(pool))
 
-    sem = asyncio.Semaphore(concurrency)
-    found: list[ProxyCandidate] = []
-    lock = asyncio.Lock()
-    stop = asyncio.Event()
+        sem = asyncio.Semaphore(concurrency)
+        found: list[ProxyCandidate] = []
+        lock = asyncio.Lock()
+        stop = asyncio.Event()
 
-    async def _one(c: ProxyCandidate) -> None:
-        if stop.is_set():
-            return
-        async with sem:
+        async def _one(c: ProxyCandidate) -> None:
             if stop.is_set():
                 return
-            ok = await asyncio.to_thread(check_proxy_tcp, c, timeout=timeout)
-        if not ok:
-            return
-        async with lock:
-            found.append(c)
-            logger.info(
-                "Live proxy %s://%s:%s",
-                c.protocol.value,
-                c.ip,
-                c.port,
-            )
-            if len(found) >= needed:
-                stop.set()
+            async with sem:
+                if stop.is_set():
+                    return
+                ok = await asyncio.to_thread(check_proxy_tcp, c, timeout=timeout)
+            if not ok:
+                return
+            async with lock:
+                found.append(c)
+                logger.info(
+                    "Live proxy %s://%s:%s",
+                    c.protocol.value,
+                    c.ip,
+                    c.port,
+                )
+                if len(found) >= needed:
+                    stop.set()
 
-    await asyncio.gather(*(_one(c) for c in pool), return_exceptions=True)
-    return found[:needed]
+        await asyncio.gather(*(_one(c) for c in pool), return_exceptions=True)
+        return found[:needed]
 
 
-async def refresh_proxy_pool(
-    session: AsyncSession,
-    *,
-    needed: int = 8,
-    replace: bool = True,
-) -> Sequence[Proxy]:
-    """
-    Find working proxies and store them.
-
-    If `replace` is True, wipe free (unassigned) proxies first — keeps bound ones.
-    """
+async def _save_candidates(
+    session: AsyncSession, live: Sequence[ProxyCandidate]
+) -> list[Proxy]:
     svc = AccountService(session)
-    if replace:
-        # Drop only unbound proxies so sticky account bindings stay intact
-        await session.execute(
-            delete(Proxy).where(Proxy.assigned_account_id.is_(None))
-        )
-        await session.flush()
-
-    live = await find_working_proxies(needed=needed)
     saved: list[Proxy] = []
     for c in live:
         proxy = await svc.get_or_create_proxy(
@@ -261,47 +254,88 @@ async def refresh_proxy_pool(
     return saved
 
 
-async def ensure_working_proxy(
-    session: AsyncSession,
+async def refresh_proxy_pool(
+    session: AsyncSession | None = None,
     *,
-    prefer_free: bool = True,
-) -> Optional[Proxy]:
+    needed: int = 8,
+    replace: bool = True,
+) -> Sequence[Proxy]:
     """
-    Return a live free proxy from DB, or scan public sources until one works.
-    """
-    svc = AccountService(session)
-    existing = await svc.pick_random_proxy(prefer_free=prefer_free)
-    if existing is not None:
-        cand = ProxyCandidate(
-            ip=existing.ip,
-            port=existing.port,
-            protocol=existing.protocol,
-            username=existing.username,
-            password=existing.password,
-        )
-        ok = await asyncio.to_thread(check_proxy_tcp, cand, timeout=5.0)
-        if ok:
-            return existing
-        existing.is_alive = False
-        await session.flush()
+    Find working proxies and store them.
 
-    # Scan fresh
-    live = await find_working_proxies(needed=3, max_checks=150)
+    Network scan runs without a DB session. `session` is only used for the
+    short persist/replace phase; if omitted, a fresh scope is opened.
+    """
+    live = await find_working_proxies(needed=needed)
+
+    async def _persist(db: AsyncSession) -> list[Proxy]:
+        if replace:
+            await db.execute(delete(Proxy).where(Proxy.assigned_account_id.is_(None)))
+            await db.flush()
+        return await _save_candidates(db, live)
+
+    if session is not None:
+        return await _persist(session)
+
+    async with session_scope() as db:
+        return await _persist(db)
+
+
+async def ensure_working_proxy(*, prefer_free: bool = True) -> Optional[Proxy]:
+    """
+    Return a committed live proxy, scanning public lists if the pool is empty.
+
+    Never holds a DB transaction across network I/O. Callers should use
+    `proxy.id` (and re-fetch inside their own session if needed).
+    """
+    # 1) Short read of an existing candidate
+    existing_id: int | None = None
+    cand: ProxyCandidate | None = None
+    async with session_scope() as db:
+        existing = await AccountService(db).pick_random_proxy(prefer_free=prefer_free)
+        if existing is not None:
+            existing_id = int(existing.id)
+            cand = ProxyCandidate(
+                ip=existing.ip,
+                port=existing.port,
+                protocol=existing.protocol,
+                username=existing.username,
+                password=existing.password,
+            )
+
+    if cand is not None and existing_id is not None:
+        ok = await asyncio.to_thread(check_proxy_tcp, cand, timeout=4.0)
+        if ok:
+            async with session_scope() as db:
+                return await db.get(Proxy, existing_id)
+        async with session_scope() as db:
+            dead = await db.get(Proxy, existing_id)
+            if dead is not None:
+                dead.is_alive = False
+
+    # 2) Fresh public scan (no DB held)
+    live = await find_working_proxies(needed=3, max_checks=80, concurrency=12)
     if not live:
         return None
-    saved: list[Proxy] = []
-    for c in live:
-        proxy = await svc.get_or_create_proxy(
-            ip=c.ip,
-            port=c.port,
-            protocol=c.protocol,
-            username=c.username,
-            password=c.password,
-        )
-        proxy.is_alive = True
-        saved.append(proxy)
-    await session.flush()
-    return random.choice(saved) if saved else None
+
+    socks_first = [c for c in live if c.protocol == ProxyProtocol.socks5] or list(live)
+    random.shuffle(socks_first)
+
+    async with session_scope() as db:
+        saved = await _save_candidates(db, live)
+        # Only unbound proxies — Account.proxy_id is UNIQUE
+        free = [p for p in saved if p.assigned_account_id is None]
+        if not free:
+            return None
+        for c in socks_first:
+            for p in free:
+                if (
+                    p.ip == c.ip
+                    and int(p.port) == int(c.port)
+                    and p.protocol == c.protocol
+                ):
+                    return p
+        return random.choice(free)
 
 
 async def wipe_all_proxies(session: AsyncSession) -> int:

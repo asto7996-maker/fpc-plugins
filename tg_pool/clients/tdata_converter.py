@@ -274,15 +274,16 @@ async def convert_tdata_to_session(
         # --- 3) Live connectivity / viability probe --------------------------
         # Cap retries — default Telethon loops for a long time and freezes the bot UX.
         try:
-            client._connection_retries = 1  # type: ignore[attr-defined]
-            client._retry_delay = 1  # type: ignore[attr-defined]
+            client._connection_retries = 0  # type: ignore[attr-defined]
+            client._retry_delay = 0  # type: ignore[attr-defined]
         except Exception:  # noqa: BLE001
             pass
         try:
-            await asyncio.wait_for(client.connect(), timeout=25.0)
+            # Keep short — long Telethon retries starve aiogram polling
+            await asyncio.wait_for(client.connect(), timeout=18.0)
         except asyncio.TimeoutError as exc:
             raise TDataConversionError(
-                "Таймаут подключения через прокси (25s) — пробую другой."
+                "Таймаут подключения через прокси (18s) — пробую другой."
             ) from exc
         except FloodWaitError as exc:
             raise TDataConversionError(

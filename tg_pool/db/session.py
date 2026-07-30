@@ -26,13 +26,21 @@ _session_factory: async_sessionmaker[AsyncSession] | None = None
 def init_engine(settings: Settings | None = None) -> AsyncEngine:
     global _engine, _session_factory
     settings = settings or get_settings()
-    _engine = create_async_engine(
-        settings.database_url,
-        echo=False,
-        pool_pre_ping=True,
-        pool_size=10,
-        max_overflow=20,
-    )
+    url = settings.database_url
+    engine_kwargs: dict = {
+        "echo": False,
+        "pool_pre_ping": True,
+    }
+    # SQLite is file-locked — NullPool avoids a false sense of connection pooling.
+    if url.startswith("sqlite"):
+        from sqlalchemy.pool import NullPool
+
+        engine_kwargs["poolclass"] = NullPool
+    else:
+        engine_kwargs["pool_size"] = 10
+        engine_kwargs["max_overflow"] = 20
+
+    _engine = create_async_engine(url, **engine_kwargs)
     _session_factory = async_sessionmaker(
         _engine,
         expire_on_commit=False,
@@ -66,6 +74,10 @@ async def create_all() -> None:
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
         await conn.run_sync(_migrate_accounts_assistant_flag)
+        # WAL lets middleware reads proceed while short writers commit
+        if str(engine.url).startswith("sqlite"):
+            await conn.exec_driver_sql("PRAGMA journal_mode=WAL")
+            await conn.exec_driver_sql("PRAGMA busy_timeout=5000")
 
 
 def _migrate_accounts_assistant_flag(sync_conn) -> None:

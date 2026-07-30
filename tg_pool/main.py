@@ -73,7 +73,13 @@ async def _run_polling_forever(dp, bot: Bot, stop_event: asyncio.Event) -> None:
     while not stop_event.is_set():
         try:
             # handle_signals=False — main() owns SIGINT/SIGTERM
-            await dp.start_polling(bot, handle_signals=False)
+            # handle_as_tasks=True — menu clicks must not wait behind TData/proxy jobs
+            await dp.start_polling(
+                bot,
+                handle_signals=False,
+                handle_as_tasks=True,
+                tasks_concurrency_limit=32,
+            )
             if stop_event.is_set():
                 break
             logger.warning("Polling ended unexpectedly — restarting in %.1fs", backoff)

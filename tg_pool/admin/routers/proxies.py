@@ -75,11 +75,9 @@ def build_proxies_router(settings: Settings) -> Router:
         async def _job() -> None:
             async with _refresh_lock:
                 try:
-                    async with session_scope() as session:
-                        saved = await refresh_proxy_pool(
-                            session, needed=8, replace=True
-                        )
-                        n = len(saved)
+                    # refresh_proxy_pool scans without holding a DB transaction
+                    saved = await refresh_proxy_pool(needed=8, replace=True)
+                    n = len(saved)
                     await status.edit_text(
                         f"✅ Найдено рабочих прокси: <b>{n}</b>",
                         parse_mode="HTML",
