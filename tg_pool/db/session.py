@@ -1,0 +1,105 @@
+"""Async SQLAlchemy engine / session factory."""
+
+from __future__ import annotations
+
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+
+from sqlalchemy.ext.asyncio import (
+    AsyncEngine,
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
+
+from tg_pool.config import Settings, get_settings
+from tg_pool.db.base import Base
+
+# Ensure all models are registered on Base.metadata before create_all()
+import tg_pool.db.models as _models  # noqa: F401
+
+
+_engine: AsyncEngine | None = None
+_session_factory: async_sessionmaker[AsyncSession] | None = None
+
+
+def init_engine(settings: Settings | None = None) -> AsyncEngine:
+    global _engine, _session_factory
+    settings = settings or get_settings()
+    url = settings.database_url
+    engine_kwargs: dict = {
+        "echo": False,
+        "pool_pre_ping": True,
+    }
+    # SQLite is file-locked — NullPool avoids a false sense of connection pooling.
+    if url.startswith("sqlite"):
+        from sqlalchemy.pool import NullPool
+
+        engine_kwargs["poolclass"] = NullPool
+    else:
+        engine_kwargs["pool_size"] = 10
+        engine_kwargs["max_overflow"] = 20
+
+    _engine = create_async_engine(url, **engine_kwargs)
+    _session_factory = async_sessionmaker(
+        _engine,
+        expire_on_commit=False,
+        class_=AsyncSession,
+    )
+    return _engine
+
+
+def get_session_factory() -> async_sessionmaker[AsyncSession]:
+    if _session_factory is None:
+        init_engine()
+    assert _session_factory is not None
+    return _session_factory
+
+
+@asynccontextmanager
+async def session_scope() -> AsyncIterator[AsyncSession]:
+    """Transactional scope — commit on success, rollback on error."""
+    factory = get_session_factory()
+    async with factory() as session:
+        try:
+            yield session
+            await session.commit()
+        except Exception:
+            await session.rollback()
+            raise
+
+
+async def create_all() -> None:
+    engine = _engine or init_engine()
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+        await conn.run_sync(_migrate_accounts_assistant_flag)
+        # WAL lets middleware reads proceed while short writers commit
+        if str(engine.url).startswith("sqlite"):
+            await conn.exec_driver_sql("PRAGMA journal_mode=WAL")
+            await conn.exec_driver_sql("PRAGMA busy_timeout=5000")
+
+
+def _migrate_accounts_assistant_flag(sync_conn) -> None:
+    """Add accounts.assistant_enabled if missing (SQLite/Postgres)."""
+    from sqlalchemy import inspect, text
+
+    insp = inspect(sync_conn)
+    if "accounts" not in insp.get_table_names():
+        return
+    cols = {c["name"] for c in insp.get_columns("accounts")}
+    if "assistant_enabled" not in cols:
+        sync_conn.execute(
+            text(
+                "ALTER TABLE accounts ADD COLUMN assistant_enabled BOOLEAN "
+                "NOT NULL DEFAULT 0"
+            )
+        )
+
+
+async def dispose_engine() -> None:
+    global _engine, _session_factory
+    if _engine is not None:
+        await _engine.dispose()
+    _engine = None
+    _session_factory = None
