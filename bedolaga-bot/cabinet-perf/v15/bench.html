@@ -1,0 +1,175 @@
+<!doctype html>
+<html lang="ru" class="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<title>Subscription scroll bench</title>
+<style>
+/* ---- verbatim from bedolaga-cabinet src/styles/globals.css ---- */
+@property --border-angle {
+  syntax: "<angle>";
+  initial-value: 0deg;
+  inherits: false;
+}
+
+.hover-border-gradient {
+  --_bg: var(--border-inner-bg, #0f172a);
+  --_accent: var(--accent-color, #00e5a0);
+  border: 1.5px solid transparent;
+  background:
+    linear-gradient(var(--_bg), var(--_bg)) padding-box,
+    conic-gradient(
+      from var(--border-angle),
+      var(--_accent) 0%,
+      transparent 25%,
+      transparent 75%,
+      var(--_accent) 100%
+    )
+    border-box;
+  animation: border-rotate var(--border-duration, 3s) linear infinite;
+}
+
+@keyframes border-rotate {
+  to {
+    --border-angle: 360deg;
+  }
+}
+
+/* traffic bar shimmer / unlimited flow (tailwind.config.js) */
+@keyframes trafficShimmer {
+  0%   { transform: translateX(-100%); }
+  100% { transform: translateX(200%); }
+}
+@keyframes unlimitedFlow {
+  0%   { background-position: 0% 50%; }
+  50%  { background-position: 100% 50%; }
+  100% { background-position: 0% 50%; }
+}
+.animate-traffic-shimmer { animation: trafficShimmer 2s ease-in-out infinite; }
+.animate-unlimited-flow  { animation: unlimitedFlow 3s ease-in-out infinite; }
+
+/* ---- page chrome, approximating the Subscription route ---- */
+* { box-sizing: border-box; }
+html, body { margin: 0; background: #0a0f1a; color: #e8eef7;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+main { max-width: 72rem; margin: 0 auto; padding: 24px 16px 112px; }
+.card {
+  position: relative; overflow: hidden; border-radius: 24px;
+  background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.06);
+  box-shadow: 0 8px 32px rgba(0,0,0,0.4);
+  padding: 28px 28px 24px; margin-bottom: 24px;
+}
+.row { display: flex; align-items: center; gap: 14px; }
+.pill { border-radius: 14px; padding: 14px; background: rgba(255,255,255,0.03);
+  border: 1px solid rgba(255,255,255,0.06); margin-bottom: 20px; }
+.bar { position: relative; height: 8px; border-radius: 10px; overflow: hidden;
+  background: rgba(255,255,255,0.06); margin: 12px 0 24px; }
+.bar > .fill { position: absolute; inset: 0; transform-origin: left; transform: scaleX(.62);
+  background: linear-gradient(90deg, #38bdf8, #00e5a0); border-radius: 10px; }
+.bar > .shimmer { position: absolute; inset: 0;
+  background: linear-gradient(90deg, transparent 0%, rgba(255,255,255,.2) 50%, transparent 100%); }
+.bar > .flow { position: absolute; inset: 0; background-size: 200% 100%;
+  background: linear-gradient(90deg, rgba(0,229,160,.31), #00e5a0, rgba(0,229,160,.31)); }
+.cta { display: flex; width: 100%; align-items: center; gap: 14px;
+  border-radius: 14px; padding: 14px; text-align: left; color: inherit; font: inherit; }
+.dot { height: 36px; width: 36px; border-radius: 10px; background: rgba(0,229,160,.07);
+  display: flex; align-items: center; justify-content: center; flex: 0 0 auto; }
+.device { display: flex; align-items: center; justify-content: space-between;
+  border-radius: 12px; padding: 14px; background: rgba(255,255,255,0.03);
+  border: 1px solid rgba(255,255,255,0.06); margin-bottom: 8px; }
+nav.bottom { position: fixed; left: 16px; right: 16px;
+  bottom: calc(16px + env(safe-area-inset-bottom, 0px));
+  border-radius: 24px; padding: 8px 4px; z-index: 50;
+  background: rgba(15,23,42,.95); border: 1px solid rgba(255,255,255,.06);
+  box-shadow: 0 4px 30px rgba(0,0,0,.4), 0 0 0 1px rgba(255,255,255,.05) inset;
+  display: flex; justify-content: space-around; }
+nav.bottom span { font-size: 10px; color: #94a3b8; padding: 10px 12px; }
+h1 { font-size: 24px; margin: 0 0 24px; }
+h2 { font-size: 16px; margin: 0 0 16px; }
+small { color: rgba(232,238,247,.35); font-size: 11px; }
+
+/* ---- THE FIX (applied when <html class="fix">) ---- */
+html.fix .hover-border-gradient {
+  --border-angle: 135deg;
+  animation: none;
+}
+html.fix .animate-unlimited-flow { animation: none; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Подписка</h1>
+
+  <div class="card">
+    <div class="row" style="justify-content:space-between;margin-bottom:24px">
+      <div><small>NORMAL</small><h2>Тариф Premium</h2></div>
+      <span style="font-size:10px;padding:4px 12px;border-radius:999px;background:rgba(0,229,160,.08)">АКТИВНА</span>
+    </div>
+
+    <small>Трафик</small>
+    <div class="bar"><div class="fill"></div><div class="shimmer animate-traffic-shimmer"></div></div>
+
+    <!-- Connect-device CTA: <HoverBorderGradient as="button"> in Subscription.tsx -->
+    <button class="hover-border-gradient cta" style="--accent-color:#00e5a0">
+      <span class="dot"></span>
+      <span style="flex:1"><b>Подключить устройство</b><br><small>2 из 5 устройств</small></span>
+    </button>
+
+    <div class="pill" style="margin-top:20px">
+      <small>ОСТАЛОСЬ</small>
+      <div style="font-size:20px;font-weight:700;font-variant-numeric:tabular-nums">27д 14:32:08</div>
+    </div>
+
+    <div class="pill">
+      <small>Локации</small>
+      <div>🇳🇱 Netherlands · 🇩🇪 Germany · 🇫🇮 Finland · 🇺🇸 USA</div>
+    </div>
+
+    <div class="pill row" style="justify-content:space-between">
+      <div><b>Автопродление</b><br><small>За 3 дня до окончания</small></div>
+      <div style="width:52px;height:28px;border-radius:999px;background:#00e5a0"></div>
+    </div>
+  </div>
+
+  <!-- Purchase CTA: <HoverBorderGradient> in PurchaseCTAButton.tsx (duration=4s) -->
+  <div class="hover-border-gradient" style="--accent-color:#38bdf8;--border-duration:4s;border-radius:16px;width:100%;overflow:hidden">
+    <div style="display:flex;align-items:center;justify-content:space-between;border-radius:14px;padding:16px 20px">
+      <div><b>Продлить подписку</b><br><small>от 149 ₽</small></div>
+      <span>›</span>
+    </div>
+  </div>
+
+  <div class="card" style="margin-top:24px">
+    <h2>Мои устройства</h2>
+    <div id="devices"></div>
+  </div>
+
+  <div class="card"><h2>Дополнительные опции</h2>
+    <div class="pill">Купить устройства</div>
+    <div class="pill">Купить трафик</div>
+    <div class="pill">Управление серверами</div>
+  </div>
+
+  <div class="card"><h2>Перевыпуск подписки</h2>
+    <div class="pill">Перевыпустить ссылку</div>
+  </div>
+</main>
+
+<nav class="bottom">
+  <span>Главная</span><span>Подписка</span><span>Баланс</span><span>Рулетка</span><span>Поддержка</span>
+</nav>
+
+<script>
+  if (location.search.includes('fix=1')) document.documentElement.classList.add('fix');
+
+  // Device rows — the real page renders one per connected device.
+  const devices = document.getElementById('devices');
+  for (let i = 0; i < 6; i++) {
+    const el = document.createElement('div');
+    el.className = 'device';
+    el.innerHTML = '<div><b>iPhone 14 Pro</b><br><small>ios &nbsp; A1B2C3D4</small></div><div>✎ 🗑</div>';
+    devices.appendChild(el);
+  }
+</script>
+</body>
+</html>
