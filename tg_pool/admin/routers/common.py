@@ -44,6 +44,14 @@ async def safe_edit(callback: CallbackQuery, text: str, reply_markup=None) -> No
         )
 
 
+async def safe_answer(callback: CallbackQuery, text: str | None = None, **kwargs) -> None:
+    """answerCallbackQuery that ignores expired query IDs."""
+    try:
+        await callback.answer(text, **kwargs)
+    except Exception:
+        pass
+
+
 async def clear_state(state: FSMContext | None) -> None:
     if state is not None:
         await state.clear()
