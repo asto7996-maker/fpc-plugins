@@ -122,13 +122,18 @@ class RedisTaskBroker:
             self._worker_task = None
 
     async def _loop(self) -> None:
+        """
+        Non-blocking poll loop.
+
+        Avoid long BRPOP on a shared Redis client — a stuck blocking read can
+        starve aiogram polling when the connection pool is tiny / saturated.
+        """
         logger.info("Redis task worker started")
         while not self._stopped.is_set():
             try:
-                item = await self.redis.brpoplpush(
-                    QUEUE_KEY, PROCESSING_KEY, timeout=2
-                )
+                item = await self.redis.rpoplpush(QUEUE_KEY, PROCESSING_KEY)
                 if item is None:
+                    await asyncio.sleep(0.5)
                     continue
                 raw = item.decode() if isinstance(item, bytes) else item
                 task = PoolTask.from_json(raw)

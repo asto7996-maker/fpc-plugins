@@ -2,7 +2,7 @@
 Application entrypoint.
 
 Starts:
-* PostgreSQL schema init
+* DB schema init
 * Redis task worker + APScheduler
 * Gemini Draft Engine listeners (Telethon)
 * aiogram admin bot polling (+ command menu, invite access)
@@ -40,6 +40,58 @@ def setup_logging(level: str) -> None:
     logging.getLogger("apscheduler").setLevel(logging.WARNING)
 
 
+async def _send_bootstrap(bot: Bot, creator_id: int) -> None:
+    from tg_pool.admin.keyboards import main_menu_kb, reply_menu_kb
+    from tg_pool.admin.texts import main_menu_text
+
+    await bot.send_message(
+        creator_id,
+        "✅ <b>Панель запущена</b>\n\n" + main_menu_text(),
+        parse_mode="HTML",
+        reply_markup=reply_menu_kb(is_creator=True),
+    )
+    await bot.send_message(
+        creator_id,
+        "Выберите раздел:",
+        parse_mode="HTML",
+        reply_markup=main_menu_kb(is_creator=True),
+    )
+
+
+async def _run_polling_forever(dp, bot: Bot, stop_event: asyncio.Event) -> None:
+    """Restart aiogram polling if it dies (conflict / network blip)."""
+    logger = logging.getLogger("tg_pool.polling")
+    backoff = 1.0
+    while not stop_event.is_set():
+        try:
+            # handle_signals=False — main() owns SIGINT/SIGTERM
+            await dp.start_polling(bot, handle_signals=False)
+            if stop_event.is_set():
+                break
+            logger.warning("Polling ended unexpectedly — restarting in %.1fs", backoff)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Polling crashed: %s — restart in %.1fs", exc, backoff)
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=backoff)
+            break
+        except asyncio.TimeoutError:
+            pass
+        backoff = min(30.0, backoff * 1.5)
+
+
+async def _heartbeat(stop_event: asyncio.Event) -> None:
+    logger = logging.getLogger("tg_pool.heartbeat")
+    while not stop_event.is_set():
+        logger.info("alive")
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=60)
+            break
+        except asyncio.TimeoutError:
+            continue
+
+
 async def amain() -> None:
     settings = get_settings()
     setup_logging(settings.log_level)
@@ -49,8 +101,12 @@ async def amain() -> None:
     await create_all()
     logger.info("Database schema ready")
 
-    redis = redis_from_url(settings.redis_url, decode_responses=False)
-    broker = RedisTaskBroker(redis, settings=settings)
+    # Separate Redis clients so a blocking queue read cannot starve other I/O
+    redis = redis_from_url(settings.redis_url, decode_responses=False, max_connections=20)
+    redis_broker = redis_from_url(
+        settings.redis_url, decode_responses=False, max_connections=10
+    )
+    broker = RedisTaskBroker(redis_broker, settings=settings)
     alerts = AlertService(settings=settings)
     TaskRouter(broker, alerts, settings=settings)
 
@@ -62,6 +118,7 @@ async def amain() -> None:
 
     bot: Bot | None = None
     polling_task: asyncio.Task | None = None
+    heartbeat_task: asyncio.Task | None = None
     stop_event = asyncio.Event()
 
     if settings.admin_bot_token:
@@ -74,6 +131,11 @@ async def amain() -> None:
                 username=None,
                 full_name="Creator",
             )
+        # Ensure no webhook steals updates from polling
+        try:
+            await bot.delete_webhook(drop_pending_updates=False)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("delete_webhook failed: %s", exc)
         await setup_bot_commands(bot)
         dp = build_dispatcher(
             settings,
@@ -82,7 +144,11 @@ async def amain() -> None:
             draft_engine=listeners.engine,
             listeners=listeners,
         )
-        polling_task = asyncio.create_task(dp.start_polling(bot), name="admin-polling")
+        polling_task = asyncio.create_task(
+            _run_polling_forever(dp, bot, stop_event),
+            name="admin-polling",
+        )
+        heartbeat_task = asyncio.create_task(_heartbeat(stop_event), name="heartbeat")
         logger.info("Admin bot polling started (creator_id=%s)", settings.creator_id)
     else:
         logger.warning("ADMIN_BOT_TOKEN empty — admin UI disabled, worker-only mode")
@@ -90,27 +156,11 @@ async def amain() -> None:
     try:
         await listeners.start()
     except Exception as exc:  # noqa: BLE001
-        # Admin bot must keep running even if no userbot sessions are ready
         logger.error("ListenerManager start failed (admin UI still up): %s", exc)
 
-    # Push a bootstrap menu to the creator so the panel is never "silent"
     if bot is not None:
         try:
-            from tg_pool.admin.keyboards import main_menu_kb, reply_menu_kb
-            from tg_pool.admin.texts import main_menu_text
-
-            await bot.send_message(
-                settings.creator_id,
-                "✅ <b>Панель запущена</b>\n\n" + main_menu_text(),
-                parse_mode="HTML",
-                reply_markup=reply_menu_kb(is_creator=True),
-            )
-            await bot.send_message(
-                settings.creator_id,
-                "Выберите раздел:",
-                parse_mode="HTML",
-                reply_markup=main_menu_kb(is_creator=True),
-            )
+            await _send_bootstrap(bot, settings.creator_id)
             logger.info("Bootstrap menu sent to creator %s", settings.creator_id)
         except Exception as exc:  # noqa: BLE001
             logger.warning("Could not push bootstrap menu: %s", exc)
@@ -135,34 +185,37 @@ async def amain() -> None:
                 return_when=asyncio.FIRST_COMPLETED,
             )
             if polling_task in done and stop_wait not in done:
-                await polling_task
+                exc = polling_task.exception() if not polling_task.cancelled() else None
+                if exc:
+                    raise exc
         else:
             await stop_event.wait()
     finally:
         logger.info("Graceful shutdown…")
-        if polling_task is not None and not polling_task.done():
-            polling_task.cancel()
+        stop_event.set()
+        for task in (polling_task, heartbeat_task):
+            if task is not None and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+        if bot is not None:
             try:
-                await polling_task
-            except asyncio.CancelledError:
+                await bot.session.close()
+            except Exception:  # noqa: BLE001
                 pass
         await listeners.stop()
         scheduler.shutdown()
         await broker.stop_worker()
         await redis.aclose()
-        if bot is not None:
-            await bot.session.close()
+        await redis_broker.aclose()
         await dispose_engine()
         logger.info("Shutdown complete")
 
 
 def main() -> None:
-    try:
-        import uvloop
-
-        uvloop.install()
-    except ImportError:
-        pass
+    # Prefer stdlib asyncio for admin-bot reliability (uvloop optional later)
     try:
         asyncio.run(amain())
     except KeyboardInterrupt:
