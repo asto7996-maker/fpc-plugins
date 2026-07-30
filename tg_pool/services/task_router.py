@@ -21,7 +21,7 @@ from tg_pool.clients.session_wrapper import FatalSessionError, SessionWrapper
 from tg_pool.clients.spambot import check_spambot
 from tg_pool.config import Settings, get_settings
 from tg_pool.db.session import session_scope
-from tg_pool.queue.broker import PoolTask, RedisTaskBroker
+from tg_pool.taskqueue.broker import PoolTask, RedisTaskBroker
 from tg_pool.services.account_service import AccountService
 from tg_pool.services.alerts import AlertService
 

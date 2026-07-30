@@ -7,7 +7,7 @@ from typing import Optional
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-from tg_pool.queue.broker import RedisTaskBroker
+from tg_pool.taskqueue.broker import RedisTaskBroker
 
 logger = logging.getLogger(__name__)
 

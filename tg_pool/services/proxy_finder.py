@@ -184,9 +184,9 @@ async def fetch_candidates(
 async def find_working_proxies(
     *,
     needed: int = 5,
-    max_checks: int = 120,
-    concurrency: int = 40,
-    timeout: float = 6.0,
+    max_checks: int = 80,
+    concurrency: int = 25,
+    timeout: float = 4.0,
 ) -> list[ProxyCandidate]:
     """
     Fetch public lists and return up to `needed` proxies that can reach Telegram.

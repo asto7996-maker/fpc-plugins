@@ -11,7 +11,7 @@ from tg_pool.admin.texts import account_detail_text, accounts_list_text
 from tg_pool.config import Settings
 from tg_pool.db.models import AccountStatus
 from tg_pool.db.session import session_scope
-from tg_pool.queue.broker import PoolTask, RedisTaskBroker
+from tg_pool.taskqueue.broker import PoolTask, RedisTaskBroker
 from tg_pool.services.account_service import AccountService
 
 

@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 from tg_pool.clients.fingerprint import generate_fingerprint
 from tg_pool.clients.spambot import _classify
 from tg_pool.db.models import Account, AccountStatus, Proxy, ProxyProtocol
-from tg_pool.queue.broker import PoolTask
+from tg_pool.taskqueue.broker import PoolTask
 
 
 class FingerprintTests(unittest.TestCase):

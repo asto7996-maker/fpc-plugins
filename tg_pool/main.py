@@ -12,8 +12,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import signal
 import sys
+from pathlib import Path
 
 from aiogram import Bot
 from redis.asyncio import from_url as redis_from_url
@@ -21,8 +23,8 @@ from redis.asyncio import from_url as redis_from_url
 from tg_pool.admin.bot import build_dispatcher, setup_bot_commands
 from tg_pool.config import get_settings
 from tg_pool.db.session import create_all, dispose_engine, init_engine, session_scope
-from tg_pool.queue.broker import RedisTaskBroker
-from tg_pool.queue.scheduler import PoolScheduler
+from tg_pool.taskqueue.broker import RedisTaskBroker
+from tg_pool.taskqueue.scheduler import PoolScheduler
 from tg_pool.services.access_service import AccessService
 from tg_pool.services.alerts import AlertService
 from tg_pool.services.listener_manager import ListenerManager
@@ -44,9 +46,15 @@ async def _send_bootstrap(bot: Bot, creator_id: int) -> None:
     from tg_pool.admin.keyboards import main_menu_kb, reply_menu_kb
     from tg_pool.admin.texts import main_menu_text
 
+    under_watchdog = bool(os.environ.get("TG_POOL_HEARTBEAT_FILE"))
+    title = (
+        "✅ <b>Панель онлайн</b> <i>(watchdog)</i>\n\n"
+        if under_watchdog
+        else "✅ <b>Панель запущена</b>\n\n"
+    )
     await bot.send_message(
         creator_id,
-        "✅ <b>Панель запущена</b>\n\n" + main_menu_text(),
+        title + main_menu_text(),
         parse_mode="HTML",
         reply_markup=reply_menu_kb(is_creator=True),
     )
@@ -81,12 +89,32 @@ async def _run_polling_forever(dp, bot: Bot, stop_event: asyncio.Event) -> None:
         backoff = min(30.0, backoff * 1.5)
 
 
+def _touch_heartbeat() -> None:
+    path = Path(os.environ.get("TG_POOL_HEARTBEAT_FILE", "/tmp/tg_pool_heartbeat"))
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(str(asyncio.get_running_loop().time()), encoding="utf-8")
+    except Exception:  # noqa: BLE001
+        logging.getLogger("tg_pool.heartbeat").debug(
+            "heartbeat touch failed", exc_info=True
+        )
+
+
 async def _heartbeat(stop_event: asyncio.Event) -> None:
+    """
+    Touch an on-disk heartbeat every few seconds.
+
+    The external watchdog kills/restarts the process if this file goes stale —
+    that recovers from event-loop freezes that normal exception handlers miss.
+    """
     logger = logging.getLogger("tg_pool.heartbeat")
+    interval = float(os.environ.get("TG_POOL_HEARTBEAT_INTERVAL_SEC", "15"))
+    _touch_heartbeat()
     while not stop_event.is_set():
+        _touch_heartbeat()
         logger.info("alive")
         try:
-            await asyncio.wait_for(stop_event.wait(), timeout=60)
+            await asyncio.wait_for(stop_event.wait(), timeout=interval)
             break
         except asyncio.TimeoutError:
             continue

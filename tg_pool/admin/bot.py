@@ -20,7 +20,7 @@ from tg_pool.admin.routers.menu import build_menu_router
 from tg_pool.admin.routers.proxies import build_proxies_router
 from tg_pool.admin.routers.start import build_start_router
 from tg_pool.config import Settings
-from tg_pool.queue.broker import RedisTaskBroker
+from tg_pool.taskqueue.broker import RedisTaskBroker
 
 if TYPE_CHECKING:
     from tg_pool.services.draft_engine import DraftEngine

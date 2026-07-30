@@ -84,13 +84,15 @@ Env: `GEMINI_API_KEY` (или ключ в настройках панели).
 
 ```bash
 cd tg_pool
-docker compose up -d
-python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
+docker compose up -d   # postgres + redis (или SQLITE в .env)
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt aiosqlite
 cp .env.example .env
 # заполните ADMIN_BOT_TOKEN, ADMIN_IDS, TELEGRAM_API_ID/HASH
 
-cd ..
+# запуск с автоперезапуском при зависании:
+chmod +x scripts/run.sh
+./scripts/run.sh
 PYTHONPATH=. python -m tg_pool
 ```
 
@@ -115,7 +117,7 @@ tg_pool/
 ├── services/task_router.py   # лимиты + ротация
 ├── services/account_service.py
 ├── services/alerts.py
-├── queue/broker.py           # Redis
-├── queue/scheduler.py       # APScheduler
+├── taskqueue/broker.py       # Redis
+├── taskqueue/scheduler.py    # APScheduler
 └── admin/bot.py              # aiogram panel
 ```
