@@ -69,15 +69,15 @@ def build_dispatcher(
     dp.message.middleware(access_mw)
     dp.callback_query.middleware(access_mw)
 
-    # Order: start (invite) first, then feature routers
+    # Order matters: global nav / callbacks before FSM catch-alls (TData archive).
     dp.include_router(build_start_router(settings))
     dp.include_router(build_menu_router(settings))
-    dp.include_router(build_accounts_router(settings, broker, listeners=listeners))
-    dp.include_router(build_add_account_router(settings))
     dp.include_router(build_proxies_router(settings))
+    dp.include_router(build_accounts_router(settings, broker, listeners=listeners))
     dp.include_router(build_access_router(settings))
-
     if draft_engine is not None:
         dp.include_router(build_drafts_router(settings, draft_engine, listeners))
+    # FSM-heavy flows last so they cannot swallow reply-keyboard navigation
+    dp.include_router(build_add_account_router(settings))
 
     return dp

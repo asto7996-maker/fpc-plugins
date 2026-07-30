@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from aiogram import F, Router
 from aiogram.filters import Command
+from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
 from sqlalchemy import func, select
 
@@ -13,28 +14,28 @@ from tg_pool.admin.keyboards import (
     reply_menu_kb,
     stats_kb,
 )
-from tg_pool.admin.routers.common import safe_edit, show_main_menu
+from tg_pool.admin.nav import (
+    REPLY_ACCOUNTS,
+    REPLY_ADD,
+    REPLY_ADMIN,
+    REPLY_GEMINI,
+    REPLY_HELP,
+    REPLY_HOME,
+    REPLY_PROFILE,
+    REPLY_STATS,
+)
+from tg_pool.admin.routers.common import clear_state, safe_edit, show_main_menu
 from tg_pool.admin.texts import help_text, main_menu_text, profile_text, stats_text
 from tg_pool.config import Settings
 from tg_pool.db.models import Account, AccountStatus, Proxy
 from tg_pool.db.session import session_scope
 
-# Reply-keyboard labels → same actions as /menu callbacks
-_REPLY_HOME = {"🏠 Меню", "Меню"}
-_REPLY_ACCOUNTS = {"🚀 Аккаунты", "Аккаунты"}
-_REPLY_ADD = {"➕ Добавить", "Добавить"}
-_REPLY_GEMINI = {"🤖 Gemini", "Gemini"}
-_REPLY_STATS = {"📊 Статистика", "Статистика"}
-_REPLY_PROFILE = {"👤 Профиль", "Профиль"}
-_REPLY_HELP = {"📖 Справка", "Справка"}
-_REPLY_ADMIN = {"🔑 Admin", "Admin"}
-
 
 def build_menu_router(settings: Settings) -> Router:
     router = Router(name="menu")
 
-    @router.message(Command("menu"))
-    async def cmd_menu(message: Message, is_creator: bool = False) -> None:
+    async def _show_menu(message: Message, is_creator: bool, state: FSMContext | None) -> None:
+        await clear_state(state)
         await message.answer(
             main_menu_text(),
             parse_mode="HTML",
@@ -46,20 +47,39 @@ def build_menu_router(settings: Settings) -> Router:
             reply_markup=main_menu_kb(is_creator=is_creator),
         )
 
-    @router.message(F.text.in_(_REPLY_HOME))
-    async def reply_home(message: Message, is_creator: bool = False) -> None:
-        await cmd_menu(message, is_creator=is_creator)
+    @router.message(Command("menu"))
+    async def cmd_menu(
+        message: Message,
+        state: FSMContext,
+        is_creator: bool = False,
+    ) -> None:
+        await _show_menu(message, is_creator, state)
 
-    @router.message(F.text.in_(_REPLY_HELP))
+    @router.message(F.text.in_(REPLY_HOME))
+    async def reply_home(
+        message: Message,
+        state: FSMContext,
+        is_creator: bool = False,
+    ) -> None:
+        await _show_menu(message, is_creator, state)
+
+    @router.message(F.text.in_(REPLY_HELP))
     @router.message(Command("help"))
-    async def cmd_help(message: Message) -> None:
+    async def cmd_help(message: Message, state: FSMContext) -> None:
         from tg_pool.admin.keyboards import back_home_kb
 
+        await clear_state(state)
         await message.answer(help_text(), parse_mode="HTML", reply_markup=back_home_kb())
 
-    @router.message(F.text.in_(_REPLY_PROFILE))
+    @router.message(F.text.in_(REPLY_PROFILE))
     @router.message(Command("profile"))
-    async def cmd_profile(message: Message, panel_user=None, is_creator: bool = False) -> None:
+    async def cmd_profile(
+        message: Message,
+        state: FSMContext,
+        panel_user=None,
+        is_creator: bool = False,
+    ) -> None:
+        await clear_state(state)
         if panel_user is None:
             await message.answer("Профиль недоступен.")
             return
@@ -69,12 +89,13 @@ def build_menu_router(settings: Settings) -> Router:
             reply_markup=profile_kb(is_creator=is_creator),
         )
 
-    @router.message(F.text.in_(_REPLY_ACCOUNTS))
-    async def reply_accounts(message: Message) -> None:
+    @router.message(F.text.in_(REPLY_ACCOUNTS))
+    async def reply_accounts(message: Message, state: FSMContext) -> None:
         from tg_pool.admin.keyboards import accounts_kb
         from tg_pool.admin.texts import accounts_list_text
         from tg_pool.services.account_service import AccountService
 
+        await clear_state(state)
         async with session_scope() as session:
             accounts = list(await AccountService(session).list_accounts())
         await message.answer(
@@ -83,27 +104,30 @@ def build_menu_router(settings: Settings) -> Router:
             reply_markup=accounts_kb(accounts),
         )
 
-    @router.message(F.text.in_(_REPLY_ADD))
-    async def reply_add(message: Message) -> None:
+    @router.message(F.text.in_(REPLY_ADD))
+    async def reply_add(message: Message, state: FSMContext) -> None:
         from tg_pool.admin.keyboards import add_account_kb
 
+        await clear_state(state)
         await message.answer(
             "➕ <b>Добавить аккаунт</b>\n\nВыберите способ импорта:",
             parse_mode="HTML",
             reply_markup=add_account_kb(),
         )
 
-    @router.message(F.text.in_(_REPLY_STATS))
-    async def reply_stats(message: Message) -> None:
+    @router.message(F.text.in_(REPLY_STATS))
+    async def reply_stats(message: Message, state: FSMContext) -> None:
+        await clear_state(state)
         text = await _stats_text()
         await message.answer(text, parse_mode="HTML", reply_markup=stats_kb())
 
-    @router.message(F.text.in_(_REPLY_GEMINI))
-    async def reply_gemini(message: Message) -> None:
+    @router.message(F.text.in_(REPLY_GEMINI))
+    async def reply_gemini(message: Message, state: FSMContext) -> None:
         from tg_pool.admin.keyboards import drafts_settings_kb
         from tg_pool.admin.texts import drafts_settings_text
         from tg_pool.services.draft_service import DraftService
 
+        await clear_state(state)
         async with session_scope() as session:
             svc = DraftService(session)
             cfg = await svc.get_settings()
@@ -125,8 +149,13 @@ def build_menu_router(settings: Settings) -> Router:
             reply_markup=drafts_settings_kb(cfg),
         )
 
-    @router.message(F.text.in_(_REPLY_ADMIN))
-    async def reply_admin(message: Message, is_creator: bool = False) -> None:
+    @router.message(F.text.in_(REPLY_ADMIN))
+    async def reply_admin(
+        message: Message,
+        state: FSMContext,
+        is_creator: bool = False,
+    ) -> None:
+        await clear_state(state)
         if not is_creator and (
             message.from_user is None or message.from_user.id != settings.creator_id
         ):
@@ -177,22 +206,30 @@ def build_menu_router(settings: Settings) -> Router:
     @router.callback_query(F.data == "menu:home")
     @router.callback_query(F.data == "nav:back")
     @router.callback_query(F.data == "nav:refresh")
-    async def cb_home(callback: CallbackQuery, is_creator: bool = False) -> None:
+    async def cb_home(
+        callback: CallbackQuery,
+        state: FSMContext,
+        is_creator: bool = False,
+    ) -> None:
+        await clear_state(state)
         await show_main_menu(callback, is_creator=is_creator, edit=True)
 
     @router.callback_query(F.data == "menu:help")
-    async def cb_help(callback: CallbackQuery) -> None:
+    async def cb_help(callback: CallbackQuery, state: FSMContext) -> None:
         from tg_pool.admin.keyboards import back_home_kb
 
+        await clear_state(state)
         await safe_edit(callback, help_text(), back_home_kb())
         await callback.answer()
 
     @router.callback_query(F.data == "menu:profile")
     async def cb_profile(
         callback: CallbackQuery,
+        state: FSMContext,
         panel_user=None,
         is_creator: bool = False,
     ) -> None:
+        await clear_state(state)
         if panel_user is None:
             await callback.answer("Нет профиля", show_alert=True)
             return
@@ -204,7 +241,8 @@ def build_menu_router(settings: Settings) -> Router:
         await callback.answer()
 
     @router.callback_query(F.data == "menu:stats")
-    async def cb_stats(callback: CallbackQuery) -> None:
+    async def cb_stats(callback: CallbackQuery, state: FSMContext) -> None:
+        await clear_state(state)
         await safe_edit(callback, await _stats_text(), stats_kb())
         await callback.answer()
 

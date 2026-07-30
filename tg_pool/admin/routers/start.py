@@ -39,8 +39,9 @@ def build_start_router(settings: Settings) -> Router:
             )
             allowed = access.has_access(user, message.from_user.id)
 
+        # Always clear leftover FSM (TData / proxy add) on /start
+        await state.clear()
         if allowed:
-            await state.clear()
             creator = is_creator or user.telegram_id == settings.creator_id
             # Persistent bottom keyboard first, then inline card
             await message.answer(

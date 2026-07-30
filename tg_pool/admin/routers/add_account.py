@@ -11,6 +11,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
 
 from tg_pool.admin.keyboards import add_account_kb, main_menu_kb, tdata_success_kb
+from tg_pool.admin.nav import ALL_REPLY_NAV
 from tg_pool.admin.routers.common import safe_edit
 from tg_pool.admin.states import AddAccountStates, ImportTDataStates
 from tg_pool.clients.tdata_converter import (
@@ -296,8 +297,16 @@ def build_add_account_router(settings: Settings) -> Router:
         finally:
             cleanup_tree(tmp_root)
 
-    @router.message(ImportTDataStates.archive)
+    @router.message(
+        ImportTDataStates.archive,
+        F.text,
+        ~F.text.in_(ALL_REPLY_NAV),
+        ~F.text.startswith("/"),
+    )
     async def tdata_not_doc(message: Message) -> None:
-        await message.answer("Пришлите ZIP именно как <b>документ</b>.", parse_mode="HTML")
+        await message.answer(
+            "Пришлите ZIP именно как <b>документ</b>, либо нажмите 🏠 Меню для отмены.",
+            parse_mode="HTML",
+        )
 
     return router
