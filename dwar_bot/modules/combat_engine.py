@@ -187,6 +187,10 @@ class CombatEngine:
         self._last_strike_fingerprint: str = ""
         self._strike_index: int = 0
 
+    @property
+    def potion_cooldown_sec(self) -> float:
+        return self._potion_cooldown_sec
+
     # ------------------------------------------------------------------
     # Публичный API
     # ------------------------------------------------------------------

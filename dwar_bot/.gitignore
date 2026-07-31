@@ -4,7 +4,9 @@ __pycache__/
 data/logs/
 data/screenshots/
 data/browser_state.json
+data/runtime_state.json
 data/cookies/*.json
 data/cookies/*.txt
 !data/cookies/.gitkeep
 .env
+*.log

@@ -14,6 +14,7 @@ from dwar_bot.modules.stats_parser import (
     PlayerStats,
     StatsParser,
 )
+from dwar_bot.modules.timers_manager import TimersManager
 
 __all__ = [
     "BackpackItem",
@@ -28,4 +29,5 @@ __all__ = [
     "QuestStatus",
     "QuestTracker",
     "StatsParser",
+    "TimersManager",
 ]
