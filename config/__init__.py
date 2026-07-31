@@ -1,0 +1,41 @@
+"""Пакет точной настройки DOM-селекторов DwarBot."""
+
+from config.selectors import (
+    CHAT_FRAME_NAME,
+    COMBAT_FRAME_NAME,
+    MAIN_FRAME_NAME,
+    NAV_FRAME_NAME,
+    SELECTORS,
+    USER_FRAME_NAME,
+    BackpackSelectors,
+    CombatSelectors,
+    DwarSelectors,
+    FrameSelectors,
+    LocationSelectors,
+    QuestSelectors,
+    StatsSelectors,
+    format_validation_report,
+    missing_selectors,
+    to_legacy_selector_kwargs,
+    validate_selectors,
+)
+
+__all__ = [
+    "MAIN_FRAME_NAME",
+    "CHAT_FRAME_NAME",
+    "USER_FRAME_NAME",
+    "COMBAT_FRAME_NAME",
+    "NAV_FRAME_NAME",
+    "SELECTORS",
+    "FrameSelectors",
+    "CombatSelectors",
+    "BackpackSelectors",
+    "QuestSelectors",
+    "LocationSelectors",
+    "StatsSelectors",
+    "DwarSelectors",
+    "validate_selectors",
+    "format_validation_report",
+    "missing_selectors",
+    "to_legacy_selector_kwargs",
+]

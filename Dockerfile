@@ -54,6 +54,7 @@ RUN playwright install-deps chromium \
 
 # Исходный код проекта
 COPY dwar_bot /app/dwar_bot
+COPY config /app/config
 COPY main.py /app/main.py
 
 # Каталоги для томов (куки, лог, капчи)
