@@ -190,17 +190,26 @@ class BotOrchestrator:
                 page = self.browser.page
 
                 # 0) Антибот / капча
+                if self.anti_bot.is_paused:
+                    self.logger.critical(
+                        "Главный цикл на паузе из-за капчи — ждём manual override"
+                    )
+                    await self.anti_bot.captcha.wait_until_resumed()
+                    continue
+
                 if self.timers.is_ready(TIMER_ANTI_BOT):
                     challenged = await self.anti_bot.handle_challenge(page)
                     if challenged:
                         self.timers.set_cooldown(TIMER_ANTI_BOT, 30.0)
                         await notify_telegram(
-                            "Капча/антибот! Требуется ручное вмешательство.",
+                            "ТРЕБУЕТСЯ ВМЕШАТЕЛЬСТВО: Появилась капча!",
                             critical=True,
                         )
-                        await asyncio.sleep(
-                            self.timers.optimal_sleep(in_combat=False, hp_critical=True)
-                        )
+                        # Пока капча активна — ждём resume / исчезновения
+                        if self.anti_bot.is_paused:
+                            await self.anti_bot.captcha.wait_until_resumed(
+                                poll_sec=3.0
+                            )
                         continue
                     self.timers.set_cooldown(TIMER_ANTI_BOT, random.uniform(8.0, 15.0))
 

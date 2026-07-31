@@ -3,6 +3,7 @@ __pycache__/
 *.log
 data/logs/
 data/screenshots/
+data/captchas/
 data/browser_state.json
 data/runtime_state.json
 data/cookies/*.json

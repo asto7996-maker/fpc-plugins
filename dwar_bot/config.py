@@ -22,6 +22,7 @@ DATA_DIR: Final[Path] = PROJECT_ROOT / "data"
 COOKIES_DIR: Final[Path] = DATA_DIR / "cookies"
 LOGS_DIR: Final[Path] = DATA_DIR / "logs"
 SCREENSHOTS_DIR: Final[Path] = DATA_DIR / "screenshots"
+CAPTCHAS_DIR: Final[Path] = DATA_DIR / "captchas"
 
 # Основной файл куков (Cookie Editor / EditThisCookie JSON)
 COOKIES_FILE: Final[Path] = COOKIES_DIR / "cookies.json"
@@ -387,6 +388,7 @@ class BotConfig:
             self.cookies.cookies_dir,
             LOGS_DIR,
             SCREENSHOTS_DIR,
+            CAPTCHAS_DIR,
             self.logging.log_file.parent,
             self.cookies.playwright_state_file.parent,
             self.cookies.cookies_file.parent,

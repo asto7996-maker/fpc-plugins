@@ -6,7 +6,8 @@
   - отключение navigator.webdriver и связанных флагов автоматизации;
   - применение cookie-сессий в BrowserContext;
   - безопасная навигация goto_with_retry с обработкой сетевых таймаутов;
-  - human_click со случайным смещением координат и паузой перед кликом;
+  - human_click по кривой Безье + пауза перед кликом;
+  - human_type с опечатками и разным темпом набора;
   - скриншоты при ошибках (если включено в конфиге).
 """
 
@@ -34,6 +35,7 @@ from playwright.async_api import (
 
 from dwar_bot.auth.cookie_manager import CookieManager, CookieSession
 from dwar_bot.config import SCREENSHOTS_DIR, BotConfig, config
+from dwar_bot.core.anti_bot import HumanBehavior
 
 logger = logging.getLogger(__name__)
 
@@ -119,6 +121,12 @@ class BrowserEngine:
         self._page: Optional[Page] = None
         self._started: bool = False
         self._network_log: List[Dict[str, Any]] = []
+        self._human = HumanBehavior(self._config)
+
+    @property
+    def human(self) -> HumanBehavior:
+        """Доступ к HumanBehavior (Bezier / idle / type)."""
+        return self._human
 
     # ------------------------------------------------------------------
     # Свойства
@@ -465,8 +473,8 @@ class BrowserEngine:
         """
         Клик с имитацией человека:
           1) ожидание элемента;
-          2) случайная пауза перед действием;
-          3) наведение с небольшим смещением координат;
+          2) случайная пауза / rare idle;
+          3) наведение по кривой Безье (HumanBehavior);
           4) короткая пауза pre_click;
           5) mouse down/up с микро-задержкой.
         """
@@ -476,6 +484,7 @@ class BrowserEngine:
         else:
             owner = page or self.page
 
+        page_ref = page or self.page
         timeout = (
             timeout_ms
             if timeout_ms is not None
@@ -483,6 +492,7 @@ class BrowserEngine:
         )
 
         try:
+            selector_str = target if isinstance(target, str) else ""
             if isinstance(target, str):
                 await owner.wait_for_selector(
                     target, timeout=timeout, state="visible"
@@ -497,10 +507,11 @@ class BrowserEngine:
                     raise BrowserEngineError("Элемент для клика не видим")
 
             await self._human_delay("click")
+            # Редкая «задумчивость» перед важным кликом
+            await self._human.random_idle(page_ref, chance=0.04)
 
             box = await element.bounding_box()
             if box is None:
-                # Fallback: обычный click Playwright
                 logger.debug(
                     "bounding_box недоступен, используем element.click()"
                 )
@@ -512,25 +523,41 @@ class BrowserEngine:
                 )
                 return
 
-            dx, dy = self._delays.click_offset()
-            # Держим клик внутри элемента (10% отступ от краёв)
-            margin_x = max(1.0, box["width"] * 0.1)
-            margin_y = max(1.0, box["height"] * 0.1)
-            x = box["x"] + box["width"] / 2 + dx
-            y = box["y"] + box["height"] / 2 + dy
-            x = min(max(x, box["x"] + margin_x), box["x"] + box["width"] - margin_x)
-            y = min(max(y, box["y"] + margin_y), box["y"] + box["height"] - margin_y)
+            try:
+                if selector_str:
+                    end = await self._human.bezier_mouse_move(
+                        page_ref,
+                        selector_str,
+                        frame=frame,
+                        element=element,
+                        timeout_ms=timeout,
+                    )
+                    x, y = end
+                else:
+                    dx, dy = self._delays.click_offset()
+                    margin_x = max(1.0, box["width"] * 0.1)
+                    margin_y = max(1.0, box["height"] * 0.1)
+                    x = box["x"] + box["width"] / 2 + dx
+                    y = box["y"] + box["height"] / 2 + dy
+                    x = min(
+                        max(x, box["x"] + margin_x),
+                        box["x"] + box["width"] - margin_x,
+                    )
+                    y = min(
+                        max(y, box["y"] + margin_y),
+                        box["y"] + box["height"] - margin_y,
+                    )
+                    await self._human.move_along_bezier(page_ref, (x, y))
+            except Exception as bezier_exc:
+                logger.debug(
+                    "Bezier move fallback to linear: %s", bezier_exc
+                )
+                dx, dy = self._delays.click_offset()
+                x = box["x"] + box["width"] / 2 + dx
+                y = box["y"] + box["height"] / 2 + dy
+                await page_ref.mouse.move(x, y, steps=random.randint(5, 18))
+                self._human.set_cursor(x, y)
 
-            page_ref = self.page if frame is None else (
-                page or self.page
-            )
-            # Для Frame координаты относительны viewport страницы —
-            # bounding_box уже в координатах страницы.
-            await page_ref.mouse.move(
-                x,
-                y,
-                steps=random.randint(5, 18),
-            )
             await self._human_delay("pre_click")
 
             for _ in range(click_count):
@@ -540,9 +567,7 @@ class BrowserEngine:
                 if click_count > 1:
                     await asyncio.sleep(random.uniform(0.05, 0.15))
 
-            logger.debug(
-                "human_click: (%.1f, %.1f) offset=(%.1f, %.1f)", x, y, dx, dy
-            )
+            logger.debug("human_click (bezier): (%.1f, %.1f)", x, y)
         except PlaywrightTimeoutError as exc:
             await self.capture_error_screenshot(prefix="human_click_timeout")
             raise BrowserEngineError(
@@ -554,6 +579,36 @@ class BrowserEngine:
             await self.capture_error_screenshot(prefix="human_click_error")
             logger.error("Ошибка human_click: %s", exc, exc_info=True)
             raise BrowserEngineError(f"human_click не удался: {exc}") from exc
+
+    async def human_type(
+        self,
+        selector: str,
+        text: str,
+        *,
+        page: Optional[Page] = None,
+        frame: Optional[Frame] = None,
+        clear_first: bool = True,
+        typo_chance: float = 0.05,
+    ) -> None:
+        """
+        Human-like набор текста через HumanBehavior.human_type
+        (разные задержки, опечатки ~5%).
+        """
+        page_ref = page or self.page
+        try:
+            await self._human.random_idle(page_ref, chance=0.06)
+            await self._human.human_type(
+                page_ref,
+                selector,
+                text,
+                frame=frame,
+                clear_first=clear_first,
+                typo_chance=typo_chance,
+            )
+        except Exception as exc:
+            await self.capture_error_screenshot(prefix="human_type_error")
+            logger.error("Ошибка human_type: %s", exc, exc_info=True)
+            raise BrowserEngineError(f"human_type не удался: {exc}") from exc
 
     async def wait_for_selector(
         self,
