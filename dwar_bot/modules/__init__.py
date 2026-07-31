@@ -1,4 +1,4 @@
-"""Игровые модули бота: статы, бой, квесты, фарм, аукцион, аналитика."""
+"""Игровые модули бота: статы, бой, квесты, фарм, аукцион, аналитика, планировщик."""
 
 from dwar_bot.modules.analytics_reporter import (
     AnalyticsReporter,
@@ -9,6 +9,10 @@ from dwar_bot.modules.auction_trader import (
     AuctionItem,
     AuctionTrader,
     TradeOffer,
+)
+from dwar_bot.modules.background_scheduler import (
+    BackgroundScheduler,
+    ScheduledTask,
 )
 from dwar_bot.modules.combat_engine import CombatEngine, CombatState, FightResult
 from dwar_bot.modules.profession_farm import FarmStats, ProfessionFarm, ResourceNode
@@ -31,6 +35,7 @@ __all__ = [
     "AnalyticsReporter",
     "AuctionItem",
     "AuctionTrader",
+    "BackgroundScheduler",
     "BackpackItem",
     "CombatEngine",
     "CombatState",
@@ -46,6 +51,7 @@ __all__ = [
     "QuestStatus",
     "QuestTracker",
     "ResourceNode",
+    "ScheduledTask",
     "SessionMetrics",
     "StatsParser",
     "TimersManager",

@@ -45,6 +45,7 @@ from dwar_bot.modules.analytics_reporter import (
     EVENT_RESOURCE_FARMED,
     AnalyticsReporter,
 )
+from dwar_bot.modules.background_scheduler import BackgroundScheduler
 from dwar_bot.modules.combat_engine import CombatEngine
 from dwar_bot.modules.profession_farm import FarmStats, ProfessionFarm
 from dwar_bot.modules.quest_tracker import QuestTracker
@@ -121,6 +122,16 @@ class BotOrchestrator:
             report_interval_hours=report_hours,
         )
 
+        # Фоновая рутина: почта, daily, бафы, cleanup
+        self.scheduler = BackgroundScheduler(
+            self.config,
+            browser=self.browser,
+            human=self.browser.human,
+            analytics=self.analytics,
+            telegram=self.telegram,
+        )
+        self.scheduler.register_default_tasks()
+
         self._stop_event = asyncio.Event()
         self._started = False
         self._consecutive_errors = 0
@@ -132,6 +143,7 @@ class BotOrchestrator:
         self._loops = 0
         self._current_task: str = "idle"
         self._pause_started_at: Optional[float] = None
+        self._in_combat_flag = False
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -175,6 +187,22 @@ class BotOrchestrator:
         except Exception as exc:
             log_exception(self.logger, "Не удалось запустить AnalyticsReporter", exc)
 
+        # Фоновый планировщик рутины (почта / daily / бафы / cleanup)
+        try:
+            self.scheduler.bind_services(
+                analytics=self.analytics,
+                telegram=self.telegram,
+                browser=self.browser,
+            )
+            await self.scheduler.start_background(
+                self.browser.page,
+                self._last_stats or PlayerStats(),
+                in_combat_flag=False,
+            )
+            self.logger.info("BackgroundScheduler запущен: %s", self.scheduler.status_summary)
+        except Exception as exc:
+            log_exception(self.logger, "Не удалось запустить BackgroundScheduler", exc)
+
         await notify_telegram(
             f"Бот запущен (server={self.config.server.server})",
             critical=False,
@@ -196,6 +224,11 @@ class BotOrchestrator:
             )
         except Exception:
             pass
+
+        try:
+            await self.scheduler.stop()
+        except Exception as exc:
+            log_exception(self.logger, "Ошибка остановки BackgroundScheduler", exc)
 
         try:
             await self.analytics.stop_scheduler()
@@ -321,6 +354,7 @@ class BotOrchestrator:
                 f"KPI сессии: {snap.gold_earned:+.2f}з "
                 f"({snap.gold_per_hour:+.2f}з/ч) WR={snap.winrate_pct:.0f}%"
             ),
+            f"Scheduler: {self.scheduler.status_summary}",
             f"Очередь квестов: {len(self._quest_queue)}",
             f"Задача: {self._current_task}",
         ]
@@ -493,6 +527,9 @@ class BotOrchestrator:
                 )
                 self._last_stats = stats
                 in_combat = bool(stats.in_combat)
+                self._in_combat_flag = in_combat
+                # Контекст для фонового планировщика (почта/daily не в бою)
+                self.scheduler.set_context(page, stats, in_combat)
                 hp_pct = stats.hp_ratio * 100.0
                 hp_critical = hp_pct > 0 and hp_pct < self.hp_critical_pct
 
@@ -522,6 +559,8 @@ class BotOrchestrator:
                 combat_state = await self.combat.parse_combat_state(page)
                 if stats.in_combat or combat_state.in_combat:
                     in_combat = True
+                    self._in_combat_flag = True
+                    self.scheduler.set_in_combat(True)
                     self._current_task = "combat"
                     self.remote_state.current_task = "combat"
                     self.logger.info(
@@ -537,6 +576,8 @@ class BotOrchestrator:
                         target_combo=None,
                         hp_threshold_pct=self.hp_critical_pct,
                     )
+                    self._in_combat_flag = False
+                    self.scheduler.set_in_combat(False)
                     if won:
                         self._fights_won += 1
                         self.analytics.track_event(
