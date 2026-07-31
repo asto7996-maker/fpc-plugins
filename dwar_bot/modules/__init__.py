@@ -1,5 +1,10 @@
-"""Игровые модули бота: парсинг статов, бой, квесты, таймеры, фарм, аукцион."""
+"""Игровые модули бота: статы, бой, квесты, фарм, аукцион, аналитика."""
 
+from dwar_bot.modules.analytics_reporter import (
+    AnalyticsReporter,
+    DailyReport,
+    SessionMetrics,
+)
 from dwar_bot.modules.auction_trader import (
     AuctionItem,
     AuctionTrader,
@@ -23,11 +28,13 @@ from dwar_bot.modules.stats_parser import (
 from dwar_bot.modules.timers_manager import TimersManager
 
 __all__ = [
+    "AnalyticsReporter",
     "AuctionItem",
     "AuctionTrader",
     "BackpackItem",
     "CombatEngine",
     "CombatState",
+    "DailyReport",
     "FarmStats",
     "FightResult",
     "GameNotification",
@@ -39,6 +46,7 @@ __all__ = [
     "QuestStatus",
     "QuestTracker",
     "ResourceNode",
+    "SessionMetrics",
     "StatsParser",
     "TimersManager",
     "TradeOffer",

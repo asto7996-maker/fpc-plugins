@@ -9,3 +9,10 @@ auth/*
 **/__pycache__/
 **/*.py[cod]
 .pytest_cache/
+dwar_bot/data/analytics.db
+dwar_bot/data/analytics_events.jsonl
+dwar_bot/data/logs/*
+dwar_bot/data/screenshots/*
+dwar_bot/data/runtime_state.json
+*.csv
+

@@ -12,6 +12,7 @@ import argparse
 import asyncio
 import json
 import logging
+import os
 import random
 import signal
 import sys
@@ -32,6 +33,17 @@ from dwar_bot.logger import (
     setup_logging,
     start_telegram_notifier,
     stop_telegram_notifier,
+)
+from dwar_bot.modules.analytics_reporter import (
+    EVENT_AUCTION_BUY,
+    EVENT_AUCTION_SELL,
+    EVENT_BATTLE_LOST,
+    EVENT_BATTLE_WON,
+    EVENT_CAPTCHA,
+    EVENT_DOWNTIME,
+    EVENT_POTION_USED,
+    EVENT_RESOURCE_FARMED,
+    AnalyticsReporter,
 )
 from dwar_bot.modules.combat_engine import CombatEngine
 from dwar_bot.modules.profession_farm import FarmStats, ProfessionFarm
@@ -102,6 +114,13 @@ class BotOrchestrator:
         )
         self.recovery = CrashRecoveryManager(self.config)
 
+        # KPI / периодические отчёты (SQLite data/analytics.db)
+        report_hours = float(os.getenv("DWAR_REPORT_INTERVAL_HOURS", "12") or "12")
+        self.analytics = AnalyticsReporter(
+            self.config,
+            report_interval_hours=report_hours,
+        )
+
         self._stop_event = asyncio.Event()
         self._started = False
         self._consecutive_errors = 0
@@ -112,6 +131,7 @@ class BotOrchestrator:
         self._fights_lost = 0
         self._loops = 0
         self._current_task: str = "idle"
+        self._pause_started_at: Optional[float] = None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -149,6 +169,12 @@ class BotOrchestrator:
         )
         await self.telegram.start()
 
+        # Фоновая рассылка KPI (каждые 12ч по умолчанию; DWAR_REPORT_INTERVAL_HOURS)
+        try:
+            await self.analytics.start_scheduler(self.telegram)
+        except Exception as exc:
+            log_exception(self.logger, "Не удалось запустить AnalyticsReporter", exc)
+
         await notify_telegram(
             f"Бот запущен (server={self.config.server.server})",
             critical=False,
@@ -170,6 +196,17 @@ class BotOrchestrator:
             )
         except Exception:
             pass
+
+        try:
+            await self.analytics.stop_scheduler()
+            # Финальный отчёт + закрытие сессии аналитики
+            try:
+                await self.analytics.send_report_now(self.telegram, timeframe_hours=24)
+            except Exception:
+                pass
+            self.analytics.close()
+        except Exception as exc:
+            log_exception(self.logger, "Ошибка остановки AnalyticsReporter", exc)
 
         try:
             await self.telegram.stop()
@@ -221,12 +258,45 @@ class BotOrchestrator:
         self.remote_state.pause()
         self._current_task = "paused"
         self.remote_state.current_task = "paused"
+        self._pause_started_at = time.monotonic()
 
     def request_resume(self) -> None:
+        if self._pause_started_at is not None:
+            downtime = max(0.0, time.monotonic() - self._pause_started_at)
+            self.analytics.track_event(
+                EVENT_DOWNTIME,
+                {"seconds": downtime, "reason": "telegram_pause"},
+            )
+            self._pause_started_at = None
         self.remote_state.resume()
         if self._current_task == "paused":
             self._current_task = "idle"
             self.remote_state.current_task = "idle"
+
+    # ------------------------------------------------------------------
+    # Analytics helpers (фарм / аукцион / ручные вызовы)
+    # ------------------------------------------------------------------
+
+    def track_resource_farmed(self, name: str, count: int = 1) -> None:
+        """Пример: после успешного сбора в ProfessionFarm."""
+        self.analytics.track_event(
+            EVENT_RESOURCE_FARMED,
+            {"name": name, "count": max(1, int(count))},
+        )
+
+    def track_auction_buy(self, item_name: str, spent_gold: float) -> None:
+        """Пример: после AuctionTrader.buy_underpriced_items."""
+        self.analytics.track_event(
+            EVENT_AUCTION_BUY,
+            {"name": item_name, "gold": float(spent_gold)},
+        )
+
+    def track_auction_sell(self, item_name: str, earned_gold: float) -> None:
+        """Пример: после AuctionTrader.post_item_for_sale / продажи."""
+        self.analytics.track_event(
+            EVENT_AUCTION_SELL,
+            {"name": item_name, "gold": float(earned_gold)},
+        )
 
     # ------------------------------------------------------------------
     # Telegram providers
@@ -243,9 +313,14 @@ class BotOrchestrator:
                 self.logger.debug("build_status_report parse: %s", exc)
 
         farm: FarmStats = self.profession_farm.stats
+        snap = self.analytics.snapshot_session()
         lines = [
             f"Loops: {self._loops}",
             f"Бои: wins={self._fights_won} losses={self._fights_lost}",
+            (
+                f"KPI сессии: {snap.gold_earned:+.2f}з "
+                f"({snap.gold_per_hour:+.2f}з/ч) WR={snap.winrate_pct:.0f}%"
+            ),
             f"Очередь квестов: {len(self._quest_queue)}",
             f"Задача: {self._current_task}",
         ]
@@ -357,17 +432,30 @@ class BotOrchestrator:
                     self.logger.critical(
                         "Главный цикл на паузе из-за капчи — ждём manual override"
                     )
+                    captcha_wait_started = time.monotonic()
                     await self.telegram.send_alert(
                         "ТРЕБУЕТСЯ ВМЕШАТЕЛЬСТВО: Капча! Пройдите проверку.",
                         photo_path=None,
                     )
                     await self.anti_bot.captcha.wait_until_resumed()
+                    self.analytics.track_event(
+                        EVENT_CAPTCHA,
+                        {
+                            "downtime_seconds": max(
+                                0.0, time.monotonic() - captcha_wait_started
+                            ),
+                            "source": "paused_flag",
+                        },
+                    )
                     continue
 
                 if self.timers.is_ready(TIMER_ANTI_BOT):
                     challenged = await self.anti_bot.handle_challenge(page)
                     if challenged:
                         self.timers.set_cooldown(TIMER_ANTI_BOT, 30.0)
+                        self.analytics.track_event(
+                            EVENT_CAPTCHA, {"source": "handle_challenge"}
+                        )
                         await notify_telegram(
                             "ТРЕБУЕТСЯ ВМЕШАТЕЛЬСТВО: Появилась капча!",
                             critical=True,
@@ -376,8 +464,19 @@ class BotOrchestrator:
                             "ТРЕБУЕТСЯ ВМЕШАТЕЛЬСТВО: Появилась капча!",
                         )
                         if self.anti_bot.is_paused:
+                            captcha_wait_started = time.monotonic()
                             await self.anti_bot.captcha.wait_until_resumed(
                                 poll_sec=3.0
+                            )
+                            self.analytics.track_event(
+                                EVENT_DOWNTIME,
+                                {
+                                    "seconds": max(
+                                        0.0,
+                                        time.monotonic() - captcha_wait_started,
+                                    ),
+                                    "reason": "captcha",
+                                },
                             )
                         continue
                     self.timers.set_cooldown(TIMER_ANTI_BOT, random.uniform(8.0, 15.0))
@@ -440,9 +539,22 @@ class BotOrchestrator:
                     )
                     if won:
                         self._fights_won += 1
+                        self.analytics.track_event(
+                            EVENT_BATTLE_WON,
+                            {
+                                "enemy": combat_state.enemy_name or "",
+                                "exp": 0,
+                                "valor": 0,
+                                "gold": 0.0,
+                            },
+                        )
                         self.logger.info("Бой выигран (всего побед: %s)", self._fights_won)
                     else:
                         self._fights_lost += 1
+                        self.analytics.track_event(
+                            EVENT_BATTLE_LOST,
+                            {"enemy": combat_state.enemy_name or ""},
+                        )
                         self.logger.warning(
                             "Бой проигран/сбой (поражений: %s)", self._fights_lost
                         )
@@ -597,6 +709,10 @@ class BotOrchestrator:
         )
         if used:
             self.timers.set_cooldown(TIMER_POTION, self.combat.potion_cooldown_sec)
+            self.analytics.track_event(
+                EVENT_POTION_USED,
+                {"name": "эликсир", "count": 1, "context": "out_of_combat"},
+            )
             self.logger.info("Эликсир использован вне боя")
             return True
         return False
