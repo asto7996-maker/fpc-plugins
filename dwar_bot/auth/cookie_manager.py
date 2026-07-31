@@ -1,11 +1,12 @@
 """
-Загрузка, валидация и ротация cookie-сессий для dwar.ru.
+Загрузка, валидация и сохранение cookie-сессий для dwar.ru.
 
-Поддерживаемые форматы экспорта Cookie Editor:
-  - JSON (массив объектов с полями name, value, domain, ...)
-  - Netscape / cookies.txt (табуляция, # комментарии)
+Поддерживаемые форматы экспорта:
+  - Cookie Editor / EditThisCookie (JSON-массив)
+  - Netscape / cookies.txt
 
-Сессии валидируются HTTP-запросом к игровому серверу и по сроку действия cookie.
+Сессии валидируются по сроку действия cookie и HTTP-запросом к главной
+странице с проверкой маркеров авторизации и игровых фреймов.
 """
 
 from __future__ import annotations
@@ -20,17 +21,38 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence
 from urllib.parse import urljoin
 
 import aiohttp
 
-from dwar_bot.config import AUTH_FAILURE_MARKERS, AUTH_SUCCESS_MARKERS, BotConfig, config
+from dwar_bot.config import (
+    AUTH_FAILURE_MARKERS,
+    AUTH_SUCCESS_MARKERS,
+    BotConfig,
+    config,
+    get_delay_range,
+)
 
 logger = logging.getLogger(__name__)
 
 NETSCAPE_HEADER = "# Netscape HTTP Cookie File"
 COOKIE_EDITOR_REQUIRED_KEYS = frozenset({"name", "value"})
+
+# HTML-признаки авторизованных фреймов игры
+AUTH_FRAME_MARKERS: tuple[str, ...] = (
+    'name="main"',
+    "name='main'",
+    'name="fight"',
+    "name='fight'",
+    'name="backpack"',
+    "name='backpack'",
+    'name="chat"',
+    "name='chat'",
+    'name="menu"',
+    "frameset",
+    "game.php",
+)
 
 
 class CookieFormat(str, Enum):
@@ -70,6 +92,24 @@ class RawCookie:
         host_lower = host.lower()
         return host_lower == cookie_domain or host_lower.endswith("." + cookie_domain)
 
+    def to_editor_dict(self) -> Dict[str, Any]:
+        """Сериализация в формат Cookie Editor / EditThisCookie."""
+        item: Dict[str, Any] = {
+            "domain": self.domain,
+            "hostOnly": not self.domain.startswith(".") if self.domain else True,
+            "httpOnly": self.http_only,
+            "name": self.name,
+            "path": self.path or "/",
+            "sameSite": self.same_site or "Lax",
+            "secure": self.secure,
+            "session": self.expires is None or self.expires <= 0,
+            "storeId": "0",
+            "value": self.value,
+        }
+        if self.expires and self.expires > 0:
+            item["expirationDate"] = self.expires
+        return item
+
 
 @dataclass(slots=True)
 class CookieSession:
@@ -93,10 +133,8 @@ class CookieSession:
         result: List[Dict[str, Any]] = []
         for cookie in self.cookies:
             domain = cookie.domain or default_domain
-            if not domain.startswith(".") and "." in domain.lstrip("."):
-                # Playwright принимает домены с точкой для поддоменов
-                if domain.count(".") >= 1 and not domain.startswith("."):
-                    domain = "." + domain.lstrip(".")
+            if domain and not domain.startswith(".") and domain.count(".") >= 1:
+                domain = "." + domain.lstrip(".")
 
             entry: Dict[str, Any] = {
                 "name": cookie.name,
@@ -123,7 +161,11 @@ class CookieSession:
 
 
 class CookieManager:
-    """Загрузка cookie из файлов, валидация и ротация сессий."""
+    """
+    Загрузка cookie из JSON, валидация сессии и сохранение обновлений.
+
+    Основной путь: data/cookies/cookies.json (Cookie Editor / EditThisCookie).
+    """
 
     def __init__(self, bot_config: Optional[BotConfig] = None) -> None:
         self._config = bot_config or config
@@ -144,6 +186,10 @@ class CookieManager:
     @property
     def sessions(self) -> Sequence[CookieSession]:
         return tuple(self._sessions)
+
+    @property
+    def cookies_file(self) -> Path:
+        return self._cookie_cfg.cookies_file
 
     async def __aenter__(self) -> "CookieManager":
         await self._ensure_http_session()
@@ -168,41 +214,79 @@ class CookieManager:
                 headers={
                     "User-Agent": self._config.browser.user_agent,
                     "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
-                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Accept": (
+                        "text/html,application/xhtml+xml,application/xml;"
+                        "q=0.9,*/*;q=0.8"
+                    ),
                 },
             )
         return self._http_session
 
     async def human_delay(self, kind: str = "action") -> None:
-        from dwar_bot.config import get_delay_range
-
         min_delay, max_delay = get_delay_range(kind)
         delay = random.uniform(min_delay, max_delay)
         logger.debug("Human delay (%s): %.2f сек", kind, delay)
         await asyncio.sleep(delay)
 
+    # ------------------------------------------------------------------
+    # Чтение и валидация JSON
+    # ------------------------------------------------------------------
+
     def discover_session_files(self) -> List[Path]:
-        """Находит файлы сессий в каталоге cookies."""
+        """Находит файлы сессий: сначала cookies.json, затем резервные."""
         cookies_dir = self._cookie_cfg.cookies_dir
         discovered: List[Path] = []
 
+        primary = self._cookie_cfg.cookies_file
+        if primary.is_file():
+            discovered.append(primary)
+
         for filename in self._cookie_cfg.session_files:
             path = cookies_dir / filename
-            if path.is_file():
+            if path.is_file() and path.resolve() not in {
+                p.resolve() for p in discovered
+            }:
                 discovered.append(path)
 
         if not discovered and cookies_dir.is_dir():
             for pattern in ("*.json", "*.txt", "*.cookies"):
-                discovered.extend(sorted(cookies_dir.glob(pattern)))
+                for path in sorted(cookies_dir.glob(pattern)):
+                    if path.resolve() not in {p.resolve() for p in discovered}:
+                        discovered.append(path)
 
-        unique: List[Path] = []
-        seen: set[str] = set()
-        for path in discovered:
-            key = str(path.resolve())
-            if key not in seen:
-                seen.add(key)
-                unique.append(path)
-        return unique
+        return discovered
+
+    def load_cookies(
+        self, path: Optional[Path] = None, *, validate_structure: bool = True
+    ) -> CookieSession:
+        """
+        Читает и валидирует JSON-файл куков (Cookie Editor / EditThisCookie).
+
+        Raises:
+            FileNotFoundError: файл отсутствует
+            CookieValidationError: невалидный JSON, пустой файл, нет PHPSESSID,
+                просроченные cookie
+        """
+        target = (path or self._cookie_cfg.cookies_file).expanduser().resolve()
+        session = self.load_session_from_file(target, name=target.stem)
+        if validate_structure:
+            self._validate_structure(session)
+        if not self._sessions:
+            self._sessions = [session]
+            self._active_index = 0
+        else:
+            replaced = False
+            for idx, existing in enumerate(self._sessions):
+                if existing.source_path.resolve() == session.source_path.resolve():
+                    self._sessions[idx] = session
+                    self._active_index = idx
+                    replaced = True
+                    break
+            if not replaced:
+                self._sessions.insert(0, session)
+                self._active_index = 0
+        logger.info("Загружены cookie из %s (%s шт.)", target, len(session.cookies))
+        return session
 
     def load_all_sessions(self) -> List[CookieSession]:
         """Синхронная загрузка всех доступных cookie-файлов."""
@@ -216,6 +300,10 @@ class CookieManager:
                 )
                 sessions.append(session)
                 logger.info("Загружена cookie-сессия: %s", session.summary())
+            except FileNotFoundError as exc:
+                logger.error("Файл cookie не найден: %s", exc)
+            except CookieValidationError as exc:
+                logger.error("Невалидные cookie в %s: %s", path, exc, exc_info=True)
             except Exception as exc:
                 logger.error(
                     "Не удалось загрузить cookie из %s: %s",
@@ -225,12 +313,12 @@ class CookieManager:
                 )
 
         self._sessions = sessions
-        if sessions:
-            self._active_index = 0
-        else:
+        self._active_index = 0 if sessions else 0
+        if not sessions:
             logger.warning(
-                "Cookie-файлы не найдены в %s. Положите экспорт Cookie Editor в каталог.",
-                self._cookie_cfg.cookies_dir,
+                "Cookie-файлы не найдены. Положите экспорт Cookie Editor в %s "
+                "(ожидается cookies.json).",
+                self._cookie_cfg.cookies_file,
             )
         return sessions
 
@@ -244,7 +332,11 @@ class CookieManager:
         if not path.is_file():
             raise FileNotFoundError(f"Cookie-файл не найден: {path}")
 
-        content = path.read_text(encoding="utf-8-sig").strip()
+        try:
+            content = path.read_text(encoding="utf-8-sig").strip()
+        except OSError as exc:
+            raise CookieValidationError(f"Не удалось прочитать {path}: {exc}") from exc
+
         if not content:
             raise CookieValidationError(f"Пустой cookie-файл: {path}")
 
@@ -269,10 +361,13 @@ class CookieManager:
         stripped = content.lstrip()
         if stripped.startswith("{") or stripped.startswith("["):
             return CookieFormat.JSON
-        if NETSCAPE_HEADER.lower() in content.lower() or self._looks_like_netscape(content):
+        if NETSCAPE_HEADER.lower() in content.lower() or self._looks_like_netscape(
+            content
+        ):
             return CookieFormat.NETSCAPE
         raise CookieValidationError(
-            "Неизвестный формат cookie: ожидается JSON (Cookie Editor) или Netscape .txt"
+            "Неизвестный формат cookie: ожидается JSON (Cookie Editor / EditThisCookie) "
+            "или Netscape .txt"
         )
 
     @staticmethod
@@ -281,25 +376,31 @@ class CookieManager:
             line = line.strip()
             if not line or line.startswith("#"):
                 continue
-            parts = line.split("\t")
-            return len(parts) >= 6
+            return len(line.split("\t")) >= 6
         return False
 
     def _parse_json_cookies(self, content: str, source: Path) -> List[RawCookie]:
         try:
             data = json.loads(content)
         except json.JSONDecodeError as exc:
-            raise CookieValidationError(f"Невалидный JSON в {source}: {exc}") from exc
+            raise CookieValidationError(
+                f"Невалидный JSON в {source}: {exc.msg} (строка {exc.lineno})"
+            ) from exc
 
         items: Iterable[Any]
         if isinstance(data, list):
             items = data
         elif isinstance(data, dict):
+            # EditThisCookie / некоторые экспорты оборачивают в объект
             if "cookies" in data and isinstance(data["cookies"], list):
                 items = data["cookies"]
+            elif all(isinstance(v, dict) and "value" in v for v in data.values()):
+                # Редкий формат: { "PHPSESSID": { "value": "...", ... } }
+                items = [{"name": k, **v} for k, v in data.items()]
             else:
                 raise CookieValidationError(
-                    f"JSON в {source} должен быть массивом cookie или объектом с ключом 'cookies'"
+                    f"JSON в {source} должен быть массивом cookie "
+                    f"(Cookie Editor / EditThisCookie) или объектом с ключом 'cookies'"
                 )
         else:
             raise CookieValidationError(f"Неподдерживаемая JSON-структура в {source}")
@@ -322,7 +423,9 @@ class CookieManager:
     def _raw_from_mapping(item: Mapping[str, Any]) -> RawCookie:
         missing = COOKIE_EDITOR_REQUIRED_KEYS - set(item.keys())
         if missing:
-            raise CookieValidationError(f"Отсутствуют поля: {', '.join(sorted(missing))}")
+            raise CookieValidationError(
+                f"Отсутствуют поля: {', '.join(sorted(missing))}"
+            )
 
         name = str(item["name"]).strip()
         value = str(item["value"])
@@ -331,19 +434,24 @@ class CookieManager:
 
         expires_raw = item.get("expirationDate", item.get("expires"))
         expires: Optional[float] = None
-        if expires_raw is not None:
+        if expires_raw is not None and expires_raw != "":
             try:
                 expires = float(expires_raw)
             except (TypeError, ValueError) as exc:
-                raise CookieValidationError(f"Некорректный expires: {expires_raw}") from exc
+                raise CookieValidationError(
+                    f"Некорректный expires: {expires_raw}"
+                ) from exc
 
         same_site_raw = item.get("sameSite")
         same_site = "Lax"
         if isinstance(same_site_raw, str) and same_site_raw.strip():
-            same_site = same_site_raw.strip()
-        elif same_site_raw is not None:
-            # Cookie Editor иногда экспортирует sameSite как null / unspecified
-            same_site = "Lax"
+            normalized = same_site_raw.strip().lower()
+            if normalized in {"no_restriction", "none"}:
+                same_site = "None"
+            elif normalized in {"lax", "strict"}:
+                same_site = normalized.capitalize()
+            else:
+                same_site = same_site_raw.strip()
 
         return RawCookie(
             name=name,
@@ -373,7 +481,7 @@ class CookieManager:
                 )
                 continue
 
-            domain, flag, path, secure, expires, name, value = parts[:7]
+            domain, _flag, path, secure, expires, name, value = parts[:7]
             if not name:
                 continue
 
@@ -404,7 +512,9 @@ class CookieManager:
     def _validate_structure(self, session: CookieSession) -> None:
         names = {c.name for c in session.cookies}
         missing_required = [
-            name for name in self._cookie_cfg.required_cookie_names if name not in names
+            name
+            for name in self._cookie_cfg.required_cookie_names
+            if name not in names
         ]
         if missing_required:
             raise CookieValidationError(
@@ -426,7 +536,9 @@ class CookieManager:
         domain_mismatched = [
             c.name
             for c in session.cookies
-            if c.domain and not self._domain_allowed(c.domain) and not c.domain_matches(host)
+            if c.domain
+            and not self._domain_allowed(c.domain)
+            and not c.domain_matches(host)
         ]
         if domain_mismatched:
             logger.warning(
@@ -450,34 +562,53 @@ class CookieManager:
             raise ValueError(f"Некорректный URL: {url}")
         return match.group(1).lower()
 
+    # ------------------------------------------------------------------
+    # Проверка валидности сессии
+    # ------------------------------------------------------------------
+
     async def validate_session(
         self,
-        session: CookieSession,
+        session: Optional[CookieSession] = None,
         *,
         url: Optional[str] = None,
     ) -> bool:
-        """Проверяет сессию HTTP-запросом к серверу."""
+        """
+        Проверяет сессию запросом к главной странице.
+
+        Критерии успеха:
+          - cookie не просрочены;
+          - HTTP 200/302;
+          - в HTML/URL есть маркеры авторизации или игровых фреймов
+            (main / fight / backpack / frameset).
+        """
+        target_session = session or self.active_session
+        if target_session is None:
+            raise CookieValidationError("Нет сессии для валидации")
+
         target_url = url or urljoin(
             self._config.server.base_url,
             self._cookie_cfg.validation_url_path,
         )
         host = self._extract_host(target_url)
 
-        for cookie in session.cookies:
+        for cookie in target_session.cookies:
             if cookie.is_expired(self._cookie_cfg.expiry_skew_sec):
-                session.validation_message = f"Просрочен cookie: {cookie.name}"
-                session.last_validation_ok = False
-                session.last_validated_at = time.time()
-                logger.warning("Сессия %s: %s", session.name, session.validation_message)
+                target_session.validation_message = f"Просрочен cookie: {cookie.name}"
+                target_session.last_validation_ok = False
+                target_session.last_validated_at = time.time()
+                logger.warning(
+                    "Сессия %s: %s",
+                    target_session.name,
+                    target_session.validation_message,
+                )
                 return False
 
-        jar = aiohttp.CookieJar(unsafe=True)
         http = await self._ensure_http_session()
 
         try:
             async with http.get(
                 target_url,
-                cookies=self._aiohttp_cookies(session, host),
+                cookies=self._aiohttp_cookies(target_session, host),
                 allow_redirects=True,
                 max_redirects=self._cookie_cfg.validation_max_redirects,
             ) as response:
@@ -488,39 +619,39 @@ class CookieManager:
                     body=body,
                     final_url=final_url,
                 )
-                session.last_validated_at = time.time()
-                session.last_validation_ok = ok
+                target_session.last_validated_at = time.time()
+                target_session.last_validation_ok = ok
                 if ok:
-                    session.validation_message = f"OK (HTTP {response.status})"
+                    target_session.validation_message = f"OK (HTTP {response.status})"
                     logger.info(
                         "Сессия %s валидна: HTTP %s, URL %s",
-                        session.name,
+                        target_session.name,
                         response.status,
                         final_url,
                     )
                 else:
-                    session.validation_message = (
+                    target_session.validation_message = (
                         f"Неавторизован (HTTP {response.status}, URL {final_url})"
                     )
                     logger.warning(
                         "Сессия %s невалидна: %s",
-                        session.name,
-                        session.validation_message,
+                        target_session.name,
+                        target_session.validation_message,
                     )
                 return ok
         except asyncio.TimeoutError:
-            session.validation_message = "Таймаут валидации"
-            session.last_validation_ok = False
-            session.last_validated_at = time.time()
-            logger.error("Таймаут валидации сессии %s", session.name)
+            target_session.validation_message = "Таймаут валидации"
+            target_session.last_validation_ok = False
+            target_session.last_validated_at = time.time()
+            logger.error("Таймаут валидации сессии %s", target_session.name)
             return False
         except aiohttp.ClientError as exc:
-            session.validation_message = f"Сетевая ошибка: {exc}"
-            session.last_validation_ok = False
-            session.last_validated_at = time.time()
+            target_session.validation_message = f"Сетевая ошибка: {exc}"
+            target_session.last_validation_ok = False
+            target_session.last_validated_at = time.time()
             logger.error(
                 "Ошибка сети при валидации %s: %s",
-                session.name,
+                target_session.name,
                 exc,
                 exc_info=True,
             )
@@ -546,30 +677,168 @@ class CookieManager:
         text = body.lower()
         url_lower = final_url.lower()
 
-        if any(marker in text for marker in AUTH_FAILURE_MARKERS):
-            if not any(marker in url_lower for marker in ("game.php", "user.php")):
-                return False
-
-        success_signals = sum(
-            1 for marker in AUTH_SUCCESS_MARKERS if marker in text or marker in url_lower
+        # Явные маркеры логина без игровых фреймов — сессия мертва
+        has_login_form = any(m in text for m in AUTH_FAILURE_MARKERS)
+        has_game_frames = any(m.lower() in text for m in AUTH_FRAME_MARKERS)
+        has_success = any(
+            marker in text or marker in url_lower for marker in AUTH_SUCCESS_MARKERS
         )
-        if success_signals >= 1:
+
+        if has_game_frames or has_success:
             return True
 
-        # PHPSESSID без формы логина — частичный признак
-        if status == 200 and "phpsessid" not in text:
-            if "password" in text and "login" in text:
-                return False
+        if has_login_form and not any(
+            marker in url_lower for marker in ("game.php", "user.php")
+        ):
+            return False
 
-        return status in {200, 302} and "dwar.ru" in url_lower
+        if status == 200 and "password" in text and (
+            "login" in text or "войти" in text
+        ):
+            return False
+
+        return status in {200, 302} and "dwar.ru" in url_lower and not has_login_form
+
+    # ------------------------------------------------------------------
+    # Сохранение обновлённых куков
+    # ------------------------------------------------------------------
+
+    def save_cookies(
+        self,
+        cookies: Optional[Sequence[RawCookie | Mapping[str, Any]]] = None,
+        destination: Optional[Path] = None,
+        *,
+        session: Optional[CookieSession] = None,
+    ) -> Path:
+        """
+        Сохраняет cookie обратно в JSON (формат Cookie Editor / EditThisCookie).
+
+        Если cookies не переданы — сохраняется активная сессия.
+        По умолчанию путь: data/cookies/cookies.json.
+        """
+        dest = (destination or self._cookie_cfg.cookies_file).expanduser().resolve()
+        dest.parent.mkdir(parents=True, exist_ok=True)
+
+        raw_list: List[RawCookie]
+        if cookies is not None:
+            raw_list = []
+            for item in cookies:
+                if isinstance(item, RawCookie):
+                    raw_list.append(item)
+                elif isinstance(item, Mapping):
+                    raw_list.append(self._raw_from_mapping(item))
+                else:
+                    raise CookieValidationError(
+                        f"Неподдерживаемый тип cookie: {type(item)!r}"
+                    )
+        else:
+            target = session or self.active_session
+            if target is None:
+                raise SessionRotationError("Нет активной сессии для сохранения")
+            raw_list = list(target.cookies)
+
+        if not raw_list:
+            raise CookieValidationError("Нечего сохранять: список cookie пуст")
+
+        payload = [cookie.to_editor_dict() for cookie in raw_list]
+        tmp_path = dest.with_suffix(dest.suffix + ".tmp")
+        try:
+            tmp_path.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            tmp_path.replace(dest)
+        except OSError as exc:
+            if tmp_path.exists():
+                try:
+                    tmp_path.unlink()
+                except OSError:
+                    logger.debug("Не удалось удалить временный файл %s", tmp_path)
+            raise CookieValidationError(
+                f"Не удалось сохранить cookie в {dest}: {exc}"
+            ) from exc
+
+        # Обновляем in-memory сессию
+        active = session or self.active_session
+        if active is not None:
+            active.cookies = raw_list
+            active.source_path = dest
+            active.format = CookieFormat.JSON
+        else:
+            self._sessions = [
+                CookieSession(
+                    name=dest.stem,
+                    source_path=dest,
+                    cookies=raw_list,
+                    format=CookieFormat.JSON,
+                )
+            ]
+            self._active_index = 0
+
+        logger.info("Cookie сохранены в %s (%s шт.)", dest, len(raw_list))
+        return dest
+
+    async def sync_from_playwright(
+        self, context: Any, destination: Optional[Path] = None
+    ) -> Path:
+        """
+        Читает cookie из Playwright BrowserContext и сохраняет в файл.
+
+        context — playwright.async_api.BrowserContext
+        """
+        pw_cookies = await context.cookies()
+        converted: List[RawCookie] = []
+        for item in pw_cookies:
+            expires_raw = item.get("expires")
+            expires: Optional[float] = None
+            if expires_raw is not None:
+                try:
+                    expires_f = float(expires_raw)
+                    # Playwright использует -1 для session cookie
+                    expires = expires_f if expires_f > 0 else None
+                except (TypeError, ValueError):
+                    expires = None
+
+            converted.append(
+                RawCookie(
+                    name=str(item.get("name", "")),
+                    value=str(item.get("value", "")),
+                    domain=str(item.get("domain", "")),
+                    path=str(item.get("path", "/") or "/"),
+                    expires=expires,
+                    http_only=bool(item.get("httpOnly", False)),
+                    secure=bool(item.get("secure", False)),
+                    same_site=str(item.get("sameSite", "Lax") or "Lax"),
+                )
+            )
+
+        converted = [c for c in converted if c.name]
+        if not converted:
+            raise CookieValidationError("Playwright context не вернул cookie")
+
+        return self.save_cookies(converted, destination=destination)
+
+    # ------------------------------------------------------------------
+    # Жизненный цикл сессий
+    # ------------------------------------------------------------------
 
     async def initialize(self, validate: bool = True) -> CookieSession:
         """Загружает сессии с диска и выбирает первую рабочую."""
         async with self._lock:
-            self.load_all_sessions()
+            # Предпочитаем явный cookies.json
+            if self._cookie_cfg.cookies_file.is_file():
+                try:
+                    self.load_cookies(self._cookie_cfg.cookies_file)
+                except (FileNotFoundError, CookieValidationError) as exc:
+                    logger.error("Не удалось загрузить cookies.json: %s", exc)
+                    self.load_all_sessions()
+            else:
+                self.load_all_sessions()
+
             if not self._sessions:
                 raise SessionRotationError(
-                    f"Нет cookie-сессий в {self._cookie_cfg.cookies_dir}"
+                    f"Нет cookie-сессий. Создайте файл {self._cookie_cfg.cookies_file} "
+                    f"экспортом Cookie Editor / EditThisCookie."
                 )
 
             if not validate:
@@ -619,29 +888,30 @@ class CookieManager:
             return await self.initialize(validate=True)
 
         if session.last_validation_ok is False:
-            if self._cookie_cfg.rotate_on_validation_failure:
+            if self._cookie_cfg.rotate_on_validation_failure and len(self._sessions) > 1:
                 return await self.rotate_session(validate=True)
-            raise CookieValidationError(session.validation_message or "Сессия невалидна")
+            raise CookieValidationError(
+                session.validation_message or "Сессия невалидна"
+            )
 
         if await self.validate_session(session):
             return session
 
-        if self._cookie_cfg.rotate_on_validation_failure:
+        if self._cookie_cfg.rotate_on_validation_failure and len(self._sessions) > 1:
             return await self.rotate_session(validate=True)
 
         raise CookieValidationError(session.validation_message or "Сессия невалидна")
 
     async def apply_to_playwright(self, context: Any) -> CookieSession:
-        """
-        Добавляет cookie активной сессии в Playwright BrowserContext.
-
-        context — playwright.async_api.BrowserContext
-        """
+        """Добавляет cookie активной сессии в Playwright BrowserContext."""
         session = await self.ensure_valid_session()
         host = self._extract_host(self._config.server.base_url)
         default_domain = f".{host.split(':')[0]}"
-        cookies = session.get_playwright_cookies(default_domain=default_domain)
+        # Для w1/w2 используем общий домен .dwar.ru
+        if host.endswith("dwar.ru"):
+            default_domain = ".dwar.ru"
 
+        cookies = session.get_playwright_cookies(default_domain=default_domain)
         await context.clear_cookies()
         await context.add_cookies(cookies)
         logger.info(
@@ -652,43 +922,11 @@ class CookieManager:
         return session
 
     def export_active_as_json(self, destination: Optional[Path] = None) -> Path:
-        """Сохраняет активную сессию в JSON (формат Cookie Editor)."""
-        session = self.active_session
-        if session is None:
-            raise SessionRotationError("Нет активной сессии для экспорта")
-
-        dest = destination or (
-            self._cookie_cfg.cookies_dir / f"{session.name}_exported.json"
-        )
-        dest.parent.mkdir(parents=True, exist_ok=True)
-
-        payload: List[Dict[str, Any]] = []
-        for cookie in session.cookies:
-            item: Dict[str, Any] = {
-                "domain": cookie.domain,
-                "hostOnly": not cookie.domain.startswith("."),
-                "httpOnly": cookie.http_only,
-                "name": cookie.name,
-                "path": cookie.path,
-                "sameSite": cookie.same_site,
-                "secure": cookie.secure,
-                "session": cookie.expires is None or cookie.expires <= 0,
-                "storeId": "0",
-                "value": cookie.value,
-            }
-            if cookie.expires and cookie.expires > 0:
-                item["expirationDate"] = cookie.expires
-            payload.append(item)
-
-        dest.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        logger.info("Сессия экспортирована в %s", dest)
-        return dest
+        """Алиас save_cookies для активной сессии."""
+        return self.save_cookies(destination=destination)
 
     def get_cookie_header(self, session: Optional[CookieSession] = None) -> str:
-        """Строка Cookie для лёгких HTTP-запросов (requests/aiohttp)."""
+        """Строка Cookie для лёгких HTTP-запросов."""
         target = session or self.active_session
         if target is None:
             raise SessionRotationError("Нет активной сессии")
