@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Точка входа для Docker / локального запуска: python main.py"""
+"""Точка входа: python main.py → MasterController FSM."""
 
 from dwar_bot.main import main
 

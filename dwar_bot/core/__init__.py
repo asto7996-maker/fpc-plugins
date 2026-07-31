@@ -1,4 +1,8 @@
-"""Ядро браузерного движка, anti-bot, Telegram, recovery и диагностика."""
+"""Ядро: браузер, anti-bot, Telegram, recovery, диагностика.
+
+MasterController импортируйте явно:
+  from dwar_bot.core.master_controller import MasterController
+"""
 
 from dwar_bot.core.anti_bot import AntiBot, CaptchaHandler, HumanBehavior
 from dwar_bot.core.browser import BrowserEngine, BrowserEngineError, NavigationError
