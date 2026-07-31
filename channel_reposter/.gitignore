@@ -1,0 +1,24 @@
+# Секреты и окружение
+.env
+
+# Сессии Pyrogram / Telethon
+*.session
+*.session-journal
+
+# База данных
+*.db
+data/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+.env.local
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+*.log

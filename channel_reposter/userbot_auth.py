@@ -1,0 +1,330 @@
+"""
+userbot_auth.py — авторизация Pyrogram-юзербота.
+
+Сценарий входа через админ-бота:
+  1) API_ID
+  2) API_HASH
+  3) номер телефона
+  4) код из Telegram / SMS
+  5) облачный пароль 2FA (если включён)
+
+Сессия сохраняется в .session — повторный вход без кода.
+В источнике достаточно подписки; в назначении аккаунт должен быть админом.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional
+
+from pyrogram import Client
+from pyrogram.errors import (
+    PhoneCodeExpired,
+    PhoneCodeInvalid,
+    PhoneNumberInvalid,
+    SessionPasswordNeeded,
+)
+
+import config
+from database import Database
+
+logger = logging.getLogger(__name__)
+
+KEY_API_ID = "auth_api_id"
+KEY_API_HASH = "auth_api_hash"
+KEY_PHONE = "auth_phone"
+KEY_PASSWORD = "auth_password"
+
+# Pyrogram умеет переподключаться «вечно» — ограничиваем, чтобы поток
+# юзербота не завис навсегда и панель могла сказать, что не так
+CONNECT_TIMEOUT = 45.0
+START_TIMEOUT = 60.0
+STOP_TIMEOUT = 20.0
+CALL_TIMEOUT = 30.0
+
+
+@dataclass
+class AuthCredentials:
+    api_id: int
+    api_hash: str
+    phone: str
+    password: str = ""
+
+
+class UserbotAuth:
+    def __init__(self, db: Database, workdir: Path) -> None:
+        self.db = db
+        self.workdir = Path(workdir)
+        self.workdir.mkdir(parents=True, exist_ok=True)
+
+        self.client: Optional[Client] = None
+        self._phone_code_hash: Optional[str] = None
+        self._pending: Optional[AuthCredentials] = None
+        self._authorized = False
+
+    def save_credentials(self, creds: AuthCredentials) -> None:
+        self.db.set(KEY_API_ID, str(creds.api_id))
+        self.db.set(KEY_API_HASH, creds.api_hash)
+        self.db.set(KEY_PHONE, creds.phone)
+        if creds.password:
+            self.db.set(KEY_PASSWORD, creds.password)
+
+    def load_credentials(self) -> Optional[AuthCredentials]:
+        api_id_s = self.db.get(KEY_API_ID) or (
+            str(config.API_ID) if config.API_ID else ""
+        )
+        api_hash = self.db.get(KEY_API_HASH) or (config.API_HASH or "")
+        phone = self.db.get(KEY_PHONE) or (config.PHONE or "")
+        password = self.db.get(KEY_PASSWORD) or (config.PASSWORD or "")
+
+        if not api_id_s or not api_hash:
+            return None
+        try:
+            api_id = int(api_id_s)
+        except ValueError:
+            return None
+        return AuthCredentials(
+            api_id=api_id,
+            api_hash=api_hash,
+            phone=phone or "",
+            password=password or "",
+        )
+
+    def session_path(self) -> Path:
+        return self.workdir / f"{config.SESSION_NAME}.session"
+
+    def has_session_file(self) -> bool:
+        return self.session_path().exists()
+
+    @property
+    def is_ready(self) -> bool:
+        return bool(self._authorized and self.client is not None)
+
+    async def _close_client(self) -> None:
+        if self.client is None:
+            return
+        try:
+            await asyncio.wait_for(self.client.stop(), timeout=STOP_TIMEOUT)
+        except Exception:
+            try:
+                await asyncio.wait_for(
+                    self.client.disconnect(), timeout=STOP_TIMEOUT
+                )
+            except Exception:
+                logger.debug("не удалось закрыть клиента", exc_info=True)
+        self.client = None
+        self._authorized = False
+
+    async def is_alive(self, timeout: float = CALL_TIMEOUT) -> bool:
+        """Живая ли сессия: лёгкий запрос get_me с таймаутом."""
+        if self.client is None or not self._authorized:
+            return False
+        try:
+            await asyncio.wait_for(self.client.get_me(), timeout=timeout)
+            return True
+        except Exception as e:
+            logger.warning("Проверка связи юзербота не прошла: %s", e)
+            return False
+
+    async def ensure_started(self) -> bool:
+        """
+        Гарантировать живого юзербота: при обрыве связи поднять заново
+        из сохранённой сессии (код при этом не нужен).
+        """
+        if await self.is_alive():
+            return True
+        logger.warning("Переподключаю юзербота…")
+        await self._close_client()
+        return await self.try_start_existing()
+
+    async def try_start_existing(self) -> bool:
+        creds = self.load_credentials()
+        if not creds or not creds.api_id or not creds.api_hash:
+            logger.info("Нет API_ID/API_HASH — юзербот не запущен")
+            return False
+
+        await self._close_client()
+
+        probe = Client(
+            name=config.SESSION_NAME,
+            api_id=creds.api_id,
+            api_hash=creds.api_hash,
+            workdir=str(self.workdir),
+            no_updates=True,
+        )
+        try:
+            # В Pyrogram 2.x connect() возвращает bool: авторизована ли сессия
+            authorized = await asyncio.wait_for(
+                probe.connect(), timeout=CONNECT_TIMEOUT
+            )
+            await asyncio.wait_for(probe.disconnect(), timeout=STOP_TIMEOUT)
+        except asyncio.TimeoutError:
+            logger.error("Telegram не ответил за %.0f сек", CONNECT_TIMEOUT)
+            try:
+                await asyncio.wait_for(probe.disconnect(), timeout=STOP_TIMEOUT)
+            except Exception:
+                logger.debug("disconnect после таймаута", exc_info=True)
+            return False
+        except Exception:
+            logger.exception("Не удалось проверить сессию")
+            try:
+                await asyncio.wait_for(probe.disconnect(), timeout=STOP_TIMEOUT)
+            except Exception:
+                logger.debug("disconnect после ошибки", exc_info=True)
+            return False
+
+        if not authorized:
+            logger.info("Сессия не авторизована — нужен /login")
+            return False
+
+        self.client = Client(
+            name=config.SESSION_NAME,
+            api_id=creds.api_id,
+            api_hash=creds.api_hash,
+            workdir=str(self.workdir),
+            no_updates=True,
+        )
+        try:
+            await asyncio.wait_for(self.client.start(), timeout=START_TIMEOUT)
+            me = await asyncio.wait_for(self.client.get_me(), timeout=CALL_TIMEOUT)
+            self._authorized = True
+            logger.info(
+                "Юзербот онлайн: %s (id=%s)",
+                me.username or me.first_name,
+                me.id,
+            )
+            return True
+        except asyncio.TimeoutError:
+            logger.error("Юзербот не поднялся за %.0f сек", START_TIMEOUT)
+            await self._close_client()
+            return False
+        except Exception:
+            logger.exception("Не удалось поднять юзербота")
+            await self._close_client()
+            return False
+
+    async def begin_login(self, creds: AuthCredentials) -> str:
+        phone = creds.phone.strip().replace(" ", "")
+        if not phone.startswith("+"):
+            phone = "+" + phone.lstrip("+")
+
+        creds = AuthCredentials(
+            api_id=creds.api_id,
+            api_hash=creds.api_hash.strip(),
+            phone=phone,
+            password=creds.password or "",
+        )
+        self.save_credentials(creds)
+        self._pending = creds
+
+        await self._close_client()
+
+        self.client = Client(
+            name=config.SESSION_NAME,
+            api_id=creds.api_id,
+            api_hash=creds.api_hash,
+            workdir=str(self.workdir),
+            no_updates=True,
+        )
+        try:
+            await asyncio.wait_for(self.client.connect(), timeout=CONNECT_TIMEOUT)
+        except asyncio.TimeoutError as e:
+            self.client = None
+            raise ValueError(
+                "Telegram не отвечает — проверьте сеть/прокси и повторите /login"
+            ) from e
+
+        try:
+            sent = await asyncio.wait_for(
+                self.client.send_code(creds.phone), timeout=CALL_TIMEOUT
+            )
+        except PhoneNumberInvalid as e:
+            await self._close_client()
+            raise ValueError(f"Некорректный номер: {creds.phone}") from e
+        except asyncio.TimeoutError as e:
+            await self._close_client()
+            raise ValueError("Telegram не ответил на запрос кода — повторите /login") from e
+
+        self._phone_code_hash = sent.phone_code_hash
+        logger.info("Код отправлен на %s", creds.phone)
+        return f"Код отправлен на {creds.phone}"
+
+    async def confirm_code(self, code: str) -> str:
+        if not self.client or not self._phone_code_hash or not self._pending:
+            raise RuntimeError("Сначала /login")
+
+        code = code.strip().replace(" ", "").replace("-", "")
+        try:
+            await self.client.sign_in(
+                phone_number=self._pending.phone,
+                phone_code_hash=self._phone_code_hash,
+                phone_code=code,
+            )
+        except SessionPasswordNeeded:
+            return "password_required"
+        except PhoneCodeInvalid as e:
+            raise ValueError("Неверный код") from e
+        except PhoneCodeExpired as e:
+            raise ValueError("Код истёк — /login заново") from e
+
+        await self._finalize_login()
+        return "ok"
+
+    async def confirm_password(self, password: str) -> None:
+        if not self.client or not self._pending:
+            raise RuntimeError("Сначала код из /login")
+
+        password = password.strip()
+        self._pending = AuthCredentials(
+            api_id=self._pending.api_id,
+            api_hash=self._pending.api_hash,
+            phone=self._pending.phone,
+            password=password,
+        )
+        self.save_credentials(self._pending)
+        await self.client.check_password(password)
+        await self._finalize_login()
+
+    async def _finalize_login(self) -> None:
+        if not self.client or not self._pending:
+            raise RuntimeError("Клиент не создан")
+
+        creds = self._pending
+        try:
+            await asyncio.wait_for(self.client.disconnect(), timeout=STOP_TIMEOUT)
+        except Exception:
+            logger.debug("disconnect перед перезапуском клиента", exc_info=True)
+
+        self.client = Client(
+            name=config.SESSION_NAME,
+            api_id=creds.api_id,
+            api_hash=creds.api_hash,
+            workdir=str(self.workdir),
+            no_updates=True,
+        )
+        await asyncio.wait_for(self.client.start(), timeout=START_TIMEOUT)
+        me = await asyncio.wait_for(self.client.get_me(), timeout=CALL_TIMEOUT)
+        self._authorized = True
+        self._phone_code_hash = None
+        logger.info(
+            "Вход выполнен: %s (id=%s)",
+            me.username or me.first_name,
+            me.id,
+        )
+
+    async def stop(self) -> None:
+        await self._close_client()
+
+    async def status_text(self) -> str:
+        if self.is_ready and self.client:
+            me = await asyncio.wait_for(self.client.get_me(), timeout=CALL_TIMEOUT)
+            return (
+                f"🟢 Юзербот: <b>{me.first_name}</b> "
+                f"(@{me.username or '—'}), id=<code>{me.id}</code>"
+            )
+        if self.has_session_file():
+            return "🟡 Есть сессия, но не авторизован — «🔐 Вход»"
+        return "🔴 Юзербот не авторизован — «🔐 Вход» /login"

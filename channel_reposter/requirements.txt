@@ -1,0 +1,7 @@
+aiogram==3.15.0
+python-dotenv==1.0.1
+pyrogram==2.0.106
+
+# Необязательно, но ускоряет шифрование Pyrogram в разы.
+# Требует компилятор и python3-dev, поэтому не включён в обязательные:
+#   pip install TgCrypto
