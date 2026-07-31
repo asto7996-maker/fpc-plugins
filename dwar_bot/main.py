@@ -23,6 +23,7 @@ from dwar_bot.config import DATA_DIR, BotConfig, config, load_config
 from dwar_bot.auth.cookie_manager import CookieManager, SessionRotationError
 from dwar_bot.core.anti_bot import AntiBot
 from dwar_bot.core.browser import BrowserEngine, BrowserEngineError
+from dwar_bot.core.recovery import CrashRecoveryManager
 from dwar_bot.core.telegram_bot import RemoteControlState, TelegramRemoteControl
 from dwar_bot.logger import (
     get_logger,
@@ -99,6 +100,7 @@ class BotOrchestrator:
             stats_provider=self.build_status_report,
             screenshot_provider=self.take_remote_screenshot,
         )
+        self.recovery = CrashRecoveryManager(self.config)
 
         self._stop_event = asyncio.Event()
         self._started = False
@@ -288,11 +290,17 @@ class BotOrchestrator:
                 return None
 
     async def main_loop(self) -> None:
-        """Основной асинхронный цикл оркестратора."""
+        """
+        Основной асинхронный цикл оркестратора.
+
+        Обёрнут в CrashRecoveryManager: health-check каждую итерацию,
+        авто-рестарт Playwright-сессии при зависании, safe_execute для
+        критических парсеров. Позволяет работать неделями без ручного рестарта.
+        """
         if not self._started:
             await self.start()
 
-        self.logger.info("Вход в main_loop")
+        self.logger.info("Вход в main_loop (с CrashRecovery)")
         while not self._stop_event.is_set() and not self.remote_state.should_stop:
             loop_started = time.monotonic()
             self._loops += 1
@@ -320,6 +328,24 @@ class BotOrchestrator:
                         break
                     self._current_task = "idle"
                     self.remote_state.current_task = "idle"
+                    continue
+
+                # --- Recovery: health-check / auto-restart ---
+                healthy = await self.recovery.safe_execute(
+                    self.recovery.ensure_healthy,
+                    self.browser,
+                    self.cookies,
+                    max_retries=2,
+                    base_delay=1.5,
+                )
+                if not healthy:
+                    self.logger.error(
+                        "Сессия нездорова после recovery — пауза и повтор"
+                    )
+                    await self.telegram.send_alert(
+                        "⚠ Recovery: сессия не восстановилась, повторная попытка..."
+                    )
+                    await asyncio.sleep(random.uniform(5.0, 12.0))
                     continue
 
                 page = self.browser.page
@@ -356,10 +382,16 @@ class BotOrchestrator:
                         continue
                     self.timers.set_cooldown(TIMER_ANTI_BOT, random.uniform(8.0, 15.0))
 
-                # 1) Сканирование состояния
+                # 1) Сканирование состояния (через safe_execute)
                 self._current_task = "scan_stats"
                 self.remote_state.current_task = self._current_task
-                stats = await self.stats_parser.parse_player_stats(page)
+                stats = await self.recovery.safe_execute(
+                    self.stats_parser.parse_player_stats,
+                    page,
+                    max_retries=3,
+                    base_delay=1.0,
+                    on_retry=self._recovery_on_retry,
+                )
                 self._last_stats = stats
                 in_combat = bool(stats.in_combat)
                 hp_pct = stats.hp_ratio * 100.0
@@ -473,10 +505,27 @@ class BotOrchestrator:
             except BrowserEngineError as exc:
                 self._consecutive_errors += 1
                 log_exception(self.logger, "BrowserEngineError в main_loop", exc)
-                await self._on_loop_error(exc)
+                try:
+                    await self.recovery.restart_session(self.browser, self.cookies)
+                    self.recovery.reset_restart_counter()
+                    await self.telegram.send_alert(
+                        f"♻ Recovery после BrowserEngineError: {exc}"
+                    )
+                except Exception as restart_exc:
+                    log_exception(
+                        self.logger, "Не удалось восстановить сессию", restart_exc
+                    )
+                    await self._on_loop_error(exc)
             except Exception as exc:
                 self._consecutive_errors += 1
                 log_exception(self.logger, "Ошибка в main_loop", exc)
+                # Пытаемся вылечить «зависшую» сессию
+                try:
+                    ok = await self.recovery.ensure_healthy(self.browser, self.cookies)
+                    if not ok:
+                        await self.recovery.restart_session(self.browser, self.cookies)
+                except Exception as recovery_exc:
+                    self.logger.error("Recovery в except: %s", recovery_exc)
                 await self._on_loop_error(exc)
 
             if self._consecutive_errors >= self.config.max_consecutive_errors:
@@ -506,6 +555,22 @@ class BotOrchestrator:
                 pass
 
         self.logger.info("Выход из main_loop")
+
+    async def _recovery_on_retry(self, attempt: int, exc: BaseException) -> None:
+        """Хук safe_execute: при сетевых/DOM ошибках пробуем soft-restart."""
+        self.logger.warning("Recovery retry #%s after %s", attempt, exc)
+        if attempt >= 2:
+            try:
+                await self.recovery.restart_session(self.browser, self.cookies)
+                await self.telegram.send_alert(
+                    f"♻ Авто-рестарт сессии (попытка {attempt}): {exc}"
+                )
+            except Exception as restart_exc:
+                self.logger.error(
+                    "restart_session во время retry не удался: %s",
+                    restart_exc,
+                    exc_info=True,
+                )
 
     async def _heal_out_of_combat(self, stats: PlayerStats) -> bool:
         """Пьёт банку из рюкзака, если кулдаун позволяет."""
