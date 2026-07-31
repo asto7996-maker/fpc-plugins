@@ -251,25 +251,63 @@ class Database:
     # ------------------------------------------------------------------
 
     def get_settings(self) -> Settings:
-        """Прочитать все настройки одним объектом."""
+        """Прочитать все настройки одним запросом (не 11 отдельных)."""
+        keys = (
+            SETTING_CAPTION,
+            SETTING_INTERVAL_SECONDS,
+            SETTING_POSTS_PER_CYCLE,
+            SETTING_IS_RUNNING,
+            SETTING_PROGRESS_ID,
+            SETTING_SOURCE_CHANNEL,
+            SETTING_TARGET_CHANNEL,
+            SETTING_START_LINK,
+            SETTING_CATCHUP,
+            SETTING_CATCHUP_SECONDS,
+            SETTING_NOTIFY_CYCLES,
+        )
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"SELECT key, value FROM settings WHERE key IN ({','.join('?' * len(keys))})",
+                keys,
+            ).fetchall()
+        data = {r["key"]: r["value"] for r in rows}
+
+        def _f(key: str, default: float) -> float:
+            try:
+                return float(data[key]) if data.get(key) not in (None, "") else float(default)
+            except (TypeError, ValueError, KeyError):
+                return float(default)
+
+        def _i(key: str, default: int) -> int:
+            try:
+                return int(float(data[key])) if data.get(key) not in (None, "") else int(default)
+            except (TypeError, ValueError, KeyError):
+                return int(default)
+
+        def _b(key: str, default: bool = False) -> bool:
+            raw = (data.get(key) or "").strip().lower()
+            if raw in ("1", "true", "yes", "on"):
+                return True
+            if raw in ("0", "false", "no", "off"):
+                return False
+            return default
+
         return Settings(
-            caption_template=self.get(SETTING_CAPTION, "") or "",
+            caption_template=data.get(SETTING_CAPTION, "") or "",
             interval_seconds=max(
-                MIN_INTERVAL_SECONDS,
-                self.get_float(SETTING_INTERVAL_SECONDS, DEFAULT_INTERVAL_SECONDS),
+                MIN_INTERVAL_SECONDS, _f(SETTING_INTERVAL_SECONDS, DEFAULT_INTERVAL_SECONDS)
             ),
-            posts_per_cycle=max(1, self.get_int(SETTING_POSTS_PER_CYCLE, 5)),
-            is_running=self.get_bool(SETTING_IS_RUNNING, False),
-            progress_id=self.get_int(SETTING_PROGRESS_ID, 0),
-            source_channel=self.get(SETTING_SOURCE_CHANNEL, "") or "",
-            target_channel=self.get(SETTING_TARGET_CHANNEL, "") or "",
-            start_link=self.get(SETTING_START_LINK, "") or "",
-            catchup_enabled=self.get_bool(SETTING_CATCHUP, False),
+            posts_per_cycle=max(1, _i(SETTING_POSTS_PER_CYCLE, 5)),
+            is_running=_b(SETTING_IS_RUNNING, False),
+            progress_id=_i(SETTING_PROGRESS_ID, 0),
+            source_channel=data.get(SETTING_SOURCE_CHANNEL, "") or "",
+            target_channel=data.get(SETTING_TARGET_CHANNEL, "") or "",
+            start_link=data.get(SETTING_START_LINK, "") or "",
+            catchup_enabled=_b(SETTING_CATCHUP, False),
             catchup_seconds=max(
-                MIN_INTERVAL_SECONDS,
-                self.get_float(SETTING_CATCHUP_SECONDS, DEFAULT_CATCHUP_SECONDS),
+                MIN_INTERVAL_SECONDS, _f(SETTING_CATCHUP_SECONDS, DEFAULT_CATCHUP_SECONDS)
             ),
-            notify_cycles=self.get_bool(SETTING_NOTIFY_CYCLES, False),
+            notify_cycles=_b(SETTING_NOTIFY_CYCLES, False),
         )
 
     def set_caption(self, text: str) -> None:

@@ -18,10 +18,12 @@ from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramConflictError
 from aiogram.fsm.storage.memory import MemoryStorage
 
 import admin_bot
 import config
+import single_instance
 from bridge import BRIDGE
 from database import Database
 from poster import REASON_ABORTED as POST_REASON_ABORTED
@@ -43,6 +45,10 @@ STUCK_AFTER = 300.0
 HEALTH_EVERY = 300.0
 # Не спамить админа сообщениями про flood
 FLOOD_NOTICE_EVERY = 600.0
+# Сколько ждать вход юзербота при старте (панель при этом уже работает)
+BOOTSTRAP_TIMEOUT = 120.0
+# Отставание event loop, после которого пишем в лог «панель подтормаживает»
+LOOP_LAG_ALERT = 3.0
 
 logging.basicConfig(
     level=logging.INFO,
@@ -60,8 +66,10 @@ def _norm_channel(val: str) -> str:
 
 
 async def _worker_bootstrap(db: Database, workdir: Path) -> str:
-    auth = UserbotAuth(db=db, workdir=workdir)
-    BRIDGE.auth = auth
+    auth = BRIDGE.auth
+    if auth is None:
+        auth = UserbotAuth(db=db, workdir=workdir)
+        BRIDGE.auth = auth
     BRIDGE.db = db
 
     ok = await auth.try_start_existing()
@@ -79,6 +87,80 @@ async def _worker_bootstrap(db: Database, workdir: Path) -> str:
         me.id,
     )
     return "userbot"
+
+
+async def _bootstrap_userbot_forever(db: Database, workdir: Path) -> None:
+    """
+    Поднимать юзербота в фоне, не задерживая панель.
+
+    Панель обязана отвечать на команды всегда — даже если сессия юзербота
+    битая, а сеть до Telegram лежит. Поэтому вход не блокирует запуск:
+    пробуем, при неудаче ждём и пробуем снова.
+    """
+    # Auth создаём сразу: панели он нужен для «🔐 Вход» и /reconnect
+    if BRIDGE.auth is None:
+        BRIDGE.auth = UserbotAuth(db=db, workdir=workdir)
+    BRIDGE.db = db
+
+    delay = 60.0
+    while True:
+        if BRIDGE.poster is not None:
+            return
+        creds = BRIDGE.auth.load_credentials() if BRIDGE.auth else None
+        if creds is None:
+            logger.info("Нет api_id/api_hash — ждём «🔐 Вход» в панели")
+            return
+        try:
+            mode = await asyncio.wait_for(
+                _worker_bootstrap(db, workdir), timeout=BOOTSTRAP_TIMEOUT
+            )
+            if mode == "userbot":
+                logger.info("Юзербот поднят, автопостинг доступен")
+                return
+        except asyncio.TimeoutError:
+            logger.error(
+                "Вход юзербота не уложился в %.0f сек — панель работает, повтор через %s",
+                BOOTSTRAP_TIMEOUT,
+                humanize_duration(delay),
+            )
+            db.set_last_error("юзербот не отвечает при запуске")
+        except Exception:
+            logger.exception("Не удалось поднять юзербота")
+            db.set_last_error("не удалось поднять юзербота — см. логи")
+
+        await asyncio.sleep(delay)
+        delay = min(delay * 2, 600.0)
+
+
+async def _loop_watchdog() -> None:
+    """
+    Следить за отзывчивостью панели.
+
+    Если между тиками прошло заметно больше секунды — event loop чем-то
+    заблокирован, и пользователь как раз видит «бот не отвечает».
+    """
+    while True:
+        started = time.monotonic()
+        await asyncio.sleep(1.0)
+        lag = time.monotonic() - started - 1.0
+        if lag > LOOP_LAG_ALERT:
+            logger.error(
+                "Панель подтормаживает: event loop был занят %.1f сек", lag
+            )
+
+
+def _warn_duplicate(db: Database) -> None:
+    """Сообщить админу про второй запущенный экземпляр (если можем)."""
+    try:
+        _notify_admin(
+            db,
+            "⚠️ Похоже, запущено <b>два процесса</b> бота с одним токеном.\n"
+            "Из-за этого команды теряются и панель кажется зависшей.\n"
+            "Оставьте один: <code>systemctl restart channel-reposter</code> "
+            "или закройте лишний <code>python main.py</code>.",
+        )
+    except Exception:
+        logger.debug("duplicate warning failed", exc_info=True)
 
 
 def _notify_admin(db: Database, text: str) -> None:
@@ -347,11 +429,32 @@ async def main() -> None:
     )
     try:
         await bot.delete_webhook(drop_pending_updates=True)
+    except TelegramConflictError:
+        logger.error("Другой процесс уже работает с этим токеном")
+        _warn_duplicate(db)
+        await bot.session.close()
+        raise
     except Exception:
         logger.exception("delete_webhook")
 
     me = await bot.get_me()
     logger.info("Admin panel @%s", me.username)
+
+    # Проверка «а не работает ли уже такой же бот» до старта поллинга:
+    # иначе два процесса будут молча делить апдейты между собой
+    try:
+        await bot.get_updates(offset=-1, limit=1, timeout=0)
+    except TelegramConflictError:
+        logger.error(
+            "С токеном @%s уже работает другой процесс — выхожу, "
+            "чтобы не делить апдейты и не «терять» команды",
+            me.username,
+        )
+        _warn_duplicate(db)
+        await bot.session.close()
+        raise
+    except Exception:
+        logger.debug("проверка конфликта не удалась", exc_info=True)
 
     workdir = Path(__file__).resolve().parent
     BRIDGE.start()
@@ -365,11 +468,6 @@ async def main() -> None:
 
     BRIDGE.notify_fn = _notify
 
-    mode = await BRIDGE.call(_worker_bootstrap(db, workdir), timeout=90)
-    # Планировщик работает всегда: вход юзербота можно сделать позже
-    # через панель, и автопостинг подхватится без перезапуска бота.
-    BRIDGE.submit(_worker_scheduler())
-
     admin_bot.set_dependencies(
         db=db,
         bot_username=me.username or "",
@@ -379,9 +477,17 @@ async def main() -> None:
 
     dp = Dispatcher(storage=MemoryStorage())
     admin_bot.setup_dispatcher(dp)
-    logger.info("Online https://t.me/%s · engine=%s", me.username, mode)
+
+    # Планировщик работает всегда: вход юзербота можно сделать позже
+    # через панель, и автопостинг подхватится без перезапуска бота.
+    BRIDGE.submit(_worker_scheduler())
+    # Вход юзербота — в фоне: панель начинает отвечать сразу, даже если
+    # сессия битая или Telegram недоступен (иначе бот «висел» на старте)
+    BRIDGE.submit(_bootstrap_userbot_forever(db, workdir))
+    logger.info("Online https://t.me/%s", me.username)
 
     hb = asyncio.create_task(_heartbeat(bot, db), name="heartbeat")
+    watchdog = asyncio.create_task(_loop_watchdog(), name="watchdog")
 
     # Свежее меню админу после рестарта — старые кнопки часто «мертвые»
     async def _announce_restart() -> None:
@@ -394,7 +500,7 @@ async def main() -> None:
                 int(raw),
                 "♻️ Бот перезапущен.\nНажмите /start — откроется новое меню "
                 "(старые кнопки могут не работать).",
-                reply_markup=admin_bot.menu_kb(db.get_settings().is_running),
+                reply_markup=admin_bot.main_kb(db),
                 parse_mode="HTML",
             )
         except Exception:
@@ -409,10 +515,18 @@ async def main() -> None:
             handle_as_tasks=True,
             allowed_updates=["message", "callback_query"],
         )
+    except TelegramConflictError:
+        logger.error(
+            "Telegram отдал 409 Conflict: с этим токеном работает другой процесс. "
+            "Остановите лишний экземпляр — панель не может отвечать, пока их два."
+        )
+        _warn_duplicate(db)
+        raise
     finally:
         announce.cancel()
         hb.cancel()
-        for task in (hb, announce):
+        watchdog.cancel()
+        for task in (hb, announce, watchdog):
             try:
                 await task
             except BaseException:
@@ -427,8 +541,24 @@ async def main() -> None:
             logger.exception("bot session close")
 
 
+def _lock_path() -> Path:
+    return Path(config.DATABASE_PATH).parent / "reposter.lock"
+
+
 if __name__ == "__main__":
+    lock = single_instance.acquire(_lock_path())
+    if lock.busy:
+        logger.error(
+            "Бот уже запущен (PID %s). Второй процесс делил бы апдейты с первым, "
+            "и панель казалась бы зависшей. Остановите старый процесс: "
+            "kill %s — или используйте systemctl restart.",
+            lock.owner_pid or "?",
+            lock.owner_pid or "<pid>",
+        )
+        sys.exit(1)
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
         logger.info("Stop")
+    finally:
+        single_instance.release(lock)

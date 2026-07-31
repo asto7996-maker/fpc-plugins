@@ -61,6 +61,16 @@ FLOOD_BUDGET = 300
 MAX_STEPS_PER_CYCLE = 600
 # Сетевые сбои внутри одного поста
 NETWORK_RETRIES = 2
+# Таймаут одного сетевого запроса к Telegram (иначе worker-loop клинит)
+RPC_TIMEOUT = 90.0
+
+
+async def _rpc(coro, *, timeout: float = RPC_TIMEOUT, label: str = "rpc"):
+    """Обёртка с таймаутом: зависший await не держит весь поток юзербота."""
+    try:
+        return await asyncio.wait_for(coro, timeout=timeout)
+    except asyncio.TimeoutError as e:
+        raise TimeoutError(f"{label} timeout after {timeout:.0f}s") from e
 
 _NETWORK_ERRORS = (
     OSError,
@@ -508,8 +518,12 @@ class ChannelPoster:
     async def _latest_message_id(self, source: int | str) -> int:
         """ID последнего поста в канале (0 если пусто)."""
         try:
-            async for msg in self.client.get_chat_history(source, limit=1):
-                return int(msg.id)
+            async def _fetch():
+                async for msg in self.client.get_chat_history(source, limit=1):
+                    return int(msg.id)
+                return 0
+
+            return await _rpc(_fetch(), label="latest_message_id")
         except FloodWait:
             raise
         except Exception as e:
@@ -613,11 +627,17 @@ class ChannelPoster:
         if not settings.is_running and not force:
             return CycleResult(reason=REASON_PAUSED, progress_id=settings.progress_id)
 
-        source = await _resolve_chat(
-            self.client, settings.source_channel or config.SOURCE_CHANNEL
+        source = await _rpc(
+            _resolve_chat(
+                self.client, settings.source_channel or config.SOURCE_CHANNEL
+            ),
+            label="resolve_source",
         )
-        target = await _resolve_chat(
-            self.client, settings.target_channel or config.TARGET_CHANNEL
+        target = await _rpc(
+            _resolve_chat(
+                self.client, settings.target_channel or config.TARGET_CHANNEL
+            ),
+            label="resolve_target",
         )
         if settings.progress_id < 0:
             logger.warning("progress_id не задан")

@@ -58,6 +58,11 @@ _rewrite_task: Optional[asyncio.Task] = None
 _cycle_task: Optional[asyncio.Task] = None
 _bridge = None
 _bot = None
+_started_at = time.monotonic()
+
+# Ручной цикл не должен «висеть» вечно, если поток юзербота умер
+CYCLE_TIMEOUT = 3600.0
+REWRITE_TIMEOUT = 6 * 3600.0
 
 
 def set_dependencies(
@@ -217,7 +222,10 @@ def menu_kb(running: bool, *, catchup: bool = False, notify: bool = False) -> In
                     callback_data="a:notify",
                 ),
             ],
-            [InlineKeyboardButton(text="📝 Rewrite подписей", callback_data="a:rewrite")],
+            [
+                InlineKeyboardButton(text="📝 Rewrite подписей", callback_data="a:rewrite"),
+                InlineKeyboardButton(text="🧹 Разблокировать", callback_data="a:unstick"),
+            ],
         ]
     )
 
@@ -344,7 +352,8 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
         "3️⃣ Ссылка на пост или «С начала»\n"
         "4️⃣ Описание → ⏱ Интервал → ▶️ Старт\n\n"
         "Команды: /status /run /pause /run_now /test\n"
-        "/interval 2ч · /limit 5 · /reconnect · /login\n\n"
+        "/interval 2ч · /limit 5 · /reconnect · /login\n"
+        "Если кажется, что бот повис: /ping и /unstick\n\n"
         + status_text(db),
         reply_markup=main_kb(db),
         parse_mode="HTML",
@@ -419,6 +428,77 @@ async def cmd_pause(message: Message) -> None:
         return
     _require_db().set_running(False)
     await message.answer("⏸ Пауза.", reply_markup=main_kb(), parse_mode="HTML")
+
+
+@router.message(Command("ping"))
+async def cmd_ping(message: Message) -> None:
+    """
+    Самая дешёвая проверка «жив ли бот».
+
+    Не трогает ни БД, ни поток юзербота: если панель отвечает на /ping,
+    но молчит на остальное — проблема не в поллинге.
+    """
+    if await _deny(message.from_user.id if message.from_user else None, message.answer):
+        return
+    uptime = humanize_duration(time.monotonic() - _started_at)
+    busy = "идёт цикл" if _busy() else "свободен"
+    await message.answer(
+        f"🏓 Панель жива. Работает {uptime}, движок: {busy}.",
+        parse_mode="HTML",
+    )
+
+
+def _clear_stuck() -> list[str]:
+    """Снять зависшие блокировки. Работает без потока юзербота."""
+    global _cycle_task, _rewrite_task
+    cleared: list[str] = []
+
+    poster = getattr(_bridge, "poster", None) if _bridge else _poster
+    if poster is not None and getattr(poster, "is_busy", False):
+        seconds = getattr(poster, "busy_seconds", 0.0)
+        poster.force_unlock()
+        cleared.append(f"цикл висел {humanize_duration(seconds)}")
+
+    for name, task in (("ручной цикл", _cycle_task), ("rewrite", _rewrite_task)):
+        if task is not None and not task.done():
+            task.cancel()
+            cleared.append(f"фоновая задача «{name}» снята")
+    _cycle_task = None
+    _rewrite_task = None
+
+    if _db is not None:
+        _db.run_asap()
+    return cleared
+
+
+@router.message(Command("unstick"))
+async def cmd_unstick(message: Message) -> None:
+    if await _deny(message.from_user.id if message.from_user else None, message.answer):
+        return
+    await _do_unstick(message.answer)
+
+
+@router.callback_query(F.data == "a:unstick")
+async def cb_unstick(c: CallbackQuery) -> None:
+    if await _deny_cb(c):
+        return
+    await _ack(c, "Снимаю блокировки")
+    await _do_unstick(c.message.answer)  # type: ignore
+
+
+async def _do_unstick(answer: Callable) -> None:
+    cleared = _clear_stuck()
+    db = _require_db()
+    body = (
+        "🧹 <b>Снято:</b>\n" + "\n".join(f"• {item}" for item in cleared)
+        if cleared
+        else "🧹 Зависших блокировок не найдено."
+    )
+    await answer(
+        f"{body}\n\nСледующий цикл — при первой возможности.\n\n" + status_text(db),
+        reply_markup=main_kb(db),
+        parse_mode="HTML",
+    )
 
 
 @router.message(Command("interval"))
@@ -1127,7 +1207,7 @@ async def _do_run_now(answer) -> None:
     async def _job():
         try:
             # force=True — ручной цикл работает и на паузе, флаги не трогаем
-            result = await _call_poster("run_cycle", timeout=None, force=True)
+            result = await _call_poster("run_cycle", timeout=CYCLE_TIMEOUT, force=True)
             await answer(_cycle_report(db, result), reply_markup=main_kb(db), parse_mode="HTML")
         except Exception as e:
             logger.exception("run_now")
@@ -1295,7 +1375,7 @@ async def _run_test(message: Message) -> None:
     async def _job():
         try:
             # Разовый лимит вместо правки настроек: сбой не испортит конфиг
-            result = await _call_poster("run_cycle", 1, timeout=None, force=True)
+            result = await _call_poster("run_cycle", 1, timeout=CYCLE_TIMEOUT, force=True)
             await message.answer(
                 _cycle_report(db, result), reply_markup=main_kb(db), parse_mode="HTML"
             )
@@ -1318,7 +1398,7 @@ async def _run_rewrite(message: Message, channel: str, limit: Optional[int]) -> 
     async def job():
         try:
             result = await _call_poster(
-                "rewrite_captions_in_channel", channel, max_posts=limit, timeout=None
+                "rewrite_captions_in_channel", channel, max_posts=limit, timeout=REWRITE_TIMEOUT
             )
             await message.answer(
                 f"{'⏹' if result.get('cancelled') else '✅'} "
@@ -1341,7 +1421,8 @@ async def on_unknown(message: Message) -> None:
     db = _require_db()
     await message.answer(
         "Не понял команду. Управление — кнопками ниже.\n"
-        "Подсказка: /status — статус, /run_now — цикл сейчас, /test — диагностика.\n\n"
+        "Подсказка: /status — статус, /run_now — цикл сейчас, /test — диагностика, "
+        "/ping — проверить, что панель жива.\n\n"
         + status_text(db),
         reply_markup=main_kb(db),
         parse_mode="HTML",

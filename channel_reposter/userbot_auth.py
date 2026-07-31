@@ -38,6 +38,13 @@ KEY_API_HASH = "auth_api_hash"
 KEY_PHONE = "auth_phone"
 KEY_PASSWORD = "auth_password"
 
+# Pyrogram умеет переподключаться «вечно» — ограничиваем, чтобы поток
+# юзербота не завис навсегда и панель могла сказать, что не так
+CONNECT_TIMEOUT = 45.0
+START_TIMEOUT = 60.0
+STOP_TIMEOUT = 20.0
+CALL_TIMEOUT = 30.0
+
 
 @dataclass
 class AuthCredentials:
@@ -100,16 +107,18 @@ class UserbotAuth:
         if self.client is None:
             return
         try:
-            await self.client.stop()
+            await asyncio.wait_for(self.client.stop(), timeout=STOP_TIMEOUT)
         except Exception:
             try:
-                await self.client.disconnect()
+                await asyncio.wait_for(
+                    self.client.disconnect(), timeout=STOP_TIMEOUT
+                )
             except Exception:
-                pass
+                logger.debug("не удалось закрыть клиента", exc_info=True)
         self.client = None
         self._authorized = False
 
-    async def is_alive(self, timeout: float = 20.0) -> bool:
+    async def is_alive(self, timeout: float = CALL_TIMEOUT) -> bool:
         """Живая ли сессия: лёгкий запрос get_me с таймаутом."""
         if self.client is None or not self._authorized:
             return False
@@ -148,14 +157,23 @@ class UserbotAuth:
         )
         try:
             # В Pyrogram 2.x connect() возвращает bool: авторизована ли сессия
-            authorized = await probe.connect()
-            await probe.disconnect()
+            authorized = await asyncio.wait_for(
+                probe.connect(), timeout=CONNECT_TIMEOUT
+            )
+            await asyncio.wait_for(probe.disconnect(), timeout=STOP_TIMEOUT)
+        except asyncio.TimeoutError:
+            logger.error("Telegram не ответил за %.0f сек", CONNECT_TIMEOUT)
+            try:
+                await asyncio.wait_for(probe.disconnect(), timeout=STOP_TIMEOUT)
+            except Exception:
+                logger.debug("disconnect после таймаута", exc_info=True)
+            return False
         except Exception:
             logger.exception("Не удалось проверить сессию")
             try:
-                await probe.disconnect()
+                await asyncio.wait_for(probe.disconnect(), timeout=STOP_TIMEOUT)
             except Exception:
-                pass
+                logger.debug("disconnect после ошибки", exc_info=True)
             return False
 
         if not authorized:
@@ -170,8 +188,8 @@ class UserbotAuth:
             no_updates=True,
         )
         try:
-            await self.client.start()
-            me = await self.client.get_me()
+            await asyncio.wait_for(self.client.start(), timeout=START_TIMEOUT)
+            me = await asyncio.wait_for(self.client.get_me(), timeout=CALL_TIMEOUT)
             self._authorized = True
             logger.info(
                 "Юзербот онлайн: %s (id=%s)",
@@ -179,6 +197,10 @@ class UserbotAuth:
                 me.id,
             )
             return True
+        except asyncio.TimeoutError:
+            logger.error("Юзербот не поднялся за %.0f сек", START_TIMEOUT)
+            await self._close_client()
+            return False
         except Exception:
             logger.exception("Не удалось поднять юзербота")
             await self._close_client()
@@ -207,14 +229,24 @@ class UserbotAuth:
             workdir=str(self.workdir),
             no_updates=True,
         )
-        await self.client.connect()
+        try:
+            await asyncio.wait_for(self.client.connect(), timeout=CONNECT_TIMEOUT)
+        except asyncio.TimeoutError as e:
+            self.client = None
+            raise ValueError(
+                "Telegram не отвечает — проверьте сеть/прокси и повторите /login"
+            ) from e
 
         try:
-            sent = await self.client.send_code(creds.phone)
+            sent = await asyncio.wait_for(
+                self.client.send_code(creds.phone), timeout=CALL_TIMEOUT
+            )
         except PhoneNumberInvalid as e:
-            await self.client.disconnect()
-            self.client = None
+            await self._close_client()
             raise ValueError(f"Некорректный номер: {creds.phone}") from e
+        except asyncio.TimeoutError as e:
+            await self._close_client()
+            raise ValueError("Telegram не ответил на запрос кода — повторите /login") from e
 
         self._phone_code_hash = sent.phone_code_hash
         logger.info("Код отправлен на %s", creds.phone)
@@ -262,9 +294,9 @@ class UserbotAuth:
 
         creds = self._pending
         try:
-            await self.client.disconnect()
+            await asyncio.wait_for(self.client.disconnect(), timeout=STOP_TIMEOUT)
         except Exception:
-            pass
+            logger.debug("disconnect перед перезапуском клиента", exc_info=True)
 
         self.client = Client(
             name=config.SESSION_NAME,
@@ -273,8 +305,8 @@ class UserbotAuth:
             workdir=str(self.workdir),
             no_updates=True,
         )
-        await self.client.start()
-        me = await self.client.get_me()
+        await asyncio.wait_for(self.client.start(), timeout=START_TIMEOUT)
+        me = await asyncio.wait_for(self.client.get_me(), timeout=CALL_TIMEOUT)
         self._authorized = True
         self._phone_code_hash = None
         logger.info(
@@ -288,7 +320,7 @@ class UserbotAuth:
 
     async def status_text(self) -> str:
         if self.is_ready and self.client:
-            me = await self.client.get_me()
+            me = await asyncio.wait_for(self.client.get_me(), timeout=CALL_TIMEOUT)
             return (
                 f"🟢 Юзербот: <b>{me.first_name}</b> "
                 f"(@{me.username or '—'}), id=<code>{me.id}</code>"
