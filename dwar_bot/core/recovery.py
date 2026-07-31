@@ -21,6 +21,7 @@ from playwright.async_api import Error as PlaywrightError, Page, TimeoutError as
 from dwar_bot.auth.cookie_manager import CookieManager
 from dwar_bot.config import BotConfig, config
 from dwar_bot.core.browser import BrowserEngine, BrowserEngineError, NavigationError
+from dwar_bot.core.self_diagnostics import CrashDump, SelfDiagnostics
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +61,7 @@ class CrashRecoveryManager:
         health_timeout_ms: int = 12_000,
         max_consecutive_restarts: int = 5,
         restart_cooldown_sec: float = 15.0,
+        diagnostics: Optional[SelfDiagnostics] = None,
     ) -> None:
         self._config = bot_config or config
         self._health_timeout_ms = health_timeout_ms
@@ -68,6 +70,16 @@ class CrashRecoveryManager:
         self._consecutive_restarts = 0
         self._last_restart_at = 0.0
         self._last_health_ok = True
+        self._diagnostics = diagnostics
+        self._last_crash_dump: Optional[CrashDump] = None
+
+    def bind_diagnostics(self, diagnostics: SelfDiagnostics) -> None:
+        """Подключить SelfDiagnostics после создания оркестратора."""
+        self._diagnostics = diagnostics
+
+    @property
+    def last_crash_dump(self) -> Optional[CrashDump]:
+        return self._last_crash_dump
 
     @property
     def consecutive_restarts(self) -> int:
@@ -75,6 +87,32 @@ class CrashRecoveryManager:
 
     def reset_restart_counter(self) -> None:
         self._consecutive_restarts = 0
+
+    async def capture_failure(
+        self,
+        page: Optional[Page],
+        exception: BaseException,
+        module_context: str = "recovery",
+        *,
+        expected_selector: str = "",
+        send_telegram: bool = True,
+    ) -> Optional[CrashDump]:
+        """Снять CrashDump через SelfDiagnostics (no-op если не привязан)."""
+        if self._diagnostics is None:
+            return None
+        try:
+            dump = await self._diagnostics.capture_crash(
+                page,
+                exception,
+                module_context,
+                expected_selector=expected_selector,
+                send_telegram=send_telegram,
+            )
+            self._last_crash_dump = dump
+            return dump
+        except Exception as exc:
+            logger.warning("capture_failure failed: %s", exc)
+            return None
 
     # ------------------------------------------------------------------
     # Health check
@@ -244,6 +282,23 @@ class CrashRecoveryManager:
             self._consecutive_restarts,
         )
 
+        # Дамп состояния ДО закрытия браузера
+        try:
+            page_before: Optional[Page] = None
+            if browser_engine.is_started:
+                try:
+                    page_before = browser_engine.page
+                except BrowserEngineError:
+                    page_before = None
+            await self.capture_failure(
+                page_before,
+                RuntimeError(f"restart_session #{self._consecutive_restarts}"),
+                module_context="recovery.restart_session",
+                send_telegram=False,
+            )
+        except Exception as dump_exc:
+            logger.debug("pre-restart dump skipped: %s", dump_exc)
+
         try:
             await browser_engine.stop()
         except Exception as exc:
@@ -345,6 +400,7 @@ class CrashRecoveryManager:
         """
         last_exc: Optional[BaseException] = None
         attempts = max(1, int(max_retries))
+        func_name = getattr(async_func, "__name__", repr(async_func))
 
         for attempt in range(attempts):
             try:
@@ -357,7 +413,7 @@ class CrashRecoveryManager:
                 delay = base_delay * (2 ** attempt) + random.uniform(0.1, 0.6)
                 logger.warning(
                     "safe_execute: %s failed (attempt %s/%s): %s — sleep %.1fs",
-                    getattr(async_func, "__name__", repr(async_func)),
+                    func_name,
                     attempt + 1,
                     attempts,
                     exc,
@@ -370,12 +426,18 @@ class CrashRecoveryManager:
                         logger.debug("on_retry hook error: %s", hook_exc)
                 await asyncio.sleep(delay)
             except Exception as exc:
-                # Неретраибельная ошибка
+                # Неретраибельная ошибка — сразу crash-dump
                 logger.error(
                     "safe_execute: non-recoverable error in %s: %s",
-                    getattr(async_func, "__name__", repr(async_func)),
+                    func_name,
                     exc,
                     exc_info=True,
+                )
+                page = _page_from_args(args, kwargs)
+                await self.capture_failure(
+                    page,
+                    exc,
+                    module_context=f"safe_execute.{func_name}",
                 )
                 raise
 
@@ -383,7 +445,13 @@ class CrashRecoveryManager:
         logger.error(
             "safe_execute: исчерпаны %s попыток для %s",
             attempts,
-            getattr(async_func, "__name__", repr(async_func)),
+            func_name,
+        )
+        page = _page_from_args(args, kwargs)
+        await self.capture_failure(
+            page,
+            last_exc,
+            module_context=f"safe_execute.{func_name}",
         )
         raise last_exc
 
@@ -410,3 +478,19 @@ class CrashRecoveryManager:
             return wrapper
 
         return decorator
+
+
+def _page_from_args(args: tuple, kwargs: dict) -> Optional[Page]:
+    """Эвристика: найти Page среди аргументов safe_execute."""
+    for value in list(args) + list(kwargs.values()):
+        if isinstance(value, Page):
+            return value
+        # BrowserEngine.page
+        page = getattr(value, "page", None)
+        if isinstance(page, Page):
+            try:
+                if not page.is_closed():
+                    return page
+            except Exception:
+                return page
+    return None

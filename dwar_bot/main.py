@@ -25,6 +25,7 @@ from dwar_bot.auth.cookie_manager import CookieManager, SessionRotationError
 from dwar_bot.core.anti_bot import AntiBot
 from dwar_bot.core.browser import BrowserEngine, BrowserEngineError
 from dwar_bot.core.recovery import CrashRecoveryManager
+from dwar_bot.core.self_diagnostics import SelfDiagnostics
 from dwar_bot.core.telegram_bot import RemoteControlState, TelegramRemoteControl
 from dwar_bot.logger import (
     get_logger,
@@ -115,6 +116,10 @@ class BotOrchestrator:
         )
         self.recovery = CrashRecoveryManager(self.config)
 
+        # Самодиагностика / crash dumps
+        self.diagnostics = SelfDiagnostics(self.config, telegram=self.telegram)
+        self.recovery.bind_diagnostics(self.diagnostics)
+
         # KPI / периодические отчёты (SQLite data/analytics.db)
         report_hours = float(os.getenv("DWAR_REPORT_INTERVAL_HOURS", "12") or "12")
         self.analytics = AnalyticsReporter(
@@ -173,6 +178,14 @@ class BotOrchestrator:
         await self.browser.start(apply_cookies=True)
         await self.browser.open_game()
         self._started = True
+
+        # Console listener + telegram для crash-репортов
+        try:
+            self.diagnostics.bind_telegram(self.telegram)
+            self.diagnostics.attach_page(self.browser.page)
+            self.diagnostics.cleanup_old_dumps(max_age_days=7, max_folder_size_mb=500)
+        except Exception as exc:
+            log_exception(self.logger, "SelfDiagnostics attach failed", exc)
 
         # Привязка провайдеров после старта браузера + фоновый Telegram
         self.telegram.bind_providers(
@@ -658,9 +671,15 @@ class BotOrchestrator:
             except BrowserEngineError as exc:
                 self._consecutive_errors += 1
                 log_exception(self.logger, "BrowserEngineError в main_loop", exc)
+                await self._capture_crash_safe(exc, module_context="main.browser")
                 try:
                     await self.recovery.restart_session(self.browser, self.cookies)
                     self.recovery.reset_restart_counter()
+                    # После рестарта — новый page для console listener
+                    try:
+                        self.diagnostics.attach_page(self.browser.page)
+                    except Exception:
+                        pass
                     await self.telegram.send_alert(
                         f"♻ Recovery после BrowserEngineError: {exc}"
                     )
@@ -668,17 +687,28 @@ class BotOrchestrator:
                     log_exception(
                         self.logger, "Не удалось восстановить сессию", restart_exc
                     )
+                    await self._capture_crash_safe(
+                        restart_exc, module_context="main.recovery"
+                    )
                     await self._on_loop_error(exc)
             except Exception as exc:
                 self._consecutive_errors += 1
                 log_exception(self.logger, "Ошибка в main_loop", exc)
+                await self._capture_crash_safe(exc, module_context="main.loop")
                 # Пытаемся вылечить «зависшую» сессию
                 try:
                     ok = await self.recovery.ensure_healthy(self.browser, self.cookies)
                     if not ok:
                         await self.recovery.restart_session(self.browser, self.cookies)
+                    try:
+                        self.diagnostics.attach_page(self.browser.page)
+                    except Exception:
+                        pass
                 except Exception as recovery_exc:
                     self.logger.error("Recovery в except: %s", recovery_exc)
+                    await self._capture_crash_safe(
+                        recovery_exc, module_context="main.recovery"
+                    )
                 await self._on_loop_error(exc)
 
             if self._consecutive_errors >= self.config.max_consecutive_errors:
@@ -715,6 +745,10 @@ class BotOrchestrator:
         if attempt >= 2:
             try:
                 await self.recovery.restart_session(self.browser, self.cookies)
+                try:
+                    self.diagnostics.attach_page(self.browser.page)
+                except Exception:
+                    pass
                 await self.telegram.send_alert(
                     f"♻ Авто-рестарт сессии (попытка {attempt}): {exc}"
                 )
@@ -757,6 +791,31 @@ class BotOrchestrator:
             self.logger.info("Эликсир использован вне боя")
             return True
         return False
+
+    async def _capture_crash_safe(
+        self,
+        exc: BaseException,
+        *,
+        module_context: str,
+        expected_selector: str = "",
+    ) -> None:
+        """Верхнеуровневый перехват: CrashDump + Telegram (без падения цикла)."""
+        try:
+            page = None
+            if self.browser.is_started:
+                try:
+                    page = self.browser.page
+                except Exception:
+                    page = None
+            await self.diagnostics.capture_crash(
+                page,
+                exc,
+                module_context,
+                expected_selector=expected_selector,
+                send_telegram=True,
+            )
+        except Exception as dump_exc:
+            self.logger.warning("capture_crash failed: %s", dump_exc)
 
     async def _on_loop_error(self, exc: BaseException) -> None:
         backoff = min(30.0, 1.5 * self._consecutive_errors)
@@ -907,6 +966,11 @@ async def async_main(argv: Optional[List[str]] = None) -> int:
         orchestrator.request_stop()
     except Exception as exc:
         log_exception(logger, "Фатальная ошибка", exc)
+        # Верхнеуровневый необработанный exception → CrashDump
+        try:
+            await orchestrator._capture_crash_safe(exc, module_context="main.fatal")
+        except Exception:
+            pass
         exit_code = 1
     finally:
         try:
