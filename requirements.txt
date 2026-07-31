@@ -1,5 +1,31 @@
-aiohttp>=3.9.0,<4.0.0
+# DwarBot — зависимости (Python 3.11+)
+# Установка: pip install -r requirements.txt && playwright install chromium
+
+# Браузерная автоматизация
 playwright>=1.41.0,<2.0.0
+
+# HTTP / Telegram Bot API (long-poll через aiohttp)
+aiohttp>=3.9.0,<4.0.0
+
+# Парсинг HTML игровых фреймов
 beautifulsoup4>=4.12.0,<5.0.0
+
+# Конфиг из .env
+python-dotenv>=1.0.0,<2.0.0
+
+# Валидация / модели (опционально для расширений и маркетинговых скриптов)
+pydantic>=2.5.0,<3.0.0
+
+# Изображения (скриншоты капчи / отчёты)
+Pillow>=10.0.0,<12.0.0
+
+# Вспомогательные HTTP-запросы
+requests>=2.31.0,<3.0.0
+
+# Альтернативный Telegram SDK (не используется ядром — бот ходит в Bot API через aiohttp;
+# оставлен для кастомных интеграций / экспериментов)
+python-telegram-bot>=21.0,<23.0
+
+# Тесты
 pytest>=7.4.0,<9.0.0
 pytest-asyncio>=0.23.0,<1.0.0

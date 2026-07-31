@@ -423,6 +423,57 @@ AUTH_SUCCESS_MARKERS: Final[Tuple[str, ...]] = (
 )
 
 
+def _apply_env_aliases() -> None:
+    """
+    Поддержка коротких/альтернативных имён из .env.example:
+      TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, COOKIES_FILE_PATH,
+      HEADLESS_MODE, DWAR_SERVER_URL
+    """
+    aliases = (
+        ("TELEGRAM_BOT_TOKEN", "DWAR_TELEGRAM_BOT_TOKEN"),
+        ("TELEGRAM_CHAT_ID", "DWAR_TELEGRAM_CHAT_ID"),
+        ("COOKIES_FILE_PATH", "DWAR_COOKIES_FILE"),
+        ("HEADLESS_MODE", "DWAR_HEADLESS"),
+    )
+    for src, dst in aliases:
+        if not os.getenv(dst) and os.getenv(src):
+            os.environ[dst] = os.environ[src]
+
+    # DWAR_SERVER_URL=https://w1.dwar.ru → DWAR_SERVER=w1
+    if not os.getenv("DWAR_SERVER"):
+        url = (os.getenv("DWAR_SERVER_URL") or "").strip().lower()
+        if "w1.dwar" in url:
+            os.environ["DWAR_SERVER"] = "w1"
+        elif "w2.dwar" in url:
+            os.environ["DWAR_SERVER"] = "w2"
+
+    # Авто-включение Telegram, если задан токен через алиас
+    token = os.getenv("DWAR_TELEGRAM_BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
+    chat = os.getenv("DWAR_TELEGRAM_CHAT_ID") or os.getenv("TELEGRAM_CHAT_ID")
+    if token and chat and os.getenv("DWAR_TELEGRAM_ENABLED") is None:
+        os.environ["DWAR_TELEGRAM_ENABLED"] = "true"
+
+
+def load_dotenv_if_available() -> None:
+    """Загрузить `.env` из корня проекта (если установлен python-dotenv)."""
+    try:
+        from dotenv import load_dotenv
+    except ImportError:
+        return
+    # Корень репозитория (рядом с main.py) и каталог пакета
+    candidates = (
+        PROJECT_ROOT.parent / ".env",
+        PROJECT_ROOT / ".env",
+        Path.cwd() / ".env",
+    )
+    for path in candidates:
+        if path.is_file():
+            load_dotenv(path, override=False)
+            break
+    else:
+        load_dotenv(override=False)
+
+
 def load_config() -> BotConfig:
     """
     Загружает конфигурацию из переменных окружения.
@@ -437,7 +488,13 @@ def load_config() -> BotConfig:
         DWAR_LOG_LEVEL              — DEBUG/INFO/WARNING/ERROR
         DWAR_TELEGRAM_*             — уведомления
         DWAR_USERNAME / DWAR_PASSWORD
+
+    Алиасы (.env.example): TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID,
+    COOKIES_FILE_PATH, HEADLESS_MODE, DWAR_SERVER_URL.
     """
+    load_dotenv_if_available()
+    _apply_env_aliases()
+
     server_name = os.getenv("DWAR_SERVER", DEFAULT_SERVER).strip().lower()
     server = GameServerConfig.for_server(server_name)
 
@@ -451,7 +508,23 @@ def load_config() -> BotConfig:
 
     cookies_dir = _env_path("DWAR_COOKIES_DIR", COOKIES_DIR)
     cookies_file = _env_path("DWAR_COOKIES_FILE", cookies_dir / "cookies.json")
+    # Docker / хост часто монтируют auth/cookies.json
+    auth_cookies = PROJECT_ROOT.parent / "auth" / "cookies.json"
+    if (
+        os.getenv("DWAR_COOKIES_FILE") is None
+        and os.getenv("COOKIES_FILE_PATH") is None
+        and auth_cookies.is_file()
+    ):
+        cookies_file = auth_cookies.resolve()
+
     log_file = _env_path("DWAR_LOG_FILE", LOG_FILE)
+
+    tg_token = os.getenv("DWAR_TELEGRAM_BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN", "")
+    tg_chat = os.getenv("DWAR_TELEGRAM_CHAT_ID") or os.getenv("TELEGRAM_CHAT_ID", "")
+    tg_enabled = _env_bool(
+        "DWAR_TELEGRAM_ENABLED",
+        bool(tg_token and tg_chat),
+    )
 
     bot_config = BotConfig(
         server=server,
@@ -493,9 +566,9 @@ def load_config() -> BotConfig:
             console=_env_bool("DWAR_LOG_CONSOLE", True),
         ),
         telegram=TelegramConfig(
-            enabled=_env_bool("DWAR_TELEGRAM_ENABLED", False),
-            bot_token=os.getenv("DWAR_TELEGRAM_BOT_TOKEN", ""),
-            chat_id=os.getenv("DWAR_TELEGRAM_CHAT_ID", ""),
+            enabled=tg_enabled,
+            bot_token=tg_token,
+            chat_id=tg_chat,
         ),
         loop_interval_sec=_env_float("DWAR_LOOP_INTERVAL_SEC", 5.0),
         max_consecutive_errors=_env_int("DWAR_MAX_CONSECUTIVE_ERRORS", 10),
