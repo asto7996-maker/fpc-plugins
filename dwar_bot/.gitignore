@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.pyo
+.env
+logs/*.log
+logs/screenshots/*
+sessions/cookies/*.json
+sessions/cookies/*.txt
+sessions/cookies/*.cookies
+sessions/storage_state/*.json
+!sessions/cookies/.gitkeep
