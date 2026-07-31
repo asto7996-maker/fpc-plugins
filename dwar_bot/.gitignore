@@ -1,0 +1,22 @@
+# Секреты и сессии
+.env
+sessions/
+*.cookies
+*.cookies.json
+*.cookies.txt
+
+# Логи и артефакты
+logs/
+screenshots/
+*.log
+
+# Профиль браузера
+profile/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.mypy_cache/
+.pytest_cache/

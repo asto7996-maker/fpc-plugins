@@ -1,0 +1,7 @@
+# Основные зависимости бота Dwar
+playwright>=1.44.0
+python-dotenv>=1.0.1
+requests>=2.31.0
+
+# Опционально для лёгкого HTTP-парсинга (не обязателен для работы Playwright-ветки)
+beautifulsoup4>=4.12.3
