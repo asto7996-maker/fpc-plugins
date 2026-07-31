@@ -1,0 +1,27 @@
+services:
+  dwar_bot:
+    build: .
+    container_name: dwar_bot
+    env_file:
+      - .env
+    environment:
+      # Пути внутри контейнера (перекрывают дефолты config.py)
+      DWAR_COOKIES_FILE: /app/auth/cookies.json
+      DWAR_LOG_FILE: /app/bot.log
+      DWAR_HEADLESS: "true"
+      DWAR_LOG_CONSOLE: "true"
+    volumes:
+      # Сессия Cookie Editor — живёт на хосте
+      - ./auth/cookies.json:/app/auth/cookies.json
+      # Лог бота для мониторинга с хоста
+      - ./bot.log:/app/bot.log
+      # Скриншоты капчи
+      - ./captchas:/app/captchas
+      # Опционально: скриншоты ошибок / runtime state
+      - ./dwar_bot/data/screenshots:/app/dwar_bot/data/screenshots
+      - ./dwar_bot/data/runtime_state.json:/app/dwar_bot/data/runtime_state.json
+    restart: unless-stopped
+    # Для VPS без GUI headless=true; при отладке можно добавить:
+    # shm_size: "256mb"
+    shm_size: "256mb"
+    stop_grace_period: 40s

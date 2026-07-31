@@ -1,0 +1,11 @@
+.env
+bot.log
+auth/cookies.json
+captchas/*
+!captchas/.gitkeep
+auth/*
+!auth/.gitkeep
+!auth/cookies.json.example
+**/__pycache__/
+**/*.py[cod]
+.pytest_cache/
