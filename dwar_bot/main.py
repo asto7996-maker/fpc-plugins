@@ -23,6 +23,7 @@ from dwar_bot.config import DATA_DIR, BotConfig, config, load_config
 from dwar_bot.auth.cookie_manager import CookieManager, SessionRotationError
 from dwar_bot.core.anti_bot import AntiBot
 from dwar_bot.core.browser import BrowserEngine, BrowserEngineError
+from dwar_bot.core.telegram_bot import RemoteControlState, TelegramRemoteControl
 from dwar_bot.logger import (
     get_logger,
     log_exception,
@@ -32,6 +33,7 @@ from dwar_bot.logger import (
     stop_telegram_notifier,
 )
 from dwar_bot.modules.combat_engine import CombatEngine
+from dwar_bot.modules.profession_farm import FarmStats, ProfessionFarm
 from dwar_bot.modules.quest_tracker import QuestTracker
 from dwar_bot.modules.stats_parser import BackpackItem, PlayerStats, StatsParser
 from dwar_bot.modules.timers_manager import (
@@ -80,6 +82,23 @@ class BotOrchestrator:
             stats_parser=self.stats_parser,
         )
         self.anti_bot = AntiBot(self.config, browser=self.browser)
+        self.profession_farm = ProfessionFarm(
+            self.config,
+            browser=self.browser,
+            human=self.browser.human,
+            stats_parser=self.stats_parser,
+            combat_engine=self.combat,
+            timers=self.timers,
+        )
+
+        # Удалённое управление Telegram (флаги shared с main_loop)
+        self.remote_state = RemoteControlState()
+        self.telegram = TelegramRemoteControl(
+            self.config,
+            state=self.remote_state,
+            stats_provider=self.build_status_report,
+            screenshot_provider=self.take_remote_screenshot,
+        )
 
         self._stop_event = asyncio.Event()
         self._started = False
@@ -90,6 +109,7 @@ class BotOrchestrator:
         self._fights_won = 0
         self._fights_lost = 0
         self._loops = 0
+        self._current_task: str = "idle"
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -119,15 +139,40 @@ class BotOrchestrator:
         await self.browser.start(apply_cookies=True)
         await self.browser.open_game()
         self._started = True
+
+        # Привязка провайдеров после старта браузера + фоновый Telegram
+        self.telegram.bind_providers(
+            stats_provider=self.build_status_report,
+            screenshot_provider=self.take_remote_screenshot,
+        )
+        await self.telegram.start()
+
         await notify_telegram(
             f"Бот запущен (server={self.config.server.server})",
             critical=False,
+        )
+        await self.telegram.send_alert(
+            f"🐉 DwarBot запущен (server={self.config.server.server})"
         )
 
     async def stop(self) -> None:
         """Graceful shutdown: состояние, cookie, браузер, telegram."""
         self.logger.info("Остановка бота (graceful shutdown)...")
         self._stop_event.set()
+        self.remote_state.request_stop()
+
+        try:
+            await self.telegram.send_alert(
+                f"⏹ Остановка бота. loops={self._loops} "
+                f"wins={self._fights_won} losses={self._fights_lost}"
+            )
+        except Exception:
+            pass
+
+        try:
+            await self.telegram.stop()
+        except Exception as exc:
+            log_exception(self.logger, "Ошибка остановки TelegramRemoteControl", exc)
 
         try:
             self._save_runtime_state()
@@ -168,10 +213,79 @@ class BotOrchestrator:
     def request_stop(self) -> None:
         self.logger.warning("Получен сигнал остановки")
         self._stop_event.set()
+        self.remote_state.request_stop()
+
+    def request_pause(self) -> None:
+        self.remote_state.pause()
+        self._current_task = "paused"
+        self.remote_state.current_task = "paused"
+
+    def request_resume(self) -> None:
+        self.remote_state.resume()
+        if self._current_task == "paused":
+            self._current_task = "idle"
+            self.remote_state.current_task = "idle"
 
     # ------------------------------------------------------------------
-    # Main loop
+    # Telegram providers
     # ------------------------------------------------------------------
+
+    async def build_status_report(self) -> str:
+        """Текст для /stats."""
+        stats = self._last_stats
+        if self.browser.is_started:
+            try:
+                stats = await self.stats_parser.parse_player_stats(self.browser.page)
+                self._last_stats = stats
+            except Exception as exc:
+                self.logger.debug("build_status_report parse: %s", exc)
+
+        farm: FarmStats = self.profession_farm.stats
+        lines = [
+            f"Loops: {self._loops}",
+            f"Бои: wins={self._fights_won} losses={self._fights_lost}",
+            f"Очередь квестов: {len(self._quest_queue)}",
+            f"Задача: {self._current_task}",
+        ]
+        if stats is not None:
+            lines.extend(
+                [
+                    f"HP: {stats.hp_current}/{stats.hp_max} ({stats.hp_ratio*100:.0f}%)",
+                    f"MP: {stats.mp_current}/{stats.mp_max}",
+                    f"Золото: {stats.gold}з {stats.silver}с {stats.copper}м",
+                    f"Бой: {'да' if stats.in_combat else 'нет'}",
+                    f"Локация: {stats.location or '?'}",
+                    f"Ник: {stats.nickname or '?'} lvl={stats.level}",
+                ]
+            )
+        else:
+            lines.append("Статы: ещё не считаны")
+
+        lines.append(f"Фарм: {farm.summary()}")
+        self.remote_state.farm_summary = farm.summary()
+        self.remote_state.current_task = self._current_task
+        return "\n".join(lines)
+
+    async def take_remote_screenshot(self) -> Optional[Path]:
+        """Скриншот для /screenshot."""
+        if not self.browser.is_started:
+            return None
+        from datetime import datetime, timezone
+
+        from dwar_bot.config import SCREENSHOTS_DIR
+
+        SCREENSHOTS_DIR.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
+        path = SCREENSHOTS_DIR / f"telegram_{stamp}.png"
+        try:
+            await self.browser.page.screenshot(path=str(path), full_page=True)
+            return path
+        except Exception as exc:
+            self.logger.error("take_remote_screenshot: %s", exc, exc_info=True)
+            try:
+                return await self.browser.capture_error_screenshot(prefix="telegram")
+            except Exception:
+                return None
 
     async def main_loop(self) -> None:
         """Основной асинхронный цикл оркестратора."""
@@ -179,7 +293,7 @@ class BotOrchestrator:
             await self.start()
 
         self.logger.info("Вход в main_loop")
-        while not self._stop_event.is_set():
+        while not self._stop_event.is_set() and not self.remote_state.should_stop:
             loop_started = time.monotonic()
             self._loops += 1
             in_combat = False
@@ -187,12 +301,39 @@ class BotOrchestrator:
             has_tasks = bool(self._quest_queue)
 
             try:
+                # Telegram remote: /stop
+                if self.remote_state.should_stop:
+                    self.logger.warning("Остановка по команде Telegram /stop")
+                    self._stop_event.set()
+                    break
+
+                # Telegram remote: /pause — ждём /resume в начале каждой итерации
+                if self.remote_state.is_paused:
+                    self._current_task = "paused"
+                    self.remote_state.current_task = "paused"
+                    self.logger.info(
+                        "Главный цикл на паузе (Telegram /pause) — ожидание /resume"
+                    )
+                    await self.remote_state.wait_if_paused(poll_sec=1.5)
+                    if self.remote_state.should_stop or self._stop_event.is_set():
+                        self._stop_event.set()
+                        break
+                    self._current_task = "idle"
+                    self.remote_state.current_task = "idle"
+                    continue
+
                 page = self.browser.page
+                self.remote_state.current_task = self._current_task
+                self.remote_state.farm_summary = self.profession_farm.stats.summary()
 
                 # 0) Антибот / капча
                 if self.anti_bot.is_paused:
                     self.logger.critical(
                         "Главный цикл на паузе из-за капчи — ждём manual override"
+                    )
+                    await self.telegram.send_alert(
+                        "ТРЕБУЕТСЯ ВМЕШАТЕЛЬСТВО: Капча! Пройдите проверку.",
+                        photo_path=None,
                     )
                     await self.anti_bot.captcha.wait_until_resumed()
                     continue
@@ -205,7 +346,9 @@ class BotOrchestrator:
                             "ТРЕБУЕТСЯ ВМЕШАТЕЛЬСТВО: Появилась капча!",
                             critical=True,
                         )
-                        # Пока капча активна — ждём resume / исчезновения
+                        await self.telegram.send_alert(
+                            "ТРЕБУЕТСЯ ВМЕШАТЕЛЬСТВО: Появилась капча!",
+                        )
                         if self.anti_bot.is_paused:
                             await self.anti_bot.captcha.wait_until_resumed(
                                 poll_sec=3.0
@@ -214,6 +357,8 @@ class BotOrchestrator:
                     self.timers.set_cooldown(TIMER_ANTI_BOT, random.uniform(8.0, 15.0))
 
                 # 1) Сканирование состояния
+                self._current_task = "scan_stats"
+                self.remote_state.current_task = self._current_task
                 stats = await self.stats_parser.parse_player_stats(page)
                 self._last_stats = stats
                 in_combat = bool(stats.in_combat)
@@ -246,9 +391,14 @@ class BotOrchestrator:
                 combat_state = await self.combat.parse_combat_state(page)
                 if stats.in_combat or combat_state.in_combat:
                     in_combat = True
+                    self._current_task = "combat"
+                    self.remote_state.current_task = "combat"
                     self.logger.info(
                         "Бой обнаружен (%s) — CombatEngine.process_fight",
                         combat_state.enemy_name or "?",
+                    )
+                    await self.telegram.send_alert(
+                        f"⚔ Нападение: {combat_state.enemy_name or 'противник'}"
                     )
                     self.combat.reset_combo()
                     won = await self.combat.process_fight(
@@ -291,6 +441,8 @@ class BotOrchestrator:
                 # 4) Задачи: квесты / перемещения
                 if self._quest_queue and self.timers.is_ready(TIMER_QUEST_STEP):
                     step = self._quest_queue[0]
+                    self._current_task = "quest"
+                    self.remote_state.current_task = f"quest:{step}"
                     self.logger.info("Выполнение квест-шага: %s", step)
                     ok = await self.quests.execute_quest_sequence(page, [step])
                     if ok:
