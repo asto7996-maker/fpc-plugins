@@ -1,0 +1,22 @@
+[
+  {
+    "name": "PHPSESSID",
+    "value": "REPLACE_WITH_YOUR_SESSION_ID",
+    "domain": ".legendofdragons.ru",
+    "path": "/",
+    "expirationDate": 4102444800,
+    "secure": true,
+    "httpOnly": true,
+    "sameSite": "lax"
+  },
+  {
+    "name": "dwar_uid",
+    "value": "REPLACE_WITH_YOUR_UID",
+    "domain": ".legendofdragons.ru",
+    "path": "/",
+    "expirationDate": 4102444800,
+    "secure": false,
+    "httpOnly": false,
+    "sameSite": "lax"
+  }
+]

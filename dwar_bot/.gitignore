@@ -1,0 +1,22 @@
+# Секреты и окружение
+.env
+
+# Реальные cookie-сессии (храним только примеры *.example)
+cookies/*.json
+cookies/*.txt
+cookies/*.bak
+!cookies/*.example
+
+# Логи и артефакты
+logs/*.log
+logs/*.log.*
+logs/screenshots/
+state/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.mypy_cache/
+.pytest_cache/
