@@ -204,11 +204,13 @@ class HumanBehavior:
             linear_t = i / steps
             eased = self._ease_in_out(linear_t)
             x, y = self._cubic_bezier(start, c1, c2, end, eased)
-            # Микро-колебания (дрожание руки), меньше у цели
-            jitter_amp = 1.8 * (1.0 - eased)
-            x += random.uniform(-jitter_amp, jitter_amp)
-            y += random.uniform(-jitter_amp, jitter_amp)
+            # Микро-колебания (дрожание руки), меньше у цели; без дрожи на концах
+            if 0 < i < steps:
+                jitter_amp = 1.8 * (1.0 - abs(2.0 * eased - 1.0))
+                x += random.uniform(-jitter_amp, jitter_amp)
+                y += random.uniform(-jitter_amp, jitter_amp)
             points.append((x, y))
+        points[0] = start
         points[-1] = end
         return points
 
