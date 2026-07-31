@@ -452,6 +452,39 @@ class StatsSelectors:
 
 
 @dataclass(frozen=True, slots=True)
+class AuctionSelectors:
+    """Аукцион / биржа и торговый чат (уточняйте через DevTools)."""
+
+    panel: str = (
+        "#auction, .auction, #market, .market, #exchange, "
+        "[data-panel='auction'], table.auction, table#lots"
+    )
+    row: str = (
+        "tr.lot, tr.auction-row, tr[data-lot-id], .auction-item, "
+        "table.auction tbody tr, #auction_list tr"
+    )
+    search_input: str = (
+        "input[name='search'], input[name='item'], #auction_search, input.search"
+    )
+    search_submit: str = (
+        "button[type='submit'], #auction_search_btn, button.search"
+    )
+    buy_button: str = (
+        "a[href*='buy'], button[data-action='buy'], .buyout, a.buy, button.buy"
+    )
+    sell_tab: str = (
+        "a[href*='sell'], [data-tab='sell'], #sell_tab, .tab-sell"
+    )
+    next_page: str = (
+        "a.next, a[rel='next'], .pagination .next, #next_page"
+    )
+    tax: str = ".tax, .fee, .commission, #tax, [data-tax]"
+    trade_chat_line: str = (
+        ".chat-message, .message, .msg, #chat .line, .trade-chat .line"
+    )
+
+
+@dataclass(frozen=True, slots=True)
 class DwarSelectors:
     """Сводный реестр всех селекторов Dwar."""
 
@@ -461,11 +494,20 @@ class DwarSelectors:
     quests: QuestSelectors = field(default_factory=QuestSelectors)
     location: LocationSelectors = field(default_factory=LocationSelectors)
     stats: StatsSelectors = field(default_factory=StatsSelectors)
+    auction: AuctionSelectors = field(default_factory=AuctionSelectors)
 
     def as_flat_dict(self) -> Dict[str, str]:
         """Плоский словарь «группа.поле → css/xpath» для валидации и логов."""
         result: Dict[str, str] = {}
-        for group_name in ("frames", "combat", "backpack", "quests", "location", "stats"):
+        for group_name in (
+            "frames",
+            "combat",
+            "backpack",
+            "quests",
+            "location",
+            "stats",
+            "auction",
+        ):
             group = getattr(self, group_name)
             for f in fields(group):
                 value = getattr(group, f.name)
@@ -793,6 +835,7 @@ def dump_selectors_json(selectors: Optional[DwarSelectors] = None) -> Dict[str, 
         "quests": asdict(s.quests),
         "location": asdict(s.location),
         "stats": asdict(s.stats),
+        "auction": asdict(s.auction),
     }
 
 
@@ -813,6 +856,7 @@ __all__ = [
     "QuestSelectors",
     "LocationSelectors",
     "StatsSelectors",
+    "AuctionSelectors",
     "DwarSelectors",
     "SELECTORS",
     "is_xpath",
