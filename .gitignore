@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+.env.*
+cookies/
+logs/
+screenshots/
+state.json
+
