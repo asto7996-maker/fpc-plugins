@@ -245,6 +245,11 @@ SKIP_REREAD_MAX_HOPS = 35
 TITLE_EXHAUSTED_PERCENT = 99
 # Не возвращаться к исчерпанному slug в течение сессии (сек)
 TITLE_EXHAUSTED_TTL_SEC = 6 * 3600
+# URL главы: том/номер, номер может быть дробным (120.5)
+CHAPTER_PATH_RE = re.compile(r"/manga/[^/]+/\d+/\d+(?:\.\d+)?")
+CHAPTER_PARSE_RE = re.compile(
+    r"mangabuff\.ru/manga/([^/]+)/(\d+)/(\d+(?:\.\d+)?)(?:\?|$|#|/)"
+)
 COMMENT_WORDS_MIN = 5
 COMMENT_WORDS_MAX = 20
 # 65% — благодарности, 35% — похожие на чужие
@@ -866,7 +871,7 @@ class MangaBuffStats:
             cleaned["resume_by_slug"] = {
                 str(k): str(v)
                 for k, v in resume.items()
-                if k and v and re.search(r"/manga/[^/]+/\d+/\d+", str(v))
+                if k and v and CHAPTER_PATH_RE.search(str(v))
             }
         return cls(**cleaned)
 
@@ -4123,7 +4128,7 @@ class MangaBuffService:
         after_global = await self._reader_global_chapter(page)
         if before_global > 0 and after_global > before_global:
             return True
-        if before_global <= 0 and re.search(r"/manga/[^/]+/\d+/\d+", now):
+        if before_global <= 0 and self._is_chapter_url(now):
             return True
         return False
 
@@ -4198,7 +4203,7 @@ class MangaBuffService:
             except Exception:  # noqa: BLE001
                 pass
             now = page.url.split("?")[0]
-            return bool(now and now != before and re.search(r"/manga/[^/]+/\d+/\d+", now))
+            return bool(now and now != before and self._is_chapter_url(now))
         except Exception as exc:  # noqa: BLE001
             logger.debug("fast hop failed: %s", exc)
             return await self._go_next_chapter(page)
@@ -4300,11 +4305,11 @@ class MangaBuffService:
                 pass
             if "404" in title.lower():
                 return None
-            if re.search(r"/manga/[^/]+/\d+/\d+", page.url):
+            if self._is_chapter_url(page.url):
                 if page.url.rstrip("/").endswith("/0") and slug:
                     await self._safe_goto(page, f"https://mangabuff.ru/manga/{slug}/1/1")
                     await self._dismiss_overlays(page)
-                if re.search(r"/manga/[^/]+/\d+/\d+", page.url):
+                if self._is_chapter_url(page.url):
                     return page.url.split("?")[0]
             return None
 
@@ -4367,20 +4372,37 @@ class MangaBuffService:
         # 1) /manga/{slug} → часто редирект сразу на главу «продолжить»
         cont_href: Optional[str] = None
         resume = (self.stats.resume_by_slug or {}).get(slug) or "" if slug else ""
+        saw_site_progress = False
         if slug:
             if await self._goto_title_card(page, slug):
-                if re.search(rf"/manga/{re.escape(slug)}/\d+/\d+", page.url or ""):
+                if re.search(
+                    rf"/manga/{re.escape(slug)}/\d+/\d+(?:\.\d+)?",
+                    page.url or "",
+                ):
                     # редирект сайта = «Продолжить» (last visited) — читать/hop вперёд
+                    saw_site_progress = True
                     opened = await _settle_unread("redirect")
                     if opened:
                         return opened
                     if self._title_is_exhausted(slug):
                         return None
+                    # settle пустой при редиректе — НЕльзя падать на /1/1
+                    logger.warning(
+                        "MangaBuff %s redirect settle empty at %s — keep progress",
+                        slug,
+                        page.url.split("?")[0],
+                    )
+                try:
+                    if await self._title_has_reading_progress(page):
+                        saw_site_progress = True
+                except Exception:  # noqa: BLE001
+                    pass
                 try:
                     cont_href = await self._find_continue_href(page, slug)
                 except Exception:  # noqa: BLE001
                     cont_href = None
                 if cont_href:
+                    saw_site_progress = True
                     logger.info("MangaBuff %s continue → %s", slug, cont_href)
                     if await self._safe_goto(page, cont_href):
                         opened = await _settle_unread("continue")
@@ -4396,6 +4418,7 @@ class MangaBuffService:
 
             # 2) Resume вместо опасного /1/1
             if resume and not self._title_is_exhausted(slug):
+                saw_site_progress = True
                 if await self._safe_goto(page, resume):
                     opened = await _settle_unread("resume")
                     if opened:
@@ -4403,11 +4426,12 @@ class MangaBuffService:
                     if self._title_is_exhausted(slug):
                         return None
 
-        # 3) Fallback 1/1 — ТОЛЬКО новый тайтл без прогресса
+        # 3) Fallback 1/1 — ТОЛЬКО новый тайтл без прогресса сайта
         if (
             slug
             and not cont_href
             and not resume
+            and not saw_site_progress
             and not self._title_is_exhausted(slug)
         ):
             for candidate in (
@@ -4420,22 +4444,25 @@ class MangaBuffService:
                         return opened
                     if self._title_is_exhausted(slug):
                         return None
-        elif slug and (cont_href or resume):
+        elif slug and (cont_href or resume or saw_site_progress):
             logger.warning(
-                "MangaBuff %s: no unread entry (cont=%s resume=%s) — skip /1/1",
+                "MangaBuff %s: no unread entry (cont=%s resume=%s progress=%s) — skip /1/1",
                 slug,
                 bool(cont_href),
                 bool(resume),
+                saw_site_progress,
             )
+            if not self._title_is_exhausted(slug):
+                self._mark_title_exhausted(slug, "no unread without reset")
             return None
 
-        if cont_href or resume:
+        if cont_href or resume or saw_site_progress:
             return None
 
         if not await self._safe_goto(page, title_href):
             return None
         await self._dismiss_overlays(page)
-        if re.search(r"/manga/[^/]+/\d+/\d+", page.url or ""):
+        if self._is_chapter_url(page.url or ""):
             return await _settle_unread("href")
         try:
             for name in (
@@ -4464,9 +4491,9 @@ class MangaBuffService:
             )
             nums = []
             for h in hrefs:
-                m = re.search(r"/manga/[^/]+/(\d+)/(\d+)", h)
+                m = re.search(r"/manga/[^/]+/(\d+)/(\d+(?:\.\d+)?)", h)
                 if m:
-                    nums.append((int(m.group(1)), int(m.group(2)), h.split("?")[0]))
+                    nums.append((int(m.group(1)), int(float(m.group(2))), h.split("?")[0]))
             if nums:
                 nums.sort()
                 for _vol, chn, h in nums:
@@ -4917,7 +4944,7 @@ class MangaBuffService:
         if not meta:
             self.stats.chapters_pending = await self._history_pool_size(page)
             if force_flush:
-                return await self._flush_history_pool_confirmed(page)
+                return await self._flush_history_pool_confirmed(page, force=True)
             return 0
 
         pool = int(meta.get("pool") or 0)
@@ -5218,11 +5245,20 @@ class MangaBuffService:
     # Comments — каждые 5–15 глав, только на текущую главу
     # ------------------------------------------------------------------
 
+    def _is_chapter_url(self, url: str) -> bool:
+        return bool(CHAPTER_PATH_RE.search(url or ""))
+
     def _parse_chapter_url(self, url: str) -> Optional[Tuple[str, int, int]]:
-        m = re.search(r"mangabuff\.ru/manga/([^/]+)/(\d+)/(\d+)", url)
+        m = CHAPTER_PARSE_RE.search(url or "")
+        if not m:
+            # fallback без якоря конца (старые вызовы / хвостовой мусор)
+            m = re.search(
+                r"mangabuff\.ru/manga/([^/]+)/(\d+)/(\d+(?:\.\d+)?)", url or ""
+            )
         if not m:
             return None
-        return m.group(1), int(m.group(2)), int(m.group(3))
+        # дробные 120.5 → 120 для URL-угадайки; навигация всё равно через next_href
+        return m.group(1), int(m.group(2)), int(float(m.group(3)))
 
     @staticmethod
     def _chapter_comment_key(slug: str, vol: int, ch: int) -> str:
@@ -5249,7 +5285,7 @@ class MangaBuffService:
             return None
         for attempt in range(1, attempts + 1):
             start_url = await self._open_first_chapter(title_href)
-            if start_url and re.search(r"/manga/[^/]+/\d+/\d+", start_url):
+            if start_url and self._is_chapter_url(start_url):
                 return start_url
             if slug and self._title_is_exhausted(slug):
                 return None
@@ -5814,14 +5850,27 @@ class MangaBuffService:
     # ------------------------------------------------------------------
 
     async def _go_next_chapter_with_retry(self, page: Page, attempts: int = 3) -> bool:
-        """Несколько попыток строго следующей главы, прежде чем сдаться."""
-        for attempt in range(1, attempts + 1):
+        """Несколько попыток строго следующей главы, прежде чем сдаться.
+
+        Если сайт не отдаёт «След. глава» и URL-угадайка один раз не сработала —
+        сразу выходим (конец тайтла), без минутного кручения ретраев.
+        """
+        href = await self._extract_next_chapter_href(page)
+        max_attempts = 1 if not href else max(1, int(attempts))
+        for attempt in range(1, max_attempts + 1):
             if await self._go_next_chapter(page):
                 return True
+            # после первой неудачи без href — это конец, не долбим
+            if not href:
+                logger.info(
+                    "MangaBuff no next chapter at %s — title end",
+                    page.url.split("?")[0],
+                )
+                return False
             logger.warning(
                 "MangaBuff next chapter retry %s/%s from %s",
                 attempt,
-                attempts,
+                max_attempts,
                 page.url.split("?")[0],
             )
             await self._tempo_pause(0.6, 1.4)
@@ -5882,6 +5931,46 @@ class MangaBuffService:
             logger.error("MangaBuff defer title %s: cannot open first chapter", slug)
             return 0
 
+        # continue/redirect часто ставит на хвост: не целимся в 90% от всего тайтла
+        try:
+            await self._wait_for_chapter_context(page, timeout_sec=3.0)
+            cur = await self._reader_global_chapter(page)
+            total_now = 0
+            try:
+                total_now = int(
+                    await page.evaluate(
+                        """() => {
+                          const ch = window.current_chapter;
+                          const t = ch && ch.total != null ? parseInt(ch.total, 10) : 0;
+                          return Number.isFinite(t) ? t : 0;
+                        }"""
+                    )
+                    or 0
+                )
+            except Exception:  # noqa: BLE001
+                total_now = total_chapters
+            if total_now <= 0:
+                total_now = total_chapters
+            has_next = bool(await self._extract_next_chapter_href(page))
+            if cur > 0 and total_now > 0:
+                remaining = max(1, int(total_now) - int(cur) + 1)
+                if remaining < max_per_title:
+                    logger.info(
+                        "MangaBuff cap %s target %s→%s (cur=%s total=%s next=%s)",
+                        slug,
+                        max_per_title,
+                        remaining,
+                        cur,
+                        total_now,
+                        has_next,
+                    )
+                    max_per_title = remaining
+            if not has_next:
+                # одна непрочитанная в конце — читаем её и закрываем тайтл
+                max_per_title = min(max_per_title, 1)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("MangaBuff remaining cap failed: %s", exc)
+
         self.stats.titles_visited += 1
         self.stats.touch(f"тайтл: {str(title.get('title') or '')[:40]}", start_url)
         logger.info(
@@ -5906,7 +5995,7 @@ class MangaBuffService:
                 break
 
             url = page.url.split("?")[0]
-            if not re.search(r"/manga/[^/]+/\d+/\d+", url):
+            if not self._is_chapter_url(url):
                 recover = last_chapter_url
                 if not recover:
                     logger.warning("MangaBuff not on chapter page: %s — stop", url)
@@ -5919,11 +6008,13 @@ class MangaBuffService:
                 if not await self._safe_goto(page, recover):
                     break
                 url = page.url.split("?")[0]
-                if not re.search(r"/manga/[^/]+/\d+/\d+", url):
+                if not self._is_chapter_url(url):
                     break
 
             if url in self._read_urls:
                 if not await self._go_next_chapter_with_retry(page):
+                    if slug:
+                        self._mark_title_exhausted(slug, "no next after revisit")
                     break
                 continue
 
@@ -5934,6 +6025,8 @@ class MangaBuffService:
             ):
                 logger.warning("MangaBuff no context at %s — try next", url)
                 if not await self._go_next_chapter_with_retry(page):
+                    if slug:
+                        self._mark_title_exhausted(slug, "no context/no next")
                     break
                 continue
 
@@ -5944,6 +6037,8 @@ class MangaBuffService:
                 self._read_urls.add(url)
                 if not await self._hop_next_unread_fast(page):
                     if not await self._go_next_chapter_with_retry(page):
+                        if slug:
+                            self._mark_title_exhausted(slug, "no unread left")
                         break
                 continue
 
@@ -5979,7 +6074,7 @@ class MangaBuffService:
 
             steps = await self._smooth_read_chapter(page)
             final_url = page.url.split("?")[0]
-            if not re.search(r"/manga/[^/]+/\d+/\d+", final_url):
+            if not self._is_chapter_url(final_url):
                 logger.warning(
                     "MangaBuff chapter aborted (left reader): %s", final_url
                 )
@@ -6000,6 +6095,8 @@ class MangaBuffService:
                         final_url,
                     )
                     if not await self._go_next_chapter_with_retry(page):
+                        if slug:
+                            self._mark_title_exhausted(slug, "no context after reload")
                         break
                     continue
 
@@ -6015,17 +6112,29 @@ class MangaBuffService:
             gap_ready = (
                 time_mod.time() - self._last_history_post_at
             ) >= self._history_min_gap_for_tier()
+            at_title_end = False
 
             if tier == "turbo" and pending >= self._turbo_pool_flush_at() and confirmed <= 0:
                 turbo_moved_next = await self._go_next_chapter_with_retry(page)
-                if gap_ready or pending >= self._turbo_pool_flush_at() + 1:
-                    confirmed = await self._flush_history_pool_confirmed(page)
+                if not turbo_moved_next:
+                    at_title_end = True
+                if gap_ready or pending >= self._turbo_pool_flush_at() + 1 or at_title_end:
+                    confirmed = await self._flush_history_pool_confirmed(
+                        page, force=at_title_end
+                    )
                     pending = await self._history_pool_size(page)
                     self.stats.chapters_pending = pending
             elif tier == "turbo" and pending >= 1 and confirmed <= 0:
                 # продолжаем читать пока копится пакет / идёт gap
                 turbo_moved_next = await self._go_next_chapter_with_retry(page)
-                if pending >= 2 and gap_ready:
+                if not turbo_moved_next:
+                    at_title_end = True
+                    confirmed = await self._flush_history_pool_confirmed(
+                        page, force=True
+                    )
+                    pending = await self._history_pool_size(page)
+                    self.stats.chapters_pending = pending
+                elif pending >= 2 and gap_ready:
                     confirmed = await self._flush_history_pool_confirmed(page)
                     pending = await self._history_pool_size(page)
                     self.stats.chapters_pending = pending
@@ -6096,7 +6205,7 @@ class MangaBuffService:
                 )
 
             await self._maybe_comment(page)
-            if not re.search(r"/manga/[^/]+/\d+/\d+", page.url.split("?")[0]):
+            if not self._is_chapter_url(page.url.split("?")[0]):
                 await self._safe_goto(page, final_url)
 
             if on_progress is not None:
@@ -6105,6 +6214,17 @@ class MangaBuffService:
                 except Exception:  # noqa: BLE001
                     pass
 
+            if at_title_end:
+                if slug:
+                    self._mark_title_exhausted(slug, "no sequential next")
+                logger.info(
+                    "MangaBuff title %s finished at end (%s/%s)",
+                    slug,
+                    chapters_this_title,
+                    max_per_title,
+                )
+                break
+
             if tier != "turbo":
                 gap_lo, gap_hi = self._chapter_gap_pause()
                 await self._human_pause(gap_lo, gap_hi)
@@ -6112,6 +6232,8 @@ class MangaBuffService:
                 break
             if tier == "turbo":
                 if not turbo_moved_next and not await self._go_next_chapter_with_retry(page):
+                    if slug:
+                        self._mark_title_exhausted(slug, "no sequential next")
                     logger.info(
                         "MangaBuff title %s stopped at %s/%s (no sequential next)",
                         slug,
@@ -6120,6 +6242,8 @@ class MangaBuffService:
                     )
                     break
             elif not await self._go_next_chapter_with_retry(page):
+                if slug:
+                    self._mark_title_exhausted(slug, "no sequential next")
                 logger.info(
                     "MangaBuff title %s stopped at %s/%s (no sequential next)",
                     slug,
@@ -6131,6 +6255,10 @@ class MangaBuffService:
         # добить остаток history_pool перед уходом с тайтла
         try:
             tail = await self._register_chapter_read(page, force_flush=True)
+            if tail <= 0:
+                pending_tail = await self._history_pool_size(page)
+                if pending_tail > 0:
+                    tail = await self._flush_history_pool_confirmed(page, force=True)
             if tail > 0:
                 self.stats.chapters_read += tail
                 chapters_this_title += tail
@@ -6548,10 +6676,10 @@ class MangaBuffService:
         """Авторы комментов глав: текущая глава + недавние URL чтения."""
         urls: List[str] = []
         cur = (page.url or "").split("?")[0]
-        if re.search(r"/manga/[^/]+/\d+/\d+", cur):
+        if self._is_chapter_url(cur):
             urls.append(cur)
         last = (self.stats.last_url or "").split("?")[0]
-        if last and re.search(r"/manga/[^/]+/\d+/\d+", last) and last not in urls:
+        if last and self._is_chapter_url(last) and last not in urls:
             urls.append(last)
         # запасные популярные главы, если своих нет
         if len(urls) < 2:
