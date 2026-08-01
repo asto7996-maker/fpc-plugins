@@ -236,7 +236,16 @@ def build_miniapp_or_callback_button(
                     icon_custom_emoji_id=resolved_emoji or None,
                 )
 
-    return InlineKeyboardButton(text=text, callback_data=callback_data)
+    # Callback fallback: still apply premium icon + optional style (Bot API 9.4).
+    final_text = strip_leading_emoji(text) if icon_custom_emoji_id else text
+    kwargs: dict = {'text': final_text, 'callback_data': callback_data}
+    if style and style not in ('default', ''):
+        resolved = _resolve_style(style)
+        if resolved:
+            kwargs['style'] = resolved
+    if icon_custom_emoji_id:
+        kwargs['icon_custom_emoji_id'] = icon_custom_emoji_id
+    return InlineKeyboardButton(**kwargs)
 
 
 # Префикс startapp/маршрута для диплинка на конкретный тикет в админ-кабинете.

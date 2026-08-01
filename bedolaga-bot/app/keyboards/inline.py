@@ -779,11 +779,22 @@ def get_main_menu_keyboard(
 
     subscription_buttons: list[InlineKeyboardButton] = []
 
+    from app.utils.premium_emoji import premium_button
+
     if show_trial:
-        subscription_buttons.append(InlineKeyboardButton(text=texts.MENU_TRIAL, callback_data='menu_trial'))
+        subscription_buttons.append(
+            premium_button(texts.MENU_TRIAL, icon='gift', callback_data='menu_trial')
+        )
 
     if show_buy:
-        subscription_buttons.append(InlineKeyboardButton(text=texts.MENU_BUY_SUBSCRIPTION, callback_data='menu_buy'))
+        subscription_buttons.append(
+            premium_button(
+                texts.MENU_BUY_SUBSCRIPTION,
+                icon='buy',
+                callback_data='menu_buy',
+                style='success',
+            )
+        )
 
     if subscription_buttons:
         paired_buttons.extend(subscription_buttons)
@@ -1274,9 +1285,18 @@ def get_subscription_keyboard(
         if happ_row:
             keyboard.append(happ_row)
 
+        from app.utils.premium_emoji import premium_button
+
         if is_trial:
             keyboard.append(
-                [InlineKeyboardButton(text=texts.MENU_BUY_SUBSCRIPTION, callback_data='subscription_upgrade')]
+                [
+                    premium_button(
+                        texts.MENU_BUY_SUBSCRIPTION,
+                        icon='buy',
+                        callback_data='subscription_upgrade',
+                        style='success',
+                    )
+                ]
             )
         else:
             # Проверяем, является ли тариф суточным
@@ -1301,15 +1321,21 @@ def get_subscription_keyboard(
                 else:
                     pause_text = texts.t('PAUSE_DAILY_BUTTON', '⏸️ Приостановить подписку')
                 keyboard.append(
-                    [InlineKeyboardButton(text=pause_text, callback_data='toggle_daily_subscription_pause')]
+                    [premium_button(pause_text, icon='lightning', callback_data='toggle_daily_subscription_pause')]
                 )
             else:
                 # Для обычного тарифа: [Продлить] [Автоплатеж]
                 keyboard.append(
                     [
-                        InlineKeyboardButton(text=texts.MENU_EXTEND_SUBSCRIPTION, callback_data='subscription_extend'),
-                        InlineKeyboardButton(
-                            text=texts.t('AUTOPAY_BUTTON', '💳 Автоплатеж'),
+                        premium_button(
+                            texts.MENU_EXTEND_SUBSCRIPTION,
+                            icon='renew',
+                            callback_data='subscription_extend',
+                            style='success',
+                        ),
+                        premium_button(
+                            texts.t('AUTOPAY_BUTTON', '💳 Автоплатеж'),
+                            icon='balance',
                             callback_data='subscription_autopay',
                         ),
                     ]
@@ -2305,6 +2331,8 @@ def get_yookassa_payment_keyboard(
 
 
 def get_autopay_notification_keyboard(subscription_id: int, language: str = DEFAULT_LANGUAGE) -> InlineKeyboardMarkup:
+    from app.utils.premium_emoji import icon_id
+
     texts = get_texts(language)
     sub_btn_text = (
         texts.t('MY_SUBSCRIPTIONS_BUTTON', '📱 Мои подписки')
@@ -2316,10 +2344,18 @@ def get_autopay_notification_keyboard(subscription_id: int, language: str = DEFA
         inline_keyboard=[
             [
                 build_miniapp_or_callback_button(
-                    text=texts.t('TOPUP_BALANCE_BUTTON', '💳 Пополнить баланс'), callback_data='balance_topup'
+                    text=texts.t('TOPUP_BALANCE_BUTTON', 'Пополнить баланс'),
+                    callback_data='balance_topup',
+                    icon_custom_emoji_id=icon_id('topup') or None,
                 )
             ],
-            [build_miniapp_or_callback_button(text=sub_btn_text, callback_data='menu_subscription')],
+            [
+                build_miniapp_or_callback_button(
+                    text=sub_btn_text,
+                    callback_data='menu_subscription',
+                    icon_custom_emoji_id=icon_id('cabinet') or None,
+                )
+            ],
         ]
     )
 
