@@ -305,23 +305,30 @@ async def main() -> None:
         mycom_cookie_value=mycom_value,
     )
 
-    try:
-        # Initial session
-        await client.ensure_session()
-        state = await client.get_state()
-        char = await client.get_char_stats()
-        logger.info(
-            "Connected! nick=%s level=%d hp=%d/%d area=%s money=%.2f",
-            char.nick, char.level, char.hp, char.hp_max,
-            state.area_id, state.money,
-        )
+    bot = DwarBot(client)
 
-        bot = DwarBot(client)
-        await bot.run()
+    # Attempt initial session — if token is expired, enter waiting mode
+    while not _shutdown_event.is_set():
+        try:
+            await client.ensure_session()
+            state = await client.get_state()
+            char = await client.get_char_stats()
+            logger.info(
+                "Connected! nick=%s level=%d hp=%d/%d area=%s money=%.2f",
+                char.nick, char.level, char.hp, char.hp_max,
+                state.area_id, state.money,
+            )
+            break  # session established, proceed to game loop
+        except TokenExpiredError as exc:
+            await bot._handle_token_expired(str(exc))
+            # After _handle_token_expired returns, the access_token has been refreshed
+            # → loop back and try ensure_session() again
+            continue
+        except Exception as exc:
+            log_exception(logger, "Fatal error during startup", exc)
+            sys.exit(2)
 
-    except Exception as exc:
-        log_exception(logger, "Fatal error", exc)
-        sys.exit(2)
+    await bot.run()
 
 
 if __name__ == "__main__":
