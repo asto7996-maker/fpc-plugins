@@ -30,8 +30,8 @@ STATE_FILE: Path = BASE_DIR / "state.json"
 # Game endpoints
 # ---------------------------------------------------------------------------
 GAME_BASE_URL: str = os.getenv("DWAR_BASE_URL", "https://dwar.ru")
-# World-specific URLs (e.g. https://w2.dwar.ru)
-_world = os.getenv("DWAR_WORLD", "w2")
+# World-specific URLs (e.g. https://w1.dwar.ru)
+_world = os.getenv("DWAR_WORLD", "w1")
 GAME_WORLD_URL: str = os.getenv("DWAR_WORLD_URL", f"https://{_world}.dwar.ru")
 GAME_LOGIN_URL: str = f"{GAME_WORLD_URL}/index.php"
 GAME_GAME_URL: str = f"{GAME_WORLD_URL}/game.php"
@@ -59,17 +59,17 @@ DEFAULT_COOKIE_FILE: Path = COOKIES_DIR / os.getenv(
 )
 
 # Required cookie names that must be present for a valid session.
-# dwar.ru authentication requires BOTH:
-#   sess-ssid  — game server PHP session
-#   mr1lad     — Astrum Play OAuth token (set on .w2.dwar.ru and .astrum-play.ru)
-# Override via env var (comma-separated): DWAR_REQUIRED_COOKIES=sess-ssid,mr1lad
-_req_env = os.getenv("DWAR_REQUIRED_COOKIES", "sess-ssid,mr1lad")
+# dwar.ru authentication requires:
+#   sess_sid  — game server PHP session ID
+#   mycom     — Astrum Play / mycom OAuth access+refresh token pair
+# Override via env var (comma-separated): DWAR_REQUIRED_COOKIES=sess_sid,mycom
+_req_env = os.getenv("DWAR_REQUIRED_COOKIES", "sess_sid,mycom")
 REQUIRED_COOKIE_NAMES: frozenset[str] = frozenset(
     c.strip() for c in _req_env.split(",") if c.strip()
 )
 
 # The game world subdomain (w1, w2, w3, …).  Override via DWAR_WORLD env var.
-DWAR_WORLD: str = os.getenv("DWAR_WORLD", "w2")
+DWAR_WORLD: str = os.getenv("DWAR_WORLD", "w1")
 
 # Maximum cookie age in seconds before forced re-login (24 h)
 COOKIE_MAX_AGE_SECONDS: int = 86_400

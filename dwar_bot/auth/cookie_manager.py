@@ -232,7 +232,17 @@ def _normalize_cookies_for_playwright(
         except (TypeError, ValueError):
             cookie["expires"] = -1.0
 
-        same_site = raw.get("sameSite", "Lax")
+        # Cookie Editor exports "no_restriction" → Playwright expects "None"
+        # "unspecified" → treat as "Lax"
+        same_site_raw = raw.get("sameSite", "Lax")
+        same_site_map = {
+            "no_restriction": "None",
+            "unspecified": "Lax",
+            "lax": "Lax",
+            "strict": "Strict",
+            "none": "None",
+        }
+        same_site = same_site_map.get(str(same_site_raw).lower(), "Lax")
         if same_site not in ("Strict", "Lax", "None"):
             same_site = "Lax"
         cookie["sameSite"] = same_site

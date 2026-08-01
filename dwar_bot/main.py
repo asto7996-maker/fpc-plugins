@@ -32,6 +32,7 @@ from dwar_bot.config import (
 )
 from dwar_bot.logger import setup_logging, log_exception
 from dwar_bot.auth.cookie_manager import CookieManager, SessionExhaustedError
+from dwar_bot.auth.oauth_login import oauth_login_and_inject, extract_access_token
 from dwar_bot.core.browser import BrowserManager
 from dwar_bot.core.anti_bot import (
     action_delay,
@@ -81,19 +82,44 @@ class DwarBot:
     # ------------------------------------------------------------------
 
     async def start(self) -> None:
-        """Start browser, inject session, initialise modules."""
+        """Start browser, obtain a fresh session via OAuth, initialise modules."""
+        from dwar_bot.config import GAME_WORLD_URL
+        _world = os.getenv("DWAR_WORLD", "w1")
+        _world_url = os.getenv("DWAR_WORLD_URL", f"https://{_world}.dwar.ru")
+        _world_domain = f"{_world}.dwar.ru"
+
         await self._browser.start()
         page = await self._browser.new_page()
 
-        logger.info("Injecting and verifying session cookies …")
-        session_ok = await self._cookie_mgr.inject_and_verify(
-            self._browser.context, page
-        )
-        if not session_ok:
-            raise SessionExhaustedError(
-                "Could not establish a valid game session.  "
-                "Add fresh cookie files to the cookies/ directory."
+        # --- Attempt OAuth auto-login first (works from any IP) ---
+        mycom_value = self._get_mycom_from_cookie_file()
+        if mycom_value:
+            logger.info("Attempting OAuth auto-login via mycom access_token …")
+            ok = await oauth_login_and_inject(
+                self._browser.context, mycom_value, _world_url, _world_domain
             )
+            if ok:
+                logger.info("OAuth auto-login succeeded.")
+            else:
+                logger.warning("OAuth auto-login failed — falling back to cookie injection.")
+                session_ok = await self._cookie_mgr.inject_and_verify(
+                    self._browser.context, page
+                )
+                if not session_ok:
+                    raise SessionExhaustedError(
+                        "Could not establish a valid game session. "
+                        "Check your cookie file / mycom token."
+                    )
+        else:
+            logger.info("No mycom cookie found — using direct cookie injection.")
+            session_ok = await self._cookie_mgr.inject_and_verify(
+                self._browser.context, page
+            )
+            if not session_ok:
+                raise SessionExhaustedError(
+                    "Could not establish a valid game session.  "
+                    "Add fresh cookie files to the cookies/ directory."
+                )
 
         # Navigate to the game
         await page.goto(GAME_GAME_URL, wait_until="domcontentloaded")
@@ -152,16 +178,55 @@ class DwarBot:
                 await sleep_random(DELAY_MAIN_LOOP.min, DELAY_MAIN_LOOP.max)
                 await maybe_idle()
 
+    async def _is_authenticated(self) -> bool:
+        """
+        Quick auth check: verify the page is on game.php (not a login redirect)
+        and the JS ``window.nick`` variable is set (Flash embeds player name).
+        """
+        page = self._browser.page
+        if page is None:
+            return False
+        url = page.url
+        if "index.php" in url or "error=" in url or "login" in url.lower():
+            return False
+        # game.php sets window.nick when authenticated
+        try:
+            nick = await page.evaluate("() => window.nick || ''")
+            if nick:
+                return True
+        except Exception:
+            pass
+        # If URL is game.php and no error, consider authenticated
+        return "game.php" in url
+
     async def _loop_iteration(self) -> None:
-        """One full cycle: read stats → handle quests → fight → rest."""
+        """One full cycle: verify session → read stats → handle quests → fight → rest."""
         assert self._stats and self._combat and self._quests and self._timers
 
         page = self._browser.page
         if page is None:
             raise RuntimeError("No active page.")
 
-        # 1. Read current character state
+        # 1. Confirm we are authenticated
+        if not await self._is_authenticated():
+            logger.warning("Not authenticated (URL: %s) — triggering re-login.", page.url)
+            await self._try_relogin()
+            await sleep_random(3.0, 6.0)
+            return
+
+        # 2. Read current character state (DOM-based for HTML5, or best-effort for Flash)
         char = await self._stats.read_stats()
+        if not char.name:
+            # Game might be Flash — extract nick from JS as fallback
+            try:
+                nick = await page.evaluate("() => window.nick || ''")
+                uid = await page.evaluate("() => window.uid || ''")
+                if nick:
+                    char.name = nick
+                    logger.debug("Flash mode: using window.nick=%s as char name.", nick)
+            except Exception:
+                pass
+
         if not char.name:
             logger.warning("Could not read character stats — may need re-login.")
             await self._try_relogin()
@@ -173,6 +238,10 @@ class DwarBot:
             char.hp_percent, char.mp_percent,
             char.exp_percent, char.gold,
         )
+
+        # Heartbeat screenshot every N iterations
+        if self._iteration % 50 == 1:
+            await self._browser.safe_screenshot(f"heartbeat_{self._iteration}")
 
         # 2. Dismiss notifications
         dismissed = await self._stats.dismiss_notifications()
@@ -228,10 +297,44 @@ class DwarBot:
 
             await sleep_random(DELAY_COMBAT.min, DELAY_COMBAT.max)
 
-    async def _try_relogin(self) -> None:
-        """Attempt to re-inject cookies and navigate back to the game."""
-        logger.warning("Attempting re-login via cookie re-injection …")
+    def _get_mycom_from_cookie_file(self) -> Optional[str]:
+        """Read the mycom OAuth cookie value from the current cookie file."""
         try:
+            import json
+            from dwar_bot.config import COOKIES_DIR
+            files = list(COOKIES_DIR.glob("*.json"))
+            if not files:
+                return None
+            data = json.loads(files[0].read_text(encoding="utf-8"))
+            for c in data:
+                if c.get("name") == "mycom":
+                    return c.get("value", "")
+        except Exception as exc:
+            logger.debug("_get_mycom_from_cookie_file error: %s", exc)
+        return None
+
+    async def _try_relogin(self) -> None:
+        """Re-establish game session using OAuth auto-login."""
+        logger.warning("Attempting OAuth re-login …")
+        try:
+            _world = os.getenv("DWAR_WORLD", "w1")
+            _world_url = os.getenv("DWAR_WORLD_URL", f"https://{_world}.dwar.ru")
+            _world_domain = f"{_world}.dwar.ru"
+
+            mycom_value = self._get_mycom_from_cookie_file()
+            if mycom_value:
+                ok = await oauth_login_and_inject(
+                    self._browser.context, mycom_value, _world_url, _world_domain
+                )
+                if ok:
+                    page = self._browser.page
+                    if page:
+                        await page.goto(GAME_GAME_URL, wait_until="domcontentloaded")
+                        await sleep_random(2.0, 4.0)
+                    logger.info("Re-login successful.")
+                    return
+
+            # Fallback: classic cookie re-injection
             page = self._browser.page
             if page is None:
                 return
@@ -242,7 +345,7 @@ class DwarBot:
             if session_ok:
                 await page.goto(GAME_GAME_URL, wait_until="domcontentloaded")
                 await sleep_random(2.0, 4.0)
-                logger.info("Re-login successful.")
+                logger.info("Re-login via cookie injection successful.")
             else:
                 logger.error("Re-login failed — session exhausted.")
                 _shutdown_event.set()
