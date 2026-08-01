@@ -518,55 +518,48 @@ class CookieManager:
 
     async def verify_session(self, page: Page) -> bool:
         """
-        Navigate to the game's home URL and verify that the injected cookies
-        result in an authenticated session.
+        Navigate to game.php and verify that the injected cookies
+        result in an authenticated session on dwar.ru.
+
+        dwar.ru auth check rules
+        ------------------------
+        * Authenticated  → stays on ``game.php`` (or a game-internal page)
+        * Not authenticated → redirected to ``index.php?error=Не+пройдена+авторизация``
 
         Returns
         -------
         bool
-            True  — session is active (no login redirect detected).
-            False — session is invalid/expired (redirected to login page).
+            True  — session is active.
+            False — session is invalid/expired.
         """
-        login_keywords = ("/login", "/signin", "login.php", "auth.php")
+        from dwar_bot.config import GAME_GAME_URL, GAME_WORLD_URL
         try:
-            logger.debug("Verifying session against %s …", GAME_BASE_URL)
-            response = await page.goto(
-                GAME_BASE_URL,
+            logger.debug("Verifying session via %s …", GAME_GAME_URL)
+            await page.goto(
+                GAME_GAME_URL,
                 timeout=PAGE_TIMEOUT_MS,
                 wait_until="domcontentloaded",
             )
-            await asyncio.sleep(1.5)  # let JS-driven redirects settle
+            await asyncio.sleep(2.0)
 
             current_url: str = page.url.lower()
-            if any(kw in current_url for kw in login_keywords):
+
+            # Auth failure: redirected back to index with error param
+            if "error=" in current_url and "index.php" in current_url:
                 logger.warning(
-                    "Session check failed — redirected to login page (%s).", page.url
+                    "Session check failed — auth error redirect: %s", page.url
                 )
                 return False
 
-            if response is not None and response.status >= 400:
+            # Auth failure: landed on login/register page
+            bad_patterns = ("index.php", "/register.php", "login", "авторизац")
+            if any(p in current_url for p in bad_patterns[:2]):
                 logger.warning(
-                    "Session check returned HTTP %d for %s.",
-                    response.status,
-                    GAME_BASE_URL,
+                    "Session check failed — on login page: %s", page.url
                 )
                 return False
 
-            # Extra check: look for a known authenticated-only element
-            try:
-                await page.wait_for_selector(
-                    SELECTORS.char_name,
-                    timeout=5_000,
-                    state="attached",
-                )
-                logger.info("Session verified — character name element found.")
-            except Exception:
-                # Element not found is not conclusive; URL check was clean, continue
-                logger.debug(
-                    "Character name selector not found during session check, "
-                    "but URL looks authenticated — proceeding."
-                )
-
+            logger.info("Session verified — authenticated page: %s", page.url)
             return True
 
         except Exception as exc:
