@@ -112,14 +112,23 @@ def _main_keyboard() -> dict:
         "inline_keyboard": [
             [
                 {"text": "📊 Статы", "callback_data": "stats"},
+                {"text": "🎒 Рюкзак", "callback_data": "inventory"},
+            ],
+            [
+                {"text": "⚔️ Бои", "callback_data": "combat"},
+                {"text": "📜 Квесты", "callback_data": "quests"},
+            ],
+            [
                 {"text": "🗺 Локация", "callback_data": "area"},
+                {"text": "⏱ Таймеры", "callback_data": "timers"},
             ],
             [
                 {"text": "📋 Лог", "callback_data": "log"},
-                {"text": "🔄 Обновить статус", "callback_data": "status"},
+                {"text": "🔄 Статус", "callback_data": "status"},
             ],
             [
-                {"text": "🍪 Обновить куки", "callback_data": "cookies"},
+                {"text": "⏸ Пауза", "callback_data": "stop"},
+                {"text": "▶️ Продолжить", "callback_data": "resume"},
             ],
         ]
     }
@@ -169,14 +178,19 @@ class TelegramBotHandler:
     async def start(self) -> None:
         """Register commands with Telegram and start the polling loop."""
         await self._api.set_commands([
-            {"command": "start",   "description": "Главное меню"},
-            {"command": "status",  "description": "Состояние бота"},
-            {"command": "stats",   "description": "Статы персонажа"},
-            {"command": "area",    "description": "Текущая локация"},
-            {"command": "log",     "description": "Последние строки лога"},
-            {"command": "cookies", "description": "Как обновить куки"},
-            {"command": "stop",    "description": "Остановить игровой цикл"},
-            {"command": "resume",  "description": "Возобновить игровой цикл"},
+            {"command": "start",     "description": "Главное меню"},
+            {"command": "status",    "description": "Состояние бота"},
+            {"command": "stats",     "description": "Статы персонажа"},
+            {"command": "inventory", "description": "Рюкзак и предметы"},
+            {"command": "combat",    "description": "Статистика боёв"},
+            {"command": "quests",    "description": "Квесты и NPC"},
+            {"command": "area",      "description": "Текущая локация"},
+            {"command": "timers",    "description": "Активные таймеры"},
+            {"command": "effects",   "description": "Активные эффекты"},
+            {"command": "log",       "description": "Последние строки лога"},
+            {"command": "cookies",   "description": "Как обновить куки"},
+            {"command": "stop",      "description": "Остановить игровой цикл"},
+            {"command": "resume",    "description": "Возобновить игровой цикл"},
         ])
         logger.info("Telegram bot commands registered. Starting polling …")
         await self._poll_loop()
@@ -219,15 +233,20 @@ class TelegramBotHandler:
     async def _dispatch_command(self, chat_id: str, text: str) -> None:
         cmd = text.split()[0].lower().lstrip("/").split("@")[0]
         handlers = {
-            "start":   self._cmd_start,
-            "status":  self._cmd_status,
-            "stats":   self._cmd_stats,
-            "area":    self._cmd_area,
-            "log":     self._cmd_log,
-            "cookies": self._cmd_cookies,
-            "stop":    self._cmd_stop,
-            "resume":  self._cmd_resume,
-            "help":    self._cmd_start,
+            "start":     self._cmd_start,
+            "status":    self._cmd_status,
+            "stats":     self._cmd_stats,
+            "inventory": self._cmd_inventory,
+            "combat":    self._cmd_combat,
+            "quests":    self._cmd_quests,
+            "area":      self._cmd_area,
+            "timers":    self._cmd_timers,
+            "effects":   self._cmd_effects,
+            "log":       self._cmd_log,
+            "cookies":   self._cmd_cookies,
+            "stop":      self._cmd_stop,
+            "resume":    self._cmd_resume,
+            "help":      self._cmd_start,
         }
         handler = handlers.get(cmd)
         if handler:
@@ -285,6 +304,82 @@ class TelegramBotHandler:
             f"📍 Локация: area {st.get('area_id','?')}\n"
             f"🏆 Флаги: {st.get('flags',0)} / {st.get('flags2',0)} / {st.get('flags3',0)}"
         )
+        await self._api.send(chat_id, text, reply_markup=_main_keyboard())
+
+    async def _cmd_inventory(self, chat_id: str) -> None:
+        st = await self._get_status()
+        inv = st.get("inventory", [])
+        if not inv:
+            text = "🎒 <b>Рюкзак пуст</b>"
+        else:
+            lines = []
+            for it in inv[:20]:
+                dur = it.get("dur", 0)
+                dmax = it.get("dur_max", 0)
+                dur_str = f" [{dur}/{dmax}]" if dmax else ""
+                broken = " ⚠️" if dmax and dur <= 0 else ""
+                lines.append(f"  • <b>{it.get('title','?')}</b> "
+                             f"<i>({it.get('kind','?')})</i>{dur_str}{broken}")
+            text = (
+                f"🎒 <b>Рюкзак — {len(inv)} предметов</b>\n\n"
+                + "\n".join(lines)
+                + f"\n\n🧪 Отваров: <b>{st.get('potions_count', 0)}</b>"
+            )
+        await self._api.send(chat_id, text, reply_markup=_main_keyboard())
+
+    async def _cmd_combat(self, chat_id: str) -> None:
+        st = await self._get_status()
+        text = (
+            f"<b>⚔️ Статистика боёв</b>\n\n"
+            f"🗡 Боёв начато: <b>{st.get('battles', 0)}</b>\n"
+            f"🏆 Побед: <b>{st.get('wins', 0)}</b>\n"
+            f"💀 Поражений: <b>{st.get('losses', 0)}</b>\n"
+            f"📈 Винрейт: <b>{st.get('win_rate', 0):.1f}%</b>\n\n"
+            f"👊 Атак совершено: {st.get('attacks', 0)}\n"
+            f"🧪 Отваров выпито: {st.get('potions_used', 0)}\n\n"
+            f"❤️ Текущее HP: {st.get('hp','?')}/{st.get('hp_max','?')}"
+        )
+        await self._api.send(chat_id, text, reply_markup=_main_keyboard())
+
+    async def _cmd_quests(self, chat_id: str) -> None:
+        st = await self._get_status()
+        text = (
+            f"<b>📜 Квесты и NPC</b>\n\n"
+            f"✅ Квестов завершено: <b>{st.get('quests_completed', 0)}</b>\n"
+            f"📝 Квестов принято: <b>{st.get('quests_accepted', 0)}</b>\n"
+            f"💬 Диалогов пройдено: <b>{st.get('dialogues', 0)}</b>\n"
+            f"👥 NPC посещено: <b>{st.get('npcs_visited', 0)}</b>\n"
+        )
+        npcs = st.get("npcs", [])
+        if npcs:
+            text += "\n<b>Доступные NPC:</b>\n" + "\n".join(
+                f"  • {n.get('title','?')} "
+                f"(⏱{n.get('time_left', 0)}с)"
+                for n in npcs[:5]
+            )
+        await self._api.send(chat_id, text, reply_markup=_main_keyboard())
+
+    async def _cmd_timers(self, chat_id: str) -> None:
+        st = await self._get_status()
+        timers = st.get("timers", [])
+        if not timers:
+            text = "⏱ <b>Активных таймеров нет</b>"
+        else:
+            lines = [
+                f"  • {t.get('description','?')}: <b>{t.get('remaining','?')}</b>"
+                for t in timers[:15]
+            ]
+            text = f"⏱ <b>Активные таймеры ({len(timers)})</b>\n\n" + "\n".join(lines)
+        await self._api.send(chat_id, text, reply_markup=_main_keyboard())
+
+    async def _cmd_effects(self, chat_id: str) -> None:
+        st = await self._get_status()
+        effects = st.get("effects", [])
+        if not effects:
+            text = "✨ <b>Активных эффектов нет</b>"
+        else:
+            lines = [f"  • {e.get('title','?')}" for e in effects[:15]]
+            text = f"✨ <b>Активные эффекты ({len(effects)})</b>\n\n" + "\n".join(lines)
         await self._api.send(chat_id, text, reply_markup=_main_keyboard())
 
     async def _cmd_area(self, chat_id: str) -> None:

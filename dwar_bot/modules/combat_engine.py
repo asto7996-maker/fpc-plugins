@@ -1,63 +1,71 @@
 """
-Combat engine — automates battle sequences.
+Combat engine — drives battles through the dwar.ru HTTP API.
 
-Flow per battle tick
---------------------
-1. Check if a battle screen is active.
-2. Read enemy HP and log entry (detect special effects / stuns).
-3. If own HP < threshold → drink HP elixir.
-4. If own MP < threshold → drink MP elixir.
-5. If HP < retreat threshold → flee.
-6. Otherwise pick skill or basic attack and execute.
-7. Detect battle result (win/lose) and handle accordingly.
+Supported combat flows
+----------------------
+* **Front / PvP battles** — ``front|locations`` → ``front|fight_join`` → ``front|fight_start``
+* **Direct attack**       — ``common|action?code=ATTACK&nick=<target>``
+* **Arena (battleground)**— ``battleground|chaotic_confirm``
+* **Potion usage**        — ``common|action?code=DRINK&artifact_id=<id>``
+* **Combat log parsing**  — from ``fight.php`` / API bonus_text
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import random
+import re
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Optional
 
-from playwright.async_api import Page
-
-from dwar_bot.config import COMBAT, DELAY_COMBAT, SELECTORS
-from dwar_bot.core.anti_bot import (
-    human_click,
-    sleep_random,
-    wait_for_selector_safe,
-)
-from dwar_bot.modules.stats_parser import StatsParser, CharStats
+from dwar_bot.config import COMBAT, DELAY_COMBAT
+from dwar_bot.core.game_client import DwarGameClient, ApiResponse, STATUS_OK
+from dwar_bot.modules.stats_parser import StatsParser, Artifact, FullProfile
 
 logger = logging.getLogger(__name__)
 
+# Action codes discovered on the live server
+CODE_ATTACK = "ATTACK"
+CODE_DRINK = "DRINK"
+CODE_UNDRINK = "UNDRINK"
+CODE_PUT_ON = "PUT_ON"
+CODE_PUT_OFF = "PUT_OFF"
+CODE_ART_REPAIR = "ART_REPAIR"
 
-# ---------------------------------------------------------------------------
-# Result types
-# ---------------------------------------------------------------------------
 
 class BattleResult(Enum):
+    NO_BATTLE = auto()
+    JOINED = auto()
     ONGOING = auto()
     WIN = auto()
     LOSE = auto()
     FLED = auto()
-    NO_BATTLE = auto()
+    ERROR = auto()
 
 
 @dataclass
 class BattleStats:
-    battles_fought: int = 0
+    battles_joined: int = 0
     wins: int = 0
     losses: int = 0
-    fled: int = 0
-    elixirs_used: int = 0
-    total_damage_dealt: int = 0
+    potions_used: int = 0
+    attacks_made: int = 0
+    consecutive_battles: int = 0
 
     @property
     def win_rate(self) -> float:
         total = self.wins + self.losses
-        return self.wins / total * 100 if total else 0.0
+        return (self.wins / total * 100) if total else 0.0
+
+
+@dataclass
+class CombatLogEntry:
+    text: str = ""
+    damage: int = 0
+    is_critical: bool = False
+    actor: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -65,213 +73,310 @@ class BattleStats:
 # ---------------------------------------------------------------------------
 
 class CombatEngine:
-    """
-    Drives combat interactions on the game page.
+    """Drives combat via HTTP API calls."""
 
-    Parameters
-    ----------
-    page:         Active Playwright page.
-    stats_parser: Shared StatsParser instance.
-    """
-
-    def __init__(self, page: Page, stats_parser: StatsParser) -> None:
-        self._page = page
-        self._stats = stats_parser
-        self.session_stats = BattleStats()
-        self._consecutive_battles = 0
+    def __init__(self, client: DwarGameClient, stats: StatsParser) -> None:
+        self._client = client
+        self._stats = stats
+        self.session = BattleStats()
 
     # ------------------------------------------------------------------
-    # Public interface
+    # State detection
     # ------------------------------------------------------------------
 
     async def is_in_battle(self) -> bool:
-        """Return True if the combat UI is currently visible."""
-        el = await wait_for_selector_safe(
-            self._page, SELECTORS.combat_attack_btn, timeout_ms=2_000
-        )
-        return el is not None
-
-    async def run_battle_tick(self, char_stats: CharStats) -> BattleResult:
-        """
-        Execute one combat decision cycle.
-
-        Should be called repeatedly until it returns anything other than
-        ``BattleResult.ONGOING``.
-        """
-        if not await self.is_in_battle():
-            return BattleResult.NO_BATTLE
-
-        # --- Safety check: retreat if HP critically low ---
-        if char_stats.hp_percent < COMBAT.hp_retreat_threshold:
-            logger.warning(
-                "HP %.1f%% below retreat threshold (%.1f%%) — fleeing!",
-                char_stats.hp_percent, COMBAT.hp_retreat_threshold,
-            )
-            self.session_stats.fled += 1
-            self._consecutive_battles = 0
-            return BattleResult.FLED
-
-        # --- Use elixirs if needed ---
-        if char_stats.hp_percent < COMBAT.hp_elixir_threshold:
-            await self._use_elixir("hp")
-
-        if char_stats.mp_percent < COMBAT.mp_elixir_threshold:
-            await self._use_elixir("mp")
-
-        # --- Decide attack ---
-        if COMBAT.prefer_skills:
-            attacked = await self._try_skill_attack()
-            if not attacked:
-                await self._basic_attack()
-        else:
-            await self._basic_attack()
-
-        # --- Check battle result ---
-        result = await self._check_result()
-        if result == BattleResult.WIN:
-            self.session_stats.wins += 1
-            self.session_stats.battles_fought += 1
-            self._consecutive_battles += 1
-            logger.info(
-                "Battle WON! (session: %d wins / %d fights, %.1f%% WR)",
-                self.session_stats.wins,
-                self.session_stats.battles_fought,
-                self.session_stats.win_rate,
-            )
-            await self._handle_win()
-        elif result == BattleResult.LOSE:
-            self.session_stats.losses += 1
-            self.session_stats.battles_fought += 1
-            self._consecutive_battles = 0
-            logger.warning(
-                "Battle LOST! (session losses: %d)", self.session_stats.losses
-            )
-            await self._handle_result_screen()
-
-        return result
+        """Return True if the character is currently in a fight."""
+        state = await self._client.get_state()
+        # flags bit 0 and a non-zero fight_id both indicate an active battle
+        return bool(state.flags & 0x1) or bool(state.fight_id)
 
     async def needs_rest(self) -> bool:
-        """Return True when the bot should stop fighting and rest."""
-        return self._consecutive_battles >= COMBAT.max_consecutive_battles
+        """True when the bot has fought too many battles in a row."""
+        return self.session.consecutive_battles >= COMBAT.max_consecutive_battles
 
     # ------------------------------------------------------------------
-    # Internal helpers
+    # Front / PvP battles
     # ------------------------------------------------------------------
 
-    async def _basic_attack(self) -> None:
-        logger.debug("Executing basic attack.")
+    async def try_join_front(self) -> BattleResult:
+        """
+        Look for an active front (PvP zone) and join it.
+
+        Returns JOINED on success, NO_BATTLE when no fronts are available.
+        """
         try:
-            await human_click(self._page, SELECTORS.combat_attack_btn, timeout_ms=5_000)
-            await sleep_random(DELAY_COMBAT.min, DELAY_COMBAT.max)
+            fronts = await self._client.get_front_locations()
+            if not fronts:
+                logger.debug("No active fronts available.")
+                return BattleResult.NO_BATTLE
+
+            logger.info("Found %d active front(s).", len(fronts))
+            for front in fronts:
+                area_id = str(front.get("area_id", "") or front.get("id", ""))
+                title = front.get("title", front.get("name", "?"))
+                if not area_id:
+                    continue
+
+                resp = await self._client.join_front(area_id)
+                if resp.status == STATUS_OK:
+                    self.session.battles_joined += 1
+                    self.session.consecutive_battles += 1
+                    logger.info("Joined front '%s' (area=%s).", title, area_id)
+                    await asyncio.sleep(random.uniform(1.5, 3.0))
+                    # Attempt to start the fight
+                    start = await self._client.start_front()
+                    if start.status == STATUS_OK:
+                        logger.info("Front battle started.")
+                    return BattleResult.JOINED
+                else:
+                    logger.debug(
+                        "join_front(%s) rejected: status=%d err=%s",
+                        area_id, resp.status, resp.error,
+                    )
+            return BattleResult.NO_BATTLE
         except Exception as exc:
-            logger.warning("basic_attack failed: %s", exc)
+            logger.warning("try_join_front error: %s", exc)
+            return BattleResult.ERROR
 
-    async def _try_skill_attack(self) -> bool:
-        """
-        Click a random available skill button.
+    # ------------------------------------------------------------------
+    # Direct attack
+    # ------------------------------------------------------------------
 
-        Returns True if a skill was used, False if no skill buttons found.
-        """
+    async def attack_player(self, nick: str) -> BattleResult:
+        """Attack a specific player/mob by nickname."""
+        if not nick:
+            return BattleResult.ERROR
         try:
-            buttons = await self._page.query_selector_all(SELECTORS.combat_skill_btns)
-            if not buttons:
+            resp = await self._client.common_action(CODE_ATTACK, {"nick": nick})
+            self.session.attacks_made += 1
+
+            err = str(resp.redirect_error or "")
+            if err and "Не задан" not in err:
+                logger.info("attack(%s) → %s", nick, err)
+                return BattleResult.ERROR
+
+            if resp.redirect_url:
+                logger.info("attack(%s) → redirect: %s", nick, resp.redirect_url)
+                self.session.battles_joined += 1
+                self.session.consecutive_battles += 1
+                return BattleResult.JOINED
+
+            logger.debug("attack(%s): status=%d", nick, resp.status)
+            return BattleResult.ONGOING
+        except Exception as exc:
+            logger.warning("attack_player(%s) error: %s", nick, exc)
+            return BattleResult.ERROR
+
+    # ------------------------------------------------------------------
+    # Arena / battleground
+    # ------------------------------------------------------------------
+
+    async def try_arena(self, area_id: str = "") -> BattleResult:
+        """Attempt to enter the chaotic arena (battleground)."""
+        try:
+            extra = {"area_id": area_id} if area_id else {}
+            resp = await self._client.entry_point("battleground", "chaotic_confirm", extra)
+            if resp.status == STATUS_OK:
+                self.session.battles_joined += 1
+                self.session.consecutive_battles += 1
+                logger.info("Entered arena battleground.")
+                return BattleResult.JOINED
+            logger.debug("Arena unavailable: status=%d err=%s", resp.status, resp.error)
+            return BattleResult.NO_BATTLE
+        except Exception as exc:
+            logger.warning("try_arena error: %s", exc)
+            return BattleResult.ERROR
+
+    # ------------------------------------------------------------------
+    # Potion / consumable usage
+    # ------------------------------------------------------------------
+
+    async def use_potion(self, artifact: Artifact) -> bool:
+        """Drink a potion by artifact id."""
+        try:
+            resp = await self._client.common_action(
+                CODE_DRINK, {"artifact_id": artifact.art_id}
+            )
+            err = str(resp.redirect_error or "")
+            if err and err.lower() not in ("false", "none", ""):
+                logger.debug("use_potion('%s') → %s", artifact.title, err)
                 return False
-
-            # Filter out disabled buttons
-            enabled = []
-            for btn in buttons:
-                try:
-                    disabled = await btn.get_attribute("disabled")
-                    cls = await btn.get_attribute("class") or ""
-                    if disabled is None and "disabled" not in cls and "cooldown" not in cls:
-                        enabled.append(btn)
-                except Exception:
-                    pass
-
-            if not enabled:
-                return False
-
-            chosen = random.choice(enabled)
-            await chosen.click()
-            logger.debug("Used skill (%d available, 1 chosen).", len(enabled))
-            await sleep_random(DELAY_COMBAT.min, DELAY_COMBAT.max)
+            self.session.potions_used += 1
+            logger.info(
+                "Used potion '%s' (total: %d).",
+                artifact.title, self.session.potions_used,
+            )
+            if resp.bonus_text:
+                for t in resp.bonus_text:
+                    logger.info("  → %s", t)
             return True
         except Exception as exc:
-            logger.debug("_try_skill_attack failed: %s", exc)
+            logger.warning("use_potion error: %s", exc)
             return False
 
-    async def _use_elixir(self, kind: str) -> None:
+    async def heal_if_needed(self, profile: FullProfile) -> bool:
         """
-        Click the HP or MP elixir button.
-
-        Parameters
-        ----------
-        kind: ``"hp"`` or ``"mp"``
+        Drink an HP potion when HP falls below the configured threshold.
+        Returns True if a potion was consumed.
         """
-        selector = SELECTORS.elixir_hp if kind == "hp" else SELECTORS.elixir_mp
+        hp_pct = profile.char.hp_percent
+        if hp_pct >= COMBAT.hp_elixir_threshold:
+            return False
+
+        potion = await self._stats.find_hp_potion()
+        if potion is None:
+            logger.warning("HP at %.0f%% but no healing potion in backpack!", hp_pct)
+            return False
+
+        logger.info("HP %.0f%% below threshold — drinking '%s'.", hp_pct, potion.title)
+        return await self.use_potion(potion)
+
+    async def restore_mana_if_needed(self, profile: FullProfile) -> bool:
+        """Drink an MP potion when mana falls below the threshold."""
+        if profile.char.mp_max <= 0:
+            return False
+        mp_pct = profile.char.mp_percent
+        if mp_pct >= COMBAT.mp_elixir_threshold:
+            return False
+
+        potion = await self._stats.find_mp_potion()
+        if potion is None:
+            return False
+
+        logger.info("MP %.0f%% below threshold — drinking '%s'.", mp_pct, potion.title)
+        return await self.use_potion(potion)
+
+    # ------------------------------------------------------------------
+    # Equipment maintenance
+    # ------------------------------------------------------------------
+
+    async def repair_broken_gear(self, profile: FullProfile) -> int:
+        """Repair all broken equipment. Returns count repaired."""
+        repaired = 0
+        for item in profile.broken_items:
+            try:
+                resp = await self._client.common_action(
+                    CODE_ART_REPAIR, {"artifact_id": item.art_id}
+                )
+                err = str(resp.redirect_error or "")
+                if not err or err.lower() in ("false", "none"):
+                    repaired += 1
+                    logger.info("Repaired '%s'.", item.title)
+                await asyncio.sleep(random.uniform(0.5, 1.5))
+            except Exception as exc:
+                logger.debug("repair '%s' failed: %s", item.title, exc)
+        return repaired
+
+    async def equip_item(self, artifact: Artifact) -> bool:
+        """Put on a piece of equipment."""
         try:
-            el = await wait_for_selector_safe(
-                self._page, selector, timeout_ms=3_000
+            resp = await self._client.common_action(
+                CODE_PUT_ON, {"artifact_id": artifact.art_id}
             )
-            if el is None:
-                logger.warning("No %s elixir found in combat bar.", kind.upper())
-                return
-            await el.click()
-            self.session_stats.elixirs_used += 1
-            logger.info("Used %s elixir (total used: %d).", kind.upper(), self.session_stats.elixirs_used)
-            await sleep_random(0.5, 1.2)
+            err = str(resp.redirect_error or "")
+            if err and "Не удалось" in err:
+                logger.debug("equip('%s') → %s", artifact.title, err)
+                return False
+            logger.info("Equipped '%s'.", artifact.title)
+            return True
         except Exception as exc:
-            logger.warning("_use_elixir('%s') failed: %s", kind, exc)
+            logger.debug("equip_item error: %s", exc)
+            return False
 
-    async def _check_result(self) -> BattleResult:
-        """Detect win/loss screens; return ONGOING if neither is visible."""
-        win_el = await wait_for_selector_safe(
-            self._page, SELECTORS.combat_result_win, timeout_ms=500
-        )
-        if win_el is not None:
-            return BattleResult.WIN
+    async def auto_equip(self, profile: FullProfile) -> int:
+        """Equip every unequipped, non-broken piece of gear. Returns count."""
+        equipped = 0
+        for item in profile.equipment:
+            if item.is_broken:
+                continue
+            # "info" as the only icon means the item is not currently worn
+            if item.icon_list and "info" in item.icon_list and len(item.icon_list) == 1:
+                if await self.equip_item(item):
+                    equipped += 1
+                await asyncio.sleep(random.uniform(0.4, 1.0))
+        return equipped
 
-        lose_el = await wait_for_selector_safe(
-            self._page, SELECTORS.combat_result_lose, timeout_ms=500
-        )
-        if lose_el is not None:
-            return BattleResult.LOSE
+    # ------------------------------------------------------------------
+    # Combat log
+    # ------------------------------------------------------------------
 
-        return BattleResult.ONGOING
-
-    async def _handle_win(self) -> None:
-        """Auto-loot (if enabled) and dismiss the result screen."""
-        if COMBAT.auto_loot:
-            loot_btn = await wait_for_selector_safe(
-                self._page, ".btn-loot, .auto-loot, [data-action='loot']", timeout_ms=2_000
-            )
-            if loot_btn:
-                await loot_btn.click()
-                await sleep_random(0.3, 0.8)
-        await self._handle_result_screen()
-
-    async def _handle_result_screen(self) -> None:
-        """Click the OK/continue button on the battle result popup."""
+    async def read_combat_log(self) -> list[CombatLogEntry]:
+        """Fetch and parse the current battle log."""
+        entries: list[CombatLogEntry] = []
         try:
-            btn = await wait_for_selector_safe(
-                self._page, SELECTORS.combat_result_btn, timeout_ms=5_000
-            )
-            if btn:
-                await sleep_random(0.5, 1.5)
-                await btn.click()
-                await sleep_random(1.0, 2.5)
+            resp = await self._client._get("/fight.php")
+            html = resp.text
+            # Log lines are plain text separated by <br> or in <div class="log">
+            text = re.sub(r"<br\s*/?>", "\n", html)
+            text = re.sub(r"<[^>]+>", " ", text)
+            for line in text.splitlines():
+                line = line.strip()
+                if not line or len(line) < 8:
+                    continue
+                if not any(kw in line.lower() for kw in
+                           ("удар", "урон", "промах", "крит", "атак", "защит", "лечен")):
+                    continue
+                dmg_m = re.search(r"(\d+)\s*(?:урон|повреж|hp|хп)", line, re.IGNORECASE)
+                entries.append(CombatLogEntry(
+                    text=line[:200],
+                    damage=int(dmg_m.group(1)) if dmg_m else 0,
+                    is_critical="крит" in line.lower(),
+                ))
         except Exception as exc:
-            logger.debug("_handle_result_screen failed: %s", exc)
+            logger.debug("read_combat_log error: %s", exc)
+        return entries[-15:]
 
-    async def read_combat_log(self) -> list[str]:
-        """Return the last N lines of the battle log."""
-        entries: list[str] = []
-        try:
-            items = await self._page.query_selector_all(SELECTORS.combat_log_entry)
-            for item in items[-10:]:
-                text = (await item.inner_text()).strip()
-                if text:
-                    entries.append(text)
-        except Exception as exc:
-            logger.debug("read_combat_log failed: %s", exc)
-        return entries
+    # ------------------------------------------------------------------
+    # High-level combat tick
+    # ------------------------------------------------------------------
+
+    async def combat_tick(self, profile: FullProfile) -> BattleResult:
+        """
+        One full combat decision cycle:
+          1. Retreat check (HP critically low)
+          2. Heal / restore mana
+          3. If already fighting → keep fighting
+          4. Otherwise look for a battle to join
+        """
+        hp_pct = profile.char.hp_percent
+
+        # 1. Critical HP — do not fight, try to heal
+        if hp_pct < COMBAT.hp_retreat_threshold:
+            logger.warning(
+                "HP %.0f%% below retreat threshold (%.0f%%) — not engaging.",
+                hp_pct, COMBAT.hp_retreat_threshold,
+            )
+            healed = await self.heal_if_needed(profile)
+            if not healed:
+                logger.info("Resting to recover HP …")
+            self.session.consecutive_battles = 0
+            return BattleResult.FLED
+
+        # 2. Top up resources
+        await self.heal_if_needed(profile)
+        await self.restore_mana_if_needed(profile)
+
+        # 3. Already in a fight?
+        if await self.is_in_battle():
+            log = await self.read_combat_log()
+            if log:
+                logger.info("Combat log: %s", log[-1].text[:120])
+            await asyncio.sleep(random.uniform(DELAY_COMBAT.min, DELAY_COMBAT.max))
+            return BattleResult.ONGOING
+
+        # 4. Rest cycle if we've been grinding too long
+        if await self.needs_rest():
+            logger.info(
+                "Fought %d battles in a row — taking a rest.",
+                self.session.consecutive_battles,
+            )
+            self.session.consecutive_battles = 0
+            await asyncio.sleep(random.uniform(30, 90))
+            return BattleResult.NO_BATTLE
+
+        # 5. Look for a fight: front first, then arena
+        result = await self.try_join_front()
+        if result == BattleResult.JOINED:
+            return result
+
+        return BattleResult.NO_BATTLE

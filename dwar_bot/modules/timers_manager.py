@@ -1,33 +1,37 @@
 """
-Timers manager — tracks in-game cooldowns, profession timers,
-energy recovery, and provides non-blocking wait logic.
+Timers manager — cooldowns, profession timers, energy/HP regeneration.
+
+Everything is tracked from the HTTP API:
+* ``common|dummy``       — server_time, flags (in-fight / jailed / …)
+* ``user.php``           — HP/MP values used to compute regeneration rate
+* ``area.php``           — time_bonus_online, tech-works windows
+* ``hunt_conf.php``      — event NPC ``time_left`` countdowns
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from dataclasses import dataclass, field
-from typing import Callable, Dict, Optional
+from typing import Callable, Optional
 
-from playwright.async_api import Page
-
-from dwar_bot.config import SELECTORS, TIMERS
-from dwar_bot.core.anti_bot import sleep_random, wait_for_selector_safe
+from dwar_bot.config import TIMERS
+from dwar_bot.core.game_client import DwarGameClient
 
 logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Timer data structures
+# Cooldown
 # ---------------------------------------------------------------------------
 
 @dataclass
 class Cooldown:
     name: str
-    ends_at: float            # Unix timestamp
-    callback: Optional[Callable] = field(default=None, repr=False)
+    ends_at: float
+    description: str = ""
 
     @property
     def remaining(self) -> float:
@@ -37,232 +41,304 @@ class Cooldown:
     def is_ready(self) -> bool:
         return self.remaining <= 0.0
 
+    def format_remaining(self) -> str:
+        r = int(self.remaining)
+        if r <= 0:
+            return "готово"
+        h, m, s = r // 3600, (r % 3600) // 60, r % 60
+        if h:
+            return f"{h}ч {m}м"
+        if m:
+            return f"{m}м {s}с"
+        return f"{s}с"
+
+
+@dataclass
+class RegenTracker:
+    """Tracks HP/MP regeneration rate from observed samples."""
+    last_hp: int = 0
+    last_mp: int = 0
+    last_sample_at: float = 0.0
+    hp_per_min: float = 0.0
+    mp_per_min: float = 0.0
+
+    def update(self, hp: int, mp: int) -> None:
+        now = time.time()
+        if self.last_sample_at > 0:
+            dt_min = (now - self.last_sample_at) / 60.0
+            if dt_min > 0.2:  # need at least 12s between samples
+                dhp = hp - self.last_hp
+                dmp = mp - self.last_mp
+                if dhp > 0:
+                    self.hp_per_min = dhp / dt_min
+                if dmp > 0:
+                    self.mp_per_min = dmp / dt_min
+        self.last_hp = hp
+        self.last_mp = mp
+        self.last_sample_at = now
+
+    def seconds_to_full_hp(self, hp: int, hp_max: int) -> float:
+        if hp >= hp_max or self.hp_per_min <= 0:
+            return 0.0
+        return (hp_max - hp) / self.hp_per_min * 60.0
+
 
 # ---------------------------------------------------------------------------
 # TimersManager
 # ---------------------------------------------------------------------------
 
 class TimersManager:
-    """
-    Central registry for all time-based game events.
+    """Central registry of all time-based game state."""
 
-    The manager tracks named cooldowns and provides helpers to:
-    * Register new cooldowns programmatically or by DOM scraping
-    * Query whether any cooldown is ready
-    * Wait (non-blocking) until a specific cooldown fires
-    * Run periodic background tasks (energy polling, crafting checks)
-    """
-
-    def __init__(self, page: Page) -> None:
-        self._page = page
-        self._cooldowns: Dict[str, Cooldown] = {}
-        self._heartbeat_task: Optional[asyncio.Task] = None
-        self._energy_task: Optional[asyncio.Task] = None
-        self._profession_task: Optional[asyncio.Task] = None
+    def __init__(self, client: DwarGameClient) -> None:
+        self._client = client
+        self._cooldowns: dict[str, Cooldown] = {}
+        self.regen = RegenTracker()
+        self._tasks: list[asyncio.Task] = []
+        self._server_time_offset: float = 0.0
+        self._time_bonus_seconds: int = 0
 
     # ------------------------------------------------------------------
-    # Cooldown registry
+    # Registry
     # ------------------------------------------------------------------
 
-    def register(
-        self,
-        name: str,
-        duration_seconds: float,
-        callback: Optional[Callable] = None,
-    ) -> Cooldown:
-        """Register a named cooldown that expires *duration_seconds* from now."""
-        cd = Cooldown(
-            name=name,
-            ends_at=time.time() + duration_seconds,
-            callback=callback,
-        )
+    def register(self, name: str, seconds: float, description: str = "") -> Cooldown:
+        cd = Cooldown(name=name, ends_at=time.time() + seconds, description=description)
         self._cooldowns[name] = cd
-        logger.debug("Cooldown registered: '%s' — %.0fs remaining.", name, duration_seconds)
+        logger.debug("Cooldown '%s' set for %.0fs.", name, seconds)
         return cd
 
-    def reset(self, name: str, duration_seconds: float) -> None:
-        """Reset an existing cooldown (or create it if new)."""
-        if name in self._cooldowns:
-            self._cooldowns[name].ends_at = time.time() + duration_seconds
-        else:
-            self.register(name, duration_seconds)
-
     def is_ready(self, name: str) -> bool:
-        """Return True if cooldown *name* has expired (or was never registered)."""
         cd = self._cooldowns.get(name)
         return cd is None or cd.is_ready
 
     def remaining(self, name: str) -> float:
-        """Seconds remaining on cooldown *name*; 0.0 if not found or expired."""
         cd = self._cooldowns.get(name)
         return cd.remaining if cd else 0.0
 
-    def ready_list(self) -> list[Cooldown]:
-        """Return all cooldowns that have expired."""
-        return [cd for cd in self._cooldowns.values() if cd.is_ready]
+    def all_cooldowns(self) -> list[Cooldown]:
+        return list(self._cooldowns.values())
+
+    def active_cooldowns(self) -> list[Cooldown]:
+        return [cd for cd in self._cooldowns.values() if not cd.is_ready]
+
+    def clear_expired(self) -> int:
+        expired = [k for k, v in self._cooldowns.items() if v.is_ready]
+        for k in expired:
+            del self._cooldowns[k]
+        return len(expired)
 
     # ------------------------------------------------------------------
-    # DOM scraping
+    # Server-side timer scraping
     # ------------------------------------------------------------------
 
-    async def scrape_craft_timers(self) -> dict[str, float]:
-        """
-        Read active crafting/profession timers from the game UI.
-
-        Returns a mapping of {timer_label: remaining_seconds}.
-        """
-        timers: dict[str, float] = {}
+    async def sync_server_time(self) -> None:
+        """Compute the local↔server clock offset."""
         try:
-            timer_els = await self._page.query_selector_all(SELECTORS.timer_craft)
-            for el in timer_els:
-                raw = (await el.inner_text()).strip()
-                secs = self._parse_timer_text(raw)
-                if secs > 0:
-                    label = await el.get_attribute("data-name") or raw
-                    timers[label] = secs
-                    self.reset(f"craft_{label}", secs)
+            state = await self._client.get_state()
+            if state.server_time:
+                self._server_time_offset = state.server_time - time.time()
+                logger.debug("Server time offset: %.1fs", self._server_time_offset)
         except Exception as exc:
-            logger.debug("scrape_craft_timers failed: %s", exc)
+            logger.debug("sync_server_time error: %s", exc)
+
+    @property
+    def server_time(self) -> float:
+        return time.time() + self._server_time_offset
+
+    async def scrape_event_timers(self) -> dict[str, int]:
+        """
+        Read all event/NPC countdowns from hunt_conf.php and register them
+        as cooldowns so the bot knows when an event is about to end.
+        """
+        timers: dict[str, int] = {}
+        try:
+            hunt = await self._client.get_hunt_conf()
+            for npc in hunt.get("npcs", []):
+                left = int(npc.get("time_left", 0))
+                if left <= 0:
+                    continue
+                name = f"npc_{npc.get('npc_id', '?')}"
+                title = npc.get("title", "")
+                timers[title] = left
+                self.register(name, left, description=title)
+        except Exception as exc:
+            logger.debug("scrape_event_timers error: %s", exc)
         return timers
 
-    async def scrape_energy_timer(self) -> float:
+    async def scrape_area_timers(self) -> dict[str, int]:
         """
-        Return seconds until energy is fully restored, or 0 if already full.
+        Parse timers embedded in area.php:
+        ``time_bonus_online``, tech-works windows, bank refresh, etc.
         """
+        timers: dict[str, int] = {}
         try:
-            el = await wait_for_selector_safe(
-                self._page, SELECTORS.timer_energy_restore, timeout_ms=2_000
-            )
-            if el:
-                raw = (await el.inner_text()).strip()
-                secs = self._parse_timer_text(raw)
-                if secs > 0:
-                    self.reset("energy_restore", secs)
-                    return secs
+            resp = await self._client._get("/area.php")
+            html = resp.text
+
+            par_m = re.search(r"var par='([^']+)'", html)
+            if not par_m:
+                return timers
+
+            import urllib.parse
+            par = dict(urllib.parse.parse_qsl(urllib.parse.unquote(par_m.group(1))))
+
+            # Online time bonus
+            bonus = par.get("time_bonus_online")
+            if bonus:
+                try:
+                    secs = int(bonus)
+                    self._time_bonus_seconds = secs
+                    timers["time_bonus"] = secs
+                    self.register("time_bonus", secs, description="Подарок за время онлайн")
+                except ValueError:
+                    pass
+
+            # Scheduled maintenance
+            tw_start = par.get("tech_works_start")
+            tw_stop = par.get("tech_works_stop")
+            if tw_start and tw_stop:
+                try:
+                    start, stop = int(tw_start), int(tw_stop)
+                    now = self.server_time
+                    if start <= now <= stop:
+                        timers["tech_works_active"] = int(stop - now)
+                        self.register("tech_works", stop - now,
+                                      description=par.get("tech_works_name", "Тех. работы"))
+                except ValueError:
+                    pass
+
+            # Fight cooldown / count
+            fc = par.get("fight_count")
+            if fc:
+                try:
+                    timers["fight_count"] = int(fc)
+                except ValueError:
+                    pass
+
         except Exception as exc:
-            logger.debug("scrape_energy_timer failed: %s", exc)
-        return 0.0
-
-    @staticmethod
-    def _parse_timer_text(raw: str) -> float:
-        """
-        Parse timer strings like ``"1:23:45"``, ``"12:34"``, ``"45s"``, ``"2ч 15м"``.
-        Returns total seconds as a float.
-        """
-        import re
-
-        raw = raw.strip()
-
-        # HH:MM:SS or MM:SS
-        m = re.match(r"(\d+):(\d{2})(?::(\d{2}))?", raw)
-        if m:
-            parts = [int(x) for x in m.groups() if x is not None]
-            if len(parts) == 3:
-                return parts[0] * 3600 + parts[1] * 60 + parts[2]
-            return parts[0] * 60 + parts[1]
-
-        # Russian: "2ч 15м 30с" or "15м 30с" or "30с"
-        total = 0.0
-        for unit, mult in [("ч", 3600), ("м", 60), ("с", 1), ("h", 3600), ("m", 60), ("s", 1)]:
-            m2 = re.search(r"(\d+)\s*" + unit, raw, re.IGNORECASE)
-            if m2:
-                total += int(m2.group(1)) * mult
-
-        return total
+            logger.debug("scrape_area_timers error: %s", exc)
+        return timers
 
     # ------------------------------------------------------------------
-    # Async wait helpers
+    # Regeneration
     # ------------------------------------------------------------------
 
-    async def wait_until_ready(
-        self,
-        name: str,
-        poll_interval: float = 5.0,
-        max_wait: float = 3600.0,
+    async def update_regen(self, hp: int, mp: int) -> None:
+        """Feed the latest HP/MP sample into the regeneration tracker."""
+        self.regen.update(hp, mp)
+
+    def estimate_full_hp_wait(self, hp: int, hp_max: int) -> float:
+        """Seconds until HP is expected to be full (0 if already full/unknown)."""
+        return self.regen.seconds_to_full_hp(hp, hp_max)
+
+    async def wait_for_hp(
+        self, target_percent: float = 90.0, max_wait: float = 1800.0
     ) -> bool:
         """
-        Suspend until cooldown *name* is ready.
-
-        Returns True when the cooldown fires, False on timeout (*max_wait*).
+        Sleep (in poll increments) until HP reaches *target_percent*.
+        Returns True when reached, False on timeout.
         """
         start = time.time()
-        while not self.is_ready(name):
-            elapsed = time.time() - start
-            if elapsed >= max_wait:
-                logger.warning(
-                    "wait_until_ready('%s') timed out after %.0fs.", name, max_wait
-                )
-                return False
-            remaining = self.remaining(name)
-            wait = min(poll_interval, remaining + 0.5)
-            logger.debug("Waiting %.0fs for cooldown '%s' …", wait, name)
+        while time.time() - start < max_wait:
+            char = await self._client.get_char_stats()
+            if char.hp_max and char.hp_percent >= target_percent:
+                logger.info("HP recovered to %.0f%%.", char.hp_percent)
+                return True
+            await self.update_regen(char.hp, char.mp)
+            eta = self.estimate_full_hp_wait(char.hp, char.hp_max)
+            wait = min(TIMERS.energy_regen_poll_interval, max(15.0, eta / 4))
+            logger.debug(
+                "HP %.0f%% — waiting %.0fs (ETA full: %.0fs)",
+                char.hp_percent, wait, eta,
+            )
             await asyncio.sleep(wait)
-        return True
+        logger.warning("wait_for_hp timed out after %.0fs.", max_wait)
+        return False
 
     # ------------------------------------------------------------------
-    # Background tasks
+    # Background polling tasks
     # ------------------------------------------------------------------
 
     def start_background_tasks(self) -> None:
-        """Start all periodic background polling coroutines."""
-        if self._heartbeat_task is None or self._heartbeat_task.done():
-            self._heartbeat_task = asyncio.ensure_future(self._heartbeat_loop())
-        if self._energy_task is None or self._energy_task.done():
-            self._energy_task = asyncio.ensure_future(self._energy_poll_loop())
-        if self._profession_task is None or self._profession_task.done():
-            self._profession_task = asyncio.ensure_future(self._profession_poll_loop())
-        logger.info("TimersManager background tasks started.")
+        """Launch periodic polling coroutines."""
+        loop_defs = [
+            (self._heartbeat_loop, "heartbeat"),
+            (self._event_poll_loop, "event_poll"),
+            (self._area_poll_loop, "area_poll"),
+        ]
+        for coro_fn, name in loop_defs:
+            task = asyncio.ensure_future(coro_fn())
+            task.set_name(name) if hasattr(task, "set_name") else None
+            self._tasks.append(task)
+        logger.info("TimersManager background tasks started (%d).", len(self._tasks))
 
     async def stop_background_tasks(self) -> None:
-        """Cancel all background tasks."""
-        for task in (self._heartbeat_task, self._energy_task, self._profession_task):
-            if task and not task.done():
-                task.cancel()
+        for t in self._tasks:
+            if not t.done():
+                t.cancel()
                 try:
-                    await task
+                    await t
                 except asyncio.CancelledError:
                     pass
+        self._tasks.clear()
         logger.info("TimersManager background tasks stopped.")
 
     async def _heartbeat_loop(self) -> None:
-        """Log a heartbeat message periodically."""
         while True:
             try:
-                ready = [cd.name for cd in self.ready_list()]
-                logger.info(
-                    "Heartbeat — tracked cooldowns: %d, ready: %s",
-                    len(self._cooldowns),
-                    ready or "none",
-                )
+                self.clear_expired()
+                active = self.active_cooldowns()
+                if active:
+                    summary = ", ".join(
+                        f"{cd.description or cd.name}: {cd.format_remaining()}"
+                        for cd in active[:5]
+                    )
+                    logger.info("Таймеры — %s", summary)
+                else:
+                    logger.debug("Heartbeat — no active cooldowns.")
                 await asyncio.sleep(TIMERS.heartbeat_interval)
             except asyncio.CancelledError:
                 break
             except Exception as exc:
-                logger.debug("Heartbeat error: %s", exc)
-                await asyncio.sleep(10)
-
-    async def _energy_poll_loop(self) -> None:
-        """Poll energy timer and update internal cooldown."""
-        while True:
-            try:
-                await self.scrape_energy_timer()
-                await asyncio.sleep(TIMERS.energy_regen_poll_interval)
-            except asyncio.CancelledError:
-                break
-            except Exception as exc:
-                logger.debug("Energy poll error: %s", exc)
+                logger.debug("heartbeat error: %s", exc)
                 await asyncio.sleep(30)
 
-    async def _profession_poll_loop(self) -> None:
-        """Poll crafting timers and update internal cooldowns."""
+    async def _event_poll_loop(self) -> None:
         while True:
             try:
-                timers = await self.scrape_craft_timers()
-                if timers:
-                    logger.debug("Craft timers updated: %s", timers)
+                await self.scrape_event_timers()
                 await asyncio.sleep(TIMERS.profession_recheck_interval)
             except asyncio.CancelledError:
                 break
             except Exception as exc:
-                logger.debug("Profession poll error: %s", exc)
+                logger.debug("event poll error: %s", exc)
                 await asyncio.sleep(60)
+
+    async def _area_poll_loop(self) -> None:
+        while True:
+            try:
+                await self.scrape_area_timers()
+                await self.sync_server_time()
+                await asyncio.sleep(TIMERS.craft_poll_interval * 4)
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                logger.debug("area poll error: %s", exc)
+                await asyncio.sleep(120)
+
+    # ------------------------------------------------------------------
+    # Summary for Telegram
+    # ------------------------------------------------------------------
+
+    def summary(self) -> list[dict]:
+        """Return active cooldowns as plain dicts (for the Telegram /timers command)."""
+        return [
+            {
+                "name": cd.name,
+                "description": cd.description or cd.name,
+                "remaining": cd.format_remaining(),
+                "seconds": int(cd.remaining),
+            }
+            for cd in sorted(self.active_cooldowns(), key=lambda c: c.remaining)
+        ]

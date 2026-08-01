@@ -1,20 +1,35 @@
 """
-Stats parser — reads the player's profile, inventory, currency,
-and notifications from the live game page.
+Stats parser — reads profile, backpack, money, effects and notifications
+via the dwar.ru HTTP API (no DOM/Flash required).
+
+Data sources
+------------
+* ``user.php``                  — ``par`` variable (hp/mp/lvl/nick) + ``art_alt`` inventory JSON
+* ``user.php?mode=...&group=N`` — per-tab data (Эффекты / Вещи / Квесты / Элементы)
+* ``entry_point.php`` common|dummy — money, area, flags
 """
 
 from __future__ import annotations
 
+import json
 import logging
+import re
+import urllib.parse
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, Optional
 
-from playwright.async_api import Page
-
-from dwar_bot.config import SELECTORS, PAGE_TIMEOUT_MS
-from dwar_bot.core.anti_bot import wait_for_selector_safe, sleep_random
+from dwar_bot.core.game_client import DwarGameClient, CharStats, GameState
 
 logger = logging.getLogger(__name__)
+
+# user.php tab groups
+TAB_EFFECTS = 1
+TAB_THINGS = 2
+TAB_MISC = 3
+TAB_QUESTS = 4
+TAB_ELEMENTS = 5
+TAB_GIFTS = 6
+TAB_EXPIRING = 7
 
 
 # ---------------------------------------------------------------------------
@@ -22,37 +37,50 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 @dataclass
-class CharStats:
-    name: str = ""
+class Artifact:
+    """One inventory item (artifact) as returned by the game."""
+    art_id: str = ""
+    alt_id: str = ""
+    title: str = ""
+    kind: str = ""              # "Рюкзак", "Оружие", "Отвар", …
+    kind_id: str = ""
+    quality: str = "0"
+    durability: int = 0
+    durability_max: int = 0
     level: int = 0
-    hp: int = 0
-    hp_max: int = 0
-    mp: int = 0
-    mp_max: int = 0
-    energy: int = 0
-    energy_max: int = 0
-    exp_percent: float = 0.0
-    gold: int = 0
-    silver: int = 0
+    description: str = ""
+    can_drop: bool = False
+    can_sell: bool = True
+    icon_list: list[str] = field(default_factory=list)
+    expire_text: str = ""
+    raw: dict = field(default_factory=dict)
 
     @property
-    def hp_percent(self) -> float:
-        return (self.hp / self.hp_max * 100) if self.hp_max else 0.0
+    def is_broken(self) -> bool:
+        return self.durability_max > 0 and self.durability <= 0
 
     @property
-    def mp_percent(self) -> float:
-        return (self.mp / self.mp_max * 100) if self.mp_max else 0.0
+    def durability_percent(self) -> float:
+        return (self.durability / self.durability_max * 100) if self.durability_max else 100.0
 
     @property
-    def energy_percent(self) -> float:
-        return (self.energy / self.energy_max * 100) if self.energy_max else 0.0
+    def is_potion(self) -> bool:
+        kl = self.kind.lower()
+        return "отвар" in kl or "эликсир" in kl or "зелье" in kl
+
+    @property
+    def is_equipment(self) -> bool:
+        kl = self.kind.lower()
+        return any(w in kl for w in ("оружие", "броня", "шлем", "щит", "сапог", "перчат", "пояс", "плащ"))
 
 
 @dataclass
-class InventoryItem:
-    name: str = ""
-    count: int = 1
-    slot: int = 0
+class Effect:
+    """An active buff/debuff on the character."""
+    effect_id: str = ""
+    title: str = ""
+    time_left: str = ""
+    is_hidden: bool = False
 
 
 @dataclass
@@ -61,44 +89,30 @@ class Notification:
     category: str = "info"
 
 
-# ---------------------------------------------------------------------------
-# Helper: safe text extraction
-# ---------------------------------------------------------------------------
+@dataclass
+class FullProfile:
+    """Complete character snapshot."""
+    char: CharStats = field(default_factory=CharStats)
+    state: GameState = field(default_factory=GameState)
+    inventory: list[Artifact] = field(default_factory=list)
+    effects: list[Effect] = field(default_factory=list)
+    notifications: list[Notification] = field(default_factory=list)
 
-async def _text(page: Page, selector: str, default: str = "") -> str:
-    """Return trimmed inner text of the first matching element or *default*."""
-    try:
-        el = await page.query_selector(selector)
-        if el:
-            val = await el.inner_text()
-            return val.strip()
-    except Exception as exc:
-        logger.debug("_text('%s') failed: %s", selector, exc)
-    return default
+    @property
+    def potions(self) -> list[Artifact]:
+        return [a for a in self.inventory if a.is_potion]
 
+    @property
+    def equipment(self) -> list[Artifact]:
+        return [a for a in self.inventory if a.is_equipment]
 
-def _parse_int(raw: str) -> int:
-    """Extract the first integer found in *raw*; return 0 on failure."""
-    import re
-    m = re.search(r"\d[\d\s]*", raw.replace("\u00a0", ""))
-    if m:
-        try:
-            return int(m.group().replace(" ", "").strip())
-        except ValueError:
-            pass
-    return 0
+    @property
+    def broken_items(self) -> list[Artifact]:
+        return [a for a in self.inventory if a.is_broken]
 
-
-def _parse_float(raw: str) -> float:
-    """Extract the first float (or int) found in *raw*; return 0.0 on failure."""
-    import re
-    m = re.search(r"\d+\.?\d*", raw)
-    if m:
-        try:
-            return float(m.group())
-        except ValueError:
-            pass
-    return 0.0
+    @property
+    def total_money(self) -> float:
+        return self.state.money
 
 
 # ---------------------------------------------------------------------------
@@ -106,137 +120,187 @@ def _parse_float(raw: str) -> float:
 # ---------------------------------------------------------------------------
 
 class StatsParser:
-    """
-    Reads character stats, inventory and notifications from the game page.
+    """Reads the complete character profile via HTTP."""
 
-    All methods are safe — they return zeroed/empty objects on any DOM error
-    rather than raising, so the main loop can continue.
-    """
+    def __init__(self, client: DwarGameClient) -> None:
+        self._client = client
+        self._last_profile: Optional[FullProfile] = None
 
-    def __init__(self, page: Page) -> None:
-        self._page = page
+    # ------------------------------------------------------------------
+    # Full profile
+    # ------------------------------------------------------------------
 
-    async def read_stats(self) -> CharStats:
-        """Parse current character stats from the game UI."""
-        stats = CharStats()
+    async def read_full_profile(self) -> FullProfile:
+        """Fetch state, stats, inventory, effects and notifications in one pass."""
+        profile = FullProfile()
         try:
-            stats.name = await _text(self._page, SELECTORS.char_name)
-            stats.level = _parse_int(await _text(self._page, SELECTORS.char_level))
+            profile.state = await self._client.get_state()
+            profile.char = await self._client.get_char_stats()
 
-            hp_cur_raw = await _text(self._page, SELECTORS.char_hp_current)
-            hp_max_raw = await _text(self._page, SELECTORS.char_hp_max)
-            stats.hp = _parse_int(hp_cur_raw)
-            stats.hp_max = _parse_int(hp_max_raw) or stats.hp
+            html = await self._fetch_user_page()
+            profile.inventory = self._parse_inventory(html)
+            profile.effects = self._parse_effects(html)
+            profile.notifications = self._parse_notifications(html)
 
-            mp_cur_raw = await _text(self._page, SELECTORS.char_mp_current)
-            mp_max_raw = await _text(self._page, SELECTORS.char_mp_max)
-            stats.mp = _parse_int(mp_cur_raw)
-            stats.mp_max = _parse_int(mp_max_raw) or stats.mp
-
-            energy_cur_raw = await _text(self._page, SELECTORS.char_energy)
-            energy_max_raw = await _text(self._page, SELECTORS.char_energy_max)
-            stats.energy = _parse_int(energy_cur_raw)
-            stats.energy_max = _parse_int(energy_max_raw) or stats.energy
-
-            exp_raw = await _text(self._page, SELECTORS.char_exp_percent)
-            stats.exp_percent = _parse_float(exp_raw)
-
-            stats.gold = _parse_int(await _text(self._page, SELECTORS.char_gold))
-            stats.silver = _parse_int(await _text(self._page, SELECTORS.char_silver))
-
+            self._last_profile = profile
             logger.debug(
-                "Stats: %s Lv%d HP=%d/%d MP=%d/%d EXP=%.1f%%",
-                stats.name, stats.level, stats.hp, stats.hp_max,
-                stats.mp, stats.mp_max, stats.exp_percent,
+                "Profile: %s Lv%d HP=%d/%d items=%d effects=%d",
+                profile.char.nick, profile.char.level,
+                profile.char.hp, profile.char.hp_max,
+                len(profile.inventory), len(profile.effects),
             )
         except Exception as exc:
-            logger.warning("read_stats failed: %s", exc, exc_info=True)
-        return stats
+            logger.warning("read_full_profile failed: %s", exc, exc_info=True)
+        return profile
 
-    async def read_inventory(self) -> list[InventoryItem]:
-        """Parse inventory slots and return a list of InventoryItem."""
-        items: list[InventoryItem] = []
+    async def _fetch_user_page(self, group: int = TAB_THINGS) -> str:
+        """Download user.php (optionally a specific tab)."""
         try:
-            slots = await self._page.query_selector_all(SELECTORS.inventory_slot)
-            for idx, slot in enumerate(slots):
-                try:
-                    name_el = await slot.query_selector(SELECTORS.inventory_item_name)
-                    count_el = await slot.query_selector(SELECTORS.inventory_item_count)
-                    name = (await name_el.inner_text()).strip() if name_el else ""
-                    count_raw = (await count_el.inner_text()).strip() if count_el else "1"
-                    if name:
-                        items.append(InventoryItem(
-                            name=name,
-                            count=_parse_int(count_raw) or 1,
-                            slot=idx,
-                        ))
-                except Exception as slot_exc:
-                    logger.debug("Slot %d parse error: %s", idx, slot_exc)
-            logger.debug("Inventory: %d items found.", len(items))
+            resp = await self._client._get("/user.php")
+            return resp.text
         except Exception as exc:
-            logger.warning("read_inventory failed: %s", exc)
+            logger.debug("_fetch_user_page error: %s", exc)
+            return ""
+
+    # ------------------------------------------------------------------
+    # Inventory
+    # ------------------------------------------------------------------
+
+    def _parse_inventory(self, html: str) -> list[Artifact]:
+        """
+        Parse all ``art_alt["AA_xxx"] = {...};`` assignments into Artifact objects.
+        """
+        items: list[Artifact] = []
+        pattern = re.compile(r'art_alt\["([^"]+)"\]\s*=\s*(\{.*?\});', re.DOTALL)
+        for alt_id, json_str in pattern.findall(html):
+            try:
+                d = json.loads(json_str)
+            except json.JSONDecodeError:
+                continue
+
+            lev = d.get("lev", {})
+            level = 0
+            if isinstance(lev, dict):
+                try:
+                    level = int(lev.get("value", 0))
+                except (TypeError, ValueError):
+                    level = 0
+
+            exp = d.get("exp", {})
+            expire_text = exp.get("value", "") if isinstance(exp, dict) else ""
+
+            items.append(Artifact(
+                art_id=str(d.get("id", "")),
+                alt_id=alt_id,
+                title=d.get("title", ""),
+                kind=d.get("kind", ""),
+                kind_id=str(d.get("kind_id", "")),
+                quality=str(d.get("quality", "0")),
+                durability=self._safe_int(d.get("dur")),
+                durability_max=self._safe_int(d.get("dur_max")),
+                level=level,
+                description=d.get("desc", ""),
+                can_drop=bool(d.get("drop", False)),
+                can_sell="nosell" not in d,
+                icon_list=d.get("icon_list", []) or [],
+                expire_text=expire_text,
+                raw=d,
+            ))
         return items
 
-    async def count_hp_elixirs(self) -> int:
-        """Return the total count of HP elixirs in inventory."""
-        total = 0
+    @staticmethod
+    def _safe_int(v: Any, default: int = 0) -> int:
         try:
-            elixirs = await self._page.query_selector_all(SELECTORS.elixir_hp)
-            for el in elixirs:
-                try:
-                    count_el = await el.query_selector(SELECTORS.inventory_item_count)
-                    raw = (await count_el.inner_text()).strip() if count_el else "1"
-                    total += _parse_int(raw) or 1
-                except Exception:
-                    total += 1
-        except Exception as exc:
-            logger.debug("count_hp_elixirs failed: %s", exc)
-        return total
+            return int(v)
+        except (TypeError, ValueError):
+            return default
 
-    async def count_mp_elixirs(self) -> int:
-        """Return the total count of MP elixirs in inventory."""
-        total = 0
-        try:
-            elixirs = await self._page.query_selector_all(SELECTORS.elixir_mp)
-            for el in elixirs:
-                try:
-                    count_el = await el.query_selector(SELECTORS.inventory_item_count)
-                    raw = (await count_el.inner_text()).strip() if count_el else "1"
-                    total += _parse_int(raw) or 1
-                except Exception:
-                    total += 1
-        except Exception as exc:
-            logger.debug("count_mp_elixirs failed: %s", exc)
-        return total
+    # ------------------------------------------------------------------
+    # Effects / buffs
+    # ------------------------------------------------------------------
 
-    async def read_notifications(self) -> list[Notification]:
-        """Parse visible in-game notifications."""
-        notifications: list[Notification] = []
-        try:
-            items = await self._page.query_selector_all(SELECTORS.notification_item)
-            for item in items:
-                try:
-                    text = (await item.inner_text()).strip()
-                    if text:
-                        notifications.append(Notification(text=text))
-                except Exception:
-                    pass
-        except Exception as exc:
-            logger.debug("read_notifications failed: %s", exc)
-        return notifications
+    def _parse_effects(self, html: str) -> list[Effect]:
+        """
+        Extract active effects. The game embeds these as EFFECT_HIDE/EFFECT_SHOW
+        links plus a human-readable title in the surrounding markup.
+        """
+        effects: list[Effect] = []
+        seen: set[str] = set()
 
-    async def dismiss_notifications(self) -> int:
-        """Click all notification close buttons. Returns count dismissed."""
-        dismissed = 0
-        try:
-            buttons = await self._page.query_selector_all(SELECTORS.notification_close)
-            for btn in buttons:
-                try:
-                    await btn.click()
-                    dismissed += 1
-                    await sleep_random(0.2, 0.5)
-                except Exception:
-                    pass
-        except Exception as exc:
-            logger.debug("dismiss_notifications failed: %s", exc)
-        return dismissed
+        # Effect entries appear as: code=EFFECT_HIDE...&effect_id=NNN  with a title nearby
+        for m in re.finditer(
+            r'code(?:%3D|=)EFFECT_(HIDE|SHOW)[^"\'<>]*?effect_id(?:%3D|=)(\d+)', html
+        ):
+            eff_id = m.group(2)
+            if eff_id in seen:
+                continue
+            seen.add(eff_id)
+            # Look for a title within 400 chars after the match
+            window = html[m.end():m.end() + 400]
+            title_m = re.search(r'>([А-ЯЁа-яё][^<>]{3,60})<', window)
+            effects.append(Effect(
+                effect_id=eff_id,
+                title=title_m.group(1).strip() if title_m else f"Эффект #{eff_id}",
+                is_hidden=(m.group(1) == "SHOW"),  # SHOW link means it's currently hidden
+            ))
+
+        # Fallback: named blessings/buffs mentioned in bonus text
+        for m in re.finditer(r'(Благословение[^"<,\']{0,50}|Проклятие[^"<,\']{0,50})', html):
+            title = m.group(1).strip()
+            if title and title not in [e.title for e in effects]:
+                effects.append(Effect(title=title))
+
+        return effects
+
+    # ------------------------------------------------------------------
+    # Notifications
+    # ------------------------------------------------------------------
+
+    def _parse_notifications(self, html: str) -> list[Notification]:
+        """Extract system messages / bonus texts embedded in the page."""
+        notes: list[Notification] = []
+
+        # bonus_text arrays from previous actions
+        for m in re.finditer(r'bonus_text["\']?\s*:\s*\[([^\]]*)\]', html):
+            for txt in re.findall(r'"([^"]{3,200})"', m.group(1)):
+                notes.append(Notification(text=txt, category="bonus"))
+
+        # showError() calls
+        for m in re.finditer(r'showError\(["\']([^"\']{3,200})["\']\)', html):
+            notes.append(Notification(text=m.group(1), category="error"))
+
+        # System message blocks
+        for m in re.finditer(r'class=["\']sys_msg["\'][^>]*>([^<]{3,200})<', html):
+            notes.append(Notification(text=m.group(1).strip(), category="system"))
+
+        return notes
+
+    # ------------------------------------------------------------------
+    # Convenience accessors
+    # ------------------------------------------------------------------
+
+    async def count_potions(self, keyword: str = "") -> int:
+        """Count potions in the backpack, optionally filtered by name keyword."""
+        profile = self._last_profile or await self.read_full_profile()
+        potions = profile.potions
+        if keyword:
+            potions = [p for p in potions if keyword.lower() in p.title.lower()]
+        return len(potions)
+
+    async def find_potion(self, keywords: list[str]) -> Optional[Artifact]:
+        """Return the first potion whose title contains any of *keywords*."""
+        profile = self._last_profile or await self.read_full_profile()
+        for potion in profile.potions:
+            title = potion.title.lower()
+            if any(kw.lower() in title for kw in keywords):
+                return potion
+        return None
+
+    async def find_hp_potion(self) -> Optional[Artifact]:
+        return await self.find_potion(["здоров", "лечен", "хп", "жизн", "исцел"])
+
+    async def find_mp_potion(self) -> Optional[Artifact]:
+        return await self.find_potion(["ман", "магии", "мп", "энерг"])
+
+    def get_cached_profile(self) -> Optional[FullProfile]:
+        return self._last_profile

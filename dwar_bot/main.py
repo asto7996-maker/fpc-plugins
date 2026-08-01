@@ -33,6 +33,10 @@ from dwar_bot.logger import setup_logging, log_exception
 from dwar_bot.auth.oauth_login import extract_access_token
 from dwar_bot.core.game_client import DwarGameClient, GameState, CharStats, TokenExpiredError
 from dwar_bot.telegram_bot import TelegramBotHandler
+from dwar_bot.modules.stats_parser import StatsParser, FullProfile
+from dwar_bot.modules.combat_engine import CombatEngine, BattleResult
+from dwar_bot.modules.quest_tracker import QuestTracker
+from dwar_bot.modules.timers_manager import TimersManager
 
 logger = logging.getLogger("dwar_bot.main")
 
@@ -62,8 +66,16 @@ async def _maybe_idle() -> None:
 class DwarBot:
     def __init__(self, client: DwarGameClient) -> None:
         self._client = client
+
+        # Game modules
+        self.stats = StatsParser(client)
+        self.combat = CombatEngine(client, self.stats)
+        self.quests = QuestTracker(client)
+        self.timers = TimersManager(client)
+
         self._iteration = 0
         self._errors_in_row = 0
+        self._profile = FullProfile()
         self._char = CharStats()
         self._state = GameState()
         self._area_title: str = ""
@@ -80,6 +92,8 @@ class DwarBot:
     def get_status(self) -> dict:
         elapsed = int(time.time() - self._started_at)
         h, m, s = elapsed // 3600, (elapsed % 3600) // 60, elapsed % 60
+        cs = self.combat.session
+        qs = self.quests.session
         return {
             "running":    not self._paused and not _shutdown_event.is_set(),
             "token_ok":   self._token_ok,
@@ -99,6 +113,31 @@ class DwarBot:
             "flags3":     self._state.flags3,
             "iteration":  self._iteration,
             "uptime":     f"{h}ч {m}м {s}с",
+            # Combat stats
+            "battles":    cs.battles_joined,
+            "wins":       cs.wins,
+            "losses":     cs.losses,
+            "win_rate":   cs.win_rate,
+            "potions_used": cs.potions_used,
+            "attacks":    cs.attacks_made,
+            # Quest stats
+            "quests_accepted":  qs.quests_accepted,
+            "quests_completed": qs.quests_completed,
+            "dialogues":        qs.dialogues_handled,
+            "npcs_visited":     qs.npcs_visited,
+            # Inventory
+            "inventory":  [
+                {"title": a.title, "kind": a.kind,
+                 "dur": a.durability, "dur_max": a.durability_max}
+                for a in self._profile.inventory
+            ],
+            "potions_count": len(self._profile.potions),
+            "effects": [
+                {"title": e.title, "id": e.effect_id}
+                for e in self._profile.effects
+            ],
+            # Timers
+            "timers": self.timers.summary(),
         }
 
     async def pause(self) -> None:
@@ -150,8 +189,12 @@ class DwarBot:
     # ------------------------------------------------------------------
 
     async def _tick(self) -> None:
-        self._state = await self._client.get_state()
-        self._char = await self._client.get_char_stats()
+        """Full orchestration cycle across all modules."""
+
+        # ---- 1. Read complete profile (stats + inventory + effects) ----
+        self._profile = await self.stats.read_full_profile()
+        self._char = self._profile.char
+        self._state = self._profile.state
 
         if not self._char.nick:
             logger.warning("No character data — renewing session.")
@@ -160,31 +203,62 @@ class DwarBot:
             return
 
         logger.info(
-            "[%d] %s Lv%d | HP %d/%d (%.0f%%) | area=%s | money=%.2f",
+            "[%d] %s Lv%d | HP %d/%d (%.0f%%) | MP %d/%d | area=%s | %.2f зол | предметов=%d",
             self._iteration,
             self._char.nick, self._char.level,
             self._char.hp, self._char.hp_max, self._char.hp_percent,
+            self._char.mp, self._char.mp_max,
             self._state.area_id, self._state.money,
+            len(self._profile.inventory),
         )
 
-        await self._decide_action()
+        # ---- 2. Feed regeneration tracker ----
+        await self.timers.update_regen(self._char.hp, self._char.mp)
 
-    async def _decide_action(self) -> None:
-        if self._state.flags & 0x1 or self._state.fight_id:
-            logger.info("Active fight — skipping decision.")
+        # ---- 3. Log new notifications ----
+        for note in self._profile.notifications[:3]:
+            logger.info("📢 %s", note.text[:150])
+
+        # ---- 4. Log active effects ----
+        if self._profile.effects:
+            logger.info(
+                "Эффекты: %s",
+                ", ".join(e.title for e in self._profile.effects[:4]),
+            )
+
+        # ---- 5. Gear maintenance ----
+        if self._profile.broken_items:
+            repaired = await self.combat.repair_broken_gear(self._profile)
+            if repaired:
+                logger.info("Отремонтировано предметов: %d", repaired)
+
+        equipped = await self.combat.auto_equip(self._profile)
+        if equipped:
+            logger.info("Надето предметов: %d", equipped)
+
+        # ---- 6. Combat ----
+        result = await self.combat.combat_tick(self._profile)
+        if result == BattleResult.JOINED:
+            logger.info("⚔️ Вступил в бой!")
+            await _sleep(3.0, 6.0)
+            return
+        if result == BattleResult.ONGOING:
+            logger.info("⚔️ Бой продолжается …")
+            return
+        if result == BattleResult.FLED:
+            # HP too low — wait for regeneration instead of fighting
+            logger.info("🩹 Восстанавливаю здоровье …")
+            await self.timers.wait_for_hp(target_percent=70.0, max_wait=600)
+            return
+
+        # ---- 7. Quests / NPC dialogue ----
+        quest_actions = await self.quests.quest_tick()
+        if quest_actions:
+            logger.info("📜 Квестовых действий: %d", quest_actions)
             await _sleep(2.0, 5.0)
             return
 
-        fronts = await self._client.get_front_locations()
-        if fronts:
-            for front in fronts[:1]:
-                area_id = str(front.get("area_id", ""))
-                if area_id:
-                    resp = await self._client.join_front(area_id)
-                    logger.info("join_front(%s): status=%d", area_id, resp.status)
-                    await _sleep(2.0, 5.0)
-                    return
-
+        # ---- 8. Area / timers refresh ----
         area = await self._client.get_area_info()
         if area.title:
             self._area_title = area.title
@@ -192,23 +266,24 @@ class DwarBot:
                 {"name": i.name, "item_type": i.item_type, "code": i.code}
                 for i in area.items
             ]
-            logger.info("Area: %s (id=%s, items=%d)", area.title, area.area_id, len(area.items))
 
-        hunt = await self._client.get_hunt_conf()
-        if hunt.get("npcs"):
-            self._npcs = hunt["npcs"]
-            for npc in hunt["npcs"]:
-                logger.info(
-                    "NPC: %s (id=%s, time_left=%ds)",
-                    npc.get("title"), npc.get("npc_id"), npc.get("time_left", 0),
-                )
+        event_timers = await self.timers.scrape_event_timers()
+        if event_timers:
+            self._npcs = [
+                {"title": t, "time_left": s, "npc_id": ""}
+                for t, s in event_timers.items()
+            ]
 
-        logger.info(
-            "flags=%d/%d/%d party=%d clan=%d",
-            self._state.flags, self._state.flags2, self._state.flags3,
-            self._state.party, self._state.clan,
-        )
-        await _sleep(3.0, 8.0)
+        active_cd = self.timers.active_cooldowns()
+        if active_cd:
+            logger.info(
+                "⏱ Таймеры: %s",
+                ", ".join(f"{c.description or c.name} {c.format_remaining()}"
+                          for c in active_cd[:3]),
+            )
+
+        logger.info("💤 Нет доступных действий — жду.")
+        await _sleep(5.0, 12.0)
 
     # ------------------------------------------------------------------
     # Token expiry handling
@@ -369,10 +444,16 @@ async def main() -> None:
             log_exception(logger, "Fatal startup error", exc)
             sys.exit(2)
 
-    await bot.run()
+    # Start background timer tasks
+    bot.timers.start_background_tasks()
+    await bot.timers.sync_server_time()
 
-    if tg_task:
-        tg_task.cancel()
+    try:
+        await bot.run()
+    finally:
+        await bot.timers.stop_background_tasks()
+        if tg_task:
+            tg_task.cancel()
 
 
 if __name__ == "__main__":
