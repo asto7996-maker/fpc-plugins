@@ -26,6 +26,11 @@ from dwar_bot.config import DELAY_RETRY, MAX_RETRIES
 
 logger = logging.getLogger(__name__)
 
+
+class TokenExpiredError(Exception):
+    """Raised when the OAuth access_token is expired and needs manual renewal."""
+
+
 _BASE_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -151,6 +156,10 @@ class DwarGameClient:
         if not self._session or age > 1200:
             await self._renew_session()
 
+    def _is_token_redirect(self, location: str) -> bool:
+        """Return True if the redirect means the OAuth token has expired."""
+        return "soc_auth.php" in location or "vkplay.ru" in location or "oauth" in location.lower()
+
     async def _renew_session(self) -> None:
         """POST to register.php with access_token to get a fresh session."""
         url = f"{self._world_url}/register.php"
@@ -165,12 +174,18 @@ class DwarGameClient:
                     "Referer": f"{self._world_url}/",
                 },
             )
+
+        location = r.headers.get("location", "")
         new_cookies = dict(r.cookies)
-        if not new_cookies.get("sess_sid"):
-            raise RuntimeError(
-                f"Session renewal failed — no sess_sid in response. "
-                f"Status={r.status_code}"
+
+        # Check if the server redirected us to the OAuth login page
+        # (which means the access_token has expired)
+        if self._is_token_redirect(location) or not new_cookies.get("sess_sid"):
+            raise TokenExpiredError(
+                f"OAuth access_token has expired. The bot needs fresh cookies.\n"
+                f"Redirect destination: {location}"
             )
+
         self._session = new_cookies
         self._session_renewed_at = time.time()
         logger.info(

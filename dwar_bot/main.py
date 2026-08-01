@@ -32,7 +32,7 @@ from dwar_bot.config import (
 )
 from dwar_bot.logger import setup_logging, log_exception
 from dwar_bot.auth.oauth_login import extract_access_token
-from dwar_bot.core.game_client import DwarGameClient, GameState, CharStats
+from dwar_bot.core.game_client import DwarGameClient, GameState, CharStats, TokenExpiredError
 
 logger = logging.getLogger("dwar_bot.main")
 
@@ -82,6 +82,8 @@ class DwarBot:
                 self._errors_in_row = 0
             except asyncio.CancelledError:
                 break
+            except TokenExpiredError as exc:
+                await self._handle_token_expired(str(exc))
             except Exception as exc:
                 self._errors_in_row += 1
                 log_exception(logger, f"Error in tick #{self._iteration}", exc)
@@ -89,7 +91,6 @@ class DwarBot:
                     logger.critical("%d consecutive errors — pausing 5min.", MAX_RETRIES)
                     await asyncio.sleep(300)
                     self._errors_in_row = 0
-                    # Force session renewal on next tick
                     self._client._session = {}
                 else:
                     await _sleep(DELAY_RETRY.min, DELAY_RETRY.max)
@@ -97,6 +98,62 @@ class DwarBot:
             if not _shutdown_event.is_set():
                 await _sleep(DELAY_MAIN_LOOP.min, DELAY_MAIN_LOOP.max)
                 await _maybe_idle()
+
+    async def _handle_token_expired(self, detail: str) -> None:
+        """
+        When the OAuth token expires: notify via Telegram, then poll the cookie
+        file every 60 s until the user uploads fresh cookies with a new token.
+        """
+        msg = (
+            "⚠️ DwarBot: OAuth токен истёк. Бот остановлен.\n\n"
+            "Чтобы возобновить работу:\n"
+            "1. Войди на https://w1.dwar.ru в браузере\n"
+            "2. Установи расширение Cookie Editor\n"
+            "3. Экспортируй все куки сайта w1.dwar.ru как JSON\n"
+            "4. Загрузи файл на сервер командой:\n"
+            "   scp cookies.json root@31.76.30.135:"
+            "/root/dwar_bot/cookies/session_cookies.json\n\n"
+            "Бот продолжит работу автоматически."
+        )
+        logger.critical("TOKEN EXPIRED: %s", detail)
+        await self._send_telegram(msg)
+
+        # Poll until a fresh token appears in the cookie file
+        from dwar_bot.config import COOKIES_DIR
+        last_mtime = 0.0
+        while not _shutdown_event.is_set():
+            try:
+                files = list(COOKIES_DIR.glob("*.json"))
+                if files:
+                    mtime = files[0].stat().st_mtime
+                    if mtime != last_mtime:
+                        new_token = _load_access_token()
+                        if new_token and new_token != self._client._access_token:
+                            self._client._access_token = new_token
+                            self._client._session = {}
+                            logger.info("Fresh OAuth token detected — resuming.")
+                            await self._send_telegram("✅ DwarBot: новый токен обнаружен, возобновляю работу.")
+                            return
+                        last_mtime = mtime
+            except Exception:
+                pass
+            await asyncio.sleep(60)
+
+    async def _send_telegram(self, text: str) -> None:
+        """Send a Telegram message (best-effort, no crash on failure)."""
+        token = os.getenv("TELEGRAM_BOT_TOKEN", TELEGRAM_BOT_TOKEN)
+        chat_id = os.getenv("TELEGRAM_CHAT_ID", TELEGRAM_CHAT_ID)
+        if not token or not chat_id:
+            return
+        try:
+            import httpx
+            async with httpx.AsyncClient(timeout=10) as c:
+                await c.post(
+                    f"https://api.telegram.org/bot{token}/sendMessage",
+                    json={"chat_id": chat_id, "text": text},
+                )
+        except Exception as exc:
+            logger.debug("Telegram send failed: %s", exc)
 
     async def _tick(self) -> None:
         """One bot iteration: read state → decide action → execute."""
