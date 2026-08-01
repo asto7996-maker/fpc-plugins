@@ -254,6 +254,26 @@ class DwarBot:
 # Entry point
 # ---------------------------------------------------------------------------
 
+async def _wait_for_cookies(cookie_dir: Path, poll_interval: float = 30.0) -> None:
+    """
+    Block until at least one .json or .txt cookie file appears in *cookie_dir*.
+    Logs a reminder every *poll_interval* seconds so the operator knows what to do.
+    """
+    while True:
+        files = list(cookie_dir.glob("*.json")) + list(cookie_dir.glob("*.txt"))
+        if files:
+            logger.info("Cookie file detected: %s — proceeding.", files[0].name)
+            return
+        logger.warning(
+            "Waiting for game session cookies in '%s'. "
+            "Export your dwar.ru cookies with 'Cookie Editor' (browser extension) "
+            "and place the JSON file as: %s/session_cookies.json",
+            cookie_dir,
+            cookie_dir,
+        )
+        await asyncio.sleep(poll_interval)
+
+
 async def main() -> None:
     setup_logging(
         level=os.getenv("DWAR_LOG_LEVEL", "INFO"),
@@ -265,6 +285,9 @@ async def main() -> None:
     # Register OS signals for graceful shutdown
     for sig in (signal.SIGINT, signal.SIGTERM):
         signal.signal(sig, _handle_signal)
+
+    from dwar_bot.config import COOKIES_DIR
+    await _wait_for_cookies(COOKIES_DIR)
 
     bot = DwarBot()
     try:
