@@ -166,7 +166,10 @@ class QuestTracker:
     # ------------------------------------------------------------------
 
     async def open_npc(self, npc_url: str) -> str:
-        """Fetch an NPC dialogue page. Returns raw HTML."""
+        """Fetch an NPC dialogue page. Returns raw HTML ('' if the URL is unsafe)."""
+        if not self._is_game_url(npc_url):
+            logger.debug("open_npc: refusing non-game URL '%s'", npc_url[:80])
+            return ""
         path = npc_url if npc_url.startswith("/") else f"/{npc_url}"
         try:
             resp = await self._client._get(path)
@@ -175,6 +178,35 @@ class QuestTracker:
         except Exception as exc:
             logger.debug("open_npc('%s') error: %s", npc_url, exc)
             return ""
+
+    # Only these PHP endpoints represent real in-game dialogue actions
+    _GAME_PAGES = (
+        "npc.php", "area.php", "entry_point.php", "quest.php",
+        "user.php", "fight.php", "shop.php", "store.php",
+    )
+    # Anything matching these is informational, not a game action
+    _BLOCKED = (
+        "/info/", "/news/", "/forum/", "/library/", "javascript:",
+        "logout", "support.", "vkplay", "mailto:", ".jpg", ".png", ".gif",
+    )
+
+    def _is_game_url(self, href: str) -> bool:
+        """
+        Return True only for relative in-game action URLs.
+
+        Rejects absolute URLs, news/forum/info pages, images and JS handlers —
+        following those derails the bot out of the game.
+        """
+        if not href or href.startswith("#"):
+            return False
+        low = href.lower()
+        # Reject absolute URLs entirely (they lead off the game pages)
+        if low.startswith(("http://", "https://", "//")):
+            return False
+        if any(b in low for b in self._BLOCKED):
+            return False
+        # Must target a known game endpoint
+        return any(p in low for p in self._GAME_PAGES)
 
     def parse_dialogue(self, html: str) -> tuple[str, list[DialogueOption]]:
         """
@@ -205,7 +237,7 @@ class QuestTracker:
             href, label = m.group(1), re.sub(r"<[^>]+>", "", m.group(2)).strip()
             if not label or len(label) > 200:
                 continue
-            if any(skip in href.lower() for skip in ("javascript:", "#", "logout", "forum")):
+            if not self._is_game_url(href):
                 continue
             code_m = re.search(r"code=([A-Z_0-9]+)", urllib.parse.unquote(href))
             quest_m = re.search(r"quest_id=(\d+)", urllib.parse.unquote(href))
@@ -223,11 +255,10 @@ class QuestTracker:
         ):
             label, onclick = m.group(1).strip(), m.group(2)
             url_m = re.search(r"['\"]([^'\"]*\.php[^'\"]*)['\"]", onclick)
-            options.append(DialogueOption(
-                text=label,
-                url=url_m.group(1) if url_m else "",
-                code="",
-            ))
+            url = url_m.group(1) if url_m else ""
+            if url and not self._is_game_url(url):
+                continue
+            options.append(DialogueOption(text=label, url=url, code=""))
 
         return dialogue_text, options
 
