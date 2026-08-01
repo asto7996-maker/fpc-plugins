@@ -40,6 +40,8 @@ POSITIVE_KEYWORDS = [
 ]
 NEGATIVE_KEYWORDS = [
     "отказ", "нет", "позже", "уйти", "выйти", "закрыть", "отменить",
+    # "Back"-style options loop the dialogue onto itself
+    "вернуться", "назад", "обратно", "к квестам", "отмена",
 ]
 
 
@@ -106,6 +108,19 @@ class QuestTracker:
         self._client = client
         self.session = QuestStats()
         self._visited_npcs: set[str] = set()
+        # NPC dialogue states with nothing left to do (reset when quests change)
+        self._exhausted_dialogues: set[str] = set()
+        self._last_quest_signature: str = ""
+
+    def _reset_exhausted_if_quests_changed(self, quests: list[Quest]) -> None:
+        """Clear the exhausted-dialogue cache whenever the quest list changes."""
+        sig = "|".join(sorted(f"{q.quest_id}:{q.status.name}" for q in quests))
+        if sig != self._last_quest_signature:
+            if self._exhausted_dialogues:
+                logger.debug("Quest state changed — re-enabling NPC dialogues.")
+            self._exhausted_dialogues.clear()
+            self._visited_npcs.clear()
+            self._last_quest_signature = sig
 
     # ------------------------------------------------------------------
     # NPC discovery
@@ -262,19 +277,43 @@ class QuestTracker:
 
         return dialogue_text, options
 
-    def choose_option(self, options: list[DialogueOption]) -> Optional[DialogueOption]:
+    @staticmethod
+    def _url_key(url: str) -> str:
         """
-        Pick the best dialogue option:
-        prefer positive/progress answers, never pick a refusal.
+        Normalised URL identity for loop detection.
+
+        The game appends a random per-request hash to NPC links, so two links
+        to the same page differ textually. Compare only path + stable params.
+        """
+        parsed = urllib.parse.urlparse(url)
+        params = urllib.parse.parse_qsl(parsed.query)
+        stable = sorted(
+            (k, v) for k, v in params
+            if k in ("npc_id", "quest_id", "area_id", "link_id", "f_id", "code", "object", "action")
+        )
+        return f"{parsed.path}?{urllib.parse.urlencode(stable)}"
+
+    def choose_option(
+        self,
+        options: list[DialogueOption],
+        visited: Optional[set[str]] = None,
+    ) -> Optional[DialogueOption]:
+        """
+        Pick the best dialogue option: prefer progress-forward answers,
+        never pick a refusal or an already-visited page.
         """
         if not options:
             return None
+        visited = visited or set()
 
-        positives = [o for o in options if o.is_positive and not o.is_negative]
+        def unseen(o: DialogueOption) -> bool:
+            return not o.url or self._url_key(o.url) not in visited
+
+        positives = [o for o in options if o.is_positive and not o.is_negative and unseen(o)]
         if positives:
             return positives[0]
 
-        neutral = [o for o in options if not o.is_negative]
+        neutral = [o for o in options if not o.is_negative and unseen(o)]
         if neutral:
             return neutral[0]
 
@@ -288,8 +327,15 @@ class QuestTracker:
         """
         steps = 0
         current_url = npc_url
+        visited: set[str] = set()
 
         for _ in range(max_steps):
+            key = self._url_key(current_url)
+            if key in visited:
+                logger.debug("Dialogue loop detected at '%s' — ending.", key)
+                break
+            visited.add(key)
+
             html = await self.open_npc(current_url)
             if not html or "404" in html[:200]:
                 break
@@ -302,9 +348,9 @@ class QuestTracker:
             read_time = min(len(text) * 0.02, DELAY_DIALOGUE.max)
             await asyncio.sleep(random.uniform(DELAY_DIALOGUE.min, max(DELAY_DIALOGUE.min + 0.5, read_time)))
 
-            choice = self.choose_option(options)
+            choice = self.choose_option(options, visited)
             if choice is None:
-                logger.debug("No further dialogue option — ending conversation.")
+                logger.debug("No new dialogue option — ending conversation.")
                 break
 
             logger.info("→ Выбираю: %s", choice.text[:80])
@@ -391,14 +437,25 @@ class QuestTracker:
         """
         actions = 0
 
+        # 0. Re-enable dialogues if the quest state moved forward
+        self._reset_exhausted_if_quests_changed(await self.read_quests())
+
         # 1. Turn in ready quests
         actions += await self.complete_ready_quests()
 
-        # 2. Story NPC
+        # 2. Story NPC — skip if this exact NPC state was already exhausted
         npc_url = await self.resolve_current_npc()
         if npc_url:
-            logger.info("Story NPC found: %s", npc_url[:90])
-            actions += await self.handle_dialogue(npc_url)
+            key = self._url_key(npc_url)
+            if key in self._exhausted_dialogues:
+                logger.debug("Story NPC '%s' already exhausted — skipping.", key)
+            else:
+                logger.info("Story NPC found: %s", npc_url[:90])
+                steps = await self.handle_dialogue(npc_url)
+                actions += steps
+                if steps <= 1:
+                    # Nothing new to do here until the quest state changes
+                    self._exhausted_dialogues.add(key)
 
         # 3. Event NPCs (arena entrances, seasonal events…)
         for npc in await self.list_available_npcs():
