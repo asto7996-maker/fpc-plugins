@@ -197,14 +197,6 @@ class AutoHealer:
                 logger.exception("AutoHealer patch crashed: %s", exc)
                 ok = False
 
-            # Only resume if process still alive (restart may kill us)
-            set_bot_state(BotState.RUNNING)
-            if self.resume_fn:
-                try:
-                    await self.resume_fn()
-                except Exception as exc:
-                    logger.debug("resume_fn: %s", exc)
-
             if ok:
                 self._fail_counts.pop(fp, None)
                 self._fail_until.pop(fp, None)
@@ -214,7 +206,20 @@ class AutoHealer:
                     f"Тесты OK — перезапуск сервиса для загрузки кода."
                 )
                 logger.info("AutoHealer SUCCESS %s", req.failed_file)
-            else:
+                # Stay in HEALING — detached restart will kill us shortly.
+                # Do NOT resume / start another heal in this process.
+                set_bot_state(BotState.HEALING)
+                return True
+
+            # Failure path: resume gameplay and allow later retry
+            set_bot_state(BotState.RUNNING)
+            if self.resume_fn:
+                try:
+                    await self.resume_fn()
+                except Exception as exc:
+                    logger.debug("resume_fn: %s", exc)
+
+            if not ok:
                 n = self._fail_counts.get(fp, 0) + 1
                 self._fail_counts[fp] = n
                 if n >= MAX_FAILS_PER_FP:

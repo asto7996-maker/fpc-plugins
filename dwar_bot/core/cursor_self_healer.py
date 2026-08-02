@@ -371,45 +371,39 @@ def consume_skip_boot_scan(max_age_sec: int = 600) -> bool:
 def _restart_service() -> bool:
     """
     Reload bot process so patched code is actually used.
-    Returns True if restart was scheduled successfully.
+
+    Must be detached: calling ``systemctl restart`` synchronously from inside
+    the unit kills us mid-call and looks like a failure. Schedule a delayed
+    restart in a new session instead.
     """
     if not restart_after_heal_enabled():
         logger.warning("DWAR_RESTART_AFTER_HEAL=0 — skipping service restart.")
         return False
 
     mark_skip_boot_scan("post-heal-restart")
-    logger.warning("Scheduling service restart to load healed code…")
+    logger.warning("Scheduling detached service restart to load healed code…")
 
-    attempts = [
-        ["systemctl", "restart", SERVICE_NAME],
-        ["systemctl", "--user", "restart", SERVICE_NAME],
-    ]
-    for cmd in attempts:
-        try:
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=60,
-            )
-            if result.returncode == 0:
-                logger.info("Restart OK via: %s", " ".join(cmd))
-                return True
-            logger.warning(
-                "Restart attempt failed (%s): %s",
-                " ".join(cmd),
-                (result.stderr or result.stdout or "")[:400],
-            )
-        except FileNotFoundError:
-            continue
-        except Exception as exc:
-            logger.error("Restart via %s error: %s", cmd[0], exc)
+    # Delayed restart outside our cgroup/session so we survive until stop arrives
+    script = (
+        f"sleep 3; "
+        f"systemctl restart {SERVICE_NAME} "
+        f"|| systemctl kill -s SIGTERM {SERVICE_NAME} "
+        f"|| kill -TERM {os.getpid()} || true"
+    )
+    try:
+        subprocess.Popen(
+            ["bash", "-lc", script],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        logger.info("Detached restart scheduled for %s", SERVICE_NAME)
+        return True
+    except Exception as exc:
+        logger.error("Detached restart failed: %s — trying self-kill", exc)
 
-    # Last resort: detach a delayed kill of ourselves — systemd Restart=always
-    # will bring the process back with new code.
     try:
         pid = os.getpid()
-        logger.warning("Falling back to self-restart (kill pid=%s)…", pid)
         subprocess.Popen(
             ["bash", "-lc", f"sleep 2; kill -TERM {pid} || true"],
             stdout=subprocess.DEVNULL,
