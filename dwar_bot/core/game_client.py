@@ -694,9 +694,17 @@ class DwarGameClient:
             data = resp.json()
             st = data.get("state", {}) or {}
             sq = data.get("sq", {})
+            # Live fight id lives on state.fight_id (not sq). Fall back to sq.
             fight_id = 0
-            if isinstance(sq, dict):
-                fight_id = int(sq.get("fight_id", 0) or 0)
+            try:
+                fight_id = int(st.get("fight_id", 0) or 0)
+            except (TypeError, ValueError):
+                fight_id = 0
+            if not fight_id and isinstance(sq, dict):
+                try:
+                    fight_id = int(sq.get("fight_id", 0) or 0)
+                except (TypeError, ValueError):
+                    fight_id = 0
             return GameState(
                 area_id=str(st.get("area_id", "0")),
                 level=int(st.get("level", 0) or 0),
@@ -927,6 +935,124 @@ class DwarGameClient:
         except Exception as exc:
             logger.debug("get_hunt_conf error: %s", exc)
             return {"npcs": [], "event": {}}
+
+    async def get_hunt_bots(
+        self,
+        area_id: str | int = "",
+        *,
+        instance_id: str | int = 0,
+        free_only: bool = True,
+    ) -> list[dict]:
+        """
+        Live mobs from ``hunt_conf.php?mode=hunt_farm`` (XML).
+
+        Each bot: id, name, level, artikul_id, fight_id, …
+        ``free_only`` keeps bots with fight_id == 0 (not already engaged).
+        """
+        aid = str(area_id or "").strip()
+        if not aid or aid == "0":
+            try:
+                st = await self.get_state()
+                aid = st.area_id or "0"
+            except Exception:
+                aid = "0"
+        try:
+            resp = await self._get(
+                "/hunt_conf.php",
+                params={
+                    "mode": "hunt_farm",
+                    "area_id": aid,
+                    "instance_id": str(instance_id or 0),
+                },
+            )
+            text = resp.text or ""
+            if not text.strip().startswith("<"):
+                logger.debug("get_hunt_bots: unexpected body %s", text[:120])
+                return []
+            root = ET.fromstring(text)
+            bots: list[dict] = []
+            for bot in root.findall(".//bot"):
+                item = dict(bot.attrib)
+                fid = str(item.get("fight_id", "0") or "0")
+                if free_only and fid not in ("0", ""):
+                    continue
+                if str(item.get("hidden", "0") or "0") in ("1", "true"):
+                    continue
+                bots.append(item)
+            return bots
+        except Exception as exc:
+            logger.debug("get_hunt_bots error: %s", exc)
+            return []
+
+    async def attack_bot(
+        self,
+        bot_id: str | int,
+        *,
+        url_error: str = "hunt.php",
+        need_confirm: int = 0,
+        confirmed: int = 1,
+        t_search: int = 0,
+        fight_id: str | int = 0,
+    ) -> ApiResponse:
+        """
+        Attack a live hunt mob (Flash ``botAttack`` / ``huntAttack``).
+
+        Must use the **live** bot id from hunt_farm, not quest target_id.
+        """
+        params: dict[str, Any] = {
+            "code": "ATTACK_BOT",
+            "bot_id": str(bot_id),
+            "url_error": url_error,
+            "in[need_confirm]": str(int(need_confirm)),
+            "in[confirmed]": str(int(confirmed)),
+            "in[tSearch]": str(int(t_search)),
+        }
+        if fight_id:
+            params["in[fight_id]"] = str(fight_id)
+
+        # Client uses GET for ATTACK_BOT
+        path = "/entry_point.php?object=common&action=action&json_mode_on=1"
+        try:
+            resp = await self._get(path, params={
+                "object": "common",
+                "action": "action",
+                "json_mode_on": "1",
+                **params,
+            })
+            if not resp.text or resp.text.strip() in ("", "null"):
+                return ApiResponse(status=0, error="empty response")
+            data = resp.json()
+        except TokenExpiredError:
+            raise
+        except Exception as exc:
+            logger.error("attack_bot(%s) error: %s", bot_id, exc)
+            return ApiResponse(status=0, error=str(exc))
+
+        key = "common|action"
+        inner = data.get(key, {}) if isinstance(data, dict) else {}
+        if not isinstance(inner, dict):
+            inner = {}
+        return ApiResponse(
+            status=int(inner.get("status", 0) or 0),
+            error=str(inner.get("error", "") or ""),
+            data=inner,
+            redirect_url=inner.get("redirect_url"),
+            redirect_error=inner.get("redirect_error"),
+            bonus_text=inner.get("bonus_text", []) or [],
+            macros=inner.get("macros", []) or [],
+            raw=data if isinstance(data, dict) else {},
+        )
+
+    async def get_fight_conf(self, fight_id: str | int = 0) -> dict:
+        """Return ``fight|conf`` payload (swf_fight_vars, fight_user, …)."""
+        fid = fight_id
+        if not fid:
+            st = await self.get_state()
+            fid = st.fight_id
+        if not fid:
+            return {}
+        resp = await self.entry_point("fight", "conf", {"fight_id": fid})
+        return resp.data if resp.status == STATUS_OK else resp.raw.get("fight|conf") or resp.data
 
     # ------------------------------------------------------------------
     # NPC dialogue API (entry_point object=npc)

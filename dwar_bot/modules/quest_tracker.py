@@ -113,6 +113,87 @@ class QuestTracker:
         self._answered_points: set[str] = set()
         # key → unix ts; soft-banned dialogues become available again
         self._soft_ban_until: dict[str, float] = {}
+        # After type=2 needs a hunt kill — remembered for brain / retry
+        self._pending_type2: dict[str, str] = {}
+        self.pending_hunt_mob: str = ""
+
+    def _infer_hunt_mob_name(self, *texts: str) -> str:
+        """Extract mob name from quest titles like 'Крэтс повержен'."""
+        blob = " ".join(t for t in texts if t).strip()
+        low = blob.lower()
+        # Common newbie quest mob
+        if "крэт" in low or "крейт" in low or "krats" in low:
+            return "Крэтс"
+        # First capitalized word before 'поверж' / 'убит' / 'побежд'
+        m = re.search(
+            r"([A-Za-zА-Яа-яЁё]{3,})\s+(?:поверж|убит|побежд|сраж)",
+            blob,
+            re.IGNORECASE,
+        )
+        if m:
+            return m.group(1)
+        return self.pending_hunt_mob or "Крэтс"
+
+    async def _attack_hunt_for_quest(self, mob_name: str) -> bool:
+        """Attack a free hunt_farm bot by name. Returns True if fight likely started."""
+        self.pending_hunt_mob = mob_name or "Крэтс"
+        try:
+            st = await self._client.get_state()
+            if st.fight_id:
+                logger.info(
+                    "Уже в бою fight_id=%s — сначала завершить бой.",
+                    st.fight_id,
+                )
+                return True
+            bots = await self._client.get_hunt_bots(
+                area_id=st.area_id, free_only=True,
+            )
+            needle = (mob_name or "").lower()
+            chosen = None
+            for b in bots:
+                if needle and needle not in str(b.get("name") or "").lower():
+                    continue
+                chosen = b
+                break
+            if chosen is None and bots and not needle:
+                chosen = bots[0]
+            if chosen is None:
+                logger.info(
+                    "hunt_farm: нет свободных '%s' (bots=%d)",
+                    mob_name, len(bots),
+                )
+                return False
+            bot_id = str(chosen.get("id") or "")
+            logger.info(
+                "Квест требует убийства → ATTACK_BOT live id=%s name=%s",
+                bot_id, chosen.get("name"),
+            )
+            atk = await self._client.attack_bot(bot_id)
+            err = str(atk.redirect_error or atk.error or "")
+            logger.info(
+                "ATTACK_BOT(%s) → status=%s %s",
+                bot_id, atk.status, err[:140],
+            )
+            if atk.data.get("param_confirm"):
+                atk = await self._client.attack_bot(bot_id, confirmed=1)
+                err = str(atk.redirect_error or atk.error or "")
+                logger.info(
+                    "ATTACK_BOT confirm(%s) → status=%s %s",
+                    bot_id, atk.status, err[:140],
+                )
+            await asyncio.sleep(random.uniform(0.5, 1.0))
+            st2 = await self._client.get_state()
+            if st2.fight_id:
+                return True
+            redir = str(atk.redirect_url or "")
+            if "fight" in redir.lower():
+                return True
+            if err and "напад" in err.lower():
+                return False
+            return atk.status == STATUS_OK
+        except Exception as exc:
+            logger.warning("_attack_hunt_for_quest: %s", exc)
+            return False
 
     def _reset_exhausted_if_quests_changed(self, quests: list[Quest]) -> None:
         sig = "|".join(sorted(f"{q.quest_id}:{q.status.name}" for q in quests))
@@ -470,41 +551,37 @@ class QuestTracker:
                 elif ans_ok:
                     raw = raw_ans
                 else:
-                    # Opening to_point often returns empty done=true — not real progress
+                    # Opening to_point often returns empty done=true — not real progress.
+                    # type=2 «Крэтс повержен» needs a LIVE hunt_farm kill first.
                     logger.info(
-                        "Ответ type=2 отклонён (msg %s → %s) — нужен бой/лут "
-                        "или другой триггер; мягкий бан диалога.",
+                        "Ответ type=2 отклонён (msg %s → %s) — ищу моба на охоте…",
                         child_id, to_point,
                     )
-                    # Quest "Проба сил" has target_id (e.g. Крэтс) — try ATTACK_BOT
-                    target_id = str(
-                        point.get("target_id")
-                        or (pt.get("point") or {}).get("target_id")
-                        or ""
+                    point_obj = pt.get("point") if isinstance(pt.get("point"), dict) else {}
+                    mob_name = self._infer_hunt_mob_name(
+                        child_title,
+                        str(point_obj.get("title") or pt.get("title") or ""),
+                        str(point_obj.get("target_name") or ""),
                     )
-                    if target_id and target_id not in ("0", ""):
-                        try:
-                            atk = await self._client.common_action(
-                                "ATTACK_BOT", {"bot_id": target_id}
-                            )
-                            err = str(atk.redirect_error or atk.error or "")
-                            logger.info(
-                                "ATTACK_BOT(%s) → status=%s %s",
-                                target_id, atk.status, err[:120],
-                            )
-                            if atk.redirect_url or (
-                                err and "напад" not in err.lower()
-                                and err.lower() not in ("false", "none", "")
-                            ):
-                                # Possible fight start — don't soft-ban yet
-                                await asyncio.sleep(random.uniform(1.0, 2.0))
-                                return max(1, steps)
-                        except Exception as exc:
-                            logger.debug("ATTACK_BOT: %s", exc)
-                    self._answered_points.add(child_id)
-                    # Soft-ban: keep trying later (travel unlock depends on this)
+                    started = await self._attack_hunt_for_quest(mob_name)
+                    if started:
+                        # Keep dialogue retryable after the fight
+                        self._pending_type2 = {
+                            "npc_id": str(npc_id),
+                            "quest_id": str(quest_id),
+                            "from_point": str(from_point or pt.get("point_id") or ""),
+                            "to_point": str(to_point),
+                            "child_id": child_id,
+                            "global_npc": int(global_npc or 0),
+                            "link_id": str(link_id or "0"),
+                            "f_id": str(f_id or "0"),
+                            "mob_name": mob_name,
+                        }
+                        await asyncio.sleep(random.uniform(0.5, 1.2))
+                        return max(1, steps)
+                    # Short soft-ban only — do NOT mark child answered forever
                     self._exhausted_dialogues.add(key)
-                    self._soft_ban_until[key] = time.time() + 180.0
+                    self._soft_ban_until[key] = time.time() + 45.0
                     break
             else:
                 # Prefer answering the CURRENT point for subdialogs; answering the

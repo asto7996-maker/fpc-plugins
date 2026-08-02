@@ -55,6 +55,7 @@ class ActionType(Enum):
     COMBAT_AREA = "combat_area"
     COMBAT_ARENA = "combat_arena"
     COMBAT_FRONT = "combat_front"
+    HUNT_MOB = "hunt_mob"
     TRAVEL = "travel"
     AREA_ACTION = "area_action"
     BUFF = "buff"
@@ -191,6 +192,8 @@ class ProgressionBrain:
         self.farm_push_until: float = 0.0
         # Travel blocked by war chief → must advance local quest NPC
         self.need_quest_unlock: bool = False
+        # Quest type=2 kill target (e.g. Крэтс) — prefer hunt_farm attack
+        self.pending_hunt_mob: str = ""
 
     def mark_cooldown(self, name: str, seconds: float) -> None:
         if seconds <= 0:
@@ -228,8 +231,12 @@ class ProgressionBrain:
             if option.action in (
                 ActionType.COMBAT_AREA, ActionType.COMBAT_FRONT,
                 ActionType.COMBAT_ARENA, ActionType.TRAVEL,
+                ActionType.HUNT_MOB,
             ):
                 self.farm_push_until = 0.0
+            if option.action == ActionType.HUNT_MOB:
+                # Keep quest unlock flag until travel succeeds
+                pass
         else:
             self._stale[key] = self._stale.get(key, 0) + 1
             if option.action in (ActionType.COMBAT_AREA, ActionType.AREA_ACTION):
@@ -294,10 +301,11 @@ class ProgressionBrain:
 
         if in_battle:
             options.append(GameOption(
-                ActionType.COMBAT_AREA,
-                "Продолжить бой",
-                score=900,
-                detail="уже в схватке",
+                ActionType.HUNT_MOB,
+                "Доиграть бой (WS)",
+                score=1200,
+                detail="уже в схватке — finish via wsproxy",
+                payload={"finish_only": True},
                 goal=GoalKind.COMBAT,
             ))
 
@@ -503,10 +511,30 @@ class ProgressionBrain:
                     goal=GoalKind.EVENT,
                 ))
 
+        # Hunt farm — real XP / quest kills (Крэтс for «Проба сил»)
+        if farm.auto_combat and farm.farm_area:
+            mob = self.pending_hunt_mob or ("Крэтс" if self.need_quest_unlock else "")
+            hunt_score = 520 if max_farm else 480
+            if self.need_quest_unlock or mob:
+                hunt_score = 950
+            elif self.farm_push_active() or empty_bag:
+                hunt_score = 720
+            options.append(GameOption(
+                ActionType.HUNT_MOB,
+                f"Охота: {mob or 'любой моб'}",
+                score=hunt_score,
+                detail="hunt_farm ATTACK_BOT + fight WS",
+                payload={"name": mob, "area_id": str(state.area_id or "")},
+                goal=GoalKind.COMBAT,
+            ))
+
         if farm.auto_combat and farm.farm_fronts:
             front_score = 440 if max_farm else 420
             if self.farm_push_active() or empty_bag:
                 front_score = 660 if max_farm else 600
+            # Fronts are useless in newbie village while quest gate is closed
+            if self.need_quest_unlock:
+                front_score = 40
             options.append(GameOption(
                 ActionType.COMBAT_FRONT,
                 "Искать фронт / PvP",
@@ -545,26 +573,31 @@ class ProgressionBrain:
         )
         if farm_mode:
             for o in options:
-                if o.action == ActionType.TRAVEL:
-                    o.score += 150.0
+                if o.action == ActionType.HUNT_MOB:
+                    o.score += 200.0 if self.need_quest_unlock else 120.0
+                elif o.action == ActionType.TRAVEL:
+                    # Travel stays gated until hunt quest completes
+                    if self.need_quest_unlock:
+                        o.score = max(1.0, o.score - 100.0)
+                    else:
+                        o.score += 150.0
                 elif o.action == ActionType.COMBAT_FRONT:
-                    o.score += 100.0
+                    if self.need_quest_unlock:
+                        o.score = min(o.score, 50.0)
+                    else:
+                        o.score += 100.0
                 elif o.action == ActionType.COMBAT_AREA and o.score > 100:
                     name = str((o.payload or {}).get("name") or "")
-                    if self.need_quest_unlock and self.empty_streak(name) < 2:
-                        # Расселина may spawn quest mob (Крэтс) for unlock
-                        o.score += 100.0
-                    elif self.empty_streak(name) >= 1:
+                    if self.empty_streak(name) >= 1:
                         o.score = min(o.score, 90.0)
                     else:
-                        # Prefer leaving the village over empty hotspot spam
                         o.score = max(1.0, o.score - 80.0)
                 elif o.action == ActionType.QUEST_NPC:
                     if self.need_quest_unlock and not str(
                         (o.payload or {}).get("global_npc", 0)
                     ) in ("1",):
-                        # Only path out of Чернаг — talk to Вождь (local)
-                        o.score += 200.0
+                        # Answer Вождь AFTER the hunt kill
+                        o.score += 180.0
                     else:
                         o.score = max(1.0, o.score - 250.0)
 
@@ -597,11 +630,16 @@ class ProgressionBrain:
         for o in options:
             if o.action == ActionType.QUEST_NPC and not farm.auto_quests:
                 continue
-            if o.action in (ActionType.COMBAT_AREA, ActionType.COMBAT_ARENA, ActionType.COMBAT_FRONT) and not farm.auto_combat:
+            if o.action in (
+                ActionType.COMBAT_AREA, ActionType.COMBAT_ARENA,
+                ActionType.COMBAT_FRONT, ActionType.HUNT_MOB,
+            ) and not farm.auto_combat:
                 continue
             if o.action == ActionType.COMBAT_FRONT and not farm.farm_fronts:
                 continue
             if o.action == ActionType.COMBAT_ARENA and not farm.farm_arena:
+                continue
+            if o.action == ActionType.HUNT_MOB and not farm.farm_area:
                 continue
             if o.action == ActionType.COMBAT_AREA and not farm.farm_area and not farm.auto_loot:
                 continue

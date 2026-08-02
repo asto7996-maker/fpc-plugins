@@ -510,6 +510,13 @@ class DwarBot:
         # fight_id / flags already on state from profile — no extra dummy round-trip
         in_battle = bool(self._state.flags & 0x1) or bool(self._state.fight_id)
 
+        # Quest type=2 kill gate → prefer hunt_farm mob
+        if self.quests.pending_hunt_mob:
+            self.brain.pending_hunt_mob = self.quests.pending_hunt_mob
+        if in_battle and not self.brain.need_quest_unlock:
+            # Stuck fight often means unfinished «Проба сил»
+            self.brain.need_quest_unlock = True
+
         event_timers = await self.timers.scrape_event_timers(hunt=hunt)
         # Newbie with empty bag stuck on village loops → force farm/travel priority
         if not self._profile.inventory and not self.brain.farm_push_active():
@@ -566,6 +573,7 @@ class DwarBot:
 
         loot_before = self._loot_claimed
         battles_before = self.combat.session.battles_joined
+        wins_before = self.combat.session.wins
         dialogues_before = self.quests.session.dialogues_handled
 
         acted = await self._execute_focus(focus)
@@ -573,9 +581,13 @@ class DwarBot:
         progressed = (
             self._loot_claimed > loot_before
             or self.combat.session.battles_joined > battles_before
+            or self.combat.session.wins > wins_before
             or self.quests.session.dialogues_handled > dialogues_before
             or (
-                focus.action in (ActionType.TRAVEL, ActionType.REPAIR, ActionType.EQUIP, ActionType.HEAL, ActionType.WAIT_REGEN)
+                focus.action in (
+                    ActionType.TRAVEL, ActionType.REPAIR, ActionType.EQUIP,
+                    ActionType.HEAL, ActionType.WAIT_REGEN, ActionType.HUNT_MOB,
+                )
                 and acted
             )
         )
@@ -604,28 +616,47 @@ class DwarBot:
             await _sleep(8.0, 18.0)
 
     async def _local_recover_stagnation(self, focus_key: str) -> bool:
-        """Break stuck loops → farm/travel. Do NOT re-enable failed quest NPCs."""
-        logger.warning("Local recover for stagnation: %s → farm push", focus_key)
+        """Break stuck loops → hunt kill / farm. Prefer quest mob over fronts."""
+        logger.warning("Local recover for stagnation: %s → hunt/farm", focus_key)
         self.brain.push_farm(600.0)
-        # Long CD on empty village hotspot so we stop clicking it
         if "расселин" in focus_key.lower() or "combat_area" in focus_key.lower():
             self.brain.mark_cooldown("Расселина", 180)
-        # Prefer real farm paths over reopening Вождь Торгор
-        if self.settings.farm.farm_fronts and self.settings.farm.auto_combat:
-            result = await self.combat.try_join_front()
-            if result in (BattleResult.JOINED, BattleResult.ONGOING):
-                logger.info("Local recover: joined front.")
+        # Finish an abandoned fight first
+        if await self.combat.is_in_battle():
+            result = await self.combat.finish_fight()
+            if result in (BattleResult.WIN, BattleResult.LOSE, BattleResult.ONGOING):
+                logger.info("Local recover: finished active fight → %s", result.name)
                 return True
-        if self.settings.farm.auto_travel:
+        # Newbie unlock: kill Крэтс on hunt_farm
+        if self.settings.farm.farm_area and self.settings.farm.auto_combat:
+            mob = (
+                self.brain.pending_hunt_mob
+                or self.quests.pending_hunt_mob
+                or ("Крэтс" if self.brain.need_quest_unlock else "")
+            )
+            result = await self.combat.try_hunt_attack(name_substr=mob)
+            if result in (
+                BattleResult.WIN, BattleResult.JOINED,
+                BattleResult.ONGOING, BattleResult.LOSE,
+            ):
+                logger.info("Local recover: hunt attack → %s", result.name)
+                if result == BattleResult.WIN:
+                    self.quests.clear_exhausted(local_only=True)
+                return True
+        if self.settings.farm.auto_travel and not self.brain.need_quest_unlock:
             moved = await self._try_area_progress()
             if moved:
                 logger.info("Local recover: travelled to new area.")
                 return True
-        if self.settings.farm.farm_area and self.settings.farm.auto_combat:
-            result = await self.combat.try_area_combat()
-            if result == BattleResult.JOINED:
+        if (
+            self.settings.farm.farm_fronts
+            and self.settings.farm.auto_combat
+            and not self.brain.need_quest_unlock
+        ):
+            result = await self.combat.try_join_front()
+            if result in (BattleResult.JOINED, BattleResult.ONGOING):
+                logger.info("Local recover: joined front.")
                 return True
-        # farm_push alone is NOT real progress — let Cursor escalate
         return False
 
     async def _process_loot_response(self, resp, label: str = "") -> int:
@@ -659,15 +690,35 @@ class DwarBot:
         payload = focus.payload or {}
 
         try:
-            # Already in a fight — just wait / observe
+            if action == ActionType.HUNT_MOB:
+                if payload.get("finish_only") or await self.combat.is_in_battle():
+                    result = await self.combat.finish_fight()
+                else:
+                    result = await self.combat.try_hunt_attack(
+                        name_substr=str(payload.get("name") or ""),
+                        area_id=str(payload.get("area_id") or ""),
+                    )
+                if result == BattleResult.WIN:
+                    await self.notify("⚔️ Охота: победа!", "battles")
+                    # Re-enable Вождь dialogue after kill
+                    self.quests.clear_exhausted(local_only=True)
+                    if self.quests.pending_hunt_mob:
+                        self.brain.pending_hunt_mob = self.quests.pending_hunt_mob
+                    return True
+                if result in (BattleResult.JOINED, BattleResult.ONGOING, BattleResult.LOSE):
+                    return True
+                self.brain.mark_cooldown(focus.title, 60)
+                return False
+
+            # Legacy: "already in fight" combat_area without action_id
             if "схватк" in (focus.detail or "") or (
                 action == ActionType.COMBAT_AREA and not payload.get("action_id")
             ):
-                log = await self.combat.read_combat_log()
-                if log:
-                    logger.info("Combat log: %s", log[-1].text[:120])
-                await _sleep(1.5, 3.5)
-                return True
+                result = await self.combat.finish_fight()
+                return result in (
+                    BattleResult.WIN, BattleResult.LOSE,
+                    BattleResult.ONGOING, BattleResult.JOINED,
+                )
 
             if action == ActionType.HEAL:
                 healed = await self.combat.heal_if_needed(self._profile)
@@ -885,18 +936,23 @@ class DwarBot:
             await self.combat.restore_mana_if_needed(profile)
 
         if await self.combat.is_in_battle():
-            log = await self.combat.read_combat_log()
-            if log:
-                logger.info("Combat log: %s", log[-1].text[:120])
-            await asyncio.sleep(random.uniform(1.2, 3.5))
-            return BattleResult.ONGOING
+            return await self.combat.finish_fight()
 
         if await self.combat.needs_rest():
             self.combat.session.consecutive_battles = 0
             await asyncio.sleep(random.uniform(20, 60))
             return BattleResult.NO_BATTLE
 
-        if farm.farm_fronts:
+        if farm.farm_area:
+            mob = self.brain.pending_hunt_mob or self.quests.pending_hunt_mob or ""
+            result = await self.combat.try_hunt_attack(name_substr=mob)
+            if result in (
+                BattleResult.JOINED, BattleResult.WIN,
+                BattleResult.ONGOING, BattleResult.LOSE,
+            ):
+                return result
+
+        if farm.farm_fronts and not self.brain.need_quest_unlock:
             result = await self.combat.try_join_front()
             if result == BattleResult.JOINED:
                 return result

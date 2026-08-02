@@ -4,6 +4,9 @@ playwright>=1.42.0
 # HTTP requests for lightweight endpoints (used by stats_parser, etc.)
 httpx[asyncio]>=0.27.0
 
+# Fight server (wsproxy) for completing battles
+websockets>=12.0
+
 # HTML/DOM parsing fallback
 beautifulsoup4>=4.12.0
 lxml>=5.2.0

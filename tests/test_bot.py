@@ -162,9 +162,55 @@ def test_auto_healer_import():
         "dwar_bot/core/bot_state.py",
         "dwar_bot/modules/combat_engine.py",
         "dwar_bot/modules/quest_tracker.py",
+        "dwar_bot/modules/fight_client.py",
     ],
 )
 def test_critical_files_parse(path: str):
     target = REPO / path
     assert target.exists()
     ast.parse(target.read_text(encoding="utf-8"))
+
+
+def test_fight_packet_roundtrip():
+    from dwar_bot.modules.fight_client import (
+        pack_params, unpack_params, PT_INT, PT_BIGINT, FS_SCCL_INIT,
+    )
+
+    pak = pack_params([
+        (0, PT_INT, FS_SCCL_INIT),
+        (0, PT_INT, 1987871878),
+        (0, PT_BIGINT, 73672258957058),
+        (0, PT_INT, 187242975),
+    ])
+    assert pak.startswith("0038")
+    vals = unpack_params(pak)
+    assert vals[0] == FS_SCCL_INIT
+    assert vals[1] == 1987871878
+    assert vals[2] == 73672258957058
+    assert vals[3] == 187242975
+
+
+def test_hunt_mob_preferred_for_quest_unlock():
+    from dwar_bot.modules.progression_brain import (
+        ProgressionBrain, ActionType, GameOption, GoalKind,
+    )
+    from dwar_bot.modules.bot_settings import BotSettings
+    from dwar_bot.modules.stats_parser import FullProfile, CharStats
+    from dwar_bot.core.game_client import GameState, AreaInfo
+
+    brain = ProgressionBrain(BotSettings())
+    brain.need_quest_unlock = True
+    brain.pending_hunt_mob = "Крэтс"
+    profile = FullProfile(
+        char=CharStats(nick="t", level=1, hp=100, hp_max=100),
+        state=GameState(area_id="932", level=1),
+    )
+    snap = brain.analyze(
+        profile=profile,
+        area=AreaInfo(area_id="932", title="Поселок Чернаг"),
+        npcs=[],
+        in_battle=False,
+    )
+    assert snap.focus is not None
+    assert snap.focus.action == ActionType.HUNT_MOB
+    assert "Крэтс" in snap.focus.title
