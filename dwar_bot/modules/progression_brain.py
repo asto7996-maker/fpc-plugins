@@ -178,6 +178,26 @@ class ProgressionBrain:
         self.last = ProgressSnapshot()
         self._action_history: list[str] = []
         self._loot_seen: set[str] = set()
+        # action_key → consecutive empty/no-progress results
+        self._stale: dict[str, int] = {}
+
+    def note_result(self, option: Optional[GameOption], *, progressed: bool) -> None:
+        """Feed back whether the chosen action produced progress (loot/fight/dialog)."""
+        if not option:
+            return
+        key = f"{option.action.value}:{option.title}"
+        if progressed:
+            self._stale.pop(key, None)
+        else:
+            self._stale[key] = self._stale.get(key, 0) + 1
+
+    def _stale_penalty(self, option: GameOption) -> float:
+        key = f"{option.action.value}:{option.title}"
+        n = self._stale.get(key, 0)
+        if n <= 0:
+            return 0.0
+        # After a few empty hotspot ticks, prefer other goals (NPC / travel / fronts)
+        return min(350.0, 80.0 * n)
 
     # ------------------------------------------------------------------
     def analyze(
@@ -402,6 +422,13 @@ class ProgressionBrain:
 
         # Filter by master switches
         options = self._filter_by_settings(options)
+        for o in options:
+            o.score = max(1.0, o.score - self._stale_penalty(o))
+        # Periodic quest nudge: every 4th stale hotspot cycle, boost story NPC
+        if any(self._stale.get(k, 0) >= 2 for k in self._stale):
+            for o in options:
+                if o.action == ActionType.QUEST_NPC:
+                    o.score += 40
         options.sort(key=lambda o: -o.score)
         focus = options[0] if options else None
 

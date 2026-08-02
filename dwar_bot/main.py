@@ -39,6 +39,7 @@ from dwar_bot.core.game_client import (
     GameState,
     CharStats,
     TokenExpiredError,
+    STATUS_OK,
     load_cookie_dict,
     persist_session_cookies,
 )
@@ -532,9 +533,24 @@ class DwarBot:
             await _sleep(8.0, 18.0)
             return
 
+        loot_before = self._loot_claimed
+        battles_before = self.combat.session.battles_joined
+        dialogues_before = self.quests.session.dialogues_handled
+
         acted = await self._execute_focus(focus)
+
+        progressed = (
+            self._loot_claimed > loot_before
+            or self.combat.session.battles_joined > battles_before
+            or self.quests.session.dialogues_handled > dialogues_before
+            or (
+                focus.action in (ActionType.TRAVEL, ActionType.REPAIR, ActionType.EQUIP, ActionType.HEAL, ActionType.WAIT_REGEN)
+                and acted
+            )
+        )
+        self.brain.note_result(focus, progressed=progressed)
+
         if not acted and focus.action != ActionType.IDLE:
-            # Soft fallback: try classic quest/combat once if planner action failed
             if farm.auto_quests and focus.action == ActionType.QUEST_NPC:
                 logger.info("Квест-действие без прогресса — помечаю NPC исчерпанным.")
             await _sleep(3.0, 7.0)
@@ -665,8 +681,12 @@ class DwarBot:
                 )
                 await self._process_loot_response(resp, label=name)
                 err = str(resp.redirect_error or resp.error or "")
+                # status OK + redirect_error often = flavor / scene text, not a hard fail
                 if err and err.lower() not in ("false", "none", ""):
-                    logger.info("Точка '%s': %s", name, err[:160])
+                    if resp.status == STATUS_OK and not resp.error:
+                        logger.info("📖 %s: %s", name, err[:180])
+                    else:
+                        logger.info("Точка '%s': %s", name, err[:160])
                 if await self.combat.is_in_battle():
                     self.combat.session.battles_joined += 1
                     self.combat.session.consecutive_battles += 1
@@ -676,7 +696,7 @@ class DwarBot:
                     return True
                 await _sleep(1.5, 3.5)
                 loot_ok = bool(resp.loot_lines())
-                return loot_ok or (not err) or resp.status > 0
+                return loot_ok or resp.status == STATUS_OK or (not err)
 
             if action == ActionType.COMBAT_ARENA:
                 result = await self.combat.try_arena()
