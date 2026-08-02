@@ -163,6 +163,7 @@ def test_auto_healer_import():
         "dwar_bot/core/cursor_self_healer.py",
         "dwar_bot/core/log_watcher.py",
         "dwar_bot/core/bot_state.py",
+        "dwar_bot/core/account_manager.py",
         "dwar_bot/modules/combat_engine.py",
         "dwar_bot/modules/quest_tracker.py",
         "dwar_bot/modules/fight_client.py",
@@ -329,6 +330,24 @@ def test_telegram_multi_admin_config():
     ) == ["999"]
 
 
+def test_multi_account_slot_isolation(tmp_path):
+    from dwar_bot.core.account_manager import AccountManager, slot_id_for_user
+    from dwar_bot.modules.bot_settings import BotSettings
+
+    assert slot_id_for_user("6037704785") == "tg-6037704785"
+    am = AccountManager(
+        allowed_user_ids=["111", "222"],
+        accounts_dir=tmp_path / "accounts",
+    )
+    s1 = am.ensure_spec("111")
+    s2 = am.ensure_spec("222")
+    assert s1.cookie_path != s2.cookie_path
+    st = BotSettings.load(s1.state_path)
+    st.farm.auto_quests = False
+    st.save()
+    assert BotSettings.load(s2.state_path).farm.auto_quests is True
+
+
 def test_telegram_acl_api():
     from dwar_bot.telegram_bot import TelegramAPI
 
@@ -336,7 +355,7 @@ def test_telegram_acl_api():
     assert api.is_admin("111")
     assert api.is_admin(222)
     assert not api.is_admin("999")
-    assert api.is_owner("111")  # alias
+    assert api.is_owner("111")
     assert api.chat_allowed({"type": "private"})
     assert not api.chat_allowed({"type": "group"})
     assert api.notify_chat_ids == ["111", "333"]

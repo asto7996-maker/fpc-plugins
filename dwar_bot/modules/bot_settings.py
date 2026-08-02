@@ -76,13 +76,17 @@ class BotSettings:
     last_report_at: float = 0.0
     total_notifies_sent: int = 0
     updated_at: float = field(default_factory=time.time)
+    # Per-account state path (not persisted inside JSON)
+    _path: Optional[Path] = field(default=None, repr=False, compare=False)
 
     # ------------------------------------------------------------------
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        data = asdict(self)
+        data.pop("_path", None)
+        return data
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "BotSettings":
+    def from_dict(cls, data: dict[str, Any], path: Optional[Path] = None) -> "BotSettings":
         farm = FarmSettings(**{
             k: v for k, v in (data.get("farm") or {}).items()
             if k in FarmSettings.__dataclass_fields__
@@ -95,7 +99,7 @@ class BotSettings:
             k: v for k, v in (data.get("report") or {}).items()
             if k in ReportSettings.__dataclass_fields__
         })
-        return cls(
+        s = cls(
             farm=farm,
             notify=notify,
             report=report,
@@ -103,9 +107,12 @@ class BotSettings:
             total_notifies_sent=int(data.get("total_notifies_sent", 0) or 0),
             updated_at=float(data.get("updated_at", time.time()) or time.time()),
         )
+        s._path = Path(path) if path else None
+        return s
 
     def save(self, path: Optional[Path] = None) -> None:
-        target = Path(path) if path else STATE_FILE
+        target = Path(path) if path else (self._path or STATE_FILE)
+        self._path = target
         self.updated_at = time.time()
         # Merge with any extra keys already in state.json
         existing: dict[str, Any] = {}
@@ -116,7 +123,11 @@ class BotSettings:
                     existing = {}
             except Exception:
                 existing = {}
-        existing["settings"] = self.to_dict()
+        # Don't persist private _path field
+        payload = self.to_dict()
+        payload.pop("_path", None)
+        existing["settings"] = payload
+        target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(
             json.dumps(existing, ensure_ascii=False, indent=2),
             encoding="utf-8",
@@ -128,16 +139,19 @@ class BotSettings:
         target = Path(path) if path else STATE_FILE
         if not target.exists():
             s = cls()
+            s._path = target
             s.save(target)
             return s
         try:
             data = json.loads(target.read_text(encoding="utf-8"))
             raw = data.get("settings") if isinstance(data, dict) else None
             if isinstance(raw, dict):
-                return cls.from_dict(raw)
+                return cls.from_dict(raw, path=target)
         except Exception as exc:
             logger.warning("Failed to load settings: %s — using defaults.", exc)
-        return cls()
+        s = cls()
+        s._path = target
+        return s
 
     # ------------------------------------------------------------------
     # Toggle helpers used by Telegram UI

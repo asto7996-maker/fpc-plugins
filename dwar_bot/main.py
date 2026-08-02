@@ -59,12 +59,13 @@ from dwar_bot.modules.progression_brain import (
     GameOption,
     ProgressionBrain,
 )
+from dwar_bot.core.account_manager import AccountManager, ACCOUNTS_DIR
 from dwar_bot.core.bot_state import BotState, get_bot_state, set_bot_state
 from dwar_bot.core.log_watcher import start_log_monitoring
 from dwar_bot.core.cursor_self_healer import ensure_cursor_cli, _augment_path
 from dwar_bot.core.auto_healer import bind_auto_healer, get_auto_healer
 from dwar_bot.core.error_recovery import get_recovery_stats
-from dwar_bot.config import COMBAT
+from dwar_bot.config import COMBAT, STATE_FILE
 
 logger = logging.getLogger("dwar_bot.main")
 
@@ -87,9 +88,18 @@ def _tg_esc(text: str) -> str:
 
 
 class DwarBot:
-    def __init__(self, client: DwarGameClient, settings: Optional[BotSettings] = None) -> None:
+    def __init__(
+        self,
+        client: DwarGameClient,
+        settings: Optional[BotSettings] = None,
+        *,
+        account_id: str = "",
+        owner_user_id: str = "",
+    ) -> None:
         self._client = client
         self.settings = settings or BotSettings.load()
+        self.account_id = account_id or "default"
+        self.owner_user_id = str(owner_user_id or "")
         self.stats = StatsParser(client)
         self.combat = CombatEngine(client, self.stats)
         self.quests = QuestTracker(client)
@@ -122,12 +132,17 @@ class DwarBot:
 
     def _apply_combat_thresholds(self) -> None:
         f = self.settings.farm
+        # Instance-local thresholds via combat engine settings if present;
+        # keep global COMBAT for backward compat but prefer farm settings on tick.
         COMBAT.hp_retreat_threshold = float(f.hp_retreat)
         COMBAT.hp_elixir_threshold = float(f.hp_heal)
         COMBAT.max_consecutive_battles = int(f.max_battles_row)
 
     async def notify(self, text: str, category: str = "") -> None:
-        if self._tg:
+        # Always deliver only to this account's owner — never broadcast to others.
+        if self._tg and self.owner_user_id:
+            await self._tg.notify_user(self.owner_user_id, text, category=category)
+        elif self._tg:
             await self._tg.notify(text, category=category)
         else:
             await self._send_telegram(text)
@@ -141,6 +156,8 @@ class DwarBot:
         return {
             "running":    not self._paused and not _shutdown_event.is_set(),
             "token_ok":   self._token_ok and not self._client.auth_blocked,
+            "account_id": self.account_id,
+            "owner_user_id": self.owner_user_id,
             "nick":       self._char.nick,
             "level":      self._char.level,
             "hp":         self._char.hp,
@@ -288,7 +305,7 @@ class DwarBot:
 
     async def apply_cookie_json(self, raw_json: str) -> str:
         """
-        Accept Cookie Editor JSON pasted via Telegram.
+        Accept Cookie Editor JSON pasted via Telegram into THIS account only.
         Returns a short human-readable status string.
         """
         try:
@@ -299,8 +316,13 @@ class DwarBot:
         if not isinstance(data, list):
             return "❌ Ожидался JSON-массив Cookie Editor."
 
-        path = DEFAULT_COOKIE_FILE
+        path = Path(self._client._cookie_file)
+        path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        try:
+            path.chmod(0o600)
+        except OSError:
+            pass
 
         cookies = {str(c.get("name")): str(c.get("value", "")) for c in data if isinstance(c, dict)}
         mycom = cookies.get("mycom", "")
@@ -327,9 +349,13 @@ class DwarBot:
             char = await self._client.get_char_stats()
             state = await self._client.get_state()
             persist_session_cookies(self._client._session, path, base_cookies=data)
+            self._char = char
+            self._state = state
             return (
-                f"✅ Куки приняты. {char.nick or '?'} Lv{char.level} "
-                f"HP {char.hp}/{char.hp_max} area={state.area_id}"
+                f"✅ Куки приняты в ваш слот <code>{self.account_id}</code>.\n"
+                f"{char.nick or '?'} Lv{char.level} "
+                f"HP {char.hp}/{char.hp_max} area={state.area_id}\n"
+                f"Другие пользователи этот аккаунт не увидят."
             )
         except TokenExpiredError as exc:
             self._token_ok = False
@@ -1319,23 +1345,16 @@ class DwarBot:
     async def _send_telegram(self, text: str) -> None:
         import httpx
         token = os.getenv("TELEGRAM_BOT_TOKEN", TELEGRAM_BOT_TOKEN)
-        chats = resolve_telegram_notify_chats(
-            chat_id=os.getenv("TELEGRAM_CHAT_ID", TELEGRAM_CHAT_ID),
-            admin_ids=os.getenv("TELEGRAM_ADMIN_IDS", TELEGRAM_ADMIN_IDS),
-            notify_ids=os.getenv("TELEGRAM_NOTIFY_CHAT_IDS", TELEGRAM_NOTIFY_CHAT_IDS),
-        )
-        if not token or not chats:
+        # Only the account owner — never all admins
+        chat_id = self.owner_user_id or os.getenv("TELEGRAM_CHAT_ID", TELEGRAM_CHAT_ID)
+        if not token or not chat_id:
             return
         try:
             async with httpx.AsyncClient(timeout=10) as c:
-                for chat_id in chats:
-                    try:
-                        await c.post(
-                            f"https://api.telegram.org/bot{token}/sendMessage",
-                            json={"chat_id": chat_id, "text": text},
-                        )
-                    except Exception as exc:
-                        logger.debug("Telegram send to %s failed: %s", chat_id, exc)
+                await c.post(
+                    f"https://api.telegram.org/bot{token}/sendMessage",
+                    json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"},
+                )
         except Exception as exc:
             logger.debug("Telegram send failed: %s", exc)
 
@@ -1389,40 +1408,41 @@ async def main() -> None:
     _world = os.getenv("DWAR_WORLD", "w1")
     _world_url = os.getenv("DWAR_WORLD_URL", f"https://{_world}.dwar.ru")
 
-    while True:
-        files = list(COOKIES_DIR.glob("*.json")) + list(COOKIES_DIR.glob("*.txt"))
-        if files:
-            logger.info("Cookie file found: %s", files[0].name)
-            break
-        logger.warning("Waiting for cookie file in '%s' …", COOKIES_DIR)
-        await asyncio.sleep(30)
+    tg_token = os.getenv("TELEGRAM_BOT_TOKEN", TELEGRAM_BOT_TOKEN)
+    tg_chatid = os.getenv("TELEGRAM_CHAT_ID", TELEGRAM_CHAT_ID)
+    tg_admins = resolve_telegram_admins(
+        chat_id=tg_chatid,
+        admin_ids=os.getenv("TELEGRAM_ADMIN_IDS", TELEGRAM_ADMIN_IDS),
+    )
+    tg_allow_groups = os.getenv(
+        "TELEGRAM_ALLOW_GROUPS",
+        "1" if TELEGRAM_ALLOW_GROUPS else "0",
+    ).lower() in ("1", "true", "yes", "on")
 
-    access_token, mycom_value, cookie_dict, cookie_path = _load_bootstrap()
-    if not access_token and not cookie_dict.get("sess_sid"):
-        logger.critical("No access_token/sess_sid in cookie file — cannot start.")
+    if not tg_admins:
+        logger.critical("TELEGRAM_ADMIN_IDS / TELEGRAM_CHAT_ID required for multi-account.")
         sys.exit(1)
 
-    client = DwarGameClient(
-        world_url=_world_url,
-        access_token=access_token,
-        mycom_cookie_value=mycom_value,
-        cookie_file=cookie_path,
-        initial_cookies=cookie_dict,
+    accounts = AccountManager(
+        allowed_user_ids=tg_admins,
+        default_world=_world,
+        default_world_url=_world_url,
     )
-    logger.info(
-        "Bootstrap cookies: sess_sid=%s mycom=%s token=%s",
-        "yes" if cookie_dict.get("sess_sid") else "no",
-        "yes" if mycom_value else "no",
-        "yes" if access_token else "no",
-    )
-
-    bot = DwarBot(client, settings=BotSettings.load())
+    primary = tg_chatid or tg_admins[0]
+    accounts.migrate_legacy(primary, DEFAULT_COOKIE_FILE, legacy_state=STATE_FILE)
+    runtimes = accounts.bootstrap_all(DwarBot)
     set_bot_state(BotState.RUNNING)
+    logger.info("Multi-account: %d user slot(s) under %s", len(runtimes), ACCOUNTS_DIR)
+
+    primary_rt = accounts.get_runtime(primary) or (runtimes[0] if runtimes else None)
+    if primary_rt is None:
+        logger.critical("No account runtimes bootstrapped.")
+        sys.exit(1)
+    bot = primary_rt.bot
 
     async def _notify_plain(text: str) -> None:
         await bot.notify(text, "errors")
 
-    # Bind global auto-healer (exceptions + stagnation + log watcher)
     healer = bind_auto_healer(
         notify_fn=_notify_plain,
         pause_fn=bot.pause_for_heal,
@@ -1430,56 +1450,22 @@ async def main() -> None:
         on_local_recover=bot._local_recover_stagnation,
     )
 
-    tg_token = os.getenv("TELEGRAM_BOT_TOKEN", TELEGRAM_BOT_TOKEN)
-    tg_chatid = os.getenv("TELEGRAM_CHAT_ID", TELEGRAM_CHAT_ID)
-    tg_admins = resolve_telegram_admins(
-        chat_id=tg_chatid,
-        admin_ids=os.getenv("TELEGRAM_ADMIN_IDS", TELEGRAM_ADMIN_IDS),
-    )
-    tg_notify = resolve_telegram_notify_chats(
-        chat_id=tg_chatid,
-        admin_ids=os.getenv("TELEGRAM_ADMIN_IDS", TELEGRAM_ADMIN_IDS),
-        notify_ids=os.getenv("TELEGRAM_NOTIFY_CHAT_IDS", TELEGRAM_NOTIFY_CHAT_IDS),
-    )
-    tg_allow_groups = os.getenv(
-        "TELEGRAM_ALLOW_GROUPS",
-        "1" if TELEGRAM_ALLOW_GROUPS else "0",
-    ).lower() in ("1", "true", "yes", "on")
     tg_task: asyncio.Task | None = None
-    if tg_token and tg_admins:
-        async def _get_status() -> dict:
-            return bot.get_status()
-
+    if tg_token:
         tg_handler = TelegramBotHandler(
             token=tg_token,
-            owner_chat_id=tg_chatid or tg_admins[0],
+            owner_chat_id=primary,
             admin_ids=tg_admins,
-            notify_chat_ids=tg_notify,
+            notify_chat_ids=tg_admins,
             allow_groups=tg_allow_groups,
-            get_status_fn=_get_status,
-            stop_fn=bot.pause,
-            resume_fn=bot.resume_game,
             log_path=LOG_FILE,
-            settings=bot.settings,
-            on_cookies_json=bot.apply_cookie_json,
-            on_report_fn=bot.build_report,
-            admin_fns={
-                "diagnose": bot.admin_diagnose,
-                "recover": bot.admin_recover,
-                "hunt": bot.admin_force_hunt,
-                "heal": bot.admin_trigger_heal,
-                "restart": bot.admin_restart_service,
-            },
+            account_manager=accounts,
         )
-        bot.bind_telegram(tg_handler)
+        for rt in runtimes:
+            rt.bot.bind_telegram(tg_handler)
         tg_task = asyncio.ensure_future(tg_handler.start())
-        logger.info(
-            "Telegram control panel started (admins=%s notify=%s).",
-            ",".join(tg_admins),
-            ",".join(tg_notify),
-        )
+        logger.info("Telegram multi-account panel (users=%s).", ",".join(tg_admins))
 
-    # Pre-install / verify CLI + API key (full-auto readiness)
     async def _boot_heal_ready() -> None:
         try:
             path = await asyncio.to_thread(ensure_cursor_cli)
@@ -1490,7 +1476,6 @@ async def main() -> None:
 
     asyncio.create_task(_boot_heal_ready(), name="cursor_cli_boot")
 
-    # Log watcher every 45s (boot-scan + ANSI-aware + AutoHealer)
     log_watcher_task = asyncio.create_task(
         start_log_monitoring(
             45,
@@ -1501,7 +1486,7 @@ async def main() -> None:
         ),
         name="log_watcher",
     )
-    # Periodic readiness re-check (reinstall CLI / reload .env if needed)
+
     async def _heal_watchdog() -> None:
         while not _shutdown_event.is_set():
             await asyncio.sleep(900)
@@ -1518,87 +1503,41 @@ async def main() -> None:
         "set" if os.getenv("CURSOR_API_KEY") else "MISSING",
     )
 
-    while not _shutdown_event.is_set():
-        try:
-            await client.ensure_session()
-            state = await client.get_state()
-            char = await client.get_char_stats()
-            if not char.nick:
-                # During fights user.php has no var par — finish fight, do NOT wipe cookies.
-                fight_id = int(getattr(state, "fight_id", 0) or 0)
-                html = ""
-                try:
-                    html = (await client._get("/user.php")).text
-                except Exception:
-                    html = ""
-                if fight_id or is_fight_lock_html(html):
-                    logger.warning(
-                        "Startup: empty nick with fight_id=%s — finishing fight…",
-                        fight_id or "?",
-                    )
-                    try:
-                        await bot.combat.finish_fight(timeout=180.0)
-                    except Exception as exc:
-                        logger.warning("Startup fight finish: %s", exc)
-                    state = await client.get_state()
-                    char = await client.get_char_stats()
-                if not char.nick:
-                    ok = await client.soft_recheck_session()
-                    if ok:
-                        state = await client.get_state()
-                        char = await client.get_char_stats()
-                if not char.nick:
-                    # Only renew if session is actually dead
-                    soft = await client.soft_recheck_session()
-                    if soft:
-                        logger.warning(
-                            "Startup: soft OK but nick empty — wait (no invalidate)."
-                        )
-                        await asyncio.sleep(5)
-                        state = await client.get_state()
-                        char = await client.get_char_stats()
-                    else:
-                        await client.invalidate_session("empty nick at startup")
-                        await client.ensure_session()
-                        state = await client.get_state()
-                        char = await client.get_char_stats()
-            logger.info(
-                "Connected! nick=%s level=%d hp=%d/%d area=%s money=%.2f sid=%s…",
-                char.nick, char.level, char.hp, char.hp_max,
-                state.area_id, state.money,
-                (client._session.get("sess_sid") or "")[:8],
-            )
-            persist_session_cookies(client._session, cookie_path)
-            try:
-                client._cookie_mtime = cookie_path.stat().st_mtime
-            except OSError:
-                pass
-            break
-        except TokenExpiredError as exc:
-            await bot._handle_token_expired(str(exc))
-        except Exception as exc:
-            log_exception(logger, "Fatal startup error", exc)
-            try:
-                await healer.handle_exception(exc, where="startup")
-            except Exception as heal_exc:
-                logger.error("Startup auto-heal failed: %s", heal_exc)
-            # systemd Restart=always will bring us back with patched code
-            sys.exit(2)
-
-    bot.timers.start_background_tasks()
-    await bot.timers.sync_server_time()
+    await accounts.start_all()
 
     try:
-        await bot.run()
+        while not _shutdown_event.is_set():
+            await asyncio.sleep(2)
+            for rt in accounts.all_runtimes():
+                if rt.task and rt.task.done() and not _shutdown_event.is_set():
+                    exc = None
+                    try:
+                        exc = rt.task.exception()
+                    except asyncio.CancelledError:
+                        pass
+                    if exc:
+                        logger.error("[%s] loop died: %s — restarting in 15s", rt.spec.slot_id, exc)
+                    await asyncio.sleep(15)
+                    if not _shutdown_event.is_set():
+                        await accounts.start_runtime(rt)
     finally:
-        await bot.timers.stop_background_tasks()
+        for rt in accounts.all_runtimes():
+            if rt.task and not rt.task.done():
+                rt.task.cancel()
+            try:
+                await rt.bot.timers.stop_background_tasks()
+            except Exception:
+                pass
+            try:
+                await rt.client.aclose()
+            except Exception:
+                pass
         if not log_watcher_task.done():
             log_watcher_task.cancel()
             try:
                 await log_watcher_task
             except asyncio.CancelledError:
                 pass
-        await client.aclose()
         if tg_task:
             tg_task.cancel()
 

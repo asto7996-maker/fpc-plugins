@@ -377,36 +377,28 @@ class DwarGameClient:
             return False
 
     async def maybe_reload_cookie_file(self) -> bool:
-        """If the cookie file mtime changed, reload it. Returns True when reloaded."""
+        """If THIS account's cookie file mtime changed, reload it."""
         try:
-            files = sorted(
-                list(COOKIES_DIR.glob("*.json")),
-                key=lambda p: p.stat().st_mtime,
-                reverse=True,
-            )
-            if not files:
+            path = self._cookie_file
+            if not path.exists():
                 return False
-            newest = files[0]
-            mtime = newest.stat().st_mtime
+            mtime = path.stat().st_mtime
             if mtime <= self._cookie_mtime:
                 return False
-            self._cookie_file = newest
             self._cookie_mtime = mtime
-            cookies = load_cookie_dict(newest)
+            cookies = load_cookie_dict(path)
             if not cookies:
                 return False
             old_token = self._access_token
             self.apply_cookies(cookies, mark_fresh=True)
-            # Force OAuth renew if we got a new mycom but no sess_sid
             if cookies.get("mycom") and not cookies.get("sess_sid"):
                 self._session.pop("sess_sid", None)
                 self._session.pop("sess_uid", None)
                 self._session.pop("sess_crc", None)
                 self._session_renewed_at = 0.0
             elif cookies.get("mycom") and self._access_token != old_token:
-                # New token — keep sess_* if present, but clear auth block
                 self._auth_blocked = False
-            logger.info("Cookie file changed (%s) — session reloaded.", newest.name)
+            logger.info("Cookie file changed (%s) — session reloaded.", path.name)
             return True
         except Exception as exc:
             logger.debug("maybe_reload_cookie_file: %s", exc)

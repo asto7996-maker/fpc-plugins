@@ -353,6 +353,7 @@ class TelegramBotHandler:
         admin_ids: Optional[list[str]] = None,
         notify_chat_ids: Optional[list[str]] = None,
         allow_groups: bool = False,
+        account_manager: Any = None,
     ) -> None:
         admins = list(admin_ids or [])
         if owner_chat_id and str(owner_chat_id) not in admins:
@@ -365,19 +366,67 @@ class TelegramBotHandler:
             notify_chat_ids=notify_chat_ids,
             allow_groups=allow_groups,
         )
+        self._accounts = account_manager
         self._get_status = get_status_fn
         self._stop_fn = stop_fn
         self._resume_fn = resume_fn
         self._log_path = log_path or Path("bot.log")
         self._settings = settings or BotSettings()
+        self._fallback_settings = self._settings
         self._on_cookies_json = on_cookies_json
         self._on_report_fn = on_report_fn
         self._notify_fn = notify_fn
         self._admin = admin_fns or {}
+        self._fallback_admin = dict(self._admin)
         self._running = True
         self._paused = False
+        self._ctx_uid: str = ""
         # Per-admin multipart cookie paste buffers (avoid cross-user mixing)
         self._cookie_buffers: dict[str, list[str]] = {}
+
+    def _bind_account(self, user_id: str) -> None:
+        """Switch handler callbacks to THIS user's isolated game account."""
+        self._ctx_uid = str(user_id)
+        if not self._accounts:
+            return
+        rt = self._accounts.get_runtime(user_id)
+        if rt is None:
+            try:
+                rt = self._accounts.create_runtime(user_id)
+            except Exception as exc:
+                logger.warning("Cannot create runtime for %s: %s", user_id, exc)
+                return
+        bot = rt.bot
+        self._settings = rt.settings
+        self._log_path = Path(getattr(bot, "account_id", "bot") and self._log_path)
+
+        async def _status() -> dict:
+            st = bot.get_status()
+            st["account_id"] = rt.spec.slot_id
+            st["waiting_for_cookies"] = rt.waiting_for_cookies
+            return st
+
+        async def _stop() -> None:
+            await bot.pause()
+
+        async def _resume() -> None:
+            await bot.resume_game()
+
+        async def _report() -> str:
+            return await bot.build_report()
+
+        self._get_status = _status
+        self._stop_fn = _stop
+        self._resume_fn = _resume
+        self._on_report_fn = _report
+        self._admin = {
+            "diagnose": bot.admin_diagnose,
+            "recover": bot.admin_recover,
+            "hunt": bot.admin_force_hunt,
+            "heal": bot.admin_trigger_heal,
+            "restart": bot.admin_restart_service,
+        }
+        bot.bind_telegram(self)
 
     # ------------------------------------------------------------------
     async def start(self) -> None:
@@ -401,7 +450,7 @@ class TelegramBotHandler:
             {"command": "session", "description": "🛡 Сессия / куки"},
             {"command": "log", "description": "📋 Последний лог"},
             {"command": "cookies", "description": "🍪 Обновить куки"},
-            {"command": "admins", "description": "👥 Список админов"},
+            {"command": "admins", "description": "👥 Аккаунты / ACL"},
             {"command": "diagnose", "description": "🔬 Полная диагностика"},
             {"command": "recover", "description": "🛠 Локальный recover"},
             {"command": "hunt", "description": "🏹 Форс-охота (Крэтс)"},
@@ -414,27 +463,33 @@ class TelegramBotHandler:
             {"command": "resume", "description": "▶️ Продолжить"},
             {"command": "help", "description": "ℹ️ Справка по командам"},
         ])
-        # Push reply keyboard to every admin/notify chat on boot
+        n_acc = len(self._accounts.all_runtimes()) if self._accounts else 1
         boot = (
             "🤖 <b>DwarBot онлайн</b>\n"
-            f"Админов: <b>{len(self._api.admin_ids)}</b>\n"
-            "Панель управления обновлена. Кнопки меню внизу чата."
+            f"Мультиаккаунт: <b>{n_acc}</b> слот(ов)\n"
+            "Каждый пользователь играет <b>своим</b> персонажем.\n"
+            "Пришлите Cookie Editor JSON своего аккаунта."
         )
         try:
             await self._api.broadcast(boot, reply_markup=_reply_keyboard())
         except Exception:
             pass
         logger.info(
-            "Telegram control panel started (admins=%d notify=%d groups=%s).",
+            "Telegram multi-account panel started (users=%d groups=%s).",
             len(self._api.admin_ids),
-            len(self._api.notify_chat_ids),
             self._api._allow_groups,
         )
         await self._poll_loop()
 
     async def notify(self, text: str, category: str = "") -> None:
-        """Send a notification to all notify chats if the category is enabled."""
-        n = self._settings.notify
+        """Legacy broadcast — prefer notify_user for account isolation."""
+        await self._api.broadcast(text)
+
+    async def notify_user(self, user_id: str, text: str, category: str = "") -> None:
+        """Send a notification only to one user's chat (their own account events)."""
+        rt = self._accounts.get_runtime(user_id) if self._accounts else None
+        settings = rt.settings if rt else self._fallback_settings
+        n = settings.notify
         gate = {
             "battles": n.battles,
             "quests": n.quests,
@@ -452,17 +507,19 @@ class TelegramBotHandler:
         }
         if category and not gate.get(category, True):
             return
-        await self._api.broadcast(text)
-        self._settings.total_notifies_sent += 1
-        if self._settings.total_notifies_sent % 10 == 0:
-            self._settings.save()
+        chat = (rt.spec.notify_chat_id if rt else None) or user_id
+        await self._api.send(str(chat), text)
+        settings.total_notifies_sent += 1
+        if settings.total_notifies_sent % 10 == 0:
+            settings.save()
 
     async def _poll_loop(self) -> None:
         while self._running:
             try:
                 updates = await self._api.get_updates()
+                # Sequential — keep per-user account binding race-free
                 for upd in updates:
-                    asyncio.ensure_future(self._handle_update(upd))
+                    await self._handle_update(upd)
             except asyncio.CancelledError:
                 break
             except Exception as exc:
@@ -516,6 +573,7 @@ class TelegramBotHandler:
     ) -> None:
         stripped = text.strip()
         uid = user_id or chat_id
+        self._bind_account(uid)
         buf = self._cookie_buffers.setdefault(uid, [])
 
         # Cookie JSON paste
@@ -731,18 +789,23 @@ class TelegramBotHandler:
     # ------------------------------------------------------------------
 
     async def _cmd_start(self, chat_id: str, message_id: Optional[int] = None) -> None:
-        st = await self._get_status()
+        st = await self._get_status() if self._get_status else {}
         icon = "🟢" if st.get("running") else "⏸"
+        wait = bool(st.get("waiting_for_cookies"))
+        slot = st.get("account_id") or "—"
+        nick = st.get("nick") or ("⏳ нет куков" if wait else "?")
         text = (
-            f"<b>🐉 DwarBot — Легенда: Наследие Драконов</b>\n\n"
-            f"{icon} {('Работает' if st.get('running') else 'Пауза')} · "
-            f"<b>{_esc(st.get('nick','?'))}</b> Lv{st.get('level','?')}\n"
+            f"<b>🐉 DwarBot — ваш слот</b>\n"
+            f"Слот: <code>{_esc(slot)}</code>\n"
+            f"{icon} <b>{_esc(nick)}</b> Lv{st.get('level','?')}\n"
             f"❤️ {st.get('hp','?')}/{st.get('hp_max','?')} · "
             f"💰 {st.get('money','?')} · "
             f"📍 {_esc(st.get('area_title') or st.get('area_id','?'))}\n\n"
-            "Кнопки меню — <b>внизу чата</b>.\n"
-            "Автопилот / уведомления / отчёты — ниже."
+            "Вы играете <b>только своим</b> аккаунтом dwar.ru.\n"
         )
+        if wait or not st.get("nick"):
+            text += "⏳ Пришлите <b>свои</b> Cookie Editor JSON сюда.\n"
+        text += "Кнопки меню — внизу чата."
         await self._api.send(chat_id, text, reply_markup=_reply_keyboard())
         await self._api.send(chat_id, "📂 <b>Панель управления</b>", reply_markup=_menu_inline())
 
@@ -772,26 +835,25 @@ class TelegramBotHandler:
             "/restart — systemctl restart\n\n"
             "<b>Управление</b>\n"
             "/stop · /resume · /settings · /menu · /admins\n\n"
-            "🍪 Куки: Cookie Editor → Export JSON → пришли сюда.\n"
-            "👥 Несколько админов: TELEGRAM_ADMIN_IDS=id1,id2"
+            "🍪 Куки: Cookie Editor → Export JSON → пришлите <b>свои</b> сюда.\n"
+            "👥 У каждого пользователя свой игровой аккаунт (TELEGRAM_ADMIN_IDS)."
         )
         await self._api.send(chat_id, text, reply_markup=_menu_inline())
 
     async def _cmd_admins(self, chat_id: str, message_id: Optional[int] = None) -> None:
-        admins = self._api.admin_ids
-        notify = self._api.notify_chat_ids
-        lines = [
-            "<b>👥 Telegram ACL</b>",
-            f"Админов: <b>{len(admins)}</b>",
-        ]
-        for i, aid in enumerate(admins, 1):
-            lines.append(f"  {i}. <code>{aid}</code>")
-        lines.append(f"Уведомления → <b>{len(notify)}</b> чат(ов)")
+        lines = ["<b>👥 Мультиаккаунт</b>", "Каждый ID = отдельный персонаж / куки."]
+        if self._accounts:
+            for uid in self._accounts.list_user_ids():
+                rt = self._accounts.get_runtime(uid)
+                brief = rt.status_brief() if rt else "не создан"
+                mine = " ← вы" if uid == (self._ctx_uid or chat_id) else ""
+                lines.append(f"• <code>{uid}</code>{mine}\n  {brief}")
+        else:
+            for i, aid in enumerate(self._api.admin_ids, 1):
+                lines.append(f"  {i}. <code>{aid}</code>")
         lines.append(
-            f"Группы: {'✅' if self._api._allow_groups else '⛔ только личка'}"
-        )
-        lines.append(
-            "\nДобавить: <code>TELEGRAM_ADMIN_IDS=id1,id2</code> в .env и restart."
+            "\nДобавить игрока: <code>TELEGRAM_ADMIN_IDS=…</code> + restart.\n"
+            "Он пришлёт <b>свои</b> куки — чужой аккаунт не подхватится."
         )
         await self._reply(chat_id, "\n".join(lines), _menu_inline(), message_id)
 
@@ -807,10 +869,11 @@ class TelegramBotHandler:
         power = prog.get("power_score", 0)
         rec = st.get("recovery") or {}
         text = (
-            f"<b>📊 Статус</b>\n\n"
+            f"<b>📊 Статус</b> · слот <code>{_esc(st.get('account_id') or '—')}</code>\n\n"
             f"{icon} Цикл: <b>{'Работает' if st.get('running') else 'Пауза'}</b> "
             f"· state <code>{_esc(st.get('bot_state','?'))}</code>\n"
             f"🔑 Токен: {token} · sess <code>{_esc(st.get('sess_sid','?'))}…</code>\n"
+            f"🧙 <b>{_esc(st.get('nick') or '—')}</b> Lv{st.get('level','?')}\n"
             f"⚔️ fight_id=<code>{st.get('fight_id',0)}</code> · "
             f"unlock={st.get('need_quest_unlock')}\n"
             f"🔄 Тик: {st.get('iteration', 0)} · ⏱ {st.get('uptime','?')}\n"
@@ -1267,10 +1330,8 @@ class TelegramBotHandler:
     async def _handle_cookie_paste(
         self, chat_id: str, chunk: str, user_id: str = ""
     ) -> None:
-        if not self._on_cookies_json:
-            await self._api.send(chat_id, "⚠️ Приём куков не настроен.")
-            return
         uid = user_id or chat_id
+        self._bind_account(uid)
         buf = self._cookie_buffers.setdefault(uid, [])
         cleaned = chunk.strip()
         if cleaned.startswith("```"):
@@ -1286,9 +1347,17 @@ class TelegramBotHandler:
             )
             return
         buf.clear()
-        await self._api.send(chat_id, "🍪 Принимаю куки…")
+        await self._api.send(
+            chat_id,
+            "🍪 Принимаю куки <b>только в ваш</b> слот…",
+        )
         try:
-            result = await self._on_cookies_json(combined)
+            if self._accounts:
+                result = await self._accounts.apply_cookies_for_user(uid, combined)
+            elif self._on_cookies_json:
+                result = await self._on_cookies_json(combined)
+            else:
+                result = "⚠️ Приём куков не настроен."
         except Exception as exc:
             result = f"❌ Ошибка: {exc}"
         await self._api.send(chat_id, result, reply_markup=_reply_keyboard())
