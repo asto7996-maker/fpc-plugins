@@ -500,7 +500,16 @@ class DwarBot:
                 if result == BattleResult.WIN:
                     self.combat.session.battles_joined += 1
                     self.quests.clear_exhausted(local_only=True)
-                    self.brain.push_farm(300.0)
+                    self.brain.mark_hunt_kill_done()
+                    try:
+                        turned = await self.quests.retry_pending_type2()
+                        if turned:
+                            self.brain.clear_hunt_gate()
+                            self.quests.clear_hunt_gate()
+                            logger.info("After fight recover: type=2 turn-in OK")
+                    except Exception as exc:
+                        logger.debug("turn-in after recover: %s", exc)
+                # Re-read profile after fight unlocks user.php
                 self._profile = await self.stats.read_full_profile()
                 self._char = self._profile.char
                 self._state = self._profile.state
@@ -529,7 +538,14 @@ class DwarBot:
                         if result == BattleResult.WIN:
                             self.combat.session.battles_joined += 1
                             self.quests.clear_exhausted(local_only=True)
-                            self.brain.push_farm(300.0)
+                            self.brain.mark_hunt_kill_done()
+                            try:
+                                turned = await self.quests.retry_pending_type2()
+                                if turned:
+                                    self.brain.clear_hunt_gate()
+                                    self.quests.clear_hunt_gate()
+                            except Exception as exc:
+                                logger.debug("turn-in after deferred fight: %s", exc)
                         self._profile = await self.stats.read_full_profile()
                         self._char = self._profile.char
                         self._state = self._profile.state
@@ -973,10 +989,13 @@ class DwarBot:
                 )
                 if steps:
                     logger.info("📜 Квестовых шагов: %d (NPC %s)", steps, npc_id)
-                    if not self.quests.pending_hunt_mob:
+                    if self.quests.has_pending_type2() or self.quests.pending_hunt_mob:
+                        # Type=2 asked for a kill mid-dialogue — hunt once, then turn in
+                        mob = self.quests.pending_hunt_mob or "Крэтс"
+                        self.brain.mark_hunt_for_quest(mob)
+                        logger.info("Сюжет ждёт убийства '%s' — одна охота, потом сдача.", mob)
+                    else:
                         self.brain.clear_hunt_gate()
-                    elif self.quests.pending_hunt_mob:
-                        self.brain.mark_hunt_for_quest(self.quests.pending_hunt_mob)
                     await self.notify(
                         f"📜 Диалог с NPC {npc_id}: <b>{steps}</b> шаг(ов)",
                         "quests",
