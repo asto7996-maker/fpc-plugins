@@ -197,13 +197,22 @@ class QuestTracker:
             return 0
 
     def _infer_hunt_mob_name(self, *texts: str) -> str:
-        """Extract mob name from quest titles like 'Крэтс повержен'."""
+        """Extract mob name from a kill-objective line. Empty = not a hunt gate."""
         blob = " ".join(t for t in texts if t).strip()
+        if not blob:
+            return ""
         low = blob.lower()
-        # Common newbie quest mob
+        # Enlistment / thanks / travel replies are NOT kill objectives
+        if any(k in low for k in ("командован", "честь для", "готов служить", "примите")):
+            return ""
+        killish = any(
+            k in low
+            for k in ("поверж", "убит", "побежд", "сражён", "сражен", "хвост", "туш", "напад")
+        )
+        if not killish and "крэт" not in low:
+            return ""
         if "крэт" in low or "крейт" in low or "krats" in low:
-            return "Крэтс"
-        # First capitalized word before 'поверж' / 'убит' / 'побежд'
+            return "Крэтс" if killish else ""
         m = re.search(
             r"([A-Za-zА-Яа-яЁё]{3,})\s+(?:поверж|убит|побежд|сраж)",
             blob,
@@ -211,7 +220,7 @@ class QuestTracker:
         )
         if m:
             return m.group(1)
-        return self.pending_hunt_mob or "Крэтс"
+        return ""
 
     async def _attack_hunt_for_quest(self, mob_name: str) -> bool:
         """Attack a free hunt_farm bot by name. Returns True if fight likely started."""
@@ -631,16 +640,28 @@ class QuestTracker:
                     raw = raw_ans
                 else:
                     # Opening to_point often returns empty done=true — not real progress.
-                    # type=2 «Крэтс повержен» needs a LIVE hunt_farm kill first.
-                    logger.info(
-                        "Ответ type=2 отклонён (msg %s → %s) — ищу моба на охоте…",
-                        child_id, to_point,
-                    )
+                    # type=2 kill lines like «Крэтс повержен» need a LIVE hunt_farm kill.
+                    # Do NOT treat enlistment replies as hunt gates.
                     point_obj = pt.get("point") if isinstance(pt.get("point"), dict) else {}
                     mob_name = self._infer_hunt_mob_name(
                         child_title,
-                        str(point_obj.get("title") or pt.get("title") or ""),
+                        str(child.get("message") or ""),
                         str(point_obj.get("target_name") or ""),
+                    )
+                    if not mob_name:
+                        logger.info(
+                            "type=2 отклонён (msg %s → %s) — это не убийство моба "
+                            "('%s'); пробую другой ответ.",
+                            child_id, to_point, child_title[:60],
+                        )
+                        self._answered_points.add(child_id)
+                        self.clear_hunt_gate()
+                        # Soft-skip only this child — keep walking other replies
+                        await asyncio.sleep(random.uniform(0.3, 0.8))
+                        continue
+                    logger.info(
+                        "Ответ type=2 отклонён (msg %s → %s) — ищу моба '%s'…",
+                        child_id, to_point, mob_name,
                     )
                     started = await self._attack_hunt_for_quest(mob_name)
                     if started:
