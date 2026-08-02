@@ -26,7 +26,11 @@ from aiogram.types import (
 import config
 from database import Database
 from formatting import extract_caption_html, safe_preview, validate_telegram_html
-from links import parse_post_link
+from links import format_channel_label, is_saved_messages, parse_post_link
+
+
+def _channel_label(value: str | None) -> str:
+    return format_channel_label(value)
 from scheduling import humanize_duration, parse_duration
 from userbot_auth import AuthCredentials
 
@@ -245,6 +249,20 @@ def cancel_kb() -> InlineKeyboardMarkup:
     )
 
 
+def target_kb() -> InlineKeyboardMarkup:
+    """Клавиатура выбора назначения: Избранное одним тапом."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="⭐ Избранное", callback_data="a:target_saved"
+                )
+            ],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="a:cancel")],
+        ]
+    )
+
+
 def interval_kb() -> InlineKeyboardMarkup:
     """Быстрый выбор интервала — без угадывания единиц измерения."""
     presets = [
@@ -299,8 +317,8 @@ def status_text(db: Database) -> str:
         f"Автопост: <b>{st}</b> · <code>{busy}</code>",
         _next_run_line(db, s),
         "",
-        f"📥 Источник: <code>{s.source_channel or '—'}</code>",
-        f"📤 Назначение: <code>{s.target_channel or '—'}</code>",
+        f"📥 Источник: <code>{_channel_label(s.source_channel)}</code>",
+        f"📤 Назначение: <code>{_channel_label(s.target_channel)}</code>",
         f"📍 Progress: <code>{s.progress_id}</code> → next "
         f"<code>{s.progress_id + 1 if s.progress_id >= 0 else '—'}</code>",
         f"📚 В очереди: <b>{backlog}</b> ID"
@@ -801,7 +819,8 @@ async def cb_link(c: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(S.link)
     await c.message.answer(  # type: ignore
         "🔗 Ссылка на пост-источник:\n"
-        "<code>https://t.me/channel/123</code>\n\n"
+        "• публичный: <code>https://t.me/channel/123</code>\n"
+        "• закрытый: <code>https://t.me/c/35839961/123</code>\n\n"
         "Указанный пост <b>не</b> публикуется — начнём со следующего.",
         reply_markup=cancel_kb(),
         parse_mode="HTML",
@@ -843,8 +862,12 @@ async def cb_source(c: CallbackQuery, state: FSMContext) -> None:
     await _ack(c)
     await state.set_state(S.source)
     await c.message.answer(  # type: ignore
-        "📥 Источник — публичный <code>@username</code>\n"
-        "<i>Админство не нужно, достаточно подписки аккаунта.</i>",
+        "📥 Источник — канал, откуда берём посты.\n\n"
+        "• публичный: <code>@username</code>\n"
+        "• закрытый: id канала, например <code>35839961</code>\n"
+        "  (из ссылки <code>t.me/c/35839961/…</code>) "
+        "или полный <code>-10035839961</code>\n\n"
+        "<i>Админство не нужно, достаточно подписки юзербота.</i>",
         reply_markup=cancel_kb(),
         parse_mode="HTML",
     )
@@ -857,9 +880,33 @@ async def cb_target(c: CallbackQuery, state: FSMContext) -> None:
     await _ack(c)
     await state.set_state(S.target)
     await c.message.answer(  # type: ignore
-        "📤 Назначение — ваш канал.\n"
-        "<i>Юзербот должен быть там админом с правом постить.</i>",
-        reply_markup=cancel_kb(),
+        "📤 Назначение — куда льём посты.\n\n"
+        "• <b>⭐ Избранное</b> — кнопка ниже или напишите "
+        "<code>избранное</code> / <code>me</code> "
+        "(админка не нужна)\n"
+        "• публичный канал: <code>@username</code>\n"
+        "• закрытый канал: id, например <code>35839961</code>\n"
+        "  (из <code>t.me/c/35839961/…</code>) "
+        "или <code>-10035839961</code>\n\n"
+        "<i>Для канала юзербот должен быть админом с правом постить.</i>",
+        reply_markup=target_kb(),
+        parse_mode="HTML",
+    )
+
+
+@router.callback_query(F.data == "a:target_saved")
+async def cb_target_saved(c: CallbackQuery, state: FSMContext) -> None:
+    if await _deny_cb(c):
+        return
+    await _ack(c, "Избранное")
+    from links import SAVED_MESSAGES
+
+    _require_db().set_target_channel(SAVED_MESSAGES)
+    await state.clear()
+    await c.message.answer(  # type: ignore
+        f"✅ Назначение: <code>{_channel_label(SAVED_MESSAGES)}</code>\n"
+        "<i>Админка не нужна — посты уйдут в Saved Messages юзербота.</i>",
+        reply_markup=main_kb(),
         parse_mode="HTML",
     )
 
@@ -1123,8 +1170,11 @@ async def on_target(message: Message, state: FSMContext) -> None:
         return
     _require_db().set_target_channel(raw)
     await state.clear()
+    note = ""
+    if is_saved_messages(raw):
+        note = "\n<i>Админка не нужна — посты уйдут в Saved Messages.</i>"
     await message.answer(
-        f"✅ Назначение: <code>{raw}</code>",
+        f"✅ Назначение: <code>{_channel_label(raw)}</code>{note}",
         reply_markup=main_kb(),
         parse_mode="HTML",
     )
@@ -1230,7 +1280,10 @@ def _cycle_report(db: Database, result) -> str:
     s = db.get_settings()
     hints = {
         "up_to_date": "Новых постов в источнике нет — всё уже перезалито.",
-        "source_empty": "Источник пуст или недоступен аккаунту юзербота.",
+        "source_empty": (
+            "Источник пуст или недоступен аккаунту юзербота "
+            "(для закрытого канала нужна подписка; укажите id, напр. 35839961)."
+        ),
         "no_start": "Не задана стартовая точка: «🔗 Старт-ссылка» или «📜 С начала».",
         "paused": "Автопостинг на паузе.",
         "aborted": "Цикл был прерван (например, новой командой).",
@@ -1274,8 +1327,8 @@ async def _run_test(message: Message) -> None:
     lines = ["<b>🧪 Диагностика</b>\n"]
     src = (s.source_channel or "").strip()
     dst = (s.target_channel or "").strip()
-    lines.append(f"Источник: <code>{src or '❌'}</code>")
-    lines.append(f"Назначение: <code>{dst or '❌'}</code>")
+    lines.append(f"Источник: <code>{_channel_label(src) if src else '❌'}</code>")
+    lines.append(f"Назначение: <code>{_channel_label(dst) if dst else '❌'}</code>")
     lines.append(f"Progress: <code>{s.progress_id}</code> → <code>{s.progress_id + 1 if s.progress_id >= 0 else '—'}</code>")
     lines.append(f"Юзербот: {'✅ онлайн' if _has_userbot() else '❌ нет сессии'}")
     lines.append(f"Занятость: {'⏳ цикл' if _busy() else 'idle'}")
@@ -1307,29 +1360,26 @@ async def _run_test(message: Message) -> None:
         lines.append("Проблемные посты: " + ", ".join(f"<code>{mid}</code>" for mid, _ in recent))
 
     if _has_userbot() and dst:
-        if _busy():
+        if is_saved_messages(dst):
+            lines.append("Права в назначении: ✅ Избранное (админка не нужна)")
+        elif _busy():
             lines.append("Права в назначении: ⏳ цикл занят")
         else:
             try:
                 async def _probe():
                     me = await _bridge.auth.client.get_me()
                     uname = f"@{me.username}" if me.username else me.first_name
-                    from pyrogram import raw
 
-                    # Сначала ResolveUsername — иначе CHANNEL_INVALID на холодной сессии
-                    chat_id = dst
+                    # resolve через poster: dialogs + access_hash для закрытых каналов
                     try:
-                        username = dst.lstrip("@")
-                        if username and not username.lstrip("-").isdigit():
-                            r = await _bridge.auth.client.invoke(
-                                raw.functions.contacts.ResolveUsername(username=username)
-                            )
-                            if hasattr(r.peer, "channel_id"):
-                                chat_id = int(f"-100{r.peer.channel_id}")
+                        from poster import _resolve_chat
+
+                        chat_id = await _resolve_chat(_bridge.auth.client, dst)
                     except Exception as e:
                         return (
                             f"❌ канал не найден: <code>{e}</code>\n"
-                            f"<i>Проверьте username назначения (не полную ссылку).</i>",
+                            f"<i>Для закрытого укажите id (35839961), "
+                            f"юзербот должен быть в канале.</i>",
                             False,
                         )
                     try:

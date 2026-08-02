@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from pyrogram.errors import ChatWriteForbidden, FloodWait  # noqa: E402
+from pyrogram.errors import ChannelPrivate, ChatWriteForbidden, FloodWait  # noqa: E402
 
 import poster as poster_module  # noqa: E402
 from database import Database  # noqa: E402
@@ -33,6 +33,7 @@ from poster import (  # noqa: E402
     REASON_PAUSED,
     REASON_UP_TO_DATE,
     ChannelPoster,
+    _chat_ref,
 )
 
 
@@ -325,6 +326,45 @@ class FailureTests(CycleTestCase):
         self.assertEqual(result.reason, "error")
         self.assertTrue(result.error)
         self.assertEqual(client.published, [])
+
+    def test_target_channel_private_is_fatal_keeps_progress(self) -> None:
+        """Закрытое назначение: не «прожигаем» очередь как up_to_date."""
+        client = FakeClient([text_message(1, "post 1"), text_message(2, "post 2")])
+        client.publish_fail = ChannelPrivate()
+        result, _ = self.run_cycle(client, limit=2)
+
+        self.assertEqual(result.reason, REASON_FATAL)
+        self.assertIn("закрытый", result.fatal_text.lower())
+        self.assertEqual(result.published, 0)
+        self.assertEqual(self.db.get_progress_id(), 0)
+        self.assertEqual(client.published, [])
+
+    def test_resolve_fail_is_fatal(self) -> None:
+        """Холодная сессия / нет access_hash — явная фатальная ошибка."""
+        client = FakeClient([text_message(1)])
+        client.resolve_fail = ChannelPrivate("CHANNEL_PRIVATE")
+        poster_module._dialogs_warmed_clients.clear()
+        result, _ = self.run_cycle(client, limit=1)
+
+        self.assertEqual(result.reason, REASON_FATAL)
+        self.assertIn("закрытый", result.fatal_text.lower())
+        self.assertIn("подпис", result.fatal_text.lower())
+        self.assertEqual(client.published, [])
+
+    def test_short_private_id_normalized_in_chat_ref(self) -> None:
+        self.assertEqual(_chat_ref("35839961"), -10035839961)
+        self.assertEqual(_chat_ref(35839961), -10035839961)
+        self.assertEqual(_chat_ref("-10035839961"), -10035839961)
+        self.assertEqual(_chat_ref("10035839961"), -10035839961)
+
+    def test_publish_to_saved_messages(self) -> None:
+        """Назначение «избранное» — без админки, id = get_me()."""
+        self.db.set_target_channel("избранное")
+        self.assertEqual(self.db.get_settings().target_channel, "me")
+        client = FakeClient([text_message(1, "to saved")])
+        result, _ = self.run_cycle(client, limit=1)
+        self.assertEqual(result.published, 1)
+        self.assertEqual(client.published[0]["text"], "to saved")
 
 
 if __name__ == "__main__":
