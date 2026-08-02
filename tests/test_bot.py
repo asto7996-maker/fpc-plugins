@@ -62,7 +62,12 @@ def test_healer_path_augment_and_snapshot_dir():
 
 
 def test_log_watcher_actionable_filter():
-    from dwar_bot.core.log_watcher import LogWatcher
+    from dwar_bot.core.log_watcher import LogWatcher, _boot_already_healed
+    from dwar_bot.core.cursor_self_healer import (
+        SKIP_BOOT_MARKER,
+        consume_skip_boot_scan,
+        mark_skip_boot_scan,
+    )
 
     assert LogWatcher._is_actionable("Traceback (most recent call last):\n  File")
     assert LogWatcher._is_actionable("CRITICAL — boom")
@@ -70,6 +75,20 @@ def test_log_watcher_actionable_filter():
     assert LogWatcher._is_actionable("STAGNATION / DOM-Desync: stuck")
     assert not LogWatcher._is_actionable("INFO something fine")
     assert not LogWatcher._is_actionable("| ERROR | httpx timeout retry")
+
+    healed = (
+        "Error in tick: boom\nTraceback (most recent call last):\n  File\n"
+        "Self-heal SUCCESS for dwar_bot/main.py\nAutoHealer SUCCESS dwar_bot/main.py\n"
+    )
+    assert _boot_already_healed(healed)
+    fresh = healed + "\nError in tick: new boom\nTraceback (most recent call last):\n"
+    assert not _boot_already_healed(fresh)
+
+    mark_skip_boot_scan("test")
+    assert SKIP_BOOT_MARKER.exists()
+    assert consume_skip_boot_scan()
+    assert not SKIP_BOOT_MARKER.exists()
+    assert not consume_skip_boot_scan()
 
 
 def test_auto_healer_import():

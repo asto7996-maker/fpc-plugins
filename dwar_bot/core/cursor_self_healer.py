@@ -26,6 +26,9 @@ TEST_TARGET = "tests/test_bot.py"
 AGENT_TIMEOUT_SEC = 300
 INSTALL_TIMEOUT_SEC = 180
 BACKUP_DIR: Path = REPO_ROOT / "dwar_bot" / ".heal_backups"
+# Written before systemctl restart so LogWatcher skips boot-scan of the
+# same error that was just healed (otherwise SUCCESS → restart → re-heal loop).
+SKIP_BOOT_MARKER: Path = REPO_ROOT / "dwar_bot" / ".heal_skip_boot"
 RESTART_AFTER_HEAL = os.getenv("DWAR_RESTART_AFTER_HEAL", "1") != "0"
 
 
@@ -266,10 +269,43 @@ def _run_pytest(env: dict) -> bool:
     return False
 
 
+def mark_skip_boot_scan(reason: str = "post-heal") -> None:
+    """Tell the next LogWatcher start to seek EOF without re-healing old errors."""
+    try:
+        SKIP_BOOT_MARKER.parent.mkdir(parents=True, exist_ok=True)
+        SKIP_BOOT_MARKER.write_text(
+            f"{time.time()}\n{reason}\n",
+            encoding="utf-8",
+        )
+    except OSError as exc:
+        logger.warning("Could not write skip-boot marker: %s", exc)
+
+
+def consume_skip_boot_scan(max_age_sec: int = 600) -> bool:
+    """Return True (and delete marker) if a fresh post-heal skip is active."""
+    try:
+        if not SKIP_BOOT_MARKER.exists():
+            return False
+        raw = SKIP_BOOT_MARKER.read_text(encoding="utf-8").strip().splitlines()
+        SKIP_BOOT_MARKER.unlink(missing_ok=True)
+        if not raw:
+            return True
+        age = time.time() - float(raw[0])
+        return age <= max_age_sec
+    except (OSError, ValueError) as exc:
+        logger.debug("skip-boot marker read failed: %s", exc)
+        try:
+            SKIP_BOOT_MARKER.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return False
+
+
 def _restart_service() -> None:
     """Reload bot process so patched code is actually used."""
     if not RESTART_AFTER_HEAL:
         return
+    mark_skip_boot_scan("post-heal-restart")
     logger.warning("Scheduling service restart to load healed code…")
     try:
         # Detach so restart isn't killed mid-flight with us

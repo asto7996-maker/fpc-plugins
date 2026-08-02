@@ -603,7 +603,7 @@ class DwarBot:
             moved = await self._try_area_progress()
             if moved:
                 return True
-        return cleared > 0
+        return False
 
     async def _process_loot_response(self, resp, label: str = "") -> int:
         """Log / notify bonus_text + artifact macros from an API response."""

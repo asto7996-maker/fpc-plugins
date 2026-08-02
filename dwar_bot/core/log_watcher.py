@@ -16,7 +16,7 @@ from typing import Awaitable, Callable, Optional
 from dwar_bot.config import LOG_FILE
 from dwar_bot.core.auto_healer import HealRequest, get_auto_healer
 from dwar_bot.core.bot_state import BotState, get_bot_state
-from dwar_bot.core.cursor_self_healer import ensure_cursor_cli
+from dwar_bot.core.cursor_self_healer import consume_skip_boot_scan, ensure_cursor_cli
 
 logger = logging.getLogger(__name__)
 
@@ -208,15 +208,22 @@ class LogWatcher:
 
         # Boot scan once — then always advance offset to EOF so the same
         # historical crash cannot re-trigger heal after service restart.
-        boot = self._boot_scan_tail()
-        if boot and self._is_actionable(boot):
-            # Only heal boot errors that look fresh (< 15 min by timestamp if present)
-            if _boot_error_is_fresh(boot):
-                logger.info("LogWatcher: boot-scan found fresh errors — healing.")
-                await self._handle_chunk(boot)
-            else:
-                logger.info("LogWatcher: boot-scan errors are stale — skipping.")
-        self._seek_end()
+        # After a successful heal+restart the skip marker is set so we do not
+        # immediately re-heal the same (still-fresh) log lines.
+        if consume_skip_boot_scan():
+            logger.info("LogWatcher: post-heal restart — skip boot-scan, seek EOF.")
+            self._seek_end()
+        else:
+            boot = self._boot_scan_tail()
+            if boot and self._is_actionable(boot):
+                if _boot_already_healed(boot):
+                    logger.info("LogWatcher: boot-scan errors already healed — skipping.")
+                elif _boot_error_is_fresh(boot):
+                    logger.info("LogWatcher: boot-scan found fresh errors — healing.")
+                    await self._handle_chunk(boot)
+                else:
+                    logger.info("LogWatcher: boot-scan errors are stale — skipping.")
+            self._seek_end()
 
         await asyncio.sleep(min(20, self.interval_seconds))
 
@@ -248,6 +255,28 @@ def _boot_error_is_fresh(chunk: str, max_age_sec: int = 900) -> bool:
         return age <= max_age_sec
     except ValueError:
         return True
+
+
+def _boot_already_healed(chunk: str) -> bool:
+    """True if the newest actionable error was already followed by a SUCCESS heal."""
+    clean = _strip_ansi(chunk)
+    success_idx = max(
+        clean.rfind("Self-heal SUCCESS"),
+        clean.rfind("AutoHealer SUCCESS"),
+    )
+    if success_idx < 0:
+        return False
+    last_err = -1
+    for marker in (
+        "Traceback (most recent call last):",
+        "Error in tick",
+        "STAGNATION",
+        "Fatal",
+    ):
+        last_err = max(last_err, clean.rfind(marker))
+    if last_err < 0:
+        return True
+    return last_err < success_idx
 
 
 async def start_log_monitoring(
