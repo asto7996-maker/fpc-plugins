@@ -16,6 +16,7 @@ import sys
 import time
 import random
 from pathlib import Path
+from typing import Optional
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -46,6 +47,8 @@ from dwar_bot.modules.stats_parser import StatsParser, FullProfile
 from dwar_bot.modules.combat_engine import CombatEngine, BattleResult
 from dwar_bot.modules.quest_tracker import QuestTracker
 from dwar_bot.modules.timers_manager import TimersManager
+from dwar_bot.modules.bot_settings import BotSettings
+from dwar_bot.config import COMBAT
 
 logger = logging.getLogger("dwar_bot.main")
 
@@ -61,16 +64,10 @@ async def _sleep(min_s: float, max_s: float) -> None:
     await asyncio.sleep(random.uniform(min_s, max_s))
 
 
-async def _maybe_idle() -> None:
-    if random.random() < IDLE_PAUSE_PROBABILITY:
-        s = random.uniform(DELAY_IDLE.min, DELAY_IDLE.max)
-        logger.info("Idle pause: %.0fs.", s)
-        await asyncio.sleep(s)
-
-
 class DwarBot:
-    def __init__(self, client: DwarGameClient) -> None:
+    def __init__(self, client: DwarGameClient, settings: Optional[BotSettings] = None) -> None:
         self._client = client
+        self.settings = settings or BotSettings.load()
         self.stats = StatsParser(client)
         self.combat = CombatEngine(client, self.stats)
         self.quests = QuestTracker(client)
@@ -88,12 +85,34 @@ class DwarBot:
         self._started_at: float = time.time()
         self._token_ok: bool = True
         self._area_moves_tried: set[str] = set()
+        self._tg: Optional[TelegramBotHandler] = None
+        self._prev_level: int = 0
+        self._prev_money: float = -1.0
+        self._prev_area: str = ""
+        self._hp_low_sent: bool = False
+        self._apply_combat_thresholds()
+
+    def bind_telegram(self, tg: TelegramBotHandler) -> None:
+        self._tg = tg
+
+    def _apply_combat_thresholds(self) -> None:
+        f = self.settings.farm
+        COMBAT.hp_retreat_threshold = float(f.hp_retreat)
+        COMBAT.hp_elixir_threshold = float(f.hp_heal)
+        COMBAT.max_consecutive_battles = int(f.max_battles_row)
+
+    async def notify(self, text: str, category: str = "") -> None:
+        if self._tg:
+            await self._tg.notify(text, category=category)
+        else:
+            await self._send_telegram(text)
 
     def get_status(self) -> dict:
         elapsed = int(time.time() - self._started_at)
         h, m, s = elapsed // 3600, (elapsed % 3600) // 60, elapsed % 60
         cs = self.combat.session
         qs = self.quests.session
+        f = self.settings.farm
         return {
             "running":    not self._paused and not _shutdown_event.is_set(),
             "token_ok":   self._token_ok and not self._client.auth_blocked,
@@ -135,15 +154,36 @@ class DwarBot:
             ],
             "timers": self.timers.summary(),
             "sess_sid": (self._client._session.get("sess_sid") or "")[:8],
+            "farm": {
+                "auto_quests": f.auto_quests,
+                "auto_combat": f.auto_combat,
+                "farm_fronts": f.farm_fronts,
+                "farm_arena": f.farm_arena,
+                "farm_area": f.farm_area,
+                "auto_travel": f.auto_travel,
+            },
+            "settings": self.settings.to_dict(),
         }
+
+    async def build_report(self) -> str:
+        if self._tg:
+            return await self._tg._build_report()
+        st = self.get_status()
+        return (
+            f"📈 Отчёт · {st.get('nick')} Lv{st.get('level')} · "
+            f"HP {st.get('hp')}/{st.get('hp_max')} · "
+            f"боёв {st.get('battles')} · диалогов {st.get('dialogues')}"
+        )
 
     async def pause(self) -> None:
         self._paused = True
         logger.info("Game loop paused via Telegram.")
+        await self.notify("⏸ Автопилот на паузе.", "heartbeat")
 
     async def resume_game(self) -> None:
         self._paused = False
         logger.info("Game loop resumed via Telegram.")
+        await self.notify("▶️ Автопилот возобновлён.", "heartbeat")
 
     async def apply_cookie_json(self, raw_json: str) -> str:
         """
@@ -204,20 +244,31 @@ class DwarBot:
                 continue
 
             self._iteration += 1
+            self._apply_combat_thresholds()
             try:
-                # Hot-reload cookies dropped on disk / via Telegram
                 await self._client.maybe_reload_cookie_file()
                 await self._tick()
+                await self._maybe_send_report()
                 self._errors_in_row = 0
             except asyncio.CancelledError:
                 break
             except TokenExpiredError as exc:
                 self._token_ok = False
+                if self.settings.notify.token:
+                    await self.notify(
+                        "⚠️ OAuth токен истёк. Пришли Cookie Editor JSON в этот чат.",
+                        "token",
+                    )
                 await self._handle_token_expired(str(exc))
                 self._token_ok = True
             except Exception as exc:
                 self._errors_in_row += 1
                 log_exception(logger, f"Error in tick #{self._iteration}", exc)
+                if self.settings.notify.errors:
+                    await self.notify(
+                        f"❌ Ошибка тика #{self._iteration}: {exc}",
+                        "errors",
+                    )
                 if self._errors_in_row >= MAX_RETRIES:
                     logger.critical("%d consecutive errors — pausing 5min.", MAX_RETRIES)
                     await asyncio.sleep(300)
@@ -228,9 +279,76 @@ class DwarBot:
 
             if not _shutdown_event.is_set():
                 await _sleep(DELAY_MAIN_LOOP.min, DELAY_MAIN_LOOP.max)
-                await _maybe_idle()
+                if self.settings.farm.idle_pauses and random.random() < IDLE_PAUSE_PROBABILITY:
+                    s = random.uniform(DELAY_IDLE.min, DELAY_IDLE.max)
+                    logger.info("Idle pause: %.0fs.", s)
+                    await asyncio.sleep(s)
+
+    async def _maybe_send_report(self) -> None:
+        r = self.settings.report
+        if not r.enabled:
+            return
+        interval = max(5, int(r.interval_min)) * 60
+        if time.time() - self.settings.last_report_at < interval:
+            return
+        try:
+            text = await self.build_report()
+            await self.notify(text, "heartbeat")
+            self.settings.last_report_at = time.time()
+            self.settings.save()
+        except Exception as exc:
+            logger.debug("auto report failed: %s", exc)
+
+    async def _emit_state_notifications(self) -> None:
+        """Compare with previous snapshot and push Telegram alerts."""
+        # Level up
+        if self._prev_level and self._char.level > self._prev_level:
+            await self.notify(
+                f"⬆️ Уровень! <b>{self._char.nick}</b> теперь Lv{self._char.level}",
+                "level_up",
+            )
+        self._prev_level = self._char.level or self._prev_level
+
+        # Money change (significant)
+        if self._prev_money >= 0 and abs(self._state.money - self._prev_money) >= 1.0:
+            delta = self._state.money - self._prev_money
+            sign = "+" if delta > 0 else ""
+            await self.notify(
+                f"💰 Деньги: {sign}{delta:.2f} → <b>{self._state.money:.2f}</b> зол.",
+                "money",
+            )
+        self._prev_money = self._state.money
+
+        # Area change
+        if self._prev_area and self._state.area_id and self._state.area_id != self._prev_area:
+            await self.notify(
+                f"🗺 Новая локация: <b>{self._area_title or self._state.area_id}</b> "
+                f"(id={self._state.area_id})",
+                "area",
+            )
+        if self._state.area_id:
+            self._prev_area = self._state.area_id
+
+        # HP low
+        if self._char.hp_max and self._char.hp_percent < self.settings.farm.hp_retreat:
+            if not self._hp_low_sent:
+                await self.notify(
+                    f"❤️ HP низко: {self._char.hp}/{self._char.hp_max} "
+                    f"({self._char.hp_percent:.0f}%)",
+                    "hp_low",
+                )
+                self._hp_low_sent = True
+        else:
+            self._hp_low_sent = False
+
+        # Effects
+        if self.settings.notify.effects and self._profile.effects:
+            titles = ", ".join(e.title for e in self._profile.effects[:4])
+            if self._iteration % 20 == 1:
+                await self.notify(f"✨ Эффекты: {titles}", "effects")
 
     async def _tick(self) -> None:
+        farm = self.settings.farm
         self._profile = await self.stats.read_full_profile()
         self._char = self._profile.char
         self._state = self._profile.state
@@ -253,6 +371,7 @@ class DwarBot:
         )
 
         await self.timers.update_regen(self._char.hp, self._char.mp)
+        await self._emit_state_notifications()
 
         for note in self._profile.notifications[:3]:
             logger.info("📢 %s", note.text[:150])
@@ -263,39 +382,56 @@ class DwarBot:
                 ", ".join(e.title for e in self._profile.effects[:4]),
             )
 
-        if self._profile.broken_items:
+        if farm.auto_repair and self._profile.broken_items:
             repaired = await self.combat.repair_broken_gear(self._profile)
             if repaired:
                 logger.info("Отремонтировано предметов: %d", repaired)
+                if self.settings.notify.gear:
+                    await self.notify(f"🔧 Отремонтировано: {repaired}", "gear")
 
-        equipped = await self.combat.auto_equip(self._profile)
-        if equipped:
-            logger.info("Надето предметов: %d", equipped)
+        if farm.auto_equip:
+            equipped = await self.combat.auto_equip(self._profile)
+            if equipped:
+                logger.info("Надето предметов: %d", equipped)
+                if self.settings.notify.gear:
+                    await self.notify(f"👕 Надето: {equipped}", "gear")
 
-        # Quests first for newbies — story unlocks combat/travel
-        quest_actions = await self.quests.quest_tick()
-        if quest_actions:
-            logger.info("📜 Квестовых действий: %d", quest_actions)
-            await _sleep(2.0, 5.0)
-            return
+        # Quests
+        if farm.auto_quests:
+            quest_actions = await self.quests.quest_tick()
+            if quest_actions:
+                logger.info("📜 Квестовых действий: %d", quest_actions)
+                await self.notify(
+                    f"📜 Квестовых действий: <b>{quest_actions}</b>",
+                    "quests",
+                )
+                await _sleep(2.0, 5.0)
+                return
 
-        result = await self.combat.combat_tick(self._profile)
-        if result == BattleResult.JOINED:
-            logger.info("⚔️ Вступил в бой!")
-            await _sleep(3.0, 6.0)
-            return
-        if result == BattleResult.ONGOING:
-            logger.info("⚔️ Бой продолжается …")
-            return
-        if result == BattleResult.FLED:
-            logger.info("🩹 Восстанавливаю здоровье …")
-            await self.timers.wait_for_hp(target_percent=70.0, max_wait=600)
-            return
+        # Combat
+        if farm.auto_combat:
+            # Temporarily narrow combat targets via engine flags on the instance
+            result = await self._combat_tick_filtered()
+            if result == BattleResult.JOINED:
+                logger.info("⚔️ Вступил в бой!")
+                await self.notify("⚔️ Вступил в бой!", "battles")
+                await _sleep(3.0, 6.0)
+                return
+            if result == BattleResult.ONGOING:
+                logger.info("⚔️ Бой продолжается …")
+                return
+            if result == BattleResult.FLED:
+                logger.info("🩹 Восстанавливаю здоровье …")
+                await self.notify("🩹 Восстановление HP…", "hp_low")
+                if farm.auto_heal:
+                    await self.timers.wait_for_hp(target_percent=70.0, max_wait=600)
+                return
 
-        # Area navigation / exploration
-        moved = await self._try_area_progress()
-        if moved:
-            return
+        # Area navigation
+        if farm.auto_travel:
+            moved = await self._try_area_progress()
+            if moved:
+                return
 
         area = await self._client.get_area_info()
         if area.title:
@@ -330,6 +466,51 @@ class DwarBot:
 
         logger.info("💤 Нет доступных действий — жду.")
         await _sleep(8.0, 18.0)
+
+    async def _combat_tick_filtered(self) -> BattleResult:
+        """Combat tick that respects farm_fronts / farm_arena / farm_area toggles."""
+        farm = self.settings.farm
+        profile = self._profile
+        hp_pct = profile.char.hp_percent
+
+        if farm.auto_heal:
+            if hp_pct < COMBAT.hp_retreat_threshold:
+                healed = await self.combat.heal_if_needed(profile)
+                if not healed:
+                    logger.info("Resting to recover HP …")
+                self.combat.session.consecutive_battles = 0
+                return BattleResult.FLED
+            await self.combat.heal_if_needed(profile)
+            await self.combat.restore_mana_if_needed(profile)
+
+        if await self.combat.is_in_battle():
+            log = await self.combat.read_combat_log()
+            if log:
+                logger.info("Combat log: %s", log[-1].text[:120])
+            await asyncio.sleep(random.uniform(1.2, 3.5))
+            return BattleResult.ONGOING
+
+        if await self.combat.needs_rest():
+            self.combat.session.consecutive_battles = 0
+            await asyncio.sleep(random.uniform(20, 60))
+            return BattleResult.NO_BATTLE
+
+        if farm.farm_fronts:
+            result = await self.combat.try_join_front()
+            if result == BattleResult.JOINED:
+                return result
+
+        if farm.farm_arena:
+            result = await self.combat.try_arena()
+            if result == BattleResult.JOINED:
+                return result
+
+        if farm.farm_area:
+            result = await self.combat.try_area_combat()
+            if result == BattleResult.JOINED:
+                return result
+
+        return BattleResult.NO_BATTLE
 
     async def _try_area_progress(self) -> bool:
         """Try travel / hotspot actions that unlock after quest gates open."""
@@ -507,7 +688,7 @@ async def main() -> None:
         "yes" if access_token else "no",
     )
 
-    bot = DwarBot(client)
+    bot = DwarBot(client, settings=BotSettings.load())
 
     tg_token = os.getenv("TELEGRAM_BOT_TOKEN", TELEGRAM_BOT_TOKEN)
     tg_chatid = os.getenv("TELEGRAM_CHAT_ID", TELEGRAM_CHAT_ID)
@@ -523,10 +704,13 @@ async def main() -> None:
             stop_fn=bot.pause,
             resume_fn=bot.resume_game,
             log_path=LOG_FILE,
+            settings=bot.settings,
             on_cookies_json=bot.apply_cookie_json,
+            on_report_fn=bot.build_report,
         )
+        bot.bind_telegram(tg_handler)
         tg_task = asyncio.ensure_future(tg_handler.start())
-        logger.info("Telegram bot started (chat_id=%s).", tg_chatid)
+        logger.info("Telegram control panel started (chat_id=%s).", tg_chatid)
 
     while not _shutdown_event.is_set():
         try:
