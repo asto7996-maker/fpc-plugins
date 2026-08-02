@@ -143,7 +143,30 @@ class ApiResponse:
     redirect_url: Optional[str] = None
     redirect_error: Any = None
     bonus_text: list = field(default_factory=list)
+    macros: list = field(default_factory=list)
     raw: dict = field(default_factory=dict)
+
+    def loot_lines(self) -> list[str]:
+        """Human-readable bonus / artifact lines from the response."""
+        lines: list[str] = []
+        for b in self.bonus_text or []:
+            if isinstance(b, str) and b.strip():
+                lines.append(b.strip())
+            elif isinstance(b, dict):
+                t = b.get("text") or b.get("title") or b.get("bonus_text") or ""
+                if t:
+                    lines.append(str(t).strip())
+        for m in self.macros or []:
+            if not isinstance(m, dict):
+                continue
+            kind = str(m.get("type") or m.get("name") or m.get("macro") or "").upper()
+            title = m.get("title") or m.get("artikul_title") or m.get("text") or ""
+            artikul = m.get("artikul") or m.get("art_id") or m.get("id") or ""
+            if "ARTIFACT" in kind or title:
+                label = str(title or artikul or kind).strip()
+                if label:
+                    lines.append(f"ARTIFACT: {label}")
+        return lines
 
 
 # ---------------------------------------------------------------------------
@@ -485,6 +508,7 @@ class DwarGameClient:
             try:
                 persist_session_cookies(self._session, self._cookie_file)
                 if self._cookie_file.exists():
+                    # Avoid treating our own write as an external cookie update
                     self._cookie_mtime = self._cookie_file.stat().st_mtime
             except Exception as exc:
                 logger.warning("Could not persist renewed session cookies: %s", exc)
@@ -611,13 +635,24 @@ class DwarGameClient:
             except TokenExpiredError:
                 raise
 
+        bonus = inner.get("bonus_text", []) or []
+        if not bonus and isinstance(data, dict):
+            bonus = data.get("bonus_text", []) or []
+        macros = inner.get("macros", []) or inner.get("macro_list", []) or []
+        if not macros and isinstance(data, dict):
+            macros = data.get("macros", []) or data.get("macro_list", []) or []
+        # Some actions nest macros under redirect / awards
+        if not macros and isinstance(inner.get("awards"), list):
+            macros = inner.get("awards") or []
+
         return ApiResponse(
             status=int(inner.get("status", 0) or 0),
             error=err,
             data=inner,
             redirect_url=inner.get("redirect_url"),
             redirect_error=inner.get("redirect_error"),
-            bonus_text=inner.get("bonus_text", []) or [],
+            bonus_text=bonus if isinstance(bonus, list) else [bonus],
+            macros=macros if isinstance(macros, list) else [],
             raw=data if isinstance(data, dict) else {},
         )
 

@@ -123,6 +123,7 @@ class TelegramAPI:
 _REPLY_MAP = {
     "🏠 Меню": "menu",
     "📊 Статус": "status",
+    "🧠 План": "progress",
     "🧙 Персонаж": "stats",
     "🤖 Автопилот": "autopilot",
     "⚔️ Бои": "combat",
@@ -141,11 +142,11 @@ _REPLY_MAP = {
 def _reply_keyboard() -> dict:
     """Persistent bottom menu — always visible in the chat."""
     rows = [
-        ["🏠 Меню", "📊 Статус", "🧙 Персонаж"],
-        ["🤖 Автопилот", "⚔️ Бои", "📜 Квесты"],
-        ["🗺 Локация", "🔔 Уведомления", "📈 Отчёты"],
-        ["⚙️ Настройки", "📋 Лог", "🍪 Куки"],
-        ["⏸ Пауза", "▶️ Старт"],
+        ["🏠 Меню", "📊 Статус", "🧠 План"],
+        ["🧙 Персонаж", "🤖 Автопилот", "⚔️ Бои"],
+        ["📜 Квесты", "🗺 Локация", "📈 Отчёты"],
+        ["🔔 Уведомления", "⚙️ Настройки", "📋 Лог"],
+        ["🍪 Куки", "⏸ Пауза", "▶️ Старт"],
     ]
     return {
         "keyboard": [[{"text": t} for t in row] for row in rows],
@@ -169,8 +170,8 @@ def _toggle_label(title: str, on: bool) -> str:
 
 def _menu_inline() -> dict:
     return _inline([
-        [_btn("📊 Статус", "status"), _btn("🧙 Персонаж", "stats")],
-        [_btn("🤖 Автопилот", "autopilot"), _btn("⚙️ Настройки", "settings")],
+        [_btn("📊 Статус", "status"), _btn("🧠 План", "progress")],
+        [_btn("🧙 Персонаж", "stats"), _btn("🤖 Автопилот", "autopilot")],
         [_btn("⚔️ Бои", "combat"), _btn("📜 Квесты", "quests")],
         [_btn("🗺 Локация", "area"), _btn("🎒 Рюкзак", "inventory")],
         [_btn("⏱ Таймеры", "timers"), _btn("✨ Эффекты", "effects")],
@@ -184,11 +185,13 @@ def _menu_inline() -> dict:
 def _autopilot_inline(s: BotSettings) -> dict:
     f = s.farm
     return _inline([
+        [_btn(_toggle_label("Макс-фарм", f.max_farm), "tg:farm:max_farm")],
         [_btn(_toggle_label("Квесты", f.auto_quests), "tg:farm:auto_quests")],
         [_btn(_toggle_label("Бои авто", f.auto_combat), "tg:farm:auto_combat")],
         [_btn(_toggle_label("Фронты", f.farm_fronts), "tg:farm:farm_fronts"),
          _btn(_toggle_label("Арена", f.farm_arena), "tg:farm:farm_arena")],
-        [_btn(_toggle_label("Точки локации", f.farm_area), "tg:farm:farm_area")],
+        [_btn(_toggle_label("Точки локации", f.farm_area), "tg:farm:farm_area"),
+         _btn(_toggle_label("Лут/награды", f.auto_loot), "tg:farm:auto_loot")],
         [_btn(_toggle_label("Переходы", f.auto_travel), "tg:farm:auto_travel")],
         [_btn(_toggle_label("Ремонт", f.auto_repair), "tg:farm:auto_repair"),
          _btn(_toggle_label("Экипировка", f.auto_equip), "tg:farm:auto_equip")],
@@ -205,6 +208,8 @@ def _notify_inline(s: BotSettings) -> dict:
     return _inline([
         [_btn(_toggle_label("Бои", n.battles), "tg:notify:battles"),
          _btn(_toggle_label("Квесты", n.quests), "tg:notify:quests")],
+        [_btn(_toggle_label("Лут", n.loot), "tg:notify:loot"),
+         _btn(_toggle_label("План", n.plan), "tg:notify:plan")],
         [_btn(_toggle_label("HP низко", n.hp_low), "tg:notify:hp_low"),
          _btn(_toggle_label("Токен", n.token), "tg:notify:token")],
         [_btn(_toggle_label("Уровень", n.level_up), "tg:notify:level_up"),
@@ -225,11 +230,12 @@ def _reports_inline(s: BotSettings) -> dict:
         [_btn(_toggle_label("Авто-отчёты", r.enabled), "tg:report:enabled")],
         [_btn("⏱ 15 мин", "report_int:15"), _btn("⏱ 30 мин", "report_int:30"),
          _btn("⏱ 60 мин", "report_int:60")],
+        [_btn(_toggle_label("План в отчёте", r.include_plan), "tg:report:include_plan")],
         [_btn(_toggle_label("Бои в отчёте", r.include_combat), "tg:report:include_combat")],
         [_btn(_toggle_label("Квесты в отчёте", r.include_quests), "tg:report:include_quests")],
         [_btn(_toggle_label("Инвентарь", r.include_inventory), "tg:report:include_inventory")],
         [_btn(_toggle_label("Таймеры", r.include_timers), "tg:report:include_timers")],
-        [_btn("📄 Отчёт сейчас", "report_now")],
+        [_btn("📄 Отчёт сейчас", "report_now"), _btn("🧠 План", "progress")],
         [_btn("🏠 Меню", "menu")],
     ])
 
@@ -305,6 +311,7 @@ class TelegramBotHandler:
             {"command": "start", "description": "🏠 Главное меню"},
             {"command": "menu", "description": "🏠 Панель управления"},
             {"command": "status", "description": "📊 Статус бота"},
+            {"command": "progress", "description": "🧠 План прогрессии"},
             {"command": "stats", "description": "🧙 Статы персонажа"},
             {"command": "inventory", "description": "🎒 Рюкзак"},
             {"command": "combat", "description": "⚔️ Статистика боёв"},
@@ -353,6 +360,8 @@ class TelegramBotHandler:
             "area": n.area,
             "gear": n.gear,
             "heartbeat": n.heartbeat,
+            "loot": n.loot,
+            "plan": n.plan,
         }
         if category and not gate.get(category, True):
             return
@@ -462,6 +471,8 @@ class TelegramBotHandler:
             "menu": self._cmd_menu,
             "help": self._cmd_help,
             "status": self._cmd_status,
+            "progress": self._cmd_progress,
+            "plan": self._cmd_progress,
             "stats": self._cmd_stats,
             "inventory": self._cmd_inventory,
             "combat": self._cmd_combat,
@@ -577,6 +588,7 @@ class TelegramBotHandler:
             f"Авто-отчёты: {self._settings.on_off(r.enabled)}\n"
             f"Интервал: <b>{r.interval_min}</b> мин\n"
             f"Последний: {last}\n\n"
+            f"В отчёте — план: {self._settings.on_off(r.include_plan)}\n"
             f"В отчёте — бои: {self._settings.on_off(r.include_combat)}\n"
             f"В отчёте — квесты: {self._settings.on_off(r.include_quests)}\n"
             f"В отчёте — инвентарь: {self._settings.on_off(r.include_inventory)}\n"
@@ -627,13 +639,14 @@ class TelegramBotHandler:
         text = (
             "<b>ℹ️ Справка DwarBot</b>\n\n"
             "<b>Основные</b>\n"
-            "/status /stats /inventory /area /timers /effects\n"
+            "/status /progress /stats /inventory /area /timers /effects\n"
             "/combat /quests /session /log /cookies\n\n"
-            "<b>Автопилот</b>\n"
-            "/autopilot — вкл/выкл фарм боёв, квестов, переходов\n"
+            "<b>Автопилот (макс-фарм)</b>\n"
+            "/autopilot — квесты, бои, лут, переходы\n"
+            "/progress — сейчас / план / можно / выбрано\n"
             "/farm_on /farm_off — всё сразу\n\n"
             "<b>Уведомления и отчёты</b>\n"
-            "/notify — какие события слать в чат\n"
+            "/notify — бои, квесты, лут, план…\n"
             "/reports — авто-отчёты · /report — отчёт сейчас\n\n"
             "<b>Управление</b>\n"
             "/stop · /resume · /settings · /menu\n\n"
@@ -644,22 +657,87 @@ class TelegramBotHandler:
     async def _cmd_status(self, chat_id: str, message_id: Optional[int] = None) -> None:
         st = await self._get_status()
         f = self._settings.farm
+        prog = st.get("progress") or {}
+        focus = prog.get("focus") or {}
         icon = "🟢" if st.get("running") else "⏸"
         token = "✅" if st.get("token_ok") else "❌"
+        now = prog.get("now") or "—"
+        chosen = focus.get("title") or "—"
+        power = prog.get("power_score", 0)
         text = (
             f"<b>📊 Статус</b>\n\n"
             f"{icon} Цикл: <b>{'Работает' if st.get('running') else 'Пауза'}</b>\n"
             f"🔑 Токен: {token} · sess <code>{_esc(st.get('sess_sid','?'))}…</code>\n"
             f"🔄 Тик: {st.get('iteration', 0)} · ⏱ {st.get('uptime','?')}\n"
             f"📍 {_esc(st.get('area_title') or 'area')} ({st.get('area_id','?')})\n\n"
+            f"<b>🧠 Сейчас:</b> {_esc(now)}\n"
+            f"<b>👉 Выбрано:</b> {_esc(chosen)}\n"
+            f"<b>Сила:</b> {power:.0f}/100\n\n"
             f"<b>Автопилот</b>\n"
+            f"🚀 Макс-фарм {self._settings.on_off(f.max_farm)} · "
+            f"🎁 Лут {self._settings.on_off(f.auto_loot)}\n"
             f"📜 Квесты {self._settings.on_off(f.auto_quests)} · "
             f"⚔️ Бои {self._settings.on_off(f.auto_combat)}\n"
             f"🗺 Переходы {self._settings.on_off(f.auto_travel)} · "
             f"🧪 Heal {self._settings.on_off(f.auto_heal)}\n\n"
-            f"⚔️ Боёв: {st.get('battles',0)} · 📜 Диалогов: {st.get('dialogues',0)}"
+            f"⚔️ Боёв: {st.get('battles',0)} · 📜 Диалогов: {st.get('dialogues',0)} · "
+            f"🎁 {st.get('loot_claimed',0)}"
         )
-        await self._reply(chat_id, text, _menu_inline(), message_id)
+        kb = _inline([
+            [_btn("🧠 План", "progress"), _btn("📄 Отчёт", "report_now")],
+            [_btn("🤖 Автопилот", "autopilot"), _btn("🏠 Меню", "menu")],
+        ])
+        await self._reply(chat_id, text, kb, message_id)
+
+    async def _cmd_progress(self, chat_id: str, message_id: Optional[int] = None) -> None:
+        st = await self._get_status()
+        prog = st.get("progress") or {}
+        lines = ["<b>🧠 Мозг прогрессии</b>"]
+        lines.append(f"<b>Сейчас:</b> {_esc(prog.get('now') or '—')}")
+        focus = prog.get("focus") or {}
+        if focus:
+            detail = focus.get("detail") or ""
+            lines.append(
+                f"<b>Выбрано:</b> {_esc(focus.get('title', '?'))}"
+                + (f" <i>({_esc(detail)})</i>" if detail else "")
+            )
+        lines.append(f"<b>Сила:</b> {prog.get('power_score', 0):.0f}/100")
+        plan = prog.get("plan") or []
+        if plan:
+            lines.append("\n<b>План:</b>")
+            for i, step in enumerate(plan[:6], 1):
+                why = step.get("why") or ""
+                lines.append(
+                    f"{i}. {_esc(step.get('title', '?'))}"
+                    + (f" — <i>{_esc(why)}</i>" if why else "")
+                )
+        options = prog.get("options") or []
+        if options:
+            lines.append("\n<b>Можно сделать:</b>")
+            focus_title = (focus or {}).get("title")
+            for opt in options[:8]:
+                mark = "👉" if opt.get("title") == focus_title else "•"
+                detail = opt.get("detail") or ""
+                lines.append(
+                    f"{mark} {_esc(opt.get('title', '?'))}"
+                    + (f" — {_esc(detail)}" if detail else "")
+                    + f" <code>{opt.get('score', 0):.0f}</code>"
+                )
+        bottlenecks = prog.get("bottlenecks") or []
+        if bottlenecks:
+            lines.append("\n<b>Узкие места:</b>")
+            for b in bottlenecks[:4]:
+                lines.append(f"⚠️ {_esc(b)}")
+        tips = prog.get("tips") or []
+        if tips:
+            lines.append("\n<b>Чтобы стать сильнее:</b>")
+            for t in tips[:4]:
+                lines.append(f"💡 {_esc(t)}")
+        kb = _inline([
+            [_btn("📄 Полный отчёт", "report_now"), _btn("📊 Статус", "status")],
+            [_btn("🏠 Меню", "menu")],
+        ])
+        await self._reply(chat_id, "\n".join(lines), kb, message_id)
 
     async def _cmd_stats(self, chat_id: str, message_id: Optional[int] = None) -> None:
         st = await self._get_status()
@@ -859,6 +937,7 @@ class TelegramBotHandler:
         await self._api.send(chat_id, text, reply_markup=_reports_inline(self._settings))
 
     async def _build_report(self) -> str:
+        """Fallback report if on_report_fn is missing — includes plan from status."""
         st = await self._get_status()
         r = self._settings.report
         parts = [
@@ -869,6 +948,24 @@ class TelegramBotHandler:
             f"📍 {_esc(st.get('area_title') or st.get('area_id','?'))} · "
             f"⏱ {st.get('uptime','?')} · тик {st.get('iteration',0)}",
         ]
+        prog = st.get("progress") or {}
+        if r.include_plan and prog:
+            parts.append("")
+            parts.append(f"<b>🧠 Сейчас:</b> {_esc(prog.get('now') or '—')}")
+            focus = prog.get("focus") or {}
+            if focus:
+                parts.append(f"<b>👉 Выбрано:</b> {_esc(focus.get('title') or '—')}")
+            plan = prog.get("plan") or []
+            if plan:
+                parts.append("<b>План:</b> " + " → ".join(
+                    _esc(s.get("title", "?")) for s in plan[:4]
+                ))
+            opts = prog.get("options") or []
+            if opts:
+                parts.append("<b>Можно:</b> " + ", ".join(
+                    _esc(o.get("title", "?")) for o in opts[:5]
+                ))
+            parts.append(f"Сила: {prog.get('power_score', 0):.0f}/100")
         if r.include_combat:
             parts.append(
                 f"⚔️ Бои: {st.get('battles',0)} · "
@@ -884,7 +981,8 @@ class TelegramBotHandler:
         if r.include_inventory:
             parts.append(
                 f"🎒 Предметов: {len(st.get('inventory') or [])} · "
-                f"🧪 {st.get('potions_count',0)}"
+                f"🧪 {st.get('potions_count',0)} · "
+                f"🎁 {st.get('loot_claimed',0)}"
             )
         if r.include_timers:
             timers = st.get("timers") or []
@@ -893,12 +991,13 @@ class TelegramBotHandler:
                     f"{t.get('description','?')}: {t.get('remaining','?')}"
                     for t in timers[:4]
                 )
-                parts.append(f"⏱ { _esc(tlines) }")
+                parts.append(f"⏱ {_esc(tlines)}")
         f = self._settings.farm
         parts.append(
-            f"🤖 Квесты {self._settings.on_off(f.auto_quests)} · "
+            f"🤖 Макс-фарм {self._settings.on_off(f.max_farm)} · "
+            f"Квесты {self._settings.on_off(f.auto_quests)} · "
             f"Бои {self._settings.on_off(f.auto_combat)} · "
-            f"Переходы {self._settings.on_off(f.auto_travel)}"
+            f"Лут {self._settings.on_off(f.auto_loot)}"
         )
         return "\n".join(parts)
 
@@ -906,6 +1005,7 @@ class TelegramBotHandler:
         for key in (
             "auto_quests", "auto_combat", "farm_fronts", "farm_arena", "farm_area",
             "auto_travel", "auto_repair", "auto_equip", "auto_heal",
+            "auto_loot", "max_farm",
         ):
             setattr(self._settings.farm, key, True)
         self._settings.save()

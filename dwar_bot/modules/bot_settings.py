@@ -31,6 +31,8 @@ class NotifySettings:
     area: bool = True
     gear: bool = False
     heartbeat: bool = False
+    loot: bool = True
+    plan: bool = True
 
 
 @dataclass
@@ -45,6 +47,8 @@ class FarmSettings:
     auto_repair: bool = True
     auto_equip: bool = True
     auto_heal: bool = True
+    auto_loot: bool = True
+    max_farm: bool = True
     idle_pauses: bool = True
     aggressive: bool = False
     hp_retreat: float = 15.0
@@ -60,6 +64,7 @@ class ReportSettings:
     include_quests: bool = True
     include_inventory: bool = True
     include_timers: bool = True
+    include_plan: bool = True
 
 
 @dataclass
@@ -176,11 +181,13 @@ class BotSettings:
     def farm_summary_lines(self) -> list[str]:
         f = self.farm
         return [
+            f"🚀 Макс-фарм: {self.on_off(f.max_farm)}",
             f"📜 Квесты: {self.on_off(f.auto_quests)}",
             f"⚔️ Бои (авто): {self.on_off(f.auto_combat)}",
             f"  ├ Фронты: {self.on_off(f.farm_fronts)}",
             f"  ├ Арена: {self.on_off(f.farm_arena)}",
             f"  └ Точки локации: {self.on_off(f.farm_area)}",
+            f"🎁 Лут / награды: {self.on_off(f.auto_loot)}",
             f"🗺 Переходы: {self.on_off(f.auto_travel)}",
             f"🔧 Ремонт: {self.on_off(f.auto_repair)}",
             f"👕 Экипировка: {self.on_off(f.auto_equip)}",
@@ -195,6 +202,8 @@ class BotSettings:
         return [
             f"⚔️ Бои: {self.on_off(n.battles)}",
             f"📜 Квесты: {self.on_off(n.quests)}",
+            f"🎁 Лут: {self.on_off(n.loot)}",
+            f"🧠 План: {self.on_off(n.plan)}",
             f"❤️ HP низко: {self.on_off(n.hp_low)}",
             f"🔑 Токен: {self.on_off(n.token)}",
             f"⬆️ Уровень: {self.on_off(n.level_up)}",

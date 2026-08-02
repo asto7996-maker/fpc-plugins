@@ -120,6 +120,25 @@ class QuestTracker:
             self._visited_npcs.clear()
             self._last_quest_signature = sig
 
+    def exhausted_npc_ids(self) -> set[str]:
+        """NPC ids whose dialogue was marked exhausted this session."""
+        out: set[str] = set()
+        for key in self._exhausted_dialogues:
+            # key format: "{global_npc}:{npc_id}:{link_id}"
+            parts = str(key).split(":")
+            if len(parts) >= 2 and parts[1]:
+                out.add(parts[1])
+        return out
+
+    def mark_npc_exhausted(
+        self,
+        npc_id: str,
+        *,
+        global_npc: int = 0,
+        link_id: str = "0",
+    ) -> None:
+        self._exhausted_dialogues.add(f"{global_npc}:{npc_id}:{link_id}")
+
     # ------------------------------------------------------------------
     # NPC discovery
     # ------------------------------------------------------------------

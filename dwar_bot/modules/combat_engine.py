@@ -422,6 +422,8 @@ class CombatEngine:
                         link_id=item.link_id,
                         object_class=item.object_class or "AREA",
                     )
+                    for line in resp.loot_lines()[:5]:
+                        logger.info("🎁 [%s] %s", item.name, line[:160])
                     # After the action, check if we entered a fight
                     if await self.is_in_battle():
                         self.session.battles_joined += 1
@@ -431,6 +433,10 @@ class CombatEngine:
                     err = str(resp.redirect_error or resp.error or "")
                     if err and err.lower() not in ("false", "none", ""):
                         logger.debug("area combat '%s': %s", item.name, err)
+                    elif resp.loot_lines():
+                        # Loot / quest tick without entering fight — still progress
+                        await asyncio.sleep(random.uniform(1.0, 2.0))
+                        return BattleResult.JOINED
                     await asyncio.sleep(random.uniform(1.0, 2.0))
 
             # Global arena NPC from hunt_conf (id 817 etc.)

@@ -48,6 +48,11 @@ from dwar_bot.modules.combat_engine import CombatEngine, BattleResult
 from dwar_bot.modules.quest_tracker import QuestTracker
 from dwar_bot.modules.timers_manager import TimersManager
 from dwar_bot.modules.bot_settings import BotSettings
+from dwar_bot.modules.progression_brain import (
+    ActionType,
+    GameOption,
+    ProgressionBrain,
+)
 from dwar_bot.config import COMBAT
 
 logger = logging.getLogger("dwar_bot.main")
@@ -72,6 +77,7 @@ class DwarBot:
         self.combat = CombatEngine(client, self.stats)
         self.quests = QuestTracker(client)
         self.timers = TimersManager(client)
+        self.brain = ProgressionBrain(self.settings)
 
         self._iteration = 0
         self._errors_in_row = 0
@@ -90,6 +96,8 @@ class DwarBot:
         self._prev_money: float = -1.0
         self._prev_area: str = ""
         self._hp_low_sent: bool = False
+        self._last_focus_key: str = ""
+        self._loot_claimed: int = 0
         self._apply_combat_thresholds()
 
     def bind_telegram(self, tg: TelegramBotHandler) -> None:
@@ -161,19 +169,63 @@ class DwarBot:
                 "farm_arena": f.farm_arena,
                 "farm_area": f.farm_area,
                 "auto_travel": f.auto_travel,
+                "auto_loot": f.auto_loot,
+                "max_farm": f.max_farm,
             },
+            "progress": self.brain.last.to_dict(),
+            "loot_claimed": self._loot_claimed,
             "settings": self.settings.to_dict(),
         }
 
     async def build_report(self) -> str:
-        if self._tg:
-            return await self._tg._build_report()
+        """Full progression-aware report for Telegram / heartbeat."""
         st = self.get_status()
-        return (
-            f"📈 Отчёт · {st.get('nick')} Lv{st.get('level')} · "
-            f"HP {st.get('hp')}/{st.get('hp_max')} · "
-            f"боёв {st.get('battles')} · диалогов {st.get('dialogues')}"
+        r = self.settings.report
+        parts = [
+            f"<b>📈 Отчёт DwarBot</b> · {time.strftime('%H:%M:%S')}",
+            f"🧙 <b>{st.get('nick','?')}</b> Lv{st.get('level','?')} · "
+            f"❤️ {st.get('hp','?')}/{st.get('hp_max','?')} · "
+            f"💰 {st.get('money','?')}",
+            f"📍 {st.get('area_title') or st.get('area_id','?')} · "
+            f"⏱ {st.get('uptime','?')} · тик {st.get('iteration',0)}",
+        ]
+        if r.include_plan:
+            parts.append("")
+            parts.append(self.brain.last.report_html())
+        if r.include_combat:
+            parts.append(
+                f"\n⚔️ Бои: {st.get('battles',0)} · "
+                f"🏆{st.get('wins',0)} / 💀{st.get('losses',0)} · "
+                f"WR {st.get('win_rate',0):.0f}%"
+            )
+        if r.include_quests:
+            parts.append(
+                f"📜 Квесты: ✅{st.get('quests_completed',0)} · "
+                f"📝{st.get('quests_accepted',0)} · "
+                f"💬{st.get('dialogues',0)}"
+            )
+        if r.include_inventory:
+            parts.append(
+                f"🎒 Предметов: {len(st.get('inventory') or [])} · "
+                f"🧪 {st.get('potions_count',0)} · "
+                f"🎁 лут-тиков: {self._loot_claimed}"
+            )
+        if r.include_timers:
+            timers = st.get("timers") or []
+            if timers:
+                tlines = ", ".join(
+                    f"{t.get('description','?')}: {t.get('remaining','?')}"
+                    for t in timers[:4]
+                )
+                parts.append(f"⏱ {tlines}")
+        f = self.settings.farm
+        parts.append(
+            f"🤖 Макс-фарм {self.settings.on_off(f.max_farm)} · "
+            f"Квесты {self.settings.on_off(f.auto_quests)} · "
+            f"Бои {self.settings.on_off(f.auto_combat)} · "
+            f"Лут {self.settings.on_off(f.auto_loot)}"
         )
+        return "\n".join(parts)
 
     async def pause(self) -> None:
         self._paused = True
@@ -348,7 +400,10 @@ class DwarBot:
                 await self.notify(f"✨ Эффекты: {titles}", "effects")
 
     async def _tick(self) -> None:
+        """Sense → plan → execute one progression action."""
         farm = self.settings.farm
+        self.brain.settings = self.settings  # keep toggles live
+
         self._profile = await self.stats.read_full_profile()
         self._char = self._profile.char
         self._state = self._profile.state
@@ -382,90 +437,301 @@ class DwarBot:
                 ", ".join(e.title for e in self._profile.effects[:4]),
             )
 
-        if farm.auto_repair and self._profile.broken_items:
-            repaired = await self.combat.repair_broken_gear(self._profile)
-            if repaired:
-                logger.info("Отремонтировано предметов: %d", repaired)
-                if self.settings.notify.gear:
-                    await self.notify(f"🔧 Отремонтировано: {repaired}", "gear")
-
-        if farm.auto_equip:
-            equipped = await self.combat.auto_equip(self._profile)
-            if equipped:
-                logger.info("Надето предметов: %d", equipped)
-                if self.settings.notify.gear:
-                    await self.notify(f"👕 Надето: {equipped}", "gear")
-
-        # Quests
-        if farm.auto_quests:
-            quest_actions = await self.quests.quest_tick()
-            if quest_actions:
-                logger.info("📜 Квестовых действий: %d", quest_actions)
-                await self.notify(
-                    f"📜 Квестовых действий: <b>{quest_actions}</b>",
-                    "quests",
-                )
-                await _sleep(2.0, 5.0)
-                return
-
-        # Combat
-        if farm.auto_combat:
-            # Temporarily narrow combat targets via engine flags on the instance
-            result = await self._combat_tick_filtered()
-            if result == BattleResult.JOINED:
-                logger.info("⚔️ Вступил в бой!")
-                await self.notify("⚔️ Вступил в бой!", "battles")
-                await _sleep(3.0, 6.0)
-                return
-            if result == BattleResult.ONGOING:
-                logger.info("⚔️ Бой продолжается …")
-                return
-            if result == BattleResult.FLED:
-                logger.info("🩹 Восстанавливаю здоровье …")
-                await self.notify("🩹 Восстановление HP…", "hp_low")
-                if farm.auto_heal:
-                    await self.timers.wait_for_hp(target_percent=70.0, max_wait=600)
-                return
-
-        # Area navigation
-        if farm.auto_travel:
-            moved = await self._try_area_progress()
-            if moved:
-                return
-
+        # World sense
         area = await self._client.get_area_info()
         if area.title:
             self._area_title = area.title
-            self._area_items = [
+        self._area_items = [
+            {
+                "name": i.name,
+                "item_type": i.item_type,
+                "code": i.code,
+                "npc_id": i.npc_id,
+                "area_id": i.area_id,
+                "action_id": i.action_id,
+            }
+            for i in area.items
+        ]
+
+        local_npcs = await self.quests.list_available_npcs()
+        story_npc = None
+        try:
+            story_npc = await self.quests.resolve_current_npc()
+        except Exception as exc:
+            logger.debug("resolve_current_npc: %s", exc)
+
+        hunt_npcs: list = []
+        try:
+            hunt = await self._client.get_hunt_conf()
+            hunt_npcs = hunt.get("npcs") or []
+            self._npcs = [
                 {
-                    "name": i.name,
-                    "item_type": i.item_type,
-                    "code": i.code,
-                    "npc_id": i.npc_id,
-                    "area_id": i.area_id,
+                    "title": n.get("title", ""),
+                    "time_left": n.get("time_left", 0),
+                    "npc_id": n.get("npc_id", ""),
+                    "url": n.get("url", ""),
                 }
-                for i in area.items
+                for n in hunt_npcs
             ]
+        except Exception:
+            pass
+
+        in_battle = False
+        try:
+            in_battle = await self.combat.is_in_battle()
+        except Exception:
+            pass
 
         event_timers = await self.timers.scrape_event_timers()
-        if event_timers:
-            self._npcs = [
-                {"title": t, "time_left": s, "npc_id": ""}
-                for t, s in event_timers.items()
-            ]
+        snap = self.brain.analyze(
+            profile=self._profile,
+            area=area,
+            npcs=self._npcs,
+            story_npc=story_npc,
+            local_npcs=local_npcs,
+            in_battle=in_battle,
+            event_timers=event_timers,
+            exhausted_npcs=self.quests.exhausted_npc_ids(),
+        )
 
-        active_cd = self.timers.active_cooldowns()
-        if active_cd:
+        focus = snap.focus
+        focus_key = (
+            f"{focus.action.value}:{focus.title}" if focus else "none"
+        )
+        logger.info(
+            "🧠 Сейчас: %s | сила=%.0f | вариантов=%d",
+            snap.now, snap.power_score, len(snap.options),
+        )
+        if focus:
             logger.info(
-                "⏱ Таймеры: %s",
-                ", ".join(
-                    f"{c.description or c.name} {c.format_remaining()}"
-                    for c in active_cd[:3]
-                ),
+                "👉 Выбрано: %s [%s] score=%.0f — %s",
+                focus.title, focus.action.value, focus.score, focus.detail,
             )
+            if snap.plan:
+                logger.info(
+                    "📋 План: %s",
+                    " → ".join(s.title for s in snap.plan[:4]),
+                )
 
-        logger.info("💤 Нет доступных действий — жду.")
-        await _sleep(8.0, 18.0)
+        # Notify on plan change (not every tick)
+        if focus_key != self._last_focus_key and focus and focus.action != ActionType.IDLE:
+            self._last_focus_key = focus_key
+            if self.settings.notify.plan:
+                await self.notify(
+                    f"🧠 <b>{focus.title}</b>\n"
+                    f"<i>{snap.now}</i>\n"
+                    f"Сила {snap.power_score:.0f}/100 · "
+                    f"вариантов {len(snap.options)}",
+                    "plan",
+                )
+        elif focus_key != self._last_focus_key:
+            self._last_focus_key = focus_key
+
+        if not focus:
+            logger.info("💤 Нет плана — жду.")
+            await _sleep(8.0, 18.0)
+            return
+
+        acted = await self._execute_focus(focus)
+        if not acted and focus.action != ActionType.IDLE:
+            # Soft fallback: try classic quest/combat once if planner action failed
+            if farm.auto_quests and focus.action == ActionType.QUEST_NPC:
+                logger.info("Квест-действие без прогресса — помечаю NPC исчерпанным.")
+            await _sleep(3.0, 7.0)
+        elif focus.action == ActionType.IDLE:
+            active_cd = self.timers.active_cooldowns()
+            if active_cd:
+                logger.info(
+                    "⏱ Таймеры: %s",
+                    ", ".join(
+                        f"{c.description or c.name} {c.format_remaining()}"
+                        for c in active_cd[:3]
+                    ),
+                )
+            await _sleep(8.0, 18.0)
+
+    async def _process_loot_response(self, resp, label: str = "") -> int:
+        """Log / notify bonus_text + artifact macros from an API response."""
+        if resp is None:
+            return 0
+        lines = []
+        try:
+            lines = resp.loot_lines()
+        except Exception:
+            for b in getattr(resp, "bonus_text", None) or []:
+                if b:
+                    lines.append(str(b))
+        if not lines:
+            return 0
+        self._loot_claimed += len(lines)
+        for line in lines[:6]:
+            logger.info("🎁 %s%s", f"[{label}] " if label else "", line[:160])
+        if self.settings.notify.loot:
+            preview = "\n".join(f"• {l[:120]}" for l in lines[:4])
+            await self.notify(
+                f"🎁 Награда{f' · {label}' if label else ''}:\n{preview}",
+                "loot",
+            )
+        return len(lines)
+
+    async def _execute_focus(self, focus: GameOption) -> bool:
+        """Run the single auto-selected action. Returns True if something useful happened."""
+        farm = self.settings.farm
+        action = focus.action
+        payload = focus.payload or {}
+
+        try:
+            # Already in a fight — just wait / observe
+            if "схватк" in (focus.detail or "") or (
+                action == ActionType.COMBAT_AREA and not payload.get("action_id")
+            ):
+                log = await self.combat.read_combat_log()
+                if log:
+                    logger.info("Combat log: %s", log[-1].text[:120])
+                await _sleep(1.5, 3.5)
+                return True
+
+            if action == ActionType.HEAL:
+                healed = await self.combat.heal_if_needed(self._profile)
+                return bool(healed)
+
+            if action == ActionType.WAIT_REGEN:
+                logger.info("🩹 Реген HP до безопасного порога…")
+                if farm.auto_heal:
+                    await self.notify("🩹 Восстановление HP…", "hp_low")
+                    await self.timers.wait_for_hp(target_percent=70.0, max_wait=600)
+                else:
+                    await _sleep(15.0, 40.0)
+                return True
+
+            if action == ActionType.REPAIR:
+                repaired = await self.combat.repair_broken_gear(self._profile)
+                if repaired:
+                    logger.info("Отремонтировано предметов: %d", repaired)
+                    if self.settings.notify.gear:
+                        await self.notify(f"🔧 Отремонтировано: {repaired}", "gear")
+                return repaired > 0
+
+            if action == ActionType.EQUIP:
+                equipped = await self.combat.auto_equip(self._profile)
+                if equipped:
+                    logger.info("Надето предметов: %d", equipped)
+                    if self.settings.notify.gear:
+                        await self.notify(f"👕 Надето: {equipped}", "gear")
+                return equipped > 0
+
+            if action == ActionType.QUEST_NPC:
+                npc_id = str(payload.get("npc_id") or "")
+                if not npc_id:
+                    return False
+                steps = await self.quests.walk_npc_api(
+                    npc_id,
+                    global_npc=int(payload.get("global_npc", 0) or 0),
+                    link_id=str(payload.get("link_id") or "0"),
+                    f_id=str(payload.get("f_id") or "0"),
+                    area_id=str(payload.get("area_id") or "0"),
+                )
+                if steps:
+                    logger.info("📜 Квестовых шагов: %d (NPC %s)", steps, npc_id)
+                    await self.notify(
+                        f"📜 Диалог с NPC {npc_id}: <b>{steps}</b> шаг(ов)",
+                        "quests",
+                    )
+                    await _sleep(2.0, 5.0)
+                    return True
+                self.quests.mark_npc_exhausted(
+                    npc_id,
+                    global_npc=int(payload.get("global_npc", 0) or 0),
+                    link_id=str(payload.get("link_id") or "0"),
+                )
+                logger.info(
+                    "NPC %s: диалог исчерпан / нужен прогресс квеста (бой/лут).",
+                    npc_id,
+                )
+                return False
+
+            if action in (ActionType.COMBAT_AREA, ActionType.AREA_ACTION):
+                name = str(payload.get("name") or "точка")
+                obj_id = str(payload.get("object_id") or self._state.area_id or "0")
+                act_id = str(payload.get("action_id") or "")
+                if not act_id:
+                    return False
+                logger.info("⚔️ Точка '%s' (action_id=%s)…", name, act_id)
+                resp = await self._client.run_area_action(
+                    object_id=obj_id,
+                    action_id=act_id,
+                    link_id=str(payload.get("link_id") or ""),
+                    object_class=str(payload.get("object_class") or "AREA"),
+                )
+                await self._process_loot_response(resp, label=name)
+                err = str(resp.redirect_error or resp.error or "")
+                if err and err.lower() not in ("false", "none", ""):
+                    logger.info("Точка '%s': %s", name, err[:160])
+                if await self.combat.is_in_battle():
+                    self.combat.session.battles_joined += 1
+                    self.combat.session.consecutive_battles += 1
+                    logger.info("⚔️ Бой начат через '%s'!", name)
+                    await self.notify(f"⚔️ Бой через <b>{name}</b>!", "battles")
+                    await _sleep(3.0, 6.0)
+                    return True
+                await _sleep(1.5, 3.5)
+                loot_ok = bool(resp.loot_lines())
+                return loot_ok or (not err) or resp.status > 0
+
+            if action == ActionType.COMBAT_ARENA:
+                result = await self.combat.try_arena()
+                if result == BattleResult.JOINED:
+                    await self.notify("⚔️ Арена: вступил в бой!", "battles")
+                    return True
+                if result == BattleResult.ONGOING:
+                    return True
+                return False
+
+            if action == ActionType.COMBAT_FRONT:
+                result = await self.combat.try_join_front()
+                if result == BattleResult.JOINED:
+                    await self.notify("⚔️ Фронт: вступил в бой!", "battles")
+                    return True
+                if result == BattleResult.ONGOING:
+                    return True
+                return False
+
+            if action == ActionType.TRAVEL:
+                area_id = str(payload.get("area_id") or "")
+                code = str(payload.get("code") or "COME_IN")
+                if not area_id:
+                    return False
+                logger.info("🗺 Переход → area %s…", area_id)
+                resp = await self._client.go_area(area_id, code=code)
+                await self._process_loot_response(resp, label=f"переход {area_id}")
+                err = str(resp.redirect_error or resp.error or "")
+                if err and err.lower() not in ("false", "none", ""):
+                    logger.info("Переход закрыт: %s", err[:160])
+                    return False
+                new_state = await self._client.get_state()
+                if new_state.area_id and new_state.area_id != self._state.area_id:
+                    logger.info("Перешёл в area %s.", new_state.area_id)
+                    self._area_moves_tried.clear()
+                    self.quests._exhausted_dialogues.clear()
+                    return True
+                return False
+
+            if action == ActionType.BUFF:
+                resp = await self._client.use_effect(show=True)
+                await self._process_loot_response(resp, label="эффект")
+                await _sleep(1.0, 2.0)
+                return True
+
+            if action == ActionType.IDLE:
+                return False
+
+        except TokenExpiredError:
+            raise
+        except Exception as exc:
+            log_exception(logger, f"execute_focus({action})", exc)
+            return False
+
+        return False
 
     async def _combat_tick_filtered(self) -> BattleResult:
         """Combat tick that respects farm_fronts / farm_arena / farm_area toggles."""
@@ -529,6 +795,7 @@ class DwarBot:
                     self._area_moves_tried.add(key)
                     logger.info("Пробую переход: %s → area %s", item.name, item.area_id)
                     resp = await self._client.go_area(item.area_id, code=item.code)
+                    await self._process_loot_response(resp, label=item.name)
                     err = str(resp.redirect_error or resp.error or "")
                     if err and err.lower() not in ("false", "none", ""):
                         logger.info("Переход закрыт: %s", err[:160])
@@ -552,6 +819,7 @@ class DwarBot:
                         link_id=item.link_id,
                         object_class=item.object_class or "AREA",
                     )
+                    await self._process_loot_response(resp, label=item.name)
                     err = str(resp.redirect_error or resp.error or "")
                     if err and err.lower() not in ("false", "none", ""):
                         logger.debug("area action '%s': %s", item.name, err)
