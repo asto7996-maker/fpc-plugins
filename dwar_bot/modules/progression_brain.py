@@ -551,14 +551,19 @@ class ProgressionBrain:
                     o.score += 100.0
                 elif o.action == ActionType.COMBAT_AREA and o.score > 100:
                     name = str((o.payload or {}).get("name") or "")
-                    if self.empty_streak(name) >= 1:
+                    if self.need_quest_unlock and self.empty_streak(name) < 2:
+                        # Расселина may spawn quest mob (Крэтс) for unlock
+                        o.score += 100.0
+                    elif self.empty_streak(name) >= 1:
                         o.score = min(o.score, 90.0)
                     else:
                         # Prefer leaving the village over empty hotspot spam
                         o.score = max(1.0, o.score - 80.0)
                 elif o.action == ActionType.QUEST_NPC:
-                    if self.need_quest_unlock:
-                        # Only path out of Чернаг — talk to Вождь
+                    if self.need_quest_unlock and not str(
+                        (o.payload or {}).get("global_npc", 0)
+                    ) in ("1",):
+                        # Only path out of Чернаг — talk to Вождь (local)
                         o.score += 200.0
                     else:
                         o.score = max(1.0, o.score - 250.0)

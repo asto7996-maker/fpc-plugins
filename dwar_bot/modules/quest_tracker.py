@@ -476,6 +476,31 @@ class QuestTracker:
                         "или другой триггер; мягкий бан диалога.",
                         child_id, to_point,
                     )
+                    # Quest "Проба сил" has target_id (e.g. Крэтс) — try ATTACK_BOT
+                    target_id = str(
+                        point.get("target_id")
+                        or (pt.get("point") or {}).get("target_id")
+                        or ""
+                    )
+                    if target_id and target_id not in ("0", ""):
+                        try:
+                            atk = await self._client.common_action(
+                                "ATTACK_BOT", {"bot_id": target_id}
+                            )
+                            err = str(atk.redirect_error or atk.error or "")
+                            logger.info(
+                                "ATTACK_BOT(%s) → status=%s %s",
+                                target_id, atk.status, err[:120],
+                            )
+                            if atk.redirect_url or (
+                                err and "напад" not in err.lower()
+                                and err.lower() not in ("false", "none", "")
+                            ):
+                                # Possible fight start — don't soft-ban yet
+                                await asyncio.sleep(random.uniform(1.0, 2.0))
+                                return max(1, steps)
+                        except Exception as exc:
+                            logger.debug("ATTACK_BOT: %s", exc)
                     self._answered_points.add(child_id)
                     # Soft-ban: keep trying later (travel unlock depends on this)
                     self._exhausted_dialogues.add(key)
