@@ -16,7 +16,14 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from database import Database  # noqa: E402
-from links import normalize_channel, parse_post_link, to_channel_chat_id  # noqa: E402
+from links import (  # noqa: E402
+    SAVED_MESSAGES,
+    format_channel_label,
+    is_saved_messages,
+    normalize_channel,
+    parse_post_link,
+    to_channel_chat_id,
+)
 from poster import _attach_caption, _is_unsupported_media  # noqa: E402
 from pyrogram.types import InputMediaPhoto  # noqa: E402
 from pyrogram import enums  # noqa: E402
@@ -136,6 +143,13 @@ class NormalizeChannelTests(unittest.TestCase):
         self.assertEqual(
             normalize_channel("t.me/c/35839961/12?single"), "-10035839961"
         )
+
+    def test_saved_messages(self) -> None:
+        for alias in ("избранное", "Избранное", "me", "ME", "saved", "saved_messages"):
+            self.assertEqual(normalize_channel(alias), SAVED_MESSAGES)
+            self.assertTrue(is_saved_messages(alias))
+        self.assertEqual(format_channel_label("me"), "⭐ Избранное")
+        self.assertEqual(format_channel_label("@ch"), "@ch")
 
     def test_db_setters_normalize(self) -> None:
         tmp = tempfile.TemporaryDirectory()

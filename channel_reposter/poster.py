@@ -39,7 +39,13 @@ from pyrogram.types import (
 
 import config
 from database import Database
-from links import normalize_channel, parse_post_link, to_channel_chat_id
+from links import (
+    SAVED_MESSAGES,
+    is_saved_messages,
+    normalize_channel,
+    parse_post_link,
+    to_channel_chat_id,
+)
 
 # Ошибки доступа к закрытому каналу — останавливаем цикл, не «прожигаем» progress
 _CHANNEL_ACCESS_ERRORS = (ChannelPrivate, ChannelInvalid, PeerIdInvalid)
@@ -114,12 +120,16 @@ class CycleResult:
 
 
 def _chat_ref(value: str | int) -> str | int:
-    """Нормализовать ссылку на канал: @username или int chat_id (-100…)."""
+    """Нормализовать ссылку: @username, int chat_id (-100…) или me (Избранное)."""
     if isinstance(value, int):
         return int(to_channel_chat_id(value))
+    if is_saved_messages(value):
+        return SAVED_MESSAGES
     raw = normalize_channel(value)
     if not raw:
         raise ValueError("Канал не задан")
+    if is_saved_messages(raw):
+        return SAVED_MESSAGES
     if raw.lstrip("-").isdigit():
         return int(raw)
     return raw
@@ -181,11 +191,16 @@ async def _resolve_chat(client: Client, value: str | int) -> int:
     """
     Вернуть числовой chat_id.
 
+    Для «избранное»/me — id самого аккаунта (Saved Messages).
     Для @username — ResolveUsername (access_hash в сессии).
     Для числового id закрытого канала (-100…) — resolve_peer / dialogs / get_chat.
     Юзербот должен уже состоять в закрытом канале.
     """
     ref = _chat_ref(value)
+    if ref == SAVED_MESSAGES or (isinstance(ref, str) and is_saved_messages(ref)):
+        me = await client.get_me()
+        return int(me.id)
+
     if isinstance(ref, int):
         return await _resolve_numeric_chat(client, ref)
 

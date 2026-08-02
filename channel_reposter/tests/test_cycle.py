@@ -357,6 +357,15 @@ class FailureTests(CycleTestCase):
         self.assertEqual(_chat_ref("-10035839961"), -10035839961)
         self.assertEqual(_chat_ref("10035839961"), -10035839961)
 
+    def test_publish_to_saved_messages(self) -> None:
+        """Назначение «избранное» — без админки, id = get_me()."""
+        self.db.set_target_channel("избранное")
+        self.assertEqual(self.db.get_settings().target_channel, "me")
+        client = FakeClient([text_message(1, "to saved")])
+        result, _ = self.run_cycle(client, limit=1)
+        self.assertEqual(result.published, 1)
+        self.assertEqual(client.published[0]["text"], "to saved")
+
 
 if __name__ == "__main__":
     unittest.main()

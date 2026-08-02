@@ -30,6 +30,50 @@ _RESERVED_USERNAMES = frozenset(
     {"c", "s", "joinchat", "addstickers", "share", "proxy", "socks", "iv"}
 )
 
+# Каноническое значение в БД / настройках для Saved Messages
+SAVED_MESSAGES = "me"
+
+# «избранное», me, saved… (после нормализации пробелов/подчёркиваний)
+_SAVED_ALIASES = frozenset(
+    {
+        "me",
+        "self",
+        "saved",
+        "savedmessages",
+        "savedmessage",
+        "избранное",
+        "избранные",
+        "избранноесообщения",
+        "избранныесообщения",
+        "избранноесообщение",
+    }
+)
+
+
+def _alias_key(raw: str) -> str:
+    return re.sub(r"[\s_\-]+", "", raw.strip().lower())
+
+
+def is_saved_messages(value: str | int | None) -> bool:
+    """True, если значение означает Избранное (Saved Messages)."""
+    if value is None or isinstance(value, int):
+        return False
+    raw = str(value).strip().lstrip("@")
+    if not raw:
+        return False
+    if raw.lower() in ("me", "self", SAVED_MESSAGES):
+        return True
+    return _alias_key(raw) in _SAVED_ALIASES
+
+
+def format_channel_label(value: str | int | None) -> str:
+    """Человекочитаемая подпись канала для статуса/ответов."""
+    if value is None or value == "":
+        return "—"
+    if is_saved_messages(value):
+        return "⭐ Избранное"
+    return str(value)
+
 
 def to_channel_chat_id(value: str | int) -> str:
     """
@@ -67,6 +111,7 @@ def normalize_channel(value: str | int | None) -> str:
       → @name
       35839961 / https://t.me/c/35839961 → -10035839961
       -10035839961 → -10035839961
+      избранное / me / saved → me
     """
     if value is None:
         return ""
@@ -76,6 +121,9 @@ def normalize_channel(value: str | int | None) -> str:
     raw = str(value).strip()
     if not raw:
         return ""
+
+    if is_saved_messages(raw):
+        return SAVED_MESSAGES
 
     # Числовой id канала/чата (в т.ч. короткий id закрытого канала)
     if raw.lstrip("-").isdigit():
@@ -103,7 +151,7 @@ def normalize_channel(value: str | int | None) -> str:
 
     raise ValueError(
         "Не удалось распознать канал. Ожидается @username, числовой id "
-        "(например 35839961) или https://t.me/c/35839961"
+        "(например 35839961), https://t.me/c/35839961 или «избранное»/me"
     )
 
 

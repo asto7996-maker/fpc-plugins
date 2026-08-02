@@ -221,9 +221,19 @@ class FakeClient:
     async def delete_messages(self, chat_id, message_ids):
         return True
 
+    async def get_me(self):
+        class _User:
+            id = 424242
+            username = "test_user"
+            first_name = "Test"
+
+        return _User()
+
     async def get_chat(self, chat_id):
         if self.resolve_fail is not None:
             raise self.resolve_fail
+        if chat_id in ("me", "self"):
+            return make_chat(424242)
         return make_chat(int(chat_id) if str(chat_id).lstrip("-").isdigit() else SOURCE_ID)
 
     async def resolve_peer(self, peer_id):
