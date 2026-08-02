@@ -499,6 +499,10 @@ class DwarBot:
         in_battle = bool(self._state.flags & 0x1) or bool(self._state.fight_id)
 
         event_timers = await self.timers.scrape_event_timers(hunt=hunt)
+        # Newbie with empty bag stuck on village loops → force farm/travel priority
+        if not self._profile.inventory and not self.brain.farm_push_active():
+            if self._iteration <= 3 or self.brain.empty_streak("Расселина") >= 1:
+                self.brain.push_farm(600.0)
         snap = self.brain.analyze(
             profile=self._profile,
             area=area,
@@ -588,22 +592,30 @@ class DwarBot:
             await _sleep(8.0, 18.0)
 
     async def _local_recover_stagnation(self, focus_key: str) -> bool:
-        """Gameplay recovery without Cursor — clear exhausted NPCs, skip CD spam."""
-        logger.warning("Local recover for stagnation: %s", focus_key)
-        cleared = self.quests.clear_exhausted(local_only=True)
-        self.brain._stale.clear()
-        # Don't hammer Rasselina — put a short CD even if server dtime is 0
+        """Break stuck loops → farm/travel. Do NOT re-enable failed quest NPCs."""
+        logger.warning("Local recover for stagnation: %s → farm push", focus_key)
+        self.brain.push_farm(600.0)
+        # Long CD on empty village hotspot so we stop clicking it
         if "расселин" in focus_key.lower() or "combat_area" in focus_key.lower():
-            self.brain.mark_cooldown("Расселина", 45)
-        if cleared:
-            logger.info("Re-enabled %d local NPC dialogues.", cleared)
-            return True
-        # Try travel once
+            self.brain.mark_cooldown("Расселина", 180)
+        # Prefer real farm paths over reopening Вождь Торгор
+        if self.settings.farm.farm_fronts and self.settings.farm.auto_combat:
+            result = await self.combat.try_join_front()
+            if result in (BattleResult.JOINED, BattleResult.ONGOING):
+                logger.info("Local recover: joined front.")
+                return True
         if self.settings.farm.auto_travel:
             moved = await self._try_area_progress()
             if moved:
+                logger.info("Local recover: travelled to new area.")
                 return True
-        return False
+        if self.settings.farm.farm_area and self.settings.farm.auto_combat:
+            result = await self.combat.try_area_combat()
+            if result == BattleResult.JOINED:
+                return True
+        # Last resort: soft-clear only GLOBAL event NPCs, never local story
+        # (local type=2 failures stay exhausted)
+        return self.brain.farm_push_active()
 
     async def _process_loot_response(self, resp, label: str = "") -> int:
         """Log / notify bonus_text + artifact macros from an API response."""
@@ -739,10 +751,13 @@ class DwarBot:
                     await self.notify(f"⚔️ Бой через <b>{name}</b>!", "battles")
                     await _sleep(3.0, 6.0)
                     return True
-                # Empty / flavor-only → honor cooldown so we don't spam
+                # Empty / flavor-only → escalate CD (stop Расселина spam)
                 if loot_n <= 0:
-                    cd = max(int(payload.get("ltime") or 0), 30)
+                    streak = self.brain.empty_streak(name) + 1  # note_result runs after
+                    base = max(int(payload.get("ltime") or 0), int(payload.get("dtime") or 0), 90)
+                    cd = min(600, base * max(1, streak))
                     self.brain.mark_cooldown(name, cd)
+                    self.brain.push_farm(300.0)
                     # Also try action_run.php once (Flash client path)
                     link_href = str(payload.get("link_href") or "")
                     if link_href and "action_run.php" in link_href:
@@ -751,16 +766,34 @@ class DwarBot:
                             logger.debug("action_run.php → %s len=%d", ar.status_code, len(ar.text or ""))
                         except Exception:
                             pass
+                    # Immediately try travel/front instead of waiting next tick
+                    if streak >= 2 and self.settings.farm.auto_travel:
+                        moved = await self._try_area_progress()
+                        if moved:
+                            return True
+                    if streak >= 2 and self.settings.farm.farm_fronts:
+                        fr = await self.combat.try_join_front()
+                        if fr == BattleResult.JOINED:
+                            await self.notify("⚔️ Фронт после пустой точки!", "battles")
+                            return True
                 await _sleep(1.5, 3.5)
                 return loot_n > 0
 
             if action == ActionType.COMBAT_ARENA:
+                time_left = int(payload.get("time_left") or 0)
+                if time_left > 90:
+                    logger.info("Арена на КД (%dс) — пропускаю, иду в фарм.", time_left)
+                    self.brain.push_farm(300.0)
+                    return False
                 result = await self.combat.try_arena()
                 if result == BattleResult.JOINED:
                     await self.notify("⚔️ Арена: вступил в бой!", "battles")
                     return True
                 if result == BattleResult.ONGOING:
                     return True
+                # Failed join → don't retry for a while
+                self.brain.mark_cooldown(focus.title, 120)
+                self.brain.push_farm(300.0)
                 return False
 
             if action == ActionType.COMBAT_FRONT:
@@ -775,20 +808,24 @@ class DwarBot:
             if action == ActionType.TRAVEL:
                 area_id = str(payload.get("area_id") or "")
                 code = str(payload.get("code") or "COME_IN")
+                name = str(payload.get("name") or area_id)
                 if not area_id:
                     return False
-                logger.info("🗺 Переход → area %s…", area_id)
+                logger.info("🗺 Переход '%s' → area %s…", name, area_id)
                 resp = await self._client.go_area(area_id, code=code)
-                await self._process_loot_response(resp, label=f"переход {area_id}")
+                await self._process_loot_response(resp, label=f"переход {name}")
                 err = str(resp.redirect_error or resp.error or "")
                 if err and err.lower() not in ("false", "none", ""):
                     logger.info("Переход закрыт: %s", err[:160])
+                    # Don't spam the same gated exit
+                    self.brain.mark_cooldown(f"Переход: {name}", 180)
                     return False
                 new_state = await self._client.get_state()
                 if new_state.area_id and new_state.area_id != self._state.area_id:
-                    logger.info("Перешёл в area %s.", new_state.area_id)
+                    logger.info("Перешёл в area %s (%s).", new_state.area_id, name)
                     self._area_moves_tried.clear()
-                    self.quests._exhausted_dialogues.clear()
+                    # Keep local quest exhaustion — only clear after real move success
+                    # for GLOBAL event keys; local story stays exhausted until TTL
                     return True
                 return False
 

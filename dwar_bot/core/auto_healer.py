@@ -22,7 +22,7 @@ NotifyFn = Callable[[str], Awaitable[None]]
 
 # Don't spam healer more often than this globally
 GLOBAL_HEAL_COOLDOWN_SEC = 120
-STAGNATION_TICKS = 5          # same focus with no progress
+STAGNATION_TICKS = 4          # consecutive no-progress ticks (any focus)
 STAGNATION_HEAL_COOLDOWN = 600
 
 
@@ -70,11 +70,8 @@ class AutoHealer:
         ))
 
     async def note_progress(self, focus_key: str, progressed: bool) -> None:
-        """Track stagnation; trigger heal when bot loops without progress."""
-        if focus_key != self._last_focus_key:
-            self._last_focus_key = focus_key
-            self._stagnation_count = 0
-            return
+        """Track stagnation across focus switches (A↔B empty loops count too)."""
+        self._last_focus_key = focus_key
         if progressed:
             self._stagnation_count = 0
             return
@@ -87,14 +84,14 @@ class AutoHealer:
         self._last_stagnation_heal = now
         self._stagnation_count = 0
 
-        # Prefer local recovery first (clear exhausted NPCs, skip CD hotspots…)
+        # Prefer local recovery: farm push / travel / fronts (not re-open quests)
         if self.on_local_recover:
             try:
                 fixed = await self.on_local_recover(focus_key)
                 if fixed:
                     await self._notify(
-                        f"🛠 <b>AutoHealer (локально):</b> снял стагнацию "
-                        f"<code>{focus_key}</code> без Cursor."
+                        f"🛠 <b>AutoHealer (локально):</b> ухожу в фарм "
+                        f"(было <code>{focus_key}</code>)."
                     )
                     return
             except Exception as exc:

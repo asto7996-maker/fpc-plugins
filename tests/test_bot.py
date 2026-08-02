@@ -31,6 +31,16 @@ def test_progression_brain_importable():
     brain = ProgressionBrain(BotSettings())
     assert brain.last is not None
     assert ActionType.IDLE.value == "idle"
+    brain.push_farm(60)
+    assert brain.farm_push_active()
+    # Escalating empty farm should demote hotspot and prefer travel
+    from dwar_bot.modules.progression_brain import GameOption, GoalKind
+    opt = GameOption(ActionType.COMBAT_AREA, "Точка: Расселина", score=795, goal=GoalKind.COMBAT)
+    brain.note_result(opt, progressed=False)
+    brain.note_result(opt, progressed=False)
+    assert brain.empty_streak("Расселина") >= 2
+    assert brain.farm_push_active()
+    assert brain._stale_penalty(opt) >= 200
 
 
 def test_main_module_syntax():

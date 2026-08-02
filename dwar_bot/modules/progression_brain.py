@@ -173,6 +173,11 @@ class ProgressionBrain:
     Call ``analyze()`` every tick with fresh world data.
     """
 
+    # Arena / event NPCs with long timers are not farm — skip until ready
+    ARENA_READY_SEC = 90
+    # After this many empty hotspot clicks, prefer travel/fronts hard
+    EMPTY_FARM_ESCALATE = 2
+
     def __init__(self, settings: BotSettings) -> None:
         self.settings = settings
         self.last = ProgressSnapshot()
@@ -182,15 +187,34 @@ class ProgressionBrain:
         self._stale: dict[str, int] = {}
         # hotspot name → unix ts when usable again (client-side CD)
         self._cooldowns: dict[str, float] = {}
+        # Farm-first mode until a fight/loot succeeds (stuck newbie village)
+        self.farm_push_until: float = 0.0
 
     def mark_cooldown(self, name: str, seconds: float) -> None:
         if seconds <= 0:
             return
-        self._cooldowns[name] = time.time() + float(seconds)
+        until = time.time() + float(seconds)
+        prev = self._cooldowns.get(name, 0)
+        self._cooldowns[name] = max(prev, until)
         logger.info("Brain CD: '%s' for %.0fs", name, seconds)
 
     def clear_cooldowns(self) -> None:
         self._cooldowns.clear()
+
+    def push_farm(self, seconds: float = 600.0) -> None:
+        """Temporarily prefer travel/fronts/hotspots over stuck quests."""
+        self.farm_push_until = max(self.farm_push_until, time.time() + seconds)
+        logger.info("Brain: farm-push ON for %.0fs", seconds)
+
+    def farm_push_active(self) -> bool:
+        return time.time() < self.farm_push_until
+
+    def empty_streak(self, name: str) -> int:
+        """How many consecutive empty results for a combat hotspot title."""
+        return max(
+            self._stale.get(f"{ActionType.COMBAT_AREA.value}:Точка: {name}", 0),
+            self._stale.get(f"{ActionType.AREA_ACTION.value}:Точка: {name}", 0),
+        )
 
     def note_result(self, option: Optional[GameOption], *, progressed: bool) -> None:
         """Feed back whether the chosen action produced progress (loot/fight/dialog)."""
@@ -199,15 +223,27 @@ class ProgressionBrain:
         key = f"{option.action.value}:{option.title}"
         if progressed:
             self._stale.pop(key, None)
+            if option.action in (
+                ActionType.COMBAT_AREA, ActionType.COMBAT_FRONT,
+                ActionType.COMBAT_ARENA, ActionType.TRAVEL,
+            ):
+                self.farm_push_until = 0.0
         else:
             self._stale[key] = self._stale.get(key, 0) + 1
+            if option.action in (ActionType.COMBAT_AREA, ActionType.AREA_ACTION):
+                if self._stale[key] >= self.EMPTY_FARM_ESCALATE:
+                    self.push_farm(480.0)
 
     def _stale_penalty(self, option: GameOption) -> float:
         key = f"{option.action.value}:{option.title}"
         n = self._stale.get(key, 0)
         if n <= 0:
             return 0.0
-        # After a few empty hotspot ticks, prefer other goals (NPC / travel / fronts)
+        # Empty hotspots / failed arena drop fast so travel/fronts win
+        if option.action in (ActionType.COMBAT_AREA, ActionType.AREA_ACTION, ActionType.COMBAT_ARENA):
+            return min(700.0, 120.0 * n)
+        if option.action == ActionType.QUEST_NPC:
+            return min(500.0, 100.0 * n)
         return min(350.0, 80.0 * n)
 
     # ------------------------------------------------------------------
@@ -355,13 +391,32 @@ class ProgressionBrain:
                 continue
 
             if item.code == "COME_IN" and item.area_id and farm.auto_travel:
-                # Travel is often gated — try occasionally, prefer when max_farm
+                travel_title = f"Переход: {name}"
+                cd_until = self._cooldowns.get(travel_title, 0)
+                if cd_until and time.time() < cd_until:
+                    left = max(0, int(cd_until - time.time()))
+                    options.append(GameOption(
+                        ActionType.IDLE,
+                        f"КД: {travel_title}",
+                        score=5,
+                        detail=f"через {left}с",
+                        goal=GoalKind.IDLE,
+                    ))
+                    continue
+                # Travel wins when local farm is empty / farm-push active
+                score = 450 if max_farm else 400
+                if self.farm_push_active() or empty_bag:
+                    score = 680 if max_farm else 620
+                # Prefer named farm exits (Дымные сопки и т.п.)
+                low = name.lower()
+                if any(kw in low for kw in ("сопк", "дымн", "охот", "лес", "поле", "дорог")):
+                    score += 40
                 options.append(GameOption(
                     ActionType.TRAVEL,
-                    f"Переход: {name}",
-                    score=450 if max_farm else 400,
+                    travel_title,
+                    score=score,
                     detail=f"→ area {item.area_id}",
-                    payload={"area_id": item.area_id, "code": item.code},
+                    payload={"area_id": item.area_id, "code": item.code, "name": name},
                     goal=GoalKind.TRAVEL,
                 ))
                 continue
@@ -384,6 +439,7 @@ class ProgressionBrain:
                     kw in name.lower()
                     for kw in ("расселин", "охот", "пещер", "тренир", "бой", "арена", "логово")
                 )
+                streak = self.empty_streak(name)
                 # Empty bag → loot/farm points outrank stuck dialogues
                 if empty_bag and farm.auto_loot:
                     score = 795 if combatish else 740
@@ -391,6 +447,9 @@ class ProgressionBrain:
                     score = 720 if max_farm else 700
                 else:
                     score = 580 if farm.auto_loot else 550
+                # After repeated empties, stop picking this hotspot
+                if streak >= self.EMPTY_FARM_ESCALATE:
+                    score = 80
                 options.append(GameOption(
                     ActionType.COMBAT_AREA if combatish else ActionType.AREA_ACTION,
                     f"Точка: {name}",
@@ -415,21 +474,41 @@ class ProgressionBrain:
         if farm.auto_combat and farm.farm_arena:
             for n in npcs or []:
                 title = str(n.get("title", ""))
-                if "арен" in title.lower():
+                if "арен" not in title.lower():
+                    continue
+                time_left = int(n.get("time_left", 0) or 0)
+                if time_left > self.ARENA_READY_SEC:
+                    # Do NOT select arena with 40–50 min CD — that was the stuck loop
                     options.append(GameOption(
-                        ActionType.COMBAT_ARENA,
-                        f"Арена: {title}",
-                        score=500 if max_farm else 480,
-                        detail=f"⏱{n.get('time_left', 0)}с",
-                        payload={"npc_id": n.get("npc_id"), "url": n.get("url", "")},
-                        goal=GoalKind.EVENT,
+                        ActionType.IDLE,
+                        f"КД арены: {title}",
+                        score=5,
+                        detail=f"⏱{time_left}с",
+                        payload={"npc_id": n.get("npc_id"), "time_left": time_left},
+                        goal=GoalKind.IDLE,
                     ))
+                    continue
+                options.append(GameOption(
+                    ActionType.COMBAT_ARENA,
+                    f"Арена: {title}",
+                    score=500 if max_farm else 480,
+                    detail=f"⏱{time_left}с",
+                    payload={
+                        "npc_id": n.get("npc_id"),
+                        "url": n.get("url", ""),
+                        "time_left": time_left,
+                    },
+                    goal=GoalKind.EVENT,
+                ))
 
         if farm.auto_combat and farm.farm_fronts:
+            front_score = 440 if max_farm else 420
+            if self.farm_push_active() or empty_bag:
+                front_score = 660 if max_farm else 600
             options.append(GameOption(
                 ActionType.COMBAT_FRONT,
                 "Искать фронт / PvP",
-                score=440 if max_farm else 420,
+                score=front_score,
                 detail="front|locations",
                 goal=GoalKind.COMBAT,
             ))
@@ -456,15 +535,24 @@ class ProgressionBrain:
         options = self._filter_by_settings(options)
         for o in options:
             o.score = max(1.0, o.score - self._stale_penalty(o))
-        # Periodic quest nudge: every 4th stale hotspot cycle, boost story NPC
-        if any(self._stale.get(k, 0) >= 2 for k in self._stale):
+
+        # When something is stale / farm-push: boost farm paths, demote stuck quests
+        farm_mode = self.farm_push_active() or any(
+            v >= self.EMPTY_FARM_ESCALATE for v in self._stale.values()
+        )
+        if farm_mode:
             for o in options:
                 if o.action == ActionType.QUEST_NPC:
-                    o.score += 40
+                    o.score = max(1.0, o.score - 250.0)
+                elif o.action in (ActionType.TRAVEL, ActionType.COMBAT_FRONT):
+                    o.score += 80.0
+                elif o.action == ActionType.COMBAT_AREA and o.score > 100:
+                    o.score += 30.0
+
         options.sort(key=lambda o: -o.score)
         focus = options[0] if options else None
 
-        plan = self._build_plan(profile, area, bottlenecks, focus)
+        plan = self._build_plan(profile, area, bottlenecks, focus, farm_mode=farm_mode)
         now = self._describe_now(char, state, area, focus, in_battle)
 
         snap = ProgressSnapshot(
@@ -559,15 +647,23 @@ class ProgressionBrain:
         area: AreaInfo,
         bottlenecks: list[str],
         focus: Optional[GameOption],
+        *,
+        farm_mode: bool = False,
     ) -> list[PlanStep]:
         steps: list[PlanStep] = []
         if focus and focus.goal == GoalKind.SURVIVE:
             steps.append(PlanStep(GoalKind.SURVIVE, "Восстановить HP", "иначе смерть / простой"))
-        steps.append(PlanStep(GoalKind.QUEST, "Закрыть диалоги Вождя / сюжет", "открывает переходы и бои"))
-        steps.append(PlanStep(GoalKind.COMBAT, "Фарм точки Расселина / мобы", "XP + лут + прогресс «Проба сил»"))
-        steps.append(PlanStep(GoalKind.GEAR, "Надеть и чинить добычу", "сила растёт от экипа"))
-        steps.append(PlanStep(GoalKind.TRAVEL, "Выйти в Дымные сопки", "когда военачальник разрешит"))
-        steps.append(PlanStep(GoalKind.EVENT, "Арена / ивенты", "доп. награды и опыт"))
+        if farm_mode or self.farm_push_active():
+            steps.append(PlanStep(GoalKind.COMBAT, "Фарм: точки / фронты / переходы", "сюжет застрял — качаемся"))
+            steps.append(PlanStep(GoalKind.TRAVEL, "Сменить локацию для фарма", "пустая Расселина / закрытый квест"))
+            steps.append(PlanStep(GoalKind.GEAR, "Надеть и чинить добычу", "сила растёт от экипа"))
+            steps.append(PlanStep(GoalKind.QUEST, "Вернуться к сюжету позже", "когда появится прогресс"))
+        else:
+            steps.append(PlanStep(GoalKind.QUEST, "Закрыть диалоги Вождя / сюжет", "открывает переходы и бои"))
+            steps.append(PlanStep(GoalKind.COMBAT, "Фарм точки Расселина / мобы", "XP + лут + прогресс «Проба сил»"))
+            steps.append(PlanStep(GoalKind.GEAR, "Надеть и чинить добычу", "сила растёт от экипа"))
+            steps.append(PlanStep(GoalKind.TRAVEL, "Выйти в Дымные сопки", "когда военачальник разрешит"))
+        steps.append(PlanStep(GoalKind.EVENT, "Арена / ивенты", "только когда таймер готов"))
         steps.append(PlanStep(GoalKind.COMBAT, "Фарм уровней и золота", "максимальный рост персонажа"))
         return steps
 
