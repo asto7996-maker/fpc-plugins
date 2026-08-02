@@ -351,7 +351,12 @@ class DwarBot:
 
             if not _shutdown_event.is_set():
                 await _sleep(DELAY_MAIN_LOOP.min, DELAY_MAIN_LOOP.max)
-                if self.settings.farm.idle_pauses and random.random() < IDLE_PAUSE_PROBABILITY:
+                # No long idle while pushing farm / leaving the village
+                if (
+                    self.settings.farm.idle_pauses
+                    and not self.brain.farm_push_active()
+                    and random.random() < IDLE_PAUSE_PROBABILITY
+                ):
                     s = random.uniform(DELAY_IDLE.min, DELAY_IDLE.max)
                     logger.info("Idle pause: %.0fs.", s)
                     await asyncio.sleep(s)
@@ -803,6 +808,8 @@ class DwarBot:
                     return True
                 if result == BattleResult.ONGOING:
                     return True
+                logger.info("Фронтов нет — продолжаю фарм/квест разблокировки.")
+                self.brain.push_farm(300.0)
                 return False
 
             if action == ActionType.TRAVEL:
@@ -818,14 +825,23 @@ class DwarBot:
                 if err and err.lower() not in ("false", "none", ""):
                     logger.info("Переход закрыт: %s", err[:160])
                     # Don't spam the same gated exit
-                    self.brain.mark_cooldown(f"Переход: {name}", 180)
+                    self.brain.mark_cooldown(f"Переход: {name}", 300)
+                    if "военачальник" in err.lower() or "покинуть селение" in err.lower():
+                        self.brain.need_quest_unlock = True
+                        self.brain.push_farm(600.0)
+                        # Re-enable Вождь so we can unlock the exit
+                        cleared = self.quests.clear_exhausted(local_only=True)
+                        logger.info(
+                            "Нужен приказ военачальника — возвращаюсь к квесту "
+                            "(снято exhausted: %d).",
+                            cleared,
+                        )
                     return False
                 new_state = await self._client.get_state()
                 if new_state.area_id and new_state.area_id != self._state.area_id:
                     logger.info("Перешёл в area %s (%s).", new_state.area_id, name)
                     self._area_moves_tried.clear()
-                    # Keep local quest exhaustion — only clear after real move success
-                    # for GLOBAL event keys; local story stays exhausted until TTL
+                    self.brain.need_quest_unlock = False
                     return True
                 return False
 
@@ -922,8 +938,10 @@ class DwarBot:
                         self._area_moves_tried.clear()
                         return True
 
-                # Hotspot actions (non-npc)
+                # Hotspot actions (non-npc) — only count real loot / fight
                 if item.action_id and item.item_type in ("action", "area", ""):
+                    if item.on_cooldown:
+                        continue
                     self._area_moves_tried.add(key)
                     logger.info("Пробую действие локации: %s", item.name)
                     resp = await self._client.run_area_action(
@@ -932,14 +950,17 @@ class DwarBot:
                         link_id=item.link_id,
                         object_class=item.object_class or "AREA",
                     )
-                    await self._process_loot_response(resp, label=item.name)
+                    loot_n = await self._process_loot_response(resp, label=item.name)
+                    if await self.combat.is_in_battle() or loot_n > 0:
+                        logger.info("Действие '%s' дало прогресс.", item.name)
+                        await _sleep(2.0, 4.0)
+                        return True
                     err = str(resp.redirect_error or resp.error or "")
                     if err and err.lower() not in ("false", "none", ""):
                         logger.debug("area action '%s': %s", item.name, err)
                     else:
-                        logger.info("Действие '%s' выполнено.", item.name)
-                        await _sleep(2.0, 4.0)
-                        return True
+                        logger.info("Действие '%s' пустое — не считаю прогрессом.", item.name)
+                        self.brain.mark_cooldown(item.name or "точка", 120)
 
         except TokenExpiredError:
             raise

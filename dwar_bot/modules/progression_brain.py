@@ -189,6 +189,8 @@ class ProgressionBrain:
         self._cooldowns: dict[str, float] = {}
         # Farm-first mode until a fight/loot succeeds (stuck newbie village)
         self.farm_push_until: float = 0.0
+        # Travel blocked by war chief → must advance local quest NPC
+        self.need_quest_unlock: bool = False
 
     def mark_cooldown(self, name: str, seconds: float) -> None:
         if seconds <= 0:
@@ -536,18 +538,30 @@ class ProgressionBrain:
         for o in options:
             o.score = max(1.0, o.score - self._stale_penalty(o))
 
-        # When something is stale / farm-push: boost farm paths, demote stuck quests
+        # Farm-push: leave village / find fights. Prefer travel→fronts; only
+        # re-boost local quests when the war chief gates the exit.
         farm_mode = self.farm_push_active() or any(
             v >= self.EMPTY_FARM_ESCALATE for v in self._stale.values()
         )
         if farm_mode:
             for o in options:
-                if o.action == ActionType.QUEST_NPC:
-                    o.score = max(1.0, o.score - 250.0)
-                elif o.action in (ActionType.TRAVEL, ActionType.COMBAT_FRONT):
-                    o.score += 80.0
+                if o.action == ActionType.TRAVEL:
+                    o.score += 150.0
+                elif o.action == ActionType.COMBAT_FRONT:
+                    o.score += 100.0
                 elif o.action == ActionType.COMBAT_AREA and o.score > 100:
-                    o.score += 30.0
+                    name = str((o.payload or {}).get("name") or "")
+                    if self.empty_streak(name) >= 1:
+                        o.score = min(o.score, 90.0)
+                    else:
+                        # Prefer leaving the village over empty hotspot spam
+                        o.score = max(1.0, o.score - 80.0)
+                elif o.action == ActionType.QUEST_NPC:
+                    if self.need_quest_unlock:
+                        # Only path out of Чернаг — talk to Вождь
+                        o.score += 200.0
+                    else:
+                        o.score = max(1.0, o.score - 250.0)
 
         options.sort(key=lambda o: -o.score)
         focus = options[0] if options else None

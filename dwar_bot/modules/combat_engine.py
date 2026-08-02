@@ -107,10 +107,10 @@ class CombatEngine:
         try:
             fronts = await self._client.get_front_locations()
             if not fronts:
-                logger.debug("No active fronts available.")
+                logger.info("Активных фронтов нет.")
                 return BattleResult.NO_BATTLE
 
-            logger.info("Found %d active front(s).", len(fronts))
+            logger.info("Найдено фронтов: %d.", len(fronts))
             for front in fronts:
                 area_id = str(front.get("area_id", "") or front.get("id", ""))
                 title = front.get("title", front.get("name", "?"))

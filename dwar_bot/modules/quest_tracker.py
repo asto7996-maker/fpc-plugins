@@ -19,6 +19,7 @@ import asyncio
 import logging
 import random
 import re
+import time
 import urllib.parse
 from dataclasses import dataclass, field
 from enum import Enum, auto
@@ -110,6 +111,8 @@ class QuestTracker:
         self._exhausted_dialogues: set[str] = set()
         self._last_quest_signature: str = ""
         self._answered_points: set[str] = set()
+        # key → unix ts; soft-banned dialogues become available again
+        self._soft_ban_until: dict[str, float] = {}
 
     def _reset_exhausted_if_quests_changed(self, quests: list[Quest]) -> None:
         sig = "|".join(sorted(f"{q.quest_id}:{q.status.name}" for q in quests))
@@ -120,8 +123,21 @@ class QuestTracker:
             self._visited_npcs.clear()
             self._last_quest_signature = sig
 
+    def _purge_expired_soft_bans(self) -> None:
+        now = time.time()
+        expired = [k for k, until in self._soft_ban_until.items() if until <= now]
+        for k in expired:
+            self._soft_ban_until.pop(k, None)
+            self._exhausted_dialogues.discard(k)
+            # Allow retrying the type=2 message after soft ban
+            parts = str(k).split(":")
+            if len(parts) >= 2:
+                # answered point ids are global across NPCs — clear all to retry
+                self._answered_points.clear()
+
     def exhausted_npc_ids(self) -> set[str]:
         """NPC ids whose dialogue was marked exhausted this session."""
+        self._purge_expired_soft_bans()
         out: set[str] = set()
         for key in self._exhausted_dialogues:
             # key format: "{global_npc}:{npc_id}:{link_id}"
@@ -137,7 +153,10 @@ class QuestTracker:
         global_npc: int = 0,
         link_id: str = "0",
     ) -> None:
-        self._exhausted_dialogues.add(f"{global_npc}:{npc_id}:{link_id}")
+        key = f"{global_npc}:{npc_id}:{link_id}"
+        self._exhausted_dialogues.add(key)
+        # Default soft ban so farm unlock can retry
+        self._soft_ban_until.setdefault(key, time.time() + 180.0)
 
     def clear_exhausted(self, *, local_only: bool = False) -> int:
         """Re-enable NPC dialogues. Returns how many keys were cleared."""
@@ -145,10 +164,14 @@ class QuestTracker:
             n = len(self._exhausted_dialogues)
             self._exhausted_dialogues.clear()
             self._answered_points.clear()
+            self._soft_ban_until.clear()
             return n
         keep = {k for k in self._exhausted_dialogues if str(k).startswith("1:")}
         n = len(self._exhausted_dialogues) - len(keep)
         self._exhausted_dialogues = keep
+        self._soft_ban_until = {
+            k: v for k, v in self._soft_ban_until.items() if k in keep
+        }
         # Allow local message answers again
         self._answered_points.clear()
         return n
@@ -314,6 +337,7 @@ class QuestTracker:
         """
         steps = 0
         key = f"{global_npc}:{npc_id}:{link_id}"
+        self._purge_expired_soft_bans()
         if key in self._exhausted_dialogues:
             return 0
 
@@ -448,11 +472,14 @@ class QuestTracker:
                 else:
                     # Opening to_point often returns empty done=true — not real progress
                     logger.info(
-                        "Ответ type=2 отклонён (msg %s → %s) — нужен другой триггер квеста.",
+                        "Ответ type=2 отклонён (msg %s → %s) — нужен бой/лут "
+                        "или другой триггер; мягкий бан диалога.",
                         child_id, to_point,
                     )
                     self._answered_points.add(child_id)
+                    # Soft-ban: keep trying later (travel unlock depends on this)
                     self._exhausted_dialogues.add(key)
+                    self._soft_ban_until[key] = time.time() + 180.0
                     break
             else:
                 # Prefer answering the CURRENT point for subdialogs; answering the
