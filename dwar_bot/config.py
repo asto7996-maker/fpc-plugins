@@ -8,6 +8,7 @@ All CSS/XPath selectors target the live game DOM as of 2024–2026.
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -267,14 +268,68 @@ class TimerConfig:
 TIMERS: TimerConfig = TimerConfig()
 
 # ---------------------------------------------------------------------------
-# Telegram notifications
+# Telegram notifications / multi-admin ACL
 # ---------------------------------------------------------------------------
 TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID: str = os.getenv("TELEGRAM_CHAT_ID", "")
+# Comma/space-separated Telegram user IDs allowed to control the bot.
+# Example: TELEGRAM_ADMIN_IDS=111111111,222222222
+# If empty, TELEGRAM_CHAT_ID is used as the sole admin (backward compatible).
+TELEGRAM_ADMIN_IDS: str = os.getenv("TELEGRAM_ADMIN_IDS", "")
+# Optional extra chat IDs that receive notifications (errors/reports), but
+# without control rights unless also listed in TELEGRAM_ADMIN_IDS / CHAT_ID.
+TELEGRAM_NOTIFY_CHAT_IDS: str = os.getenv("TELEGRAM_NOTIFY_CHAT_IDS", "")
+# Allow group chats (default: private only). Admins are still checked by from.id.
+TELEGRAM_ALLOW_GROUPS: bool = os.getenv("TELEGRAM_ALLOW_GROUPS", "0").lower() in (
+    "1", "true", "yes", "on",
+)
 # Minimum log level to forward to Telegram: "INFO", "WARNING", "ERROR", "CRITICAL"
 TELEGRAM_MIN_LEVEL: str = os.getenv("TELEGRAM_MIN_LEVEL", "WARNING")
 # Maximum messages per minute to avoid Telegram rate-limits
 TELEGRAM_RATE_LIMIT: int = 20
+
+
+def parse_telegram_ids(*raw_values: str) -> list[str]:
+    """Parse comma/space/semicolon-separated Telegram chat/user IDs."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for raw in raw_values:
+        if not raw:
+            continue
+        for part in re.split(r"[,;\s]+", str(raw).strip()):
+            pid = part.strip()
+            if not pid or pid in seen:
+                continue
+            seen.add(pid)
+            out.append(pid)
+    return out
+
+
+def resolve_telegram_admins(
+    chat_id: str = "",
+    admin_ids: str = "",
+) -> list[str]:
+    """
+    Authorized controller IDs: TELEGRAM_ADMIN_IDS ∪ TELEGRAM_CHAT_ID.
+
+    Empty admin list falls back to a single TELEGRAM_CHAT_ID for compatibility.
+    """
+    ids = parse_telegram_ids(admin_ids, chat_id)
+    if ids:
+        return ids
+    return parse_telegram_ids(chat_id)
+
+
+def resolve_telegram_notify_chats(
+    chat_id: str = "",
+    admin_ids: str = "",
+    notify_ids: str = "",
+) -> list[str]:
+    """Chats that receive bot notifications (boot, errors, gameplay alerts)."""
+    explicit = parse_telegram_ids(notify_ids)
+    if explicit:
+        return explicit
+    return resolve_telegram_admins(chat_id=chat_id, admin_ids=admin_ids)
 
 # ---------------------------------------------------------------------------
 # Misc bot behavior

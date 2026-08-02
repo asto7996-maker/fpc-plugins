@@ -63,13 +63,23 @@ class _TelegramHandler(logging.Handler):
     Non-blocking Telegram log handler.
 
     Queues log records and flushes them from a background asyncio task,
-    respecting TELEGRAM_RATE_LIMIT messages per minute.
+    respecting TELEGRAM_RATE_LIMIT messages per minute. Supports multiple
+    destination chat IDs (multi-admin notify).
     """
 
-    def __init__(self, token: str, chat_id: str, rate_limit: int = TELEGRAM_RATE_LIMIT) -> None:
+    def __init__(
+        self,
+        token: str,
+        chat_id: str | list[str],
+        rate_limit: int = TELEGRAM_RATE_LIMIT,
+    ) -> None:
         super().__init__()
         self._token = token
-        self._chat_id = chat_id
+        if isinstance(chat_id, str):
+            chats = [c.strip() for c in chat_id.replace(";", ",").split(",") if c.strip()]
+        else:
+            chats = [str(c).strip() for c in chat_id if str(c).strip()]
+        self._chat_ids = chats
         self._rate_limit = rate_limit
         self._queue: asyncio.Queue[str] = asyncio.Queue(maxsize=500)
         self._task: Optional[asyncio.Task] = None
@@ -111,23 +121,25 @@ class _TelegramHandler(logging.Handler):
             except asyncio.TimeoutError:
                 break
 
-            payload = {
-                "chat_id": self._chat_id,
-                "text": f"🤖 DwarBot\n{text}",
-                "parse_mode": "HTML",
-                "disable_web_page_preview": True,
-            }
-            try:
-                async with httpx.AsyncClient(timeout=10.0) as client:
-                    resp = await client.post(url, json=payload)
-                    if resp.status_code not in (200, 429):
-                        logging.getLogger(__name__).debug(
-                            "Telegram API returned %d", resp.status_code
-                        )
-            except Exception as exc:
-                logging.getLogger(__name__).debug(
-                    "Telegram send failed: %s", exc
-                )
+            for chat_id in self._chat_ids:
+                payload = {
+                    "chat_id": chat_id,
+                    "text": f"🤖 DwarBot\n{text}",
+                    "parse_mode": "HTML",
+                    "disable_web_page_preview": True,
+                }
+                try:
+                    async with httpx.AsyncClient(timeout=10.0) as client:
+                        resp = await client.post(url, json=payload)
+                        if resp.status_code not in (200, 429):
+                            logging.getLogger(__name__).debug(
+                                "Telegram API returned %d for %s",
+                                resp.status_code, chat_id,
+                            )
+                except Exception as exc:
+                    logging.getLogger(__name__).debug(
+                        "Telegram send failed (%s): %s", chat_id, exc
+                    )
             await asyncio.sleep(interval)
 
 

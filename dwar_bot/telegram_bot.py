@@ -30,11 +30,39 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 class TelegramAPI:
-    def __init__(self, token: str, owner_chat_id: str) -> None:
+    def __init__(
+        self,
+        token: str,
+        admin_ids: list[str] | str,
+        *,
+        notify_chat_ids: Optional[list[str]] = None,
+        allow_groups: bool = False,
+    ) -> None:
         self._token = token
-        self._owner = str(owner_chat_id)
+        if isinstance(admin_ids, str):
+            admin_ids = [admin_ids] if admin_ids else []
+        self._admins: set[str] = {str(x).strip() for x in admin_ids if str(x).strip()}
+        # Backward-compatible primary chat (first admin)
+        self._owner = next(iter(self._admins), "")
+        notify = notify_chat_ids if notify_chat_ids is not None else list(self._admins)
+        self._notify_chats: list[str] = []
+        seen: set[str] = set()
+        for cid in notify:
+            s = str(cid).strip()
+            if s and s not in seen:
+                seen.add(s)
+                self._notify_chats.append(s)
+        self._allow_groups = bool(allow_groups)
         self._base = f"https://api.telegram.org/bot{token}"
         self._offset: int = 0
+
+    @property
+    def admin_ids(self) -> list[str]:
+        return sorted(self._admins)
+
+    @property
+    def notify_chat_ids(self) -> list[str]:
+        return list(self._notify_chats)
 
     async def _post(self, method: str, payload: dict) -> Optional[Any]:
         try:
@@ -67,6 +95,21 @@ class TelegramAPI:
         if reply_markup:
             payload["reply_markup"] = reply_markup
         await self._post("sendMessage", payload)
+
+    async def broadcast(
+        self,
+        text: str,
+        reply_markup: Optional[dict] = None,
+        *,
+        chat_ids: Optional[list[str]] = None,
+    ) -> None:
+        """Send the same message to every notify/admin chat."""
+        targets = chat_ids if chat_ids is not None else self._notify_chats
+        for cid in targets:
+            try:
+                await self.send(cid, text, reply_markup=reply_markup)
+            except Exception as exc:
+                logger.debug("broadcast to %s failed: %s", cid, exc)
 
     async def edit_message(
         self,
@@ -111,8 +154,19 @@ class TelegramAPI:
     async def set_commands(self, commands: list[dict]) -> None:
         await self._post("setMyCommands", {"commands": commands})
 
+    def is_admin(self, user_id: Any) -> bool:
+        return str(user_id) in self._admins
+
     def is_owner(self, chat_id: Any) -> bool:
-        return str(chat_id) == self._owner
+        """Backward-compatible alias for is_admin()."""
+        return self.is_admin(chat_id)
+
+    def chat_allowed(self, chat: dict) -> bool:
+        """Private chats always OK; groups only when explicitly enabled."""
+        ctype = str((chat or {}).get("type") or "private")
+        if ctype in ("group", "supergroup", "channel"):
+            return self._allow_groups
+        return True
 
 
 # ---------------------------------------------------------------------------
@@ -285,30 +339,45 @@ class TelegramBotHandler:
     def __init__(
         self,
         token: str,
-        owner_chat_id: str,
-        get_status_fn: Callable[[], Coroutine],
-        stop_fn: Callable[[], Coroutine],
-        resume_fn: Callable[[], Coroutine],
-        log_path: Path,
-        settings: BotSettings,
+        owner_chat_id: str = "",
+        get_status_fn: Optional[Callable[[], Coroutine]] = None,
+        stop_fn: Optional[Callable[[], Coroutine]] = None,
+        resume_fn: Optional[Callable[[], Coroutine]] = None,
+        log_path: Optional[Path] = None,
+        settings: Optional[BotSettings] = None,
         on_cookies_json: Optional[Callable[[str], Coroutine]] = None,
         on_report_fn: Optional[Callable[[], Coroutine]] = None,
         notify_fn: Optional[Callable[[str], Coroutine]] = None,
         admin_fns: Optional[dict[str, Callable[..., Coroutine]]] = None,
+        *,
+        admin_ids: Optional[list[str]] = None,
+        notify_chat_ids: Optional[list[str]] = None,
+        allow_groups: bool = False,
     ) -> None:
-        self._api = TelegramAPI(token, owner_chat_id)
+        admins = list(admin_ids or [])
+        if owner_chat_id and str(owner_chat_id) not in admins:
+            admins = [str(owner_chat_id), *admins]
+        if not admins:
+            raise ValueError("TelegramBotHandler requires at least one admin id")
+        self._api = TelegramAPI(
+            token,
+            admins,
+            notify_chat_ids=notify_chat_ids,
+            allow_groups=allow_groups,
+        )
         self._get_status = get_status_fn
         self._stop_fn = stop_fn
         self._resume_fn = resume_fn
-        self._log_path = log_path
-        self._settings = settings
+        self._log_path = log_path or Path("bot.log")
+        self._settings = settings or BotSettings()
         self._on_cookies_json = on_cookies_json
         self._on_report_fn = on_report_fn
         self._notify_fn = notify_fn
         self._admin = admin_fns or {}
         self._running = True
         self._paused = False
-        self._cookie_buffer: list[str] = []
+        # Per-admin multipart cookie paste buffers (avoid cross-user mixing)
+        self._cookie_buffers: dict[str, list[str]] = {}
 
     # ------------------------------------------------------------------
     async def start(self) -> None:
@@ -332,6 +401,7 @@ class TelegramBotHandler:
             {"command": "session", "description": "🛡 Сессия / куки"},
             {"command": "log", "description": "📋 Последний лог"},
             {"command": "cookies", "description": "🍪 Обновить куки"},
+            {"command": "admins", "description": "👥 Список админов"},
             {"command": "diagnose", "description": "🔬 Полная диагностика"},
             {"command": "recover", "description": "🛠 Локальный recover"},
             {"command": "hunt", "description": "🏹 Форс-охота (Крэтс)"},
@@ -344,20 +414,26 @@ class TelegramBotHandler:
             {"command": "resume", "description": "▶️ Продолжить"},
             {"command": "help", "description": "ℹ️ Справка по командам"},
         ])
-        # Push reply keyboard to owner on boot
+        # Push reply keyboard to every admin/notify chat on boot
+        boot = (
+            "🤖 <b>DwarBot онлайн</b>\n"
+            f"Админов: <b>{len(self._api.admin_ids)}</b>\n"
+            "Панель управления обновлена. Кнопки меню внизу чата."
+        )
         try:
-            await self._api.send(
-                self._api._owner,
-                "🤖 <b>DwarBot онлайн</b>\nПанель управления обновлена. Кнопки меню внизу чата.",
-                reply_markup=_reply_keyboard(),
-            )
+            await self._api.broadcast(boot, reply_markup=_reply_keyboard())
         except Exception:
             pass
-        logger.info("Telegram control panel started.")
+        logger.info(
+            "Telegram control panel started (admins=%d notify=%d groups=%s).",
+            len(self._api.admin_ids),
+            len(self._api.notify_chat_ids),
+            self._api._allow_groups,
+        )
         await self._poll_loop()
 
     async def notify(self, text: str, category: str = "") -> None:
-        """Send a notification to the owner if the category is enabled."""
+        """Send a notification to all notify chats if the category is enabled."""
         n = self._settings.notify
         gate = {
             "battles": n.battles,
@@ -376,7 +452,7 @@ class TelegramBotHandler:
         }
         if category and not gate.get(category, True):
             return
-        await self._api.send(self._api._owner, text)
+        await self._api.broadcast(text)
         self._settings.total_notifies_sent += 1
         if self._settings.total_notifies_sent % 10 == 0:
             self._settings.save()
@@ -396,45 +472,66 @@ class TelegramBotHandler:
     async def _handle_update(self, upd: dict) -> None:
         msg = upd.get("message")
         if msg:
-            chat_id = str(msg["chat"]["id"])
-            if not self._api.is_owner(chat_id):
-                await self._api.send(chat_id, "⛔ Нет доступа.")
+            chat = msg.get("chat") or {}
+            chat_id = str(chat.get("id", ""))
+            from_user = msg.get("from") or {}
+            user_id = str(from_user.get("id") or chat_id)
+            if not self._api.chat_allowed(chat):
+                await self._api.send(chat_id, "⛔ Группы отключены. Пишите боту в личку.")
+                return
+            if not self._api.is_admin(user_id):
+                # Quiet deny in groups to avoid spam; reply in private.
+                if str(chat.get("type") or "") == "private":
+                    await self._api.send(chat_id, "⛔ Нет доступа. Добавьте свой Telegram ID в TELEGRAM_ADMIN_IDS.")
                 return
             text = (msg.get("text") or "").strip()
-            await self._dispatch(chat_id, text)
+            await self._dispatch(chat_id, text, user_id=user_id)
             return
 
         cb = upd.get("callback_query")
         if cb:
-            chat_id = str(cb["from"]["id"])
-            if not self._api.is_owner(chat_id):
-                await self._api.answer_callback(cb["id"], "⛔ Нет доступа.")
+            from_user = cb.get("from") or {}
+            user_id = str(from_user.get("id", ""))
+            msg = cb.get("message") or {}
+            chat = msg.get("chat") or {}
+            chat_id = str(chat.get("id") or user_id)
+            if not self._api.chat_allowed(chat):
+                await self._api.answer_callback(cb["id"], "⛔ Группы отключены", show_alert=True)
+                return
+            if not self._api.is_admin(user_id):
+                await self._api.answer_callback(cb["id"], "⛔ Нет доступа", show_alert=True)
                 return
             data = cb.get("data", "")
-            mid = cb.get("message", {}).get("message_id")
+            mid = msg.get("message_id")
             await self._api.answer_callback(cb["id"])
-            await self._dispatch(chat_id, data, message_id=mid)
+            await self._dispatch(chat_id, data, message_id=mid, user_id=user_id)
 
     # ------------------------------------------------------------------
     async def _dispatch(
-        self, chat_id: str, text: str, message_id: Optional[int] = None
+        self,
+        chat_id: str,
+        text: str,
+        message_id: Optional[int] = None,
+        user_id: str = "",
     ) -> None:
         stripped = text.strip()
+        uid = user_id or chat_id
+        buf = self._cookie_buffers.setdefault(uid, [])
 
         # Cookie JSON paste
         if self._looks_like_cookie_json(stripped) or (
-            self._cookie_buffer and (
+            buf and (
                 stripped.startswith(("[", "{", '"'))
                 or stripped.endswith("]")
                 or "mycom" in stripped
                 or "sess_" in stripped
             )
         ):
-            await self._handle_cookie_paste(chat_id, stripped)
+            await self._handle_cookie_paste(chat_id, stripped, user_id=uid)
             return
 
-        if self._cookie_buffer and stripped.startswith("/"):
-            self._cookie_buffer.clear()
+        if buf and stripped.startswith("/"):
+            buf.clear()
 
         # Reply keyboard labels
         if stripped in _REPLY_MAP:
@@ -500,6 +597,7 @@ class TelegramBotHandler:
             "session": self._cmd_session,
             "log": self._cmd_log,
             "cookies": self._cmd_cookies,
+            "admins": self._cmd_admins,
             "diagnose": self._cmd_diagnose,
             "recover": self._cmd_recover,
             "hunt": self._cmd_hunt,
@@ -673,10 +771,29 @@ class TelegramBotHandler:
             "/errors — история классификации ошибок\n"
             "/restart — systemctl restart\n\n"
             "<b>Управление</b>\n"
-            "/stop · /resume · /settings · /menu\n\n"
-            "🍪 Куки: Cookie Editor → Export JSON → пришли сюда."
+            "/stop · /resume · /settings · /menu · /admins\n\n"
+            "🍪 Куки: Cookie Editor → Export JSON → пришли сюда.\n"
+            "👥 Несколько админов: TELEGRAM_ADMIN_IDS=id1,id2"
         )
         await self._api.send(chat_id, text, reply_markup=_menu_inline())
+
+    async def _cmd_admins(self, chat_id: str, message_id: Optional[int] = None) -> None:
+        admins = self._api.admin_ids
+        notify = self._api.notify_chat_ids
+        lines = [
+            "<b>👥 Telegram ACL</b>",
+            f"Админов: <b>{len(admins)}</b>",
+        ]
+        for i, aid in enumerate(admins, 1):
+            lines.append(f"  {i}. <code>{aid}</code>")
+        lines.append(f"Уведомления → <b>{len(notify)}</b> чат(ов)")
+        lines.append(
+            f"Группы: {'✅' if self._api._allow_groups else '⛔ только личка'}"
+        )
+        lines.append(
+            "\nДобавить: <code>TELEGRAM_ADMIN_IDS=id1,id2</code> в .env и restart."
+        )
+        await self._reply(chat_id, "\n".join(lines), _menu_inline(), message_id)
 
     async def _cmd_status(self, chat_id: str, message_id: Optional[int] = None) -> None:
         st = await self._get_status()
@@ -1147,24 +1264,28 @@ class TelegramBotHandler:
             "mycom" in t or "sess_sid" in t or '"name"' in t[:240]
         )
 
-    async def _handle_cookie_paste(self, chat_id: str, chunk: str) -> None:
+    async def _handle_cookie_paste(
+        self, chat_id: str, chunk: str, user_id: str = ""
+    ) -> None:
         if not self._on_cookies_json:
             await self._api.send(chat_id, "⚠️ Приём куков не настроен.")
             return
+        uid = user_id or chat_id
+        buf = self._cookie_buffers.setdefault(uid, [])
         cleaned = chunk.strip()
         if cleaned.startswith("```"):
             cleaned = cleaned.strip("`")
             if cleaned.lower().startswith("json"):
                 cleaned = cleaned[4:].lstrip()
-        self._cookie_buffer.append(cleaned)
-        combined = "\n".join(self._cookie_buffer).strip()
+        buf.append(cleaned)
+        combined = "\n".join(buf).strip()
         if not (combined.startswith("[") and combined.endswith("]")):
             await self._api.send(
                 chat_id,
-                f"🍪 Фрагмент JSON ({len(self._cookie_buffer)}). Пришли остаток.",
+                f"🍪 Фрагмент JSON ({len(buf)}). Пришли остаток.",
             )
             return
-        self._cookie_buffer.clear()
+        buf.clear()
         await self._api.send(chat_id, "🍪 Принимаю куки…")
         try:
             result = await self._on_cookies_json(combined)

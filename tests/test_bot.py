@@ -279,3 +279,40 @@ def test_fight_lock_html_detection():
     )
     assert ok.nick == "xylophaze"
     assert ok.level == 1
+
+
+def test_telegram_multi_admin_config():
+    from dwar_bot.config import (
+        parse_telegram_ids,
+        resolve_telegram_admins,
+        resolve_telegram_notify_chats,
+    )
+
+    assert parse_telegram_ids("1, 2;3\n4") == ["1", "2", "3", "4"]
+    assert parse_telegram_ids("1", "1,2") == ["1", "2"]
+    # Backward compatible: only CHAT_ID
+    assert resolve_telegram_admins(chat_id="111", admin_ids="") == ["111"]
+    # ADMIN_IDS ∪ CHAT_ID
+    assert resolve_telegram_admins(chat_id="111", admin_ids="222,333") == [
+        "222", "333", "111",
+    ]
+    # Explicit notify list wins
+    assert resolve_telegram_notify_chats(
+        chat_id="111", admin_ids="222", notify_ids="999"
+    ) == ["999"]
+
+
+def test_telegram_acl_api():
+    from dwar_bot.telegram_bot import TelegramAPI
+
+    api = TelegramAPI("tok", ["111", "222"], notify_chat_ids=["111", "333"], allow_groups=False)
+    assert api.is_admin("111")
+    assert api.is_admin(222)
+    assert not api.is_admin("999")
+    assert api.is_owner("111")  # alias
+    assert api.chat_allowed({"type": "private"})
+    assert not api.chat_allowed({"type": "group"})
+    assert api.notify_chat_ids == ["111", "333"]
+
+    api_g = TelegramAPI("tok", "111", allow_groups=True)
+    assert api_g.chat_allowed({"type": "supergroup"})

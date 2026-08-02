@@ -27,10 +27,15 @@ from dwar_bot.config import (
     IDLE_PAUSE_PROBABILITY,
     LOG_FILE,
     MAX_RETRIES,
+    TELEGRAM_ADMIN_IDS,
+    TELEGRAM_ALLOW_GROUPS,
     TELEGRAM_BOT_TOKEN,
     TELEGRAM_CHAT_ID,
+    TELEGRAM_NOTIFY_CHAT_IDS,
     DEFAULT_COOKIE_FILE,
     COOKIES_DIR,
+    resolve_telegram_admins,
+    resolve_telegram_notify_chats,
 )
 from dwar_bot.logger import setup_logging, log_exception
 from dwar_bot.auth.oauth_login import extract_access_token
@@ -1266,15 +1271,23 @@ class DwarBot:
     async def _send_telegram(self, text: str) -> None:
         import httpx
         token = os.getenv("TELEGRAM_BOT_TOKEN", TELEGRAM_BOT_TOKEN)
-        chat_id = os.getenv("TELEGRAM_CHAT_ID", TELEGRAM_CHAT_ID)
-        if not token or not chat_id:
+        chats = resolve_telegram_notify_chats(
+            chat_id=os.getenv("TELEGRAM_CHAT_ID", TELEGRAM_CHAT_ID),
+            admin_ids=os.getenv("TELEGRAM_ADMIN_IDS", TELEGRAM_ADMIN_IDS),
+            notify_ids=os.getenv("TELEGRAM_NOTIFY_CHAT_IDS", TELEGRAM_NOTIFY_CHAT_IDS),
+        )
+        if not token or not chats:
             return
         try:
             async with httpx.AsyncClient(timeout=10) as c:
-                await c.post(
-                    f"https://api.telegram.org/bot{token}/sendMessage",
-                    json={"chat_id": chat_id, "text": text},
-                )
+                for chat_id in chats:
+                    try:
+                        await c.post(
+                            f"https://api.telegram.org/bot{token}/sendMessage",
+                            json={"chat_id": chat_id, "text": text},
+                        )
+                    except Exception as exc:
+                        logger.debug("Telegram send to %s failed: %s", chat_id, exc)
         except Exception as exc:
             logger.debug("Telegram send failed: %s", exc)
 
@@ -1312,7 +1325,13 @@ async def main() -> None:
     setup_logging(
         level=os.getenv("DWAR_LOG_LEVEL", "INFO"),
         telegram_token=os.getenv("TELEGRAM_BOT_TOKEN", TELEGRAM_BOT_TOKEN),
-        telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID", TELEGRAM_CHAT_ID),
+        telegram_chat_id=",".join(
+            resolve_telegram_notify_chats(
+                chat_id=os.getenv("TELEGRAM_CHAT_ID", TELEGRAM_CHAT_ID),
+                admin_ids=os.getenv("TELEGRAM_ADMIN_IDS", TELEGRAM_ADMIN_IDS),
+                notify_ids=os.getenv("TELEGRAM_NOTIFY_CHAT_IDS", TELEGRAM_NOTIFY_CHAT_IDS),
+            )
+        ),
         telegram_min_level=os.getenv("TELEGRAM_MIN_LEVEL", "WARNING"),
     )
 
@@ -1365,14 +1384,30 @@ async def main() -> None:
 
     tg_token = os.getenv("TELEGRAM_BOT_TOKEN", TELEGRAM_BOT_TOKEN)
     tg_chatid = os.getenv("TELEGRAM_CHAT_ID", TELEGRAM_CHAT_ID)
+    tg_admins = resolve_telegram_admins(
+        chat_id=tg_chatid,
+        admin_ids=os.getenv("TELEGRAM_ADMIN_IDS", TELEGRAM_ADMIN_IDS),
+    )
+    tg_notify = resolve_telegram_notify_chats(
+        chat_id=tg_chatid,
+        admin_ids=os.getenv("TELEGRAM_ADMIN_IDS", TELEGRAM_ADMIN_IDS),
+        notify_ids=os.getenv("TELEGRAM_NOTIFY_CHAT_IDS", TELEGRAM_NOTIFY_CHAT_IDS),
+    )
+    tg_allow_groups = os.getenv(
+        "TELEGRAM_ALLOW_GROUPS",
+        "1" if TELEGRAM_ALLOW_GROUPS else "0",
+    ).lower() in ("1", "true", "yes", "on")
     tg_task: asyncio.Task | None = None
-    if tg_token and tg_chatid:
+    if tg_token and tg_admins:
         async def _get_status() -> dict:
             return bot.get_status()
 
         tg_handler = TelegramBotHandler(
             token=tg_token,
-            owner_chat_id=tg_chatid,
+            owner_chat_id=tg_chatid or tg_admins[0],
+            admin_ids=tg_admins,
+            notify_chat_ids=tg_notify,
+            allow_groups=tg_allow_groups,
             get_status_fn=_get_status,
             stop_fn=bot.pause,
             resume_fn=bot.resume_game,
@@ -1390,7 +1425,11 @@ async def main() -> None:
         )
         bot.bind_telegram(tg_handler)
         tg_task = asyncio.ensure_future(tg_handler.start())
-        logger.info("Telegram control panel started (chat_id=%s).", tg_chatid)
+        logger.info(
+            "Telegram control panel started (admins=%s notify=%s).",
+            ",".join(tg_admins),
+            ",".join(tg_notify),
+        )
 
     # Pre-install / verify CLI + API key (full-auto readiness)
     async def _boot_heal_ready() -> None:
