@@ -56,6 +56,7 @@ from dwar_bot.modules.progression_brain import (
 )
 from dwar_bot.core.bot_state import BotState, set_bot_state
 from dwar_bot.core.log_watcher import start_log_monitoring
+from dwar_bot.core.cursor_self_healer import ensure_cursor_cli, _load_dotenv, _augment_path
 from dwar_bot.config import COMBAT
 
 logger = logging.getLogger("dwar_bot.main")
@@ -230,17 +231,25 @@ class DwarBot:
         )
         return "\n".join(parts)
 
-    async def pause(self) -> None:
+    async def pause(self, *, quiet: bool = False) -> None:
         self._paused = True
         set_bot_state(BotState.PAUSED)
-        logger.info("Game loop paused via Telegram.")
-        await self.notify("⏸ Автопилот на паузе.", "heartbeat")
+        logger.info("Game loop paused%s.", " (heal)" if quiet else " via Telegram")
+        if not quiet:
+            await self.notify("⏸ Автопилот на паузе.", "heartbeat")
 
-    async def resume_game(self) -> None:
+    async def resume_game(self, *, quiet: bool = False) -> None:
         self._paused = False
         set_bot_state(BotState.RUNNING)
-        logger.info("Game loop resumed via Telegram.")
-        await self.notify("▶️ Автопилот возобновлён.", "heartbeat")
+        logger.info("Game loop resumed%s.", " (heal)" if quiet else " via Telegram")
+        if not quiet:
+            await self.notify("▶️ Автопилот возобновлён.", "heartbeat")
+
+    async def pause_for_heal(self) -> None:
+        await self.pause(quiet=True)
+
+    async def resume_after_heal(self) -> None:
+        await self.resume_game(quiet=True)
 
     async def apply_cookie_json(self, raw_json: str) -> str:
         """
@@ -946,10 +955,14 @@ async def main() -> None:
     try:
         from dotenv import load_dotenv
         load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+        load_dotenv(Path(__file__).resolve().parent / ".env")
     except ImportError:
-        # Fallback: lightweight loader from self-healer
         from dwar_bot.core.cursor_self_healer import _load_dotenv
         _load_dotenv()
+        _load_dotenv(Path(__file__).resolve().parent / ".env")
+
+    # Ensure agent CLI is on PATH for this process
+    os.environ.update(_augment_path(os.environ.copy()))
 
     setup_logging(
         level=os.getenv("DWAR_LOG_LEVEL", "INFO"),
@@ -1016,22 +1029,32 @@ async def main() -> None:
         tg_task = asyncio.ensure_future(tg_handler.start())
         logger.info("Telegram control panel started (chat_id=%s).", tg_chatid)
 
-    # Background auto-debug: scan bot.log every 300s → Cursor healer
+    # Background auto-debug: scan bot.log every 300s → Cursor healer (fully automatic)
     async def _notify_plain(text: str) -> None:
         await bot.notify(text, "errors")
+
+    # Pre-install / verify CLI without blocking the game loop
+    async def _boot_cli() -> None:
+        try:
+            path = await asyncio.to_thread(ensure_cursor_cli)
+            logger.info("Cursor Agent CLI ready: %s", path)
+        except Exception as exc:
+            logger.error("Cursor CLI bootstrap failed (will retry on heal): %s", exc)
+
+    asyncio.create_task(_boot_cli(), name="cursor_cli_boot")
 
     log_watcher_task = asyncio.create_task(
         start_log_monitoring(
             300,
             log_path=LOG_FILE,
             notify_fn=_notify_plain,
-            pause_fn=bot.pause,
-            resume_fn=bot.resume_game,
+            pause_fn=bot.pause_for_heal,
+            resume_fn=bot.resume_after_heal,
         ),
         name="log_watcher",
     )
     logger.info(
-        "LogWatcher task created (300s) · CURSOR_API_KEY=%s",
+        "LogWatcher FULL-AUTO (300s) · CURSOR_API_KEY=%s",
         "set" if os.getenv("CURSOR_API_KEY") else "MISSING",
     )
 

@@ -52,6 +52,28 @@ def test_healer_prompt_mentions_selectors():
     assert "dwar_bot/main.py" in prompt
 
 
+def test_healer_path_augment_and_snapshot_dir():
+    from dwar_bot.core.cursor_self_healer import _augment_path, BACKUP_DIR, REPO_ROOT
+
+    env = _augment_path({})
+    assert ".local/bin" in env.get("PATH", "") or "local" in env.get("PATH", "")
+    assert REPO_ROOT.exists()
+    assert BACKUP_DIR.name == ".heal_backups"
+
+
+def test_log_watcher_actionable_filter():
+    from dwar_bot.core.log_watcher import LogWatcher
+
+    assert LogWatcher._is_actionable("Traceback (most recent call last):\n  File")
+    assert LogWatcher._is_actionable("CRITICAL — boom")
+    assert not LogWatcher._is_actionable("INFO something ERROR-ish but soft")
+    # Soft ERROR alone without exception — not actionable
+    assert not LogWatcher._is_actionable("| ERROR | httpx timeout retry")
+    assert LogWatcher._is_actionable(
+        "| ERROR | dwar_bot.main\nValueError: boom\n"
+    )
+
+
 @pytest.mark.parametrize(
     "path",
     [

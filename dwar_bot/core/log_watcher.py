@@ -1,6 +1,9 @@
 """
-Background log monitor — every N seconds scans ``bot.log`` for fatal markers
-and triggers Cursor self-healing via ``cursor_self_healer.patch_code_with_cursor``.
+Background log monitor — fully automatic heal loop.
+
+Every N seconds tails ``bot.log``, detects fatal errors, pauses briefly,
+runs Cursor self-healer, verifies tests, and **always** resumes the bot
+(with retry cooldown on failure — no permanent stuck pause).
 """
 
 from __future__ import annotations
@@ -8,41 +11,50 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import time
 from pathlib import Path
 from typing import Awaitable, Callable, Optional
 
 from dwar_bot.config import LOG_FILE
 from dwar_bot.core.bot_state import BotState, get_bot_state, set_bot_state
-from dwar_bot.core.cursor_self_healer import patch_code_with_cursor
+from dwar_bot.core.cursor_self_healer import ensure_cursor_cli, patch_code_with_cursor
 
 logger = logging.getLogger(__name__)
 
 ERROR_MARKERS = (
-    "ERROR",
-    "CRITICAL",
     "Traceback",
+    "CRITICAL",
     "TimeoutError",
     "ElementHandleError",
     "DOM-Desync",
+    "FileNotFoundError",
+    "TokenExpiredError",
 )
 
-# File "…/dwar_bot/modules/combat_engine.py", line 42, in foo
-_FILE_RE = re.compile(
-    r'File\s+"([^"]+\.py)"',
-    re.MULTILINE,
-)
+# Soft markers only count when accompanied by a real exception/traceback
+SOFT_MARKERS = (" ERROR ", "| ERROR |", "ERROR —", " ERROR|")
+
+_FILE_RE = re.compile(r'File\s+"([^"]+\.py)"', re.MULTILINE)
 _TRACEBACK_RE = re.compile(
     r"(Traceback \(most recent call last\):.*?)(?=\n\d{4}-\d{2}-\d{2}|\n[A-Z]+\s+\||\Z)",
     re.DOTALL,
+)
+_EXCEPTION_RE = re.compile(
+    r"^([A-Za-z_][\w\.]*Error|[A-Za-z_][\w\.]*Exception):\s*.+$",
+    re.MULTILINE,
 )
 
 NotifyFn = Callable[[str], Awaitable[None]]
 PauseFn = Callable[[], Awaitable[None]]
 ResumeFn = Callable[[], Awaitable[None]]
 
+# After a failed heal, wait this long before trying the same fingerprint again
+RETRY_COOLDOWN_SEC = 600
+MAX_HEAL_ATTEMPTS_PER_FP = 3
+
 
 class LogWatcher:
-    """Tail ``bot.log`` by byte offset and heal on error markers."""
+    """Tail ``bot.log`` by byte offset and auto-heal on fatal markers."""
 
     def __init__(
         self,
@@ -63,8 +75,10 @@ class LogWatcher:
         self._task: Optional[asyncio.Task] = None
         self._heal_lock = asyncio.Lock()
         self._last_fingerprint: str = ""
+        self._fp_attempts: dict[str, int] = {}
+        self._fp_cooldown_until: dict[str, float] = {}
+        self._cli_ready = False
 
-    # ------------------------------------------------------------------
     async def start(self) -> None:
         if self._running:
             return
@@ -89,21 +103,16 @@ class LogWatcher:
 
     def _seek_end(self) -> None:
         try:
-            if self.log_path.exists():
-                self._offset = self.log_path.stat().st_size
-            else:
-                self._offset = 0
+            self._offset = self.log_path.stat().st_size if self.log_path.exists() else 0
         except OSError:
             self._offset = 0
 
     def _read_new(self) -> str:
-        """Read bytes since last offset using file.tell()-style tracking."""
         try:
             if not self.log_path.exists():
                 return ""
             size = self.log_path.stat().st_size
             if size < self._offset:
-                # Log rotated / truncated
                 self._offset = 0
             if size == self._offset:
                 return ""
@@ -117,16 +126,26 @@ class LogWatcher:
             return ""
 
     @staticmethod
-    def _chunk_has_error(chunk: str) -> bool:
-        return any(m in chunk for m in ERROR_MARKERS)
+    def _is_actionable(chunk: str) -> bool:
+        """True only for real crashes — ignore soft ERROR spam without traceback."""
+        if any(m in chunk for m in ERROR_MARKERS):
+            return True
+        if _EXCEPTION_RE.search(chunk) and any(m in chunk for m in SOFT_MARKERS):
+            return True
+        return False
 
     @staticmethod
     def _extract_traceback(chunk: str) -> str:
         m = _TRACEBACK_RE.search(chunk)
         if m:
             return m.group(1).strip()
-        # Fallback: from first marker to end (capped)
-        for marker in ("Traceback (most recent call last):", "CRITICAL", "ERROR"):
+        for marker in (
+            "Traceback (most recent call last):",
+            "CRITICAL",
+            "FileNotFoundError",
+            "TokenExpiredError",
+            "ERROR",
+        ):
             idx = chunk.find(marker)
             if idx >= 0:
                 return chunk[idx: idx + 4000].strip()
@@ -135,31 +154,29 @@ class LogWatcher:
     @staticmethod
     def _extract_failed_file(traceback_text: str, chunk: str) -> str:
         paths = _FILE_RE.findall(traceback_text) or _FILE_RE.findall(chunk)
-        # Prefer project files under dwar_bot/
         for p in reversed(paths):
             norm = p.replace("\\", "/")
             if "/dwar_bot/" in norm or norm.startswith("dwar_bot/"):
-                # return path from dwar_bot/ onward when absolute
                 idx = norm.find("dwar_bot/")
                 return norm[idx:] if idx >= 0 else norm
         if paths:
             return paths[-1]
-        # Heuristic from logger name lines: dwar_bot.modules.combat_engine
         m = re.search(
             r"dwar_bot\.(?:modules|core|auth)\.([a-zA-Z0-9_]+)",
             chunk,
         )
         if m:
             name = m.group(1)
+            root = Path(__file__).resolve().parents[2]
             for folder in ("modules", "core", "auth"):
                 candidate = f"dwar_bot/{folder}/{name}.py"
-                if Path(candidate).exists() or (Path(__file__).resolve().parents[2] / candidate).exists():
+                if (root / candidate).exists():
                     return candidate
         return "dwar_bot/main.py"
 
     async def _send(self, text: str) -> None:
         if not self._notify:
-            logger.info("LogWatcher notify (no Telegram): %s", text[:200])
+            logger.info("LogWatcher notify: %s", text[:200])
             return
         try:
             await self._notify(text)
@@ -182,68 +199,112 @@ class LogWatcher:
             except Exception as exc:
                 logger.debug("resume_fn: %s", exc)
 
+    async def _ensure_cli(self) -> None:
+        if self._cli_ready:
+            return
+        try:
+            path = await asyncio.to_thread(ensure_cursor_cli)
+            self._cli_ready = True
+            logger.info("LogWatcher: Cursor CLI ready (%s)", path)
+        except Exception as exc:
+            logger.error("LogWatcher: CLI auto-install failed: %s", exc)
+            self._cli_ready = False
+
     async def _handle_error_chunk(self, chunk: str) -> None:
         traceback_text = self._extract_traceback(chunk)
         failed_file = self._extract_failed_file(traceback_text, chunk)
         fingerprint = f"{failed_file}:{hash(traceback_text[-500:])}"
-        if fingerprint == self._last_fingerprint:
-            logger.debug("LogWatcher: duplicate error fingerprint — skip.")
+
+        now = time.time()
+        cooldown_until = self._fp_cooldown_until.get(fingerprint, 0)
+        if now < cooldown_until:
+            logger.debug(
+                "LogWatcher: fingerprint cooling down (%.0fs left)",
+                cooldown_until - now,
+            )
             return
+
+        attempts = self._fp_attempts.get(fingerprint, 0)
+        if attempts >= MAX_HEAL_ATTEMPTS_PER_FP:
+            # Back off longer, but keep bot running
+            self._fp_cooldown_until[fingerprint] = now + RETRY_COOLDOWN_SEC * 3
+            logger.warning(
+                "LogWatcher: max heal attempts for %s — cooldown, bot keeps running.",
+                failed_file,
+            )
+            await self._send(
+                f"⚠️ <b>LogWatcher:</b> ошибка в <code>{failed_file}</code> "
+                f"повторяется ({attempts} попыток). Беру паузу {RETRY_COOLDOWN_SEC * 3 // 60} мин "
+                f"на авто-фикс, бот <b>продолжает</b> работу.\n"
+                f"<pre>{traceback_text[:800]}</pre>"
+            )
+            return
+
+        if fingerprint == self._last_fingerprint and attempts > 0:
+            # Same error again after resume — allowed if cooldown passed
+            pass
         self._last_fingerprint = fingerprint
 
         logger.warning(
-            "LogWatcher: error detected in logs → file=%s",
-            failed_file,
+            "LogWatcher: actionable error → file=%s attempt=%d",
+            failed_file, attempts + 1,
         )
 
         async with self._heal_lock:
+            await self._ensure_cli()
             await self._pause_bot()
             set_bot_state(BotState.HEALING)
+            self._fp_attempts[fingerprint] = attempts + 1
 
-            # Offload blocking subprocess work to a thread
             ok = await asyncio.to_thread(
                 patch_code_with_cursor, failed_file, traceback_text
             )
 
+            # ALWAYS resume — fully automatic, never stick on PAUSED
+            await self._resume_bot()
+
             if ok:
-                # Keep offset at current end (already advanced by _read_new)
-                await self._resume_bot()
+                self._fp_attempts.pop(fingerprint, None)
+                self._fp_cooldown_until.pop(fingerprint, None)
                 await self._send(
-                    f"🔍 <b>LogWatcher (300s Check):</b> В логах обнаружена ошибка в "
-                    f"<code>{failed_file}</code>. Код успешно исправлен через Cursor API "
-                    f"и проверен тестами! Бот продолжит работу."
+                    f"🔍 <b>LogWatcher (авто):</b> Ошибка в <code>{failed_file}</code>.\n"
+                    f"Код исправлен через Cursor Agent, тесты OK — бот продолжил работу."
                 )
-                logger.info("LogWatcher: heal succeeded for %s — resumed.", failed_file)
+                logger.info("LogWatcher: heal OK for %s — auto-resumed.", failed_file)
             else:
-                set_bot_state(BotState.PAUSED)
+                self._fp_cooldown_until[fingerprint] = now + RETRY_COOLDOWN_SEC
                 await self._send(
-                    f"🆘 <b>LogWatcher SOS:</b> Ошибка в <code>{failed_file}</code>.\n"
-                    f"Авто-исправление через Cursor не удалось (таймаут / тесты / CLI).\n"
-                    f"Бот остаётся на <b>паузе</b>. Проверь логи и правь вручную, "
-                    f"затем /resume.\n\n"
-                    f"<pre>{traceback_text[:1500]}</pre>"
+                    f"🔄 <b>LogWatcher (авто-повтор):</b> Не удалось сразу починить "
+                    f"<code>{failed_file}</code>.\n"
+                    f"Бот <b>снят с паузы</b> и продолжит работу. "
+                    f"Повторный авто-фикс через {RETRY_COOLDOWN_SEC // 60} мин.\n"
+                    f"<pre>{traceback_text[:1200]}</pre>"
                 )
-                logger.error("LogWatcher: heal FAILED for %s — bot stays paused.", failed_file)
+                logger.error(
+                    "LogWatcher: heal failed for %s — auto-resumed, retry in %ds",
+                    failed_file, RETRY_COOLDOWN_SEC,
+                )
 
     async def _loop(self) -> None:
-        # Initial delay so startup noise is not treated as a crash
-        await asyncio.sleep(min(60, self.interval_seconds))
+        # Bootstrap CLI in background ASAP
+        asyncio.create_task(self._ensure_cli(), name="log_watcher_cli_boot")
+        await asyncio.sleep(min(45, self.interval_seconds))
+
         while self._running:
             try:
-                # Skip scan while already healing / manually paused by healer
                 if get_bot_state() == BotState.HEALING:
-                    await asyncio.sleep(self.interval_seconds)
+                    await asyncio.sleep(5)
                     continue
 
                 chunk = self._read_new()
-                if chunk and self._chunk_has_error(chunk):
-                    # Ignore watcher/healer own ERROR lines to avoid recursion
+                if chunk and self._is_actionable(chunk):
                     filtered = "\n".join(
                         line for line in chunk.splitlines()
                         if "log_watcher" not in line
                         and "cursor_self_healer" not in line
+                        and "httpx" not in line
                     )
-                    if self._chunk_has_error(filtered):
+                    if self._is_actionable(filtered):
                         await self._handle_error_chunk(filtered)
             except asyncio.CancelledError:
                 raise
@@ -264,9 +325,7 @@ async def start_log_monitoring(
     """
     Background LogWatcher loop (blocks until cancelled).
 
-    Start from ``main.py`` as::
-
-        asyncio.create_task(start_log_monitoring(300, notify_fn=..., pause_fn=..., resume_fn=...))
+    Fully automatic: CLI install → detect → heal → pytest → always resume.
     """
     watcher = LogWatcher(
         log_path=log_path,
@@ -278,7 +337,7 @@ async def start_log_monitoring(
     watcher._seek_end()
     watcher._running = True
     logger.info(
-        "LogWatcher started — interval=%ds file=%s offset=%d",
+        "LogWatcher started — interval=%ds file=%s offset=%d (fully automatic)",
         watcher.interval_seconds, watcher.log_path, watcher._offset,
     )
     try:
