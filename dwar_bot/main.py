@@ -54,6 +54,8 @@ from dwar_bot.modules.progression_brain import (
     GameOption,
     ProgressionBrain,
 )
+from dwar_bot.core.bot_state import BotState, set_bot_state
+from dwar_bot.core.log_watcher import start_log_monitoring
 from dwar_bot.config import COMBAT
 
 logger = logging.getLogger("dwar_bot.main")
@@ -230,11 +232,13 @@ class DwarBot:
 
     async def pause(self) -> None:
         self._paused = True
+        set_bot_state(BotState.PAUSED)
         logger.info("Game loop paused via Telegram.")
         await self.notify("⏸ Автопилот на паузе.", "heartbeat")
 
     async def resume_game(self) -> None:
         self._paused = False
+        set_bot_state(BotState.RUNNING)
         logger.info("Game loop resumed via Telegram.")
         await self.notify("▶️ Автопилот возобновлён.", "heartbeat")
 
@@ -938,6 +942,15 @@ def _load_bootstrap() -> tuple[str, str, dict[str, str], Path]:
 
 
 async def main() -> None:
+    # Load .env (CURSOR_API_KEY etc.) before anything else
+    try:
+        from dotenv import load_dotenv
+        load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+    except ImportError:
+        # Fallback: lightweight loader from self-healer
+        from dwar_bot.core.cursor_self_healer import _load_dotenv
+        _load_dotenv()
+
     setup_logging(
         level=os.getenv("DWAR_LOG_LEVEL", "INFO"),
         telegram_token=os.getenv("TELEGRAM_BOT_TOKEN", TELEGRAM_BOT_TOKEN),
@@ -979,6 +992,7 @@ async def main() -> None:
     )
 
     bot = DwarBot(client, settings=BotSettings.load())
+    set_bot_state(BotState.RUNNING)
 
     tg_token = os.getenv("TELEGRAM_BOT_TOKEN", TELEGRAM_BOT_TOKEN)
     tg_chatid = os.getenv("TELEGRAM_CHAT_ID", TELEGRAM_CHAT_ID)
@@ -1001,6 +1015,25 @@ async def main() -> None:
         bot.bind_telegram(tg_handler)
         tg_task = asyncio.ensure_future(tg_handler.start())
         logger.info("Telegram control panel started (chat_id=%s).", tg_chatid)
+
+    # Background auto-debug: scan bot.log every 300s → Cursor healer
+    async def _notify_plain(text: str) -> None:
+        await bot.notify(text, "errors")
+
+    log_watcher_task = asyncio.create_task(
+        start_log_monitoring(
+            300,
+            log_path=LOG_FILE,
+            notify_fn=_notify_plain,
+            pause_fn=bot.pause,
+            resume_fn=bot.resume_game,
+        ),
+        name="log_watcher",
+    )
+    logger.info(
+        "LogWatcher task created (300s) · CURSOR_API_KEY=%s",
+        "set" if os.getenv("CURSOR_API_KEY") else "MISSING",
+    )
 
     while not _shutdown_event.is_set():
         try:
@@ -1038,6 +1071,12 @@ async def main() -> None:
         await bot.run()
     finally:
         await bot.timers.stop_background_tasks()
+        if not log_watcher_task.done():
+            log_watcher_task.cancel()
+            try:
+                await log_watcher_task
+            except asyncio.CancelledError:
+                pass
         await client.aclose()
         if tg_task:
             tg_task.cancel()

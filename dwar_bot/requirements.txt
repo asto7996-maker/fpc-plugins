@@ -17,5 +17,9 @@ pydantic>=2.6.0
 # Retry / backoff utilities
 tenacity>=8.3.0
 
+# Env / self-healer
+python-dotenv>=1.0.0
+pytest>=8.0.0
+
 # Rich terminal output (optional, for development/debug)
 rich>=13.7.0
