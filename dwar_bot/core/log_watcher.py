@@ -115,6 +115,17 @@ class LogWatcher:
     @staticmethod
     def _is_actionable(chunk: str) -> bool:
         clean = _strip_ansi(chunk)
+        # Auth/cookie expiry needs a human cookie paste — Cursor cannot fix it
+        low = clean.lower()
+        if (
+            "token expired" in low
+            or "access_token has expired" in low
+            or "oauth access_token expired" in low
+            or "waiting for fresh cookies" in low
+            or "нужны свежие куки" in low
+            or "soc_auth.php" in low and "token" in low
+        ):
+            return False
         if any(m in clean for m in ERROR_MARKERS):
             return True
         if SOFT_ERROR_RE.search(clean) and (
