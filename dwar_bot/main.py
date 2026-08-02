@@ -1524,11 +1524,44 @@ async def main() -> None:
             state = await client.get_state()
             char = await client.get_char_stats()
             if not char.nick:
-                # sess_* from file may be stale — renew once
-                await client.invalidate_session("empty nick at startup")
-                await client.ensure_session()
-                state = await client.get_state()
-                char = await client.get_char_stats()
+                # During fights user.php has no var par — finish fight, do NOT wipe cookies.
+                fight_id = int(getattr(state, "fight_id", 0) or 0)
+                html = ""
+                try:
+                    html = (await client._get("/user.php")).text
+                except Exception:
+                    html = ""
+                if fight_id or is_fight_lock_html(html):
+                    logger.warning(
+                        "Startup: empty nick with fight_id=%s — finishing fight…",
+                        fight_id or "?",
+                    )
+                    try:
+                        await bot.combat.finish_fight(timeout=180.0)
+                    except Exception as exc:
+                        logger.warning("Startup fight finish: %s", exc)
+                    state = await client.get_state()
+                    char = await client.get_char_stats()
+                if not char.nick:
+                    ok = await client.soft_recheck_session()
+                    if ok:
+                        state = await client.get_state()
+                        char = await client.get_char_stats()
+                if not char.nick:
+                    # Only renew if session is actually dead
+                    soft = await client.soft_recheck_session()
+                    if soft:
+                        logger.warning(
+                            "Startup: soft OK but nick empty — wait (no invalidate)."
+                        )
+                        await asyncio.sleep(5)
+                        state = await client.get_state()
+                        char = await client.get_char_stats()
+                    else:
+                        await client.invalidate_session("empty nick at startup")
+                        await client.ensure_session()
+                        state = await client.get_state()
+                        char = await client.get_char_stats()
             logger.info(
                 "Connected! nick=%s level=%d hp=%d/%d area=%s money=%.2f sid=%s…",
                 char.nick, char.level, char.hp, char.hp_max,
