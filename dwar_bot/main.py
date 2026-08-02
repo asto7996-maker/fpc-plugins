@@ -44,7 +44,7 @@ from dwar_bot.core.game_client import (
     persist_session_cookies,
 )
 from dwar_bot.telegram_bot import TelegramBotHandler
-from dwar_bot.modules.stats_parser import StatsParser, FullProfile
+from dwar_bot.modules.stats_parser import StatsParser, FullProfile, is_fight_lock_html
 from dwar_bot.modules.combat_engine import CombatEngine, BattleResult
 from dwar_bot.modules.quest_tracker import QuestTracker
 from dwar_bot.modules.timers_manager import TimersManager
@@ -474,29 +474,88 @@ class DwarBot:
         self._state = self._profile.state
 
         if not self._char.nick:
-            # Soft path: never wipe sess_sid on a single empty parse — that was
-            # killing live sessions when OAuth token could not renew.
-            logger.warning("No character data — soft recheck (no invalidate).")
-            ok = await self._client.soft_recheck_session()
-            if ok:
-                # Retry profile once
+            # In-fight lock: user.php returns a fight.php redirect stub without
+            # ``var par`` — soft recheck still passes because state.fight_id is set.
+            # Old path skipped forever → "Soft recheck OK but nick still empty".
+            fight_id = int(getattr(self._state, "fight_id", 0) or 0)
+            html_hint = ""
+            try:
+                html_hint = await self.stats._fetch_user_page()
+            except Exception:
+                html_hint = ""
+            fight_locked = bool(fight_id) or is_fight_lock_html(html_hint)
+            if fight_locked:
+                logger.warning(
+                    "Nick empty but fight active (fight_id=%s) — finishing fight…",
+                    fight_id or "?",
+                )
+                result = await self.combat.finish_fight(timeout=180.0)
+                logger.info("In-fight recover → %s", result.name)
+                if result == BattleResult.WIN:
+                    self.combat.session.battles_joined += 1
+                    self.quests.clear_exhausted(local_only=True)
+                    self.brain.push_farm(300.0)
                 self._profile = await self.stats.read_full_profile()
                 self._char = self._profile.char
                 self._state = self._profile.state
                 if self._char.nick:
-                    logger.info("Soft recheck OK — nick=%s", self._char.nick)
+                    logger.info(
+                        "After fight: %s Lv%d fight_id=%s",
+                        self._char.nick, self._char.level, self._state.fight_id,
+                    )
                 else:
-                    logger.warning("Soft recheck OK but nick still empty — skip tick.")
-                    await _sleep(5.0, 10.0)
+                    logger.warning("Still no nick after fight finish — soft wait.")
+                    await _sleep(3.0, 6.0)
                     return
             else:
-                logger.warning(
-                    "Soft recheck failed — waiting for cookies (no blind renew)."
-                )
-                self._token_ok = False
-                raise TokenExpiredError(
-                    "Session dead and OAuth renew unsafe — paste fresh cookies."
-                )
+                logger.warning("No character data — soft recheck (no invalidate).")
+                ok = await self._client.soft_recheck_session()
+                if ok:
+                    st2 = await self._client.get_state()
+                    if st2.fight_id:
+                        self._state = st2
+                        logger.warning(
+                            "Soft OK + fight_id=%s — finish fight next.",
+                            st2.fight_id,
+                        )
+                        result = await self.combat.finish_fight(timeout=180.0)
+                        logger.info("Deferred fight finish → %s", result.name)
+                        if result == BattleResult.WIN:
+                            self.combat.session.battles_joined += 1
+                            self.quests.clear_exhausted(local_only=True)
+                            self.brain.push_farm(300.0)
+                        self._profile = await self.stats.read_full_profile()
+                        self._char = self._profile.char
+                        self._state = self._profile.state
+                        if self._char.nick:
+                            logger.info(
+                                "Recovered after deferred fight — nick=%s",
+                                self._char.nick,
+                            )
+                    if not self._char.nick:
+                        self._profile = await self.stats.read_full_profile()
+                        self._char = self._profile.char
+                        self._state = self._profile.state
+                        if self._char.nick:
+                            logger.info("Soft recheck OK — nick=%s", self._char.nick)
+                        else:
+                            logger.warning(
+                                "Soft recheck OK but nick still empty — skip tick."
+                            )
+                            await _sleep(5.0, 10.0)
+                            return
+                else:
+                    logger.warning(
+                        "Soft recheck failed — waiting for cookies (no blind renew)."
+                    )
+                    self._token_ok = False
+                    raise TokenExpiredError(
+                        "Session dead and OAuth renew unsafe — paste fresh cookies."
+                    )
+
+        if not self._char.nick:
+            await _sleep(3.0, 6.0)
+            return
 
         logger.info(
             "[%d] %s Lv%d | HP %d/%d (%.0f%%) | MP %d/%d | area=%s | %.2f зол | предметов=%d | sid=%s…",

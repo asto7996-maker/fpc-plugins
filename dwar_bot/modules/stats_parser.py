@@ -32,6 +32,21 @@ TAB_GIFTS = 6
 TAB_EXPIRING = 7
 
 
+def is_fight_lock_html(html: str) -> bool:
+    """
+    True when user.php returns the in-fight redirect stub.
+
+    During a fight the server often serves a short page that only boots
+    ``fight.php`` (via ``tProcessMenu``) and has no ``var par=…`` character blob.
+    Soft session recheck still succeeds because ``common|dummy`` returns state
+    (including ``fight_id``).
+    """
+    text = html or ""
+    if "var par=" in text:
+        return False
+    return "fight.php" in text and "tProcessMenu" in text
+
+
 # ---------------------------------------------------------------------------
 # Data containers
 # ---------------------------------------------------------------------------
@@ -138,6 +153,11 @@ class StatsParser:
             # One user.php for nick/hp + inventory/effects (avoid double GET)
             html = await self._fetch_user_page()
             profile.char = self._client.parse_char_stats(html)
+            if not profile.char.nick and is_fight_lock_html(html):
+                logger.info(
+                    "user.php fight-lock stub (no var par); fight_id=%s — finish fight first",
+                    getattr(profile.state, "fight_id", 0) or 0,
+                )
             profile.inventory = self._parse_inventory(html)
             profile.effects = self._parse_effects(html)
             profile.notifications = self._parse_notifications(html)

@@ -261,3 +261,21 @@ def test_hunt_mob_preferred_for_quest_unlock():
     assert snap.focus is not None
     assert snap.focus.action == ActionType.HUNT_MOB
     assert "Крэтс" in snap.focus.title
+
+
+def test_fight_lock_html_detection():
+    from dwar_bot.modules.stats_parser import is_fight_lock_html
+    from dwar_bot.core.game_client import DwarGameClient
+
+    stub = (
+        "<html><script>tProcessMenu('fight.php?id=1');</script></html>"
+    )
+    assert is_fight_lock_html(stub) is True
+    assert is_fight_lock_html("var par='nick=xylophaze&lvl=1'") is False
+    assert is_fight_lock_html("") is False
+    assert DwarGameClient.parse_char_stats(stub).nick == ""
+    ok = DwarGameClient.parse_char_stats(
+        "var par='nick=xylophaze&lvl=1&hp=10&hp_max=100'"
+    )
+    assert ok.nick == "xylophaze"
+    assert ok.level == 1
