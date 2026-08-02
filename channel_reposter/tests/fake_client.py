@@ -216,5 +216,9 @@ class FakeClient:
     async def get_chat(self, chat_id):
         return make_chat(int(chat_id) if str(chat_id).lstrip("-").isdigit() else SOURCE_ID)
 
+    async def resolve_peer(self, peer_id):
+        """Прогрев peer для закрытых каналов (числовой id)."""
+        return int(peer_id) if str(peer_id).lstrip("-").isdigit() else peer_id
+
     async def invoke(self, *args, **kwargs):
         raise RuntimeError("resolve not supported in tests")

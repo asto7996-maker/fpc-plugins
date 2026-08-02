@@ -16,7 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from database import Database  # noqa: E402
-from links import normalize_channel, parse_post_link  # noqa: E402
+from links import normalize_channel, parse_post_link, to_channel_chat_id  # noqa: E402
 from poster import _attach_caption, _is_unsupported_media  # noqa: E402
 from pyrogram.types import InputMediaPhoto  # noqa: E402
 from pyrogram import enums  # noqa: E402
@@ -114,8 +114,24 @@ class NormalizeChannelTests(unittest.TestCase):
         )
 
     def test_numeric_id(self) -> None:
+        # Короткий id закрытого канала (из t.me/c/<id>/…) → полный chat_id
+        self.assertEqual(normalize_channel("35839961"), "-10035839961")
+        self.assertEqual(normalize_channel(35839961), "-10035839961")
+        self.assertEqual(normalize_channel("-10035839961"), "-10035839961")
         self.assertEqual(normalize_channel("-100123"), "-100123")
-        self.assertEqual(normalize_channel(12345), "12345")
+        self.assertEqual(to_channel_chat_id("35839961"), "-10035839961")
+        self.assertEqual(to_channel_chat_id(-10035839961), "-10035839961")
+
+    def test_private_channel_url(self) -> None:
+        self.assertEqual(
+            normalize_channel("https://t.me/c/35839961"), "-10035839961"
+        )
+        self.assertEqual(
+            normalize_channel("https://t.me/c/35839961/500"), "-10035839961"
+        )
+        self.assertEqual(
+            normalize_channel("t.me/c/35839961/12?single"), "-10035839961"
+        )
 
     def test_db_setters_normalize(self) -> None:
         tmp = tempfile.TemporaryDirectory()
@@ -133,6 +149,12 @@ class NormalizeChannelTests(unittest.TestCase):
         s = db.get_settings()
         self.assertEqual(s.source_channel, "@porno_sliv_altushek_v_tg")
         self.assertEqual(s.target_channel, "@sw3atsh0p")
+
+        db.set_source_channel("35839961")
+        db.set_target_channel("https://t.me/c/111222333")
+        s = db.get_settings()
+        self.assertEqual(s.source_channel, "-10035839961")
+        self.assertEqual(s.target_channel, "-100111222333")
 
 
 class DatabaseTests(unittest.TestCase):

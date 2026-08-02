@@ -801,7 +801,8 @@ async def cb_link(c: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(S.link)
     await c.message.answer(  # type: ignore
         "🔗 Ссылка на пост-источник:\n"
-        "<code>https://t.me/channel/123</code>\n\n"
+        "• публичный: <code>https://t.me/channel/123</code>\n"
+        "• закрытый: <code>https://t.me/c/35839961/123</code>\n\n"
         "Указанный пост <b>не</b> публикуется — начнём со следующего.",
         reply_markup=cancel_kb(),
         parse_mode="HTML",
@@ -843,8 +844,12 @@ async def cb_source(c: CallbackQuery, state: FSMContext) -> None:
     await _ack(c)
     await state.set_state(S.source)
     await c.message.answer(  # type: ignore
-        "📥 Источник — публичный <code>@username</code>\n"
-        "<i>Админство не нужно, достаточно подписки аккаунта.</i>",
+        "📥 Источник — канал, откуда берём посты.\n\n"
+        "• публичный: <code>@username</code>\n"
+        "• закрытый: id канала, например <code>35839961</code>\n"
+        "  (из ссылки <code>t.me/c/35839961/…</code>) "
+        "или полный <code>-10035839961</code>\n\n"
+        "<i>Админство не нужно, достаточно подписки юзербота.</i>",
         reply_markup=cancel_kb(),
         parse_mode="HTML",
     )
@@ -857,7 +862,11 @@ async def cb_target(c: CallbackQuery, state: FSMContext) -> None:
     await _ack(c)
     await state.set_state(S.target)
     await c.message.answer(  # type: ignore
-        "📤 Назначение — ваш канал.\n"
+        "📤 Назначение — куда льём посты.\n\n"
+        "• публичный: <code>@username</code>\n"
+        "• закрытый: id канала, например <code>35839961</code>\n"
+        "  (из ссылки <code>t.me/c/35839961/…</code>) "
+        "или полный <code>-10035839961</code>\n\n"
         "<i>Юзербот должен быть там админом с правом постить.</i>",
         reply_markup=cancel_kb(),
         parse_mode="HTML",
@@ -1230,7 +1239,10 @@ def _cycle_report(db: Database, result) -> str:
     s = db.get_settings()
     hints = {
         "up_to_date": "Новых постов в источнике нет — всё уже перезалито.",
-        "source_empty": "Источник пуст или недоступен аккаунту юзербота.",
+        "source_empty": (
+            "Источник пуст или недоступен аккаунту юзербота "
+            "(для закрытого канала нужна подписка; укажите id, напр. 35839961)."
+        ),
         "no_start": "Не задана стартовая точка: «🔗 Старт-ссылка» или «📜 С начала».",
         "paused": "Автопостинг на паузе.",
         "aborted": "Цикл был прерван (например, новой командой).",
@@ -1316,20 +1328,29 @@ async def _run_test(message: Message) -> None:
                     uname = f"@{me.username}" if me.username else me.first_name
                     from pyrogram import raw
 
-                    # Сначала ResolveUsername — иначе CHANNEL_INVALID на холодной сессии
-                    chat_id = dst
+                    # ResolveUsername / resolve_peer — иначе CHANNEL_INVALID на холодной сессии
+                    chat_id: str | int = dst
                     try:
-                        username = dst.lstrip("@")
-                        if username and not username.lstrip("-").isdigit():
+                        from links import normalize_channel, to_channel_chat_id
+
+                        normalized = normalize_channel(dst)
+                        username = normalized.lstrip("@")
+                        if username.lstrip("-").isdigit():
+                            chat_id = int(to_channel_chat_id(username))
+                            await _bridge.auth.client.resolve_peer(chat_id)
+                        else:
                             r = await _bridge.auth.client.invoke(
-                                raw.functions.contacts.ResolveUsername(username=username)
+                                raw.functions.contacts.ResolveUsername(
+                                    username=username
+                                )
                             )
                             if hasattr(r.peer, "channel_id"):
                                 chat_id = int(f"-100{r.peer.channel_id}")
                     except Exception as e:
                         return (
                             f"❌ канал не найден: <code>{e}</code>\n"
-                            f"<i>Проверьте username назначения (не полную ссылку).</i>",
+                            f"<i>Для закрытого укажите id (35839961), "
+                            f"юзербот должен быть в канале.</i>",
                             False,
                         )
                     try:

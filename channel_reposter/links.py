@@ -14,6 +14,12 @@ _LINK_PRIVATE = re.compile(
 _LINK_PUBLIC = re.compile(
     r"(?:https?://)?t\.me/([A-Za-z0-9_]+)/(\d+)", re.IGNORECASE
 )
+# https://t.me/c/123456789  |  https://t.me/c/123456789/500 (как ссылка на канал)
+_CHANNEL_PRIVATE = re.compile(
+    r"(?:https?://)?(?:www\.)?(?:t\.me|telegram\.me|telegram\.dog)/c/(\d+)"
+    r"(?:/\d+)?(?:\?.*)?$",
+    re.IGNORECASE,
+)
 # https://t.me/channel_username  |  @https://t.me/channel_username/...
 _CHANNEL_URL = re.compile(
     r"(?:https?://)?(?:www\.)?(?:t\.me|telegram\.me|telegram\.dog)/"
@@ -25,6 +31,29 @@ _RESERVED_USERNAMES = frozenset(
 )
 
 
+def to_channel_chat_id(value: str | int) -> str:
+    """
+    Привести числовой id к полному chat_id канала (-100…).
+
+    Примеры:
+      35839961           → -10035839961   (id из ссылки t.me/c/35839961/…)
+      -10035839961       → -10035839961
+      -123456789         → -123456789     (уже отрицательный — как есть)
+    """
+    if isinstance(value, int):
+        if value > 0:
+            return f"-100{value}"
+        return str(value)
+
+    raw = str(value).strip()
+    if not raw or not raw.lstrip("-").isdigit():
+        raise ValueError(f"Не числовой id канала: {value!r}")
+
+    if raw.startswith("-"):
+        return raw
+    return f"-100{raw}"
+
+
 def normalize_channel(value: str | int | None) -> str:
     """
     Привести канал к виду, понятному Telegram API.
@@ -32,23 +61,29 @@ def normalize_channel(value: str | int | None) -> str:
     Примеры:
       @name / name / https://t.me/name / @https://t.me/name/123
       → @name
-      -100123… / 123… → строка с id
+      35839961 / https://t.me/c/35839961 → -10035839961
+      -10035839961 → -10035839961
     """
     if value is None:
         return ""
     if isinstance(value, int):
-        return str(value)
+        return to_channel_chat_id(value)
 
     raw = str(value).strip()
     if not raw:
         return ""
 
-    # Числовой id канала/чата
+    # Числовой id канала/чата (в т.ч. короткий id закрытого канала)
     if raw.lstrip("-").isdigit():
-        return raw
+        return to_channel_chat_id(raw)
 
     # Снять ведущий @ (часто остаётся от «@https://t.me/...»)
     candidate = raw[1:] if raw.startswith("@") else raw
+
+    # Закрытый канал: t.me/c/<internal_id>[/<msg_id>]
+    m = _CHANNEL_PRIVATE.search(candidate)
+    if m:
+        return to_channel_chat_id(m.group(1))
 
     m = _CHANNEL_URL.search(candidate)
     if m:
@@ -63,7 +98,8 @@ def normalize_channel(value: str | int | None) -> str:
         return f"@{username}"
 
     raise ValueError(
-        "Не удалось распознать канал. Ожидается @username или https://t.me/username"
+        "Не удалось распознать канал. Ожидается @username, числовой id "
+        "(например 35839961) или https://t.me/c/35839961"
     )
 
 
@@ -85,7 +121,7 @@ def parse_post_link(link: str) -> tuple[str | int, int]:
         # Полный chat_id = -100 + internal_id
         internal_id = int(m.group(1))
         message_id = int(m.group(2))
-        chat_id = int(f"-100{internal_id}")
+        chat_id = int(to_channel_chat_id(internal_id))
         return chat_id, message_id
 
     m = _LINK_PUBLIC.search(link)

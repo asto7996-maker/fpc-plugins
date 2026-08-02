@@ -122,12 +122,31 @@ def _chat_ref(value: str | int) -> str | int:
 
 async def _resolve_chat(client: Client, value: str | int) -> int:
     """
-    Вернуть числовой chat_id. Для @username сначала ResolveUsername,
-    чтобы в сессии был access_hash (иначе бывает CHANNEL_INVALID).
+    Вернуть числовой chat_id.
+
+    Для @username — ResolveUsername (access_hash в сессии).
+    Для числового id закрытого канала (-100…) — resolve_peer / get_chat,
+    чтобы peer был «прогрет» (иначе CHANNEL_INVALID / ChannelPrivate).
+    Юзербот должен уже состоять в закрытом канале.
     """
     ref = _chat_ref(value)
     if isinstance(ref, int):
-        return ref
+        try:
+            await client.resolve_peer(ref)
+            return ref
+        except Exception as e:
+            logger.debug("resolve_peer(%s): %s — пробуем get_chat", ref, e)
+        try:
+            chat = await client.get_chat(ref)
+            return int(chat.id)
+        except Exception as e:
+            logger.warning(
+                "Не удалось открыть канал %s: %s "
+                "(для закрытого канала юзербот должен быть подписан / админом)",
+                ref,
+                e,
+            )
+            raise
 
     username = str(ref).lstrip("@")
     try:
@@ -778,9 +797,13 @@ class ChannelPoster:
                 )
                 break
             except (ChannelPrivate, ChannelInvalid) as e:
-                logger.error("Источник недоступен: %s", e)
+                logger.error("Канал недоступен (источник/назначение): %s", e)
                 result.reason = REASON_FATAL
-                result.fatal_text = f"источник недоступен: {e}"
+                result.fatal_text = (
+                    f"закрытый канал недоступен: {e}. "
+                    "Юзербот должен быть подписан на источник и админом "
+                    "в назначении; укажите id вида 35839961 или -100…"
+                )
                 break
             except _NETWORK_ERRORS as e:
                 logger.error("Сеть недоступна: %s", e)
