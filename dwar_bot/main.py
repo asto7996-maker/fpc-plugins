@@ -196,6 +196,7 @@ class DwarBot:
             "auth_blocked": self._client.auth_blocked,
             "fight_id": getattr(self._state, "fight_id", 0) or 0,
             "need_quest_unlock": self.brain.need_quest_unlock,
+            "awaiting_quest_turnin": self.brain.awaiting_quest_turnin,
             "pending_hunt_mob": self.brain.pending_hunt_mob or self.quests.pending_hunt_mob,
             "recovery": {
                 "last_kind": get_recovery_stats().last_kind,
@@ -626,18 +627,22 @@ class DwarBot:
         # fight_id / flags already on state from profile — no extra dummy round-trip
         in_battle = bool(self._state.flags & 0x1) or bool(self._state.fight_id)
 
-        # Quest type=2 kill gate → prefer hunt_farm mob
+        # Quest type=2 kill gate → prefer hunt_farm mob (one kill, then turn-in)
         if self.quests.pending_hunt_mob:
             self.brain.pending_hunt_mob = self.quests.pending_hunt_mob
-        if in_battle and not self.brain.need_quest_unlock:
-            # Stuck fight often means unfinished «Проба сил»
-            self.brain.need_quest_unlock = True
+            if not self.brain.awaiting_quest_turnin:
+                self.brain.need_quest_unlock = True
+        elif not self.brain.awaiting_quest_turnin:
+            # No live quest kill request — don't keep farming last mob forever
+            if self.brain.pending_hunt_mob and self.brain._hunt_streak >= 1:
+                self.brain.pending_hunt_mob = ""
+                self.brain.need_quest_unlock = False
 
         event_timers = await self.timers.scrape_event_timers(hunt=hunt)
-        # Newbie with empty bag stuck on village loops → force farm/travel priority
+        # Empty bag: light farm nudge, not a 10‑minute hunt lock
         if not self._profile.inventory and not self.brain.farm_push_active():
-            if self._iteration <= 3 or self.brain.empty_streak("Расселина") >= 1:
-                self.brain.push_farm(600.0)
+            if self._iteration <= 2 and self.brain.empty_streak("Расселина") >= 2:
+                self.brain.push_farm(180.0)
         snap = self.brain.analyze(
             profile=self._profile,
             area=area,
@@ -761,8 +766,7 @@ class DwarBot:
 
     async def admin_force_hunt(self, mob: str = "") -> str:
         mob = mob or self.brain.pending_hunt_mob or self.quests.pending_hunt_mob or "Крэтс"
-        self.brain.pending_hunt_mob = mob
-        self.brain.need_quest_unlock = True
+        self.brain.mark_hunt_for_quest(mob)
         if await self.combat.is_in_battle():
             result = await self.combat.finish_fight()
             return f"Доигрывал бой → {result.name}"
@@ -889,8 +893,19 @@ class DwarBot:
                     )
                 if result == BattleResult.WIN:
                     await self.notify("⚔️ Охота: победа!", "battles")
-                    # Re-enable Вождь dialogue after kill
+                    self.brain.mark_hunt_kill_done()
                     self.quests.clear_exhausted(local_only=True)
+                    # Immediately try type=2 turn-in — do not farm more Крэтс
+                    turned = 0
+                    try:
+                        turned = await self.quests.retry_pending_type2()
+                    except Exception as exc:
+                        logger.debug("retry_pending_type2: %s", exc)
+                    if turned:
+                        self.brain.clear_hunt_gate()
+                        self.quests.clear_hunt_gate()
+                        await self.notify("📜 Квест: убийство сдано Вождю", "quests")
+                        return True
                     if self.quests.pending_hunt_mob:
                         self.brain.pending_hunt_mob = self.quests.pending_hunt_mob
                     return True
@@ -942,6 +957,13 @@ class DwarBot:
                 npc_id = str(payload.get("npc_id") or "")
                 if not npc_id:
                     return False
+                # Prefer finishing pending type=2 turn-in first
+                if self.quests.has_pending_type2() and self.brain.awaiting_quest_turnin:
+                    turned = await self.quests.retry_pending_type2()
+                    if turned:
+                        self.brain.clear_hunt_gate()
+                        await self.notify("📜 Квест: убийство сдано", "quests")
+                        return True
                 steps = await self.quests.walk_npc_api(
                     npc_id,
                     global_npc=int(payload.get("global_npc", 0) or 0),
@@ -951,6 +973,10 @@ class DwarBot:
                 )
                 if steps:
                     logger.info("📜 Квестовых шагов: %d (NPC %s)", steps, npc_id)
+                    if not self.quests.pending_hunt_mob:
+                        self.brain.clear_hunt_gate()
+                    elif self.quests.pending_hunt_mob:
+                        self.brain.mark_hunt_for_quest(self.quests.pending_hunt_mob)
                     await self.notify(
                         f"📜 Диалог с NPC {npc_id}: <b>{steps}</b> шаг(ов)",
                         "quests",
@@ -1074,11 +1100,12 @@ class DwarBot:
                     self.brain.mark_cooldown(f"Переход: {name}", 300)
                     if "военачальник" in err.lower() or "покинуть селение" in err.lower():
                         self.brain.need_quest_unlock = True
-                        self.brain.push_farm(600.0)
-                        # Re-enable Вождь so we can unlock the exit
+                        self.brain.awaiting_quest_turnin = False
+                        # Soft nudge — story NPC first, hunt only if type=2 asks
+                        self.brain.push_farm(120.0)
                         cleared = self.quests.clear_exhausted(local_only=True)
                         logger.info(
-                            "Нужен приказ военачальника — возвращаюсь к квесту "
+                            "Нужен приказ военачальника — возвращаюсь к сюжету "
                             "(снято exhausted: %d).",
                             cleared,
                         )
@@ -1088,6 +1115,8 @@ class DwarBot:
                     logger.info("Перешёл в area %s (%s).", new_state.area_id, name)
                     self._area_moves_tried.clear()
                     self.brain.need_quest_unlock = False
+                    self.brain.clear_hunt_gate()
+                    self.quests.clear_hunt_gate()
                     return True
                 return False
 

@@ -194,6 +194,10 @@ class ProgressionBrain:
         self.need_quest_unlock: bool = False
         # Quest type=2 kill target (e.g. Крэтс) — prefer hunt_farm attack
         self.pending_hunt_mob: str = ""
+        # After a quest-required kill: talk to NPC before hunting again
+        self.awaiting_quest_turnin: bool = False
+        # Consecutive casual hunts without quest/loot progress
+        self._hunt_streak: int = 0
 
     def mark_cooldown(self, name: str, seconds: float) -> None:
         if seconds <= 0:
@@ -214,6 +218,26 @@ class ProgressionBrain:
     def farm_push_active(self) -> bool:
         return time.time() < self.farm_push_until
 
+    def mark_hunt_for_quest(self, mob: str) -> None:
+        """Quest type=2 needs a live kill — hunt once, then turn in."""
+        self.pending_hunt_mob = mob or self.pending_hunt_mob or "Крэтс"
+        self.need_quest_unlock = True
+        self.awaiting_quest_turnin = False
+        self._hunt_streak = 0
+
+    def mark_hunt_kill_done(self) -> None:
+        """Kill landed — next priority is NPC dialogue / turn-in, not more farms."""
+        self.awaiting_quest_turnin = True
+        self._hunt_streak = 0
+        # Soften farm-push so story NPC wins
+        self.farm_push_until = 0.0
+
+    def clear_hunt_gate(self) -> None:
+        """Quest kill gate cleared (dialogue advanced or travel unlocked)."""
+        self.pending_hunt_mob = ""
+        self.awaiting_quest_turnin = False
+        self._hunt_streak = 0
+
     def empty_streak(self, name: str) -> int:
         """How many consecutive empty results for a combat hotspot title."""
         return max(
@@ -231,14 +255,22 @@ class ProgressionBrain:
             if option.action in (
                 ActionType.COMBAT_AREA, ActionType.COMBAT_FRONT,
                 ActionType.COMBAT_ARENA, ActionType.TRAVEL,
-                ActionType.HUNT_MOB,
             ):
                 self.farm_push_until = 0.0
             if option.action == ActionType.HUNT_MOB:
-                # Keep quest unlock flag until travel succeeds
-                pass
+                self.mark_hunt_kill_done()
+            elif option.action == ActionType.QUEST_NPC:
+                # Dialogue moved — hunt gate may be cleared by caller;
+                # at least stop forcing more kills until type=2 asks again.
+                self.awaiting_quest_turnin = False
+                self._hunt_streak = 0
+            elif option.action == ActionType.TRAVEL:
+                self.need_quest_unlock = False
+                self.clear_hunt_gate()
         else:
             self._stale[key] = self._stale.get(key, 0) + 1
+            if option.action == ActionType.HUNT_MOB:
+                self._hunt_streak += 1
             if option.action in (ActionType.COMBAT_AREA, ActionType.AREA_ACTION):
                 if self._stale[key] >= self.EMPTY_FARM_ESCALATE:
                     self.push_farm(480.0)
@@ -335,9 +367,14 @@ class ProgressionBrain:
         if farm.auto_quests and story_npc and story_npc.get("npc_id"):
             sid = str(story_npc["npc_id"])
             if sid not in exhausted:
-                is_global = int(story_npc.get("global_npc", 1) or 1) == 1
-                # Global seasonal NPCs (летопись / арена-указатель) must not outrank village story
-                score = 520 if is_global else 780
+                raw_g = story_npc.get("global_npc", 1)
+                is_global = int(0 if raw_g in (0, "0", False) else (raw_g or 1)) == 1
+                # Global seasonal NPCs must not outrank village story
+                score = 520 if is_global else 820
+                if self.awaiting_quest_turnin and not is_global:
+                    score = 1250  # turn in kill BEFORE next hunt
+                elif self.need_quest_unlock and not is_global:
+                    score = 900
                 options.append(GameOption(
                     ActionType.QUEST_NPC,
                     f"Сюжетный NPC #{sid}",
@@ -348,7 +385,7 @@ class ProgressionBrain:
                     ),
                     payload={
                         "npc_id": sid,
-                        "global_npc": int(story_npc.get("global_npc", 1) or 1),
+                        "global_npc": 1 if is_global else 0,
                         "link_id": str(story_npc.get("link_id") or "0"),
                         "f_id": str(story_npc.get("f_id") or "0"),
                         "area_id": str(story_npc.get("area_id") or area.area_id or "0"),
@@ -361,10 +398,15 @@ class ProgressionBrain:
                 break
             if str(npc.npc_id) in exhausted:
                 continue
+            qscore = 800 if not npc.is_global else 520
+            if self.awaiting_quest_turnin and not npc.is_global:
+                qscore = 1200
+            elif self.need_quest_unlock and not npc.is_global:
+                qscore = 880
             options.append(GameOption(
                 ActionType.QUEST_NPC,
                 f"NPC: {npc.title}",
-                score=760 if not npc.is_global else 520,
+                score=qscore,
                 detail=f"id={npc.npc_id}",
                 payload={
                     "npc_id": str(npc.npc_id),
@@ -384,10 +426,13 @@ class ProgressionBrain:
             if itype == "npc" and item.npc_id and farm.auto_quests:
                 if str(item.npc_id) in exhausted:
                     continue
+                nscore = 850 if self.awaiting_quest_turnin else (
+                    800 if self.need_quest_unlock else 770
+                )
                 options.append(GameOption(
                     ActionType.QUEST_NPC,
                     f"NPC: {name}",
-                    score=770,
+                    score=nscore,
                     detail=f"локальный id={item.npc_id}",
                     payload={
                         "npc_id": str(item.npc_id),
@@ -511,19 +556,35 @@ class ProgressionBrain:
                     goal=GoalKind.EVENT,
                 ))
 
-        # Hunt farm — real XP / quest kills (Крэтс for «Проба сил»)
+        # Hunt farm — ONLY when quest type=2 needs a kill, or light XP between story beats.
+        # Endless Крэтс farming is NOT the goal — story → kill objective → turn-in → loot → gear.
         if farm.auto_combat and farm.farm_area:
             mob = self.pending_hunt_mob or ("Крэтс" if self.need_quest_unlock else "")
-            hunt_score = 520 if max_farm else 480
-            if self.need_quest_unlock or mob:
-                hunt_score = 950
+            if self.awaiting_quest_turnin:
+                # Already killed — do NOT hunt again until NPC dialogue advances
+                hunt_score = 80
+            elif self.need_quest_unlock and mob:
+                hunt_score = 980  # one required kill for «Проба сил» etc.
+            elif mob and self.pending_hunt_mob:
+                hunt_score = 700
             elif self.farm_push_active() or empty_bag:
-                hunt_score = 720
+                hunt_score = 420  # light farm, never above story NPC (~800+)
+            else:
+                hunt_score = 320
+            # Cap spam: after several hunts without turn-in, demote hard
+            if self._hunt_streak >= 2 and not self.need_quest_unlock:
+                hunt_score = min(hunt_score, 200)
+            if self._hunt_streak >= 1 and self.awaiting_quest_turnin:
+                hunt_score = 40
             options.append(GameOption(
                 ActionType.HUNT_MOB,
                 f"Охота: {mob or 'любой моб'}",
                 score=hunt_score,
-                detail="hunt_farm ATTACK_BOT + fight WS",
+                detail=(
+                    "квестовое убийство (type=2)"
+                    if (self.need_quest_unlock and not self.awaiting_quest_turnin)
+                    else "hunt_farm — слабый приоритет vs сюжет"
+                ),
                 payload={"name": mob, "area_id": str(state.area_id or "")},
                 goal=GoalKind.COMBAT,
             ))
@@ -531,9 +592,8 @@ class ProgressionBrain:
         if farm.auto_combat and farm.farm_fronts:
             front_score = 440 if max_farm else 420
             if self.farm_push_active() or empty_bag:
-                front_score = 660 if max_farm else 600
-            # Fronts are useless in newbie village while quest gate is closed
-            if self.need_quest_unlock:
+                front_score = 560 if max_farm else 500
+            if self.need_quest_unlock or self.awaiting_quest_turnin:
                 front_score = 40
             options.append(GameOption(
                 ActionType.COMBAT_FRONT,
@@ -566,17 +626,19 @@ class ProgressionBrain:
         for o in options:
             o.score = max(1.0, o.score - self._stale_penalty(o))
 
-        # Farm-push: leave village / find fights. Prefer travel→fronts; only
-        # re-boost local quests when the war chief gates the exit.
+        # Farm-push: leave village / find fights — but NEVER outrank an active
+        # quest kill turn-in. Story first: NPC → required kill → turn-in → travel.
         farm_mode = self.farm_push_active() or any(
             v >= self.EMPTY_FARM_ESCALATE for v in self._stale.values()
         )
-        if farm_mode:
+        if farm_mode and not self.awaiting_quest_turnin:
             for o in options:
                 if o.action == ActionType.HUNT_MOB:
-                    o.score += 200.0 if self.need_quest_unlock else 120.0
+                    if self.need_quest_unlock and not self.awaiting_quest_turnin:
+                        o.score += 50.0  # mild boost for the one required kill
+                    else:
+                        o.score += 40.0
                 elif o.action == ActionType.TRAVEL:
-                    # Travel stays gated until hunt quest completes
                     if self.need_quest_unlock:
                         o.score = max(1.0, o.score - 100.0)
                     else:
@@ -585,21 +647,27 @@ class ProgressionBrain:
                     if self.need_quest_unlock:
                         o.score = min(o.score, 50.0)
                     else:
-                        o.score += 100.0
+                        o.score += 80.0
                 elif o.action == ActionType.COMBAT_AREA and o.score > 100:
                     name = str((o.payload or {}).get("name") or "")
                     if self.empty_streak(name) >= 1:
                         o.score = min(o.score, 90.0)
                     else:
-                        o.score = max(1.0, o.score - 80.0)
+                        o.score = max(1.0, o.score - 40.0)
                 elif o.action == ActionType.QUEST_NPC:
                     if self.need_quest_unlock and not str(
                         (o.payload or {}).get("global_npc", 0)
                     ) in ("1",):
-                        # Answer Вождь AFTER the hunt kill
-                        o.score += 180.0
-                    else:
-                        o.score = max(1.0, o.score - 250.0)
+                        o.score += 100.0
+                    # Do not demote local story NPCs during farm-push
+        elif self.awaiting_quest_turnin:
+            for o in options:
+                if o.action == ActionType.QUEST_NPC and not str(
+                    (o.payload or {}).get("global_npc", 0)
+                ) in ("1",):
+                    o.score = max(o.score, 1250.0)
+                elif o.action == ActionType.HUNT_MOB:
+                    o.score = min(o.score, 60.0)
 
         options.sort(key=lambda o: -o.score)
         focus = options[0] if options else None
@@ -716,12 +784,16 @@ class ProgressionBrain:
             steps.append(PlanStep(GoalKind.GEAR, "Надеть и чинить добычу", "сила растёт от экипа"))
             steps.append(PlanStep(GoalKind.QUEST, "Вернуться к сюжету позже", "когда появится прогресс"))
         else:
-            steps.append(PlanStep(GoalKind.QUEST, "Закрыть диалоги Вождя / сюжет", "открывает переходы и бои"))
-            steps.append(PlanStep(GoalKind.COMBAT, "Фарм точки Расселина / мобы", "XP + лут + прогресс «Проба сил»"))
+            steps.append(PlanStep(GoalKind.QUEST, "Сюжет / диалоги Вождя", "открывает переходы и новые цели"))
+            if self.awaiting_quest_turnin:
+                steps.insert(0, PlanStep(GoalKind.QUEST, "Сдать убийство Вождю", "type=2 после охоты"))
+            elif self.need_quest_unlock and self.pending_hunt_mob:
+                steps.insert(0, PlanStep(GoalKind.COMBAT, f"Убить {self.pending_hunt_mob} по квесту", "одно убийство, не фарм"))
+            steps.append(PlanStep(GoalKind.COMBAT, "Мобы / точки по сюжету", "XP и лут между этапами"))
             steps.append(PlanStep(GoalKind.GEAR, "Надеть и чинить добычу", "сила растёт от экипа"))
             steps.append(PlanStep(GoalKind.TRAVEL, "Выйти в Дымные сопки", "когда военачальник разрешит"))
         steps.append(PlanStep(GoalKind.EVENT, "Арена / ивенты", "только когда таймер готов"))
-        steps.append(PlanStep(GoalKind.COMBAT, "Фарм уровней и золота", "максимальный рост персонажа"))
+        steps.append(PlanStep(GoalKind.COMBAT, "Фарм уровней и золота", "после сюжета / между квестами"))
         return steps
 
     def _describe_now(

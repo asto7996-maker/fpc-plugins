@@ -117,6 +117,85 @@ class QuestTracker:
         self._pending_type2: dict[str, str] = {}
         self.pending_hunt_mob: str = ""
 
+    def clear_hunt_gate(self) -> None:
+        """Clear quest kill gate after turn-in or travel unlock."""
+        self.pending_hunt_mob = ""
+        self._pending_type2 = {}
+
+    def has_pending_type2(self) -> bool:
+        return bool(self._pending_type2)
+
+    async def retry_pending_type2(self) -> int:
+        """
+        After a hunt kill, re-submit the type=2 answer that was waiting.
+
+        Returns dialogue steps advanced (0 if nothing pending / failed).
+        """
+        pending = dict(self._pending_type2 or {})
+        if not pending:
+            return 0
+        npc_id = str(pending.get("npc_id") or "")
+        to_point = str(pending.get("to_point") or "")
+        from_point = str(pending.get("from_point") or "")
+        child_id = str(pending.get("child_id") or "")
+        quest_id = pending.get("quest_id") or 0
+        if not npc_id or not to_point:
+            return 0
+        logger.info(
+            "Сдача type=2 после охоты: NPC %s msg %s → %s (mob=%s)",
+            npc_id, child_id or from_point, to_point, pending.get("mob_name"),
+        )
+        # Soft-ban keys must not block the turn-in
+        self._answered_points.discard(child_id)
+        self._answered_points.discard(to_point)
+        for key in list(self._exhausted_dialogues):
+            if f":{npc_id}:" in f":{key}:":
+                self._exhausted_dialogues.discard(key)
+                self._soft_ban_until.pop(key, None)
+
+        global_npc = int(pending.get("global_npc") or 0)
+        link_id = str(pending.get("link_id") or "0")
+        f_id = str(pending.get("f_id") or "0")
+        try:
+            raw_ans = await self._client.npc_answer(
+                npc_id,
+                quest_id=quest_id,
+                point_id=to_point,
+                global_npc=global_npc,
+                link_id=link_id,
+                f_id=f_id,
+                subpoint_id=to_point,
+            )
+            ans = raw_ans.get("npc|answer") or {}
+            if int(ans.get("status", 0) or 0) != STATUS_OK:
+                raw_ans = await self._client.npc_answer(
+                    npc_id,
+                    quest_id=quest_id,
+                    point_id=from_point or child_id,
+                    global_npc=global_npc,
+                    link_id=link_id,
+                    f_id=f_id,
+                    subpoint_id=child_id or to_point,
+                )
+                ans = raw_ans.get("npc|answer") or {}
+            ok = int(ans.get("status", 0) or 0) == STATUS_OK
+            if ok:
+                self.session.dialogues_handled += 1
+                self.clear_hunt_gate()
+                awards = (raw_ans.get("npc|point") or {}).get("award_list") or []
+                for a in awards[:5]:
+                    logger.info("  Награда (type=2): %s", a)
+                logger.info("type=2 принят — охота больше не нужна для этого этапа.")
+                return 1
+            logger.info(
+                "type=2 ещё не принят: %s — вернусь к Вождю через walk_npc",
+                ans.get("error") or ans.get("status"),
+            )
+            return 0
+        except Exception as exc:
+            logger.warning("retry_pending_type2: %s", exc)
+            return 0
+
     def _infer_hunt_mob_name(self, *texts: str) -> str:
         """Extract mob name from quest titles like 'Крэтс повержен'."""
         blob = " ".join(t for t in texts if t).strip()
@@ -636,6 +715,9 @@ class QuestTracker:
             steps += 1
             if quest_id and ans_ok:
                 self.session.quests_accepted += 1
+            # Successful dialogue step clears hunt gate (kill already turned in)
+            if ans_ok or moved:
+                self.clear_hunt_gate()
 
             awards = (raw.get("npc|point") or {}).get("award_list") or []
             for a in awards[:5]:

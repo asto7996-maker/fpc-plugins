@@ -263,6 +263,33 @@ def test_hunt_mob_preferred_for_quest_unlock():
     assert "Крэтс" in snap.focus.title
 
 
+def test_story_turnin_outranks_hunt_after_kill():
+    from dwar_bot.modules.progression_brain import ProgressionBrain, ActionType
+    from dwar_bot.modules.bot_settings import BotSettings
+    from dwar_bot.modules.stats_parser import FullProfile, CharStats
+    from dwar_bot.core.game_client import GameState, AreaInfo
+
+    brain = ProgressionBrain(BotSettings())
+    brain.need_quest_unlock = True
+    brain.pending_hunt_mob = "Крэтс"
+    brain.mark_hunt_kill_done()
+    profile = FullProfile(
+        char=CharStats(nick="t", level=2, hp=100, hp_max=100),
+        state=GameState(area_id="932", level=2),
+    )
+    snap = brain.analyze(
+        profile=profile,
+        area=AreaInfo(area_id="932", title="Поселок Чернаг"),
+        npcs=[],
+        story_npc={"npc_id": "42", "global_npc": 0},
+        local_npcs=[],
+        in_battle=False,
+    )
+    assert snap.focus is not None
+    assert snap.focus.action == ActionType.QUEST_NPC
+    assert snap.focus.score >= 1200
+
+
 def test_fight_lock_html_detection():
     from dwar_bot.modules.stats_parser import is_fight_lock_html
     from dwar_bot.core.game_client import DwarGameClient
