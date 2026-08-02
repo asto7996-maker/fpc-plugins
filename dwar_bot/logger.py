@@ -200,6 +200,10 @@ def setup_logging(
         "Logging initialised — level=%s  file=%s", level, LOG_FILE
     )
 
+    # HTTP client libraries are extremely noisy at INFO (every request)
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+
     _cleanup_old_logs()
 
 

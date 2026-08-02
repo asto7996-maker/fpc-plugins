@@ -438,7 +438,7 @@ class DwarBot:
                 ", ".join(e.title for e in self._profile.effects[:4]),
             )
 
-        # World sense
+        # World sense — fetch each resource at most once per tick
         area = await self._client.get_area_info()
         if area.title:
             self._area_title = area.title
@@ -454,36 +454,32 @@ class DwarBot:
             for i in area.items
         ]
 
-        local_npcs = await self.quests.list_available_npcs()
+        hunt: dict = {}
+        try:
+            hunt = await self._client.get_hunt_conf()
+        except Exception:
+            hunt = {}
+        self._npcs = [
+            {
+                "title": n.get("title", ""),
+                "time_left": n.get("time_left", 0),
+                "npc_id": n.get("npc_id", ""),
+                "url": n.get("url", ""),
+            }
+            for n in (hunt.get("npcs") or [])
+        ]
+
+        local_npcs = await self.quests.list_available_npcs(area=area, hunt=hunt)
         story_npc = None
         try:
             story_npc = await self.quests.resolve_current_npc()
         except Exception as exc:
             logger.debug("resolve_current_npc: %s", exc)
 
-        hunt_npcs: list = []
-        try:
-            hunt = await self._client.get_hunt_conf()
-            hunt_npcs = hunt.get("npcs") or []
-            self._npcs = [
-                {
-                    "title": n.get("title", ""),
-                    "time_left": n.get("time_left", 0),
-                    "npc_id": n.get("npc_id", ""),
-                    "url": n.get("url", ""),
-                }
-                for n in hunt_npcs
-            ]
-        except Exception:
-            pass
+        # fight_id / flags already on state from profile — no extra dummy round-trip
+        in_battle = bool(self._state.flags & 0x1) or bool(self._state.fight_id)
 
-        in_battle = False
-        try:
-            in_battle = await self.combat.is_in_battle()
-        except Exception:
-            pass
-
-        event_timers = await self.timers.scrape_event_timers()
+        event_timers = await self.timers.scrape_event_timers(hunt=hunt)
         snap = self.brain.analyze(
             profile=self._profile,
             area=area,
@@ -679,14 +675,20 @@ class DwarBot:
                     link_id=str(payload.get("link_id") or ""),
                     object_class=str(payload.get("object_class") or "AREA"),
                 )
-                await self._process_loot_response(resp, label=name)
+                loot_n = await self._process_loot_response(resp, label=name)
                 err = str(resp.redirect_error or resp.error or "")
-                # status OK + redirect_error often = flavor / scene text, not a hard fail
+                # Always log outcome so empty loops are visible in /log
                 if err and err.lower() not in ("false", "none", ""):
                     if resp.status == STATUS_OK and not resp.error:
                         logger.info("📖 %s: %s", name, err[:180])
                     else:
                         logger.info("Точка '%s': %s", name, err[:160])
+                else:
+                    logger.info(
+                        "Точка '%s': status=%s loot=%d fight_hint=%s",
+                        name, resp.status, loot_n,
+                        bool(getattr(resp, "redirect_url", None)),
+                    )
                 if await self.combat.is_in_battle():
                     self.combat.session.battles_joined += 1
                     self.combat.session.consecutive_battles += 1
@@ -695,8 +697,8 @@ class DwarBot:
                     await _sleep(3.0, 6.0)
                     return True
                 await _sleep(1.5, 3.5)
-                loot_ok = bool(resp.loot_lines())
-                return loot_ok or resp.status == STATUS_OK or (not err)
+                # Flavor-only / empty OK → report acted but caller marks stale
+                return loot_n > 0 or resp.status == STATUS_OK or (not err)
 
             if action == ActionType.COMBAT_ARENA:
                 result = await self.combat.try_arena()

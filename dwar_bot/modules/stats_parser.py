@@ -135,9 +135,9 @@ class StatsParser:
         profile = FullProfile()
         try:
             profile.state = await self._client.get_state()
-            profile.char = await self._client.get_char_stats()
-
+            # One user.php for nick/hp + inventory/effects (avoid double GET)
             html = await self._fetch_user_page()
+            profile.char = self._client.parse_char_stats(html)
             profile.inventory = self._parse_inventory(html)
             profile.effects = self._parse_effects(html)
             profile.notifications = self._parse_notifications(html)

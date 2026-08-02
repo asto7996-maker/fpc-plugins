@@ -706,42 +706,47 @@ class DwarGameClient:
     # Character stats (user.php)
     # ------------------------------------------------------------------
 
-    async def get_char_stats(self) -> CharStats:
+    async def get_char_stats(self, html: Optional[str] = None) -> CharStats:
         try:
-            resp = await self._get("/user.php")
-            html = resp.text
-            par_m = re.search(r"var par='([^']+)'", html)
-            if not par_m:
-                logger.debug("No par variable in user.php")
-                return CharStats()
-            par = dict(urllib.parse.parse_qsl(par_m.group(1), keep_blank_values=True))
-
-            chat_m = re.search(r"sessionUpdate\((\{[^}]+\})\)", html)
-            avail = 0
-            if chat_m:
-                try:
-                    chat = json.loads(chat_m.group(1))
-                    avail = int(chat.get("avail", 0))
-                except Exception:
-                    pass
-
-            return CharStats(
-                nick=par.get("nick", ""),
-                level=int(par.get("lvl", 0) or 0),
-                hp=int(par.get("hp", 0) or 0),
-                hp_max=int(par.get("hpMax", 0) or 0),
-                mp=int(par.get("mp", 0) or 0),
-                mp_max=int(par.get("mpMax", 0) or 0),
-                kind=int(par.get("sk", par.get("kind", 0)) or 0),
-                lc_id=par.get("LC_id", ""),
-                online=int(par.get("online", 1) or 1),
-                avail=avail,
-            )
+            if html is None:
+                resp = await self._get("/user.php")
+                html = resp.text
+            return self.parse_char_stats(html)
         except TokenExpiredError:
             raise
         except Exception as exc:
             logger.error("get_char_stats error: %s", exc)
             return CharStats()
+
+    @staticmethod
+    def parse_char_stats(html: str) -> CharStats:
+        """Parse CharStats from an already-fetched user.php body."""
+        par_m = re.search(r"var par='([^']+)'", html or "")
+        if not par_m:
+            return CharStats()
+        par = dict(urllib.parse.parse_qsl(par_m.group(1), keep_blank_values=True))
+
+        chat_m = re.search(r"sessionUpdate\((\{[^}]+\})\)", html)
+        avail = 0
+        if chat_m:
+            try:
+                chat = json.loads(chat_m.group(1))
+                avail = int(chat.get("avail", 0))
+            except Exception:
+                pass
+
+        return CharStats(
+            nick=par.get("nick", ""),
+            level=int(par.get("lvl", 0) or 0),
+            hp=int(par.get("hp", 0) or 0),
+            hp_max=int(par.get("hpMax", 0) or 0),
+            mp=int(par.get("mp", 0) or 0),
+            mp_max=int(par.get("mpMax", 0) or 0),
+            kind=int(par.get("sk", par.get("kind", 0)) or 0),
+            lc_id=par.get("LC_id", ""),
+            online=int(par.get("online", 1) or 1),
+            avail=avail,
+        )
 
     # ------------------------------------------------------------------
     # Area info (area.php)

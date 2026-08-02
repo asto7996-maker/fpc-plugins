@@ -278,11 +278,17 @@ class ProgressionBrain:
         if farm.auto_quests and story_npc and story_npc.get("npc_id"):
             sid = str(story_npc["npc_id"])
             if sid not in exhausted:
+                is_global = int(story_npc.get("global_npc", 1) or 1) == 1
+                # Global seasonal NPCs (летопись / арена-указатель) must not outrank village story
+                score = 520 if is_global else 780
                 options.append(GameOption(
                     ActionType.QUEST_NPC,
                     f"Сюжетный NPC #{sid}",
-                    score=780,
-                    detail="сервер указал следующего NPC",
+                    score=score,
+                    detail=(
+                        "глобальный указатель" if is_global
+                        else "сервер указал следующего NPC"
+                    ),
                     payload={
                         "npc_id": sid,
                         "global_npc": int(story_npc.get("global_npc", 1) or 1),
@@ -290,7 +296,7 @@ class ProgressionBrain:
                         "f_id": str(story_npc.get("f_id") or "0"),
                         "area_id": str(story_npc.get("area_id") or area.area_id or "0"),
                     },
-                    goal=GoalKind.QUEST,
+                    goal=GoalKind.EVENT if is_global else GoalKind.QUEST,
                 ))
 
         for npc in (local_npcs or []):

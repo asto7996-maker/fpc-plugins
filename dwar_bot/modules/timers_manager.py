@@ -146,14 +146,16 @@ class TimersManager:
     def server_time(self) -> float:
         return time.time() + self._server_time_offset
 
-    async def scrape_event_timers(self) -> dict[str, int]:
+    async def scrape_event_timers(
+        self, hunt: Optional[dict] = None
+    ) -> dict[str, int]:
         """
-        Read all event/NPC countdowns from hunt_conf.php and register them
-        as cooldowns so the bot knows when an event is about to end.
+        Read event/NPC countdowns from hunt_conf (reuse ``hunt`` if provided).
         """
         timers: dict[str, int] = {}
         try:
-            hunt = await self._client.get_hunt_conf()
+            if hunt is None:
+                hunt = await self._client.get_hunt_conf()
             for npc in hunt.get("npcs", []):
                 left = int(npc.get("time_left", 0))
                 if left <= 0:

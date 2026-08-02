@@ -143,13 +143,23 @@ class QuestTracker:
     # NPC discovery
     # ------------------------------------------------------------------
 
-    async def list_available_npcs(self) -> list[NpcInfo]:
+    async def list_available_npcs(
+        self,
+        *,
+        area: Any = None,
+        hunt: Optional[dict] = None,
+    ) -> list[NpcInfo]:
+        """
+        Discover NPCs. Pass already-fetched ``area`` / ``hunt`` to avoid
+        duplicate area.php / hunt_conf.php requests within one bot tick.
+        """
         npcs: list[NpcInfo] = []
         seen: set[str] = set()
 
         # Local NPCs from area items
         try:
-            area = await self._client.get_area_info()
+            if area is None:
+                area = await self._client.get_area_info()
             for item in area.items:
                 if item.item_type == "npc" and item.npc_id:
                     key = f"local:{item.npc_id}:{item.link_id}"
@@ -178,7 +188,8 @@ class QuestTracker:
 
         # Global / event NPCs
         try:
-            hunt = await self._client.get_hunt_conf()
+            if hunt is None:
+                hunt = await self._client.get_hunt_conf()
             for n in hunt.get("npcs", []):
                 nid = str(n.get("npc_id", ""))
                 if not nid or f"global:{nid}" in seen:
