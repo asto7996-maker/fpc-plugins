@@ -122,6 +122,7 @@ def test_log_watcher_actionable_filter():
         consume_skip_boot_scan,
         mark_skip_boot_scan,
     )
+    from dwar_bot.core.error_recovery import classify_text, ErrorClass
 
     assert LogWatcher._is_actionable("Traceback (most recent call last):\n  File")
     assert LogWatcher._is_actionable("CRITICAL — boom")
@@ -129,6 +130,8 @@ def test_log_watcher_actionable_filter():
     assert LogWatcher._is_actionable("STAGNATION / DOM-Desync: stuck")
     assert not LogWatcher._is_actionable("INFO something fine")
     assert not LogWatcher._is_actionable("| ERROR | httpx timeout retry")
+    assert not LogWatcher._is_actionable("TOKEN EXPIRED: OAuth access_token has expired")
+    assert classify_text("TOKEN EXPIRED").kind == ErrorClass.AUTH
 
     healed = (
         "Error in tick: boom\nTraceback (most recent call last):\n  File\n"
@@ -169,6 +172,50 @@ def test_critical_files_parse(path: str):
     target = REPO / path
     assert target.exists()
     ast.parse(target.read_text(encoding="utf-8"))
+
+
+def test_error_classifier_routes():
+    from dwar_bot.core.error_recovery import (
+        classify_text, classify_exception, ErrorClass, cursor_prompt_for,
+    )
+
+    assert classify_text("TOKEN EXPIRED access_token").kind == ErrorClass.AUTH
+    assert classify_text("ConnectTimeout: timed out").kind == ErrorClass.NETWORK
+    assert classify_text("STAGNATION focus=hunt").kind == ErrorClass.STAGNATION
+    assert classify_text("ATTACK_BOT failed type=2").kind == ErrorClass.PROTOCOL
+    assert classify_text("ValueError: boom").kind == ErrorClass.CODE_BUG
+
+    class TokenExpiredError(Exception):
+        pass
+
+    # Named like production
+    TokenExpiredError.__name__ = "TokenExpiredError"
+    c = classify_exception(TokenExpiredError("dead"), where="tick")
+    assert c.kind == ErrorClass.AUTH
+    assert not c.allow_cursor
+
+    prompt = cursor_prompt_for(
+        classify_text("STAGNATION", focus_key="hunt_mob:Крэтс"),
+        "raw",
+    )
+    assert "hunt_farm" in prompt.lower() or "HUNT" in prompt or "Крэт" in prompt or "wsproxy" in prompt.lower() or "fight" in prompt.lower()
+
+
+def test_session_invalidate_refuses_when_blocked():
+    import asyncio
+    from dwar_bot.core.game_client import DwarGameClient
+
+    c = DwarGameClient("https://w1.dwar.ru")
+    c._session["sess_sid"] = "abc"
+    c._auth_blocked = True
+
+    async def _run():
+        await c.invalidate_session("should refuse")
+        assert c._session.get("sess_sid") == "abc"
+        await c.invalidate_session("force wipe", force=True)
+        assert not c._session.get("sess_sid")
+
+    asyncio.run(_run())
 
 
 def test_fight_packet_roundtrip():

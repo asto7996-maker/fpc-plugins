@@ -412,15 +412,71 @@ class DwarGameClient:
             logger.debug("maybe_reload_cookie_file: %s", exc)
             return False
 
+    async def soft_recheck_session(self) -> bool:
+        """
+        Re-validate without destroying sess_sid.
+
+        Returns True if the session still answers game API with a live state.
+        Does **not** call invalidate/renew.
+        """
+        if not self._session.get("sess_sid"):
+            return False
+        try:
+            await self.maybe_reload_cookie_file()
+            client = await self._client()
+            url = f"{self._world_url}/entry_point.php?object=common&action=dummy&json_mode_on=1"
+            resp = await client.post(
+                url,
+                data={"json_mode_on": "1", "object": "common", "action": "dummy"},
+                headers=self._headers,
+                cookies=self._session,
+                timeout=15.0,
+            )
+            if resp.cookies:
+                self._session.update(dict(resp.cookies))
+            text = (resp.text or "").lstrip()
+            if text.startswith("{") or text.startswith("["):
+                data = resp.json()
+                st = data.get("state") or {}
+                if st.get("area_id") is not None or st.get("level") is not None:
+                    try:
+                        persist_session_cookies(self._session, self._cookie_file)
+                    except Exception:
+                        pass
+                    return True
+                err = str(data.get("error") or "")
+                if "авториз" in err.lower():
+                    return False
+            return False
+        except Exception as exc:
+            logger.debug("soft_recheck_session: %s", exc)
+            return False
+
+    async def keepalive(self) -> bool:
+        """Cheap heartbeat — refresh server-side session TTL without renew."""
+        if self._auth_blocked:
+            return False
+        if not self._session.get("sess_sid"):
+            return False
+        return await self.soft_recheck_session()
+
     async def ensure_session(self) -> None:
         """
         Ensure we have a usable sess_sid.
 
         Does **not** renew on age. Only renews when sess_sid is missing
         and we are not in an auth-blocked state.
+        Soft-path: if sess_sid exists, keep it even after transient glitches.
         """
         if self._auth_blocked:
-            raise TokenExpiredError("OAuth access_token expired — waiting for fresh cookies.")
+            # Allow cookie-file hot reload to clear the block
+            reloaded = await self.maybe_reload_cookie_file()
+            if reloaded and self._session.get("sess_sid") and not self._auth_blocked:
+                return
+            if self._auth_blocked:
+                raise TokenExpiredError(
+                    "OAuth access_token expired — waiting for fresh cookies."
+                )
 
         await self.maybe_reload_cookie_file()
 
@@ -428,6 +484,32 @@ class DwarGameClient:
             return
 
         await self._renew_session()
+
+    async def invalidate_session(self, reason: str = "", *, force: bool = False) -> None:
+        """
+        Drop sess_* cookies.
+
+        Soft policy: unless ``force=True``, refuse to wipe a sess_sid when we
+        already know OAuth renew cannot succeed (auth_blocked / no token).
+        That was the main breakage cascade: empty nick → invalidate → renew fail.
+        """
+        if not force and self._auth_blocked:
+            logger.warning(
+                "Refuse invalidate (%s) — auth already blocked; keep sess for soft wait.",
+                reason,
+            )
+            return
+        if not force and not self._access_token and not self._mycom_value:
+            logger.warning("Refuse invalidate (%s) — no token to renew with.", reason)
+            return
+        had = bool(self._session.get("sess_sid"))
+        self._session.pop("sess_sid", None)
+        self._session.pop("sess_uid", None)
+        self._session.pop("sess_crc", None)
+        self._session.pop("sess_nn", None)
+        self._session_renewed_at = 0.0
+        if had or reason:
+            logger.warning("Session invalidated%s", f": {reason}" if reason else "")
 
     def _is_token_redirect(self, location: str) -> bool:
         loc = (location or "").lower()
@@ -535,14 +617,6 @@ class DwarGameClient:
                 new_cookies.get("sess_sid", "")[:8],
             )
 
-    async def invalidate_session(self, reason: str = "") -> None:
-        """Drop sess_* so the next call renews (does not set auth_blocked)."""
-        async with self._lock:
-            for k in ("sess_sid", "sess_uid", "sess_crc", "sess_nn"):
-                self._session.pop(k, None)
-            self._session_renewed_at = 0.0
-            logger.warning("Session invalidated%s", f": {reason}" if reason else "")
-
     # ------------------------------------------------------------------
     # Core HTTP helpers
     # ------------------------------------------------------------------
@@ -584,7 +658,7 @@ class DwarGameClient:
                         "Auth failure on %s %s (status=%s loc=%s) — renewing.",
                         method, path, resp.status_code, resp.headers.get("location", ""),
                     )
-                    await self.invalidate_session("auth failure response")
+                    await self.invalidate_session("auth failure response", force=True)
                     await self._renew_session()
                     continue
 

@@ -1,23 +1,17 @@
 """
-Auto-healer orchestrator — fully automatic error fixing.
+Auto-healer orchestrator — classifies errors and routes recovery.
 
-Triggers
+Priority
 --------
-* Uncaught exceptions in the game loop
-* LogWatcher ERROR / Traceback markers
-* Gameplay stagnation (no progress across focus switches)
-* Periodic heal-readiness watchdog
-
-Flow
-----
-pause quietly → Cursor CLI patch → pytest → systemctl restart → resume
+1. IGNORE / AUTH / NETWORK / RATE_LIMIT → local only (never Cursor)
+2. PROTOCOL / STAGNATION → local gameplay recover, Cursor only if that fails
+3. CODE_BUG → Cursor CLI patch → pytest → restart
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-import re
 import time
 import traceback
 from dataclasses import dataclass, field
@@ -25,17 +19,25 @@ from typing import Any, Awaitable, Callable, Optional
 
 from dwar_bot.core.bot_state import BotState, get_bot_state, set_bot_state
 from dwar_bot.core.cursor_self_healer import heal_ready, patch_code_with_cursor
+from dwar_bot.core.error_recovery import (
+    ErrorClass,
+    ClassifiedError,
+    classify_exception,
+    classify_text,
+    cursor_prompt_for,
+    get_recovery_stats,
+)
 
 logger = logging.getLogger(__name__)
 
 NotifyFn = Callable[[str], Awaitable[None]]
 
-GLOBAL_HEAL_COOLDOWN_SEC = 90
-STAGNATION_TICKS = 4
-STAGNATION_HEAL_COOLDOWN = 480
-# Max Cursor heal attempts per fingerprint before backing off longer
+GLOBAL_HEAL_COOLDOWN_SEC = 120
+STAGNATION_TICKS = 5
+STAGNATION_HEAL_COOLDOWN = 600
 MAX_FAILS_PER_FP = 3
 FP_BACKOFF_SEC = 1800
+NETWORK_BACKOFF_SEC = 20
 
 
 @dataclass
@@ -44,11 +46,12 @@ class HealRequest:
     traceback_text: str
     reason: str = "exception"
     force: bool = False
+    classified: Optional[ClassifiedError] = None
 
 
 @dataclass
 class AutoHealer:
-    """Process-wide healer with cooldowns and local recovery hooks."""
+    """Process-wide healer with classification, local recover, Cursor escalate."""
 
     notify_fn: Optional[NotifyFn] = None
     pause_fn: Optional[Callable[[], Awaitable[None]]] = None
@@ -64,6 +67,7 @@ class AutoHealer:
     _fail_counts: dict[str, int] = field(default_factory=dict)
     _fail_until: dict[str, float] = field(default_factory=dict)
     _ready_checked: bool = False
+    _network_until: float = 0.0
 
     async def _notify(self, text: str) -> None:
         if not self.notify_fn:
@@ -74,7 +78,6 @@ class AutoHealer:
             logger.debug("heal notify: %s", exc)
 
     async def ensure_ready(self) -> bool:
-        """Boot / watchdog: verify CLI + API key once (and retry later)."""
         ok, detail = await asyncio.to_thread(heal_ready)
         self._ready_checked = True
         if ok:
@@ -82,24 +85,61 @@ class AutoHealer:
         else:
             logger.error("AutoHealer NOT ready — %s", detail)
             await self._notify(
-                f"⚠️ <b>AutoHealer не готов</b> (автофикс недоступен):\n"
-                f"<code>{detail[:400]}</code>"
+                f"⚠️ <b>AutoHealer не готов</b>:\n<code>{detail[:400]}</code>"
             )
         return ok
 
     async def handle_exception(self, exc: BaseException, *, where: str = "tick") -> bool:
-        """Called directly from main loop on uncaught errors."""
+        classified = classify_exception(exc, where=where)
+        get_recovery_stats().note(classified.kind, where)
         tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
-        failed = _guess_file_from_tb(tb) or "dwar_bot/main.py"
-        logger.error("AutoHealer: exception in %s → %s", where, failed)
+        logger.error(
+            "AutoHealer: %s in %s → %s (cursor=%s)",
+            classified.kind.name, where, classified.failed_file, classified.allow_cursor,
+        )
+
+        if classified.kind == ErrorClass.IGNORE:
+            return False
+
+        if classified.kind == ErrorClass.AUTH:
+            await self._notify(
+                "🔑 <b>Сессия/OAuth</b> — Cursor не чинит это.\n"
+                "Пришли Cookie Editor JSON (/cookies)."
+            )
+            return False
+
+        if classified.kind == ErrorClass.NETWORK:
+            self._network_until = time.time() + NETWORK_BACKOFF_SEC
+            logger.warning("Network error — backoff %ds", NETWORK_BACKOFF_SEC)
+            return False
+
+        if classified.kind == ErrorClass.RATE_LIMIT:
+            self._network_until = time.time() + 60
+            return False
+
+        if classified.kind in (ErrorClass.PROTOCOL, ErrorClass.STAGNATION):
+            if self.on_local_recover:
+                try:
+                    if await self.on_local_recover(f"{where}:{classified.summary}"):
+                        await self._notify(
+                            f"🛠 <b>Локальный recover</b> ({classified.kind.name})"
+                        )
+                        return True
+                except Exception as rec_exc:
+                    logger.debug("local recover: %s", rec_exc)
+
+        if not classified.allow_cursor:
+            return False
+
+        prompt = cursor_prompt_for(classified, f"[{where}] {exc}\n{tb}")
         return await self.heal(HealRequest(
-            failed_file=failed,
-            traceback_text=f"[{where}] {exc}\n{tb}",
-            reason="exception",
+            failed_file=classified.failed_file,
+            traceback_text=prompt,
+            reason=classified.kind.name.lower(),
+            classified=classified,
         ))
 
     async def note_progress(self, focus_key: str, progressed: bool) -> None:
-        """Track stagnation across focus switches (A↔B empty loops count too)."""
         self._last_focus_key = focus_key
         if progressed:
             self._stagnation_count = 0
@@ -113,55 +153,54 @@ class AutoHealer:
         self._last_stagnation_heal = now
         self._stagnation_count = 0
 
-        # Prefer local recovery: farm push / travel / fronts (must be real progress)
+        classified = classify_text(
+            "STAGNATION / no gameplay progress",
+            focus_key=focus_key,
+        )
+        get_recovery_stats().note(ErrorClass.STAGNATION, focus_key)
+
         if self.on_local_recover:
             try:
                 fixed = await self.on_local_recover(focus_key)
                 if fixed:
                     await self._notify(
-                        f"🛠 <b>AutoHealer (локально):</b> ухожу в фарм "
-                        f"(было <code>{focus_key}</code>)."
+                        f"🛠 <b>AutoHealer (локально):</b> "
+                        f"<code>{focus_key}</code>"
                     )
                     return
             except Exception as exc:
                 logger.debug("local recover: %s", exc)
 
-        tb = (
-            "STAGNATION / DOM-Desync: бот зациклился без прогресса.\n"
-            f"focus={focus_key}\n"
-            "Симптомы: пустой лут с точки локации, квест type=2 не принимается "
-            "(Лиха беда начало!), NPC помечены exhausted, inventory пуст.\n"
-            "Нужно: починить протокол npc|answer для type=2 message-переходов, "
-            "уважать cooldown dtime/ltime/hidden у area actions, не спамить "
-            "Расселину на кулдауне, сбрасывать exhausted NPC по таймеру, "
-            "пробовать action_run.php / альтернативные параметры боя.\n"
-            "Проверь config/selectors.py и актуальный HTTP API в "
-            "dwar_bot/core/game_client.py, dwar_bot/modules/quest_tracker.py, "
-            "dwar_bot/modules/progression_brain.py, dwar_bot/main.py."
+        # Escalate to Cursor only with game-logic prompt — not for auth
+        prompt = cursor_prompt_for(
+            classified,
+            f"STAGNATION focus={focus_key}\n"
+            "Бот крутит действия без XP/лута/смены area. "
+            "Нужен hunt_farm + fight WS + quest answer.",
         )
-        logger.warning("AutoHealer: stagnation → Cursor heal (%s)", focus_key)
+        logger.warning("AutoHealer: stagnation → Cursor (%s)", focus_key)
         await self.heal(HealRequest(
-            failed_file=_file_for_focus(focus_key),
-            traceback_text=tb,
+            failed_file=classified.failed_file,
+            traceback_text=prompt,
             reason="stagnation",
             force=True,
+            classified=classified,
         ))
 
     async def heal(self, req: HealRequest) -> bool:
+        # Refuse auth-shaped prompts even if force
+        classified = req.classified or classify_text(req.traceback_text)
+        if classified.kind == ErrorClass.AUTH:
+            logger.info("AutoHealer: refusing Cursor heal for AUTH")
+            return False
+
         fp = f"{req.reason}:{req.failed_file}:{hash(req.traceback_text[-400:])}"
         now = time.time()
 
-        # Per-fingerprint backoff after repeated failures
         until = self._fail_until.get(fp, 0.0)
         if until and now < until and not req.force:
-            logger.debug("AutoHealer: fingerprint backoff until %.0f", until)
-            return False
-
-        if not req.force and fp == self._last_fp and now - self._last_heal_at < GLOBAL_HEAL_COOLDOWN_SEC:
-            logger.debug("AutoHealer: cooldown skip %s", fp)
             return False
         if not req.force and now - self._last_heal_at < GLOBAL_HEAL_COOLDOWN_SEC:
-            logger.debug("AutoHealer: global cooldown")
             return False
 
         async with self._lock:
@@ -174,7 +213,6 @@ class AutoHealer:
             if self.pause_fn:
                 try:
                     await self.pause_fn()
-                    # Re-assert HEALING — pause_fn must not leave us as PAUSED
                     set_bot_state(BotState.HEALING)
                 except Exception as exc:
                     logger.warning("pause_fn during heal failed: %s", exc)
@@ -200,18 +238,16 @@ class AutoHealer:
             if ok:
                 self._fail_counts.pop(fp, None)
                 self._fail_until.pop(fp, None)
+                get_recovery_stats().cursor_heals += 1
                 await self._notify(
                     f"✅ <b>AutoHealer SUCCESS</b>\n"
                     f"<code>{req.failed_file}</code> ({req.reason})\n"
-                    f"Тесты OK — перезапуск сервиса для загрузки кода."
+                    f"Тесты OK — перезапуск сервиса."
                 )
                 logger.info("AutoHealer SUCCESS %s", req.failed_file)
-                # Stay in HEALING — detached restart will kill us shortly.
-                # Do NOT resume / start another heal in this process.
                 set_bot_state(BotState.HEALING)
                 return True
 
-            # Failure path: resume gameplay and allow later retry
             set_bot_state(BotState.RUNNING)
             if self.resume_fn:
                 try:
@@ -219,41 +255,20 @@ class AutoHealer:
                 except Exception as exc:
                     logger.debug("resume_fn: %s", exc)
 
-            if not ok:
-                n = self._fail_counts.get(fp, 0) + 1
-                self._fail_counts[fp] = n
-                if n >= MAX_FAILS_PER_FP:
-                    self._fail_until[fp] = time.time() + FP_BACKOFF_SEC
-                    logger.error(
-                        "AutoHealer: fingerprint %s failed %d× — backoff %ds",
-                        fp[:80], n, FP_BACKOFF_SEC,
-                    )
-                await self._notify(
-                    f"🔄 <b>AutoHealer FAIL</b>\n"
-                    f"<code>{req.failed_file}</code> ({req.reason}) · попытка {n}\n"
-                    f"Продолжаю работу, повторю позже.\n"
-                    f"<pre>{req.traceback_text[:800]}</pre>"
-                )
-                logger.error("AutoHealer FAIL %s", req.failed_file)
-            return ok
+            n = self._fail_counts.get(fp, 0) + 1
+            self._fail_counts[fp] = n
+            if n >= MAX_FAILS_PER_FP:
+                self._fail_until[fp] = time.time() + FP_BACKOFF_SEC
+            await self._notify(
+                f"🔄 <b>AutoHealer FAIL</b>\n"
+                f"<code>{req.failed_file}</code> · попытка {n}\n"
+                f"<pre>{req.traceback_text[:600]}</pre>"
+            )
+            logger.error("AutoHealer FAIL %s", req.failed_file)
+            return False
 
-
-def _guess_file_from_tb(tb: str) -> str:
-    paths = re.findall(r'File "([^"]+\.py)"', tb)
-    for p in reversed(paths):
-        norm = p.replace("\\", "/")
-        if "dwar_bot/" in norm:
-            return norm[norm.find("dwar_bot/"):]
-    return paths[-1] if paths else "dwar_bot/main.py"
-
-
-def _file_for_focus(focus_key: str) -> str:
-    low = focus_key.lower()
-    if "quest" in low or "npc" in low or "вожд" in low:
-        return "dwar_bot/modules/quest_tracker.py"
-    if "combat" in low or "расселин" in low or "area" in low or "точк" in low:
-        return "dwar_bot/modules/progression_brain.py"
-    return "dwar_bot/main.py"
+    def network_blocked(self) -> bool:
+        return time.time() < self._network_until
 
 
 _HEALER: Optional[AutoHealer] = None

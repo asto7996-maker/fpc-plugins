@@ -58,6 +58,7 @@ from dwar_bot.core.bot_state import BotState, get_bot_state, set_bot_state
 from dwar_bot.core.log_watcher import start_log_monitoring
 from dwar_bot.core.cursor_self_healer import ensure_cursor_cli, _augment_path
 from dwar_bot.core.auto_healer import bind_auto_healer, get_auto_healer
+from dwar_bot.core.error_recovery import get_recovery_stats
 from dwar_bot.config import COMBAT
 
 logger = logging.getLogger("dwar_bot.main")
@@ -72,6 +73,12 @@ def _handle_signal(signum, frame) -> None:
 
 async def _sleep(min_s: float, max_s: float) -> None:
     await asyncio.sleep(random.uniform(min_s, max_s))
+
+
+def _tg_esc(text: str) -> str:
+    return (
+        str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    )
 
 
 class DwarBot:
@@ -180,6 +187,20 @@ class DwarBot:
             "progress": self.brain.last.to_dict(),
             "loot_claimed": self._loot_claimed,
             "settings": self.settings.to_dict(),
+            "bot_state": get_bot_state().name,
+            "auth_blocked": self._client.auth_blocked,
+            "fight_id": getattr(self._state, "fight_id", 0) or 0,
+            "need_quest_unlock": self.brain.need_quest_unlock,
+            "pending_hunt_mob": self.brain.pending_hunt_mob or self.quests.pending_hunt_mob,
+            "recovery": {
+                "last_kind": get_recovery_stats().last_kind,
+                "auth_waits": get_recovery_stats().auth_waits,
+                "network_retries": get_recovery_stats().network_retries,
+                "protocol_recovers": get_recovery_stats().protocol_recovers,
+                "stagnation_local": get_recovery_stats().stagnation_local,
+                "cursor_heals": get_recovery_stats().cursor_heals,
+                "history": list(get_recovery_stats().history[-8:]),
+            },
         }
 
     async def build_report(self) -> str:
@@ -320,6 +341,9 @@ class DwarBot:
             self._iteration += 1
             self._apply_combat_thresholds()
             try:
+                if get_auto_healer().network_blocked():
+                    await asyncio.sleep(5)
+                    continue
                 await self._client.maybe_reload_cookie_file()
                 await self._tick()
                 await self._maybe_send_report()
@@ -352,11 +376,20 @@ class DwarBot:
                     logger.critical("%d consecutive errors — pausing 5min.", MAX_RETRIES)
                     await asyncio.sleep(300)
                     self._errors_in_row = 0
-                    await self._client.invalidate_session("too many errors")
+                    # Soft recheck only — do NOT wipe sess when token is dead
+                    ok = await self._client.soft_recheck_session()
+                    if not ok:
+                        logger.warning("After error pause session still dead.")
                 else:
                     await _sleep(DELAY_RETRY.min, DELAY_RETRY.max)
 
             if not _shutdown_event.is_set():
+                # Keepalive every ~10 ticks
+                if self._iteration % 10 == 0:
+                    try:
+                        await self._client.keepalive()
+                    except Exception:
+                        pass
                 await _sleep(DELAY_MAIN_LOOP.min, DELAY_MAIN_LOOP.max)
                 # No long idle while pushing farm / leaving the village
                 if (
@@ -441,10 +474,29 @@ class DwarBot:
         self._state = self._profile.state
 
         if not self._char.nick:
-            logger.warning("No character data — session may be stale, renewing once.")
-            await self._client.invalidate_session("empty character")
-            await self._client.ensure_session()
-            return
+            # Soft path: never wipe sess_sid on a single empty parse — that was
+            # killing live sessions when OAuth token could not renew.
+            logger.warning("No character data — soft recheck (no invalidate).")
+            ok = await self._client.soft_recheck_session()
+            if ok:
+                # Retry profile once
+                self._profile = await self.stats.read_full_profile()
+                self._char = self._profile.char
+                self._state = self._profile.state
+                if self._char.nick:
+                    logger.info("Soft recheck OK — nick=%s", self._char.nick)
+                else:
+                    logger.warning("Soft recheck OK but nick still empty — skip tick.")
+                    await _sleep(5.0, 10.0)
+                    return
+            else:
+                logger.warning(
+                    "Soft recheck failed — waiting for cookies (no blind renew)."
+                )
+                self._token_ok = False
+                raise TokenExpiredError(
+                    "Session dead and OAuth renew unsafe — paste fresh cookies."
+                )
 
         logger.info(
             "[%d] %s Lv%d | HP %d/%d (%.0f%%) | MP %d/%d | area=%s | %.2f зол | предметов=%d | sid=%s…",
@@ -615,6 +667,75 @@ class DwarBot:
                 )
             await _sleep(8.0, 18.0)
 
+    async def admin_diagnose(self) -> str:
+        """Full diagnostic dump for Telegram /diagnose."""
+        st = self.get_status()
+        rs = get_recovery_stats()
+        lines = [
+            "<b>🔬 Диагностика</b>",
+            f"state=<code>{st.get('bot_state')}</code> token={'OK' if st.get('token_ok') else 'DEAD'}",
+            f"auth_blocked={st.get('auth_blocked')} sid=<code>{st.get('sess_sid')}</code>",
+            f"area={st.get('area_id')} fight_id={st.get('fight_id')}",
+            f"unlock={st.get('need_quest_unlock')} hunt={st.get('pending_hunt_mob') or '—'}",
+            f"wins={st.get('wins')} losses={st.get('losses')} loot={st.get('loot_claimed')}",
+            "",
+            "<b>Recovery</b>",
+            f"last={rs.last_kind or '—'} auth={rs.auth_waits} net={rs.network_retries}",
+            f"proto={rs.protocol_recovers} stag={rs.stagnation_local} cursor={rs.cursor_heals}",
+        ]
+        if rs.history:
+            lines.append("<b>История:</b>")
+            for h in rs.history[-6:]:
+                lines.append(f"• <code>{_tg_esc(h)}</code>")
+        # Soft session probe
+        try:
+            ok = await self._client.soft_recheck_session()
+            lines.append(f"soft_recheck={'✅' if ok else '❌'}")
+        except Exception as exc:
+            lines.append(f"soft_recheck err: {exc}")
+        return "\n".join(lines)
+
+    async def admin_force_hunt(self, mob: str = "") -> str:
+        mob = mob or self.brain.pending_hunt_mob or self.quests.pending_hunt_mob or "Крэтс"
+        self.brain.pending_hunt_mob = mob
+        self.brain.need_quest_unlock = True
+        if await self.combat.is_in_battle():
+            result = await self.combat.finish_fight()
+            return f"Доигрывал бой → {result.name}"
+        result = await self.combat.try_hunt_attack(name_substr=mob)
+        if result == BattleResult.WIN:
+            self.quests.clear_exhausted(local_only=True)
+        return f"Охота '{mob}' → {result.name}"
+
+    async def admin_recover(self) -> str:
+        ok = await self._local_recover_stagnation("telegram:/recover")
+        return "✅ Local recover сработал" if ok else "⚠️ Local recover без эффекта"
+
+    async def admin_trigger_heal(self, reason: str = "manual") -> str:
+        from dwar_bot.core.auto_healer import HealRequest
+        ok = await get_auto_healer().heal(HealRequest(
+            failed_file="dwar_bot/main.py",
+            traceback_text=(
+                "MANUAL HEAL via Telegram.\n"
+                "Проверь hunt_farm + fight WS + quest type=2 + session soft path.\n"
+                f"reason={reason}"
+            ),
+            reason="manual",
+            force=True,
+        ))
+        return "✅ Heal запущен" if ok else "⚠️ Heal не стартовал (cooldown/AUTH/занят)"
+
+    async def admin_restart_service(self) -> str:
+        from dwar_bot.core.cursor_self_healer import mark_skip_boot_scan
+        mark_skip_boot_scan("telegram-restart")
+        # Detached restart like healer
+        import subprocess
+        subprocess.Popen(
+            ["bash", "-c", "sleep 2; systemctl restart dwar_bot.service"],
+            start_new_session=True,
+        )
+        return "♻️ Restart через 2с…"
+
     async def _local_recover_stagnation(self, focus_key: str) -> bool:
         """Break stuck loops → hunt kill / farm. Prefer quest mob over fronts."""
         logger.warning("Local recover for stagnation: %s → hunt/farm", focus_key)
@@ -643,6 +764,10 @@ class DwarBot:
                 if result == BattleResult.WIN:
                     self.quests.clear_exhausted(local_only=True)
                 return True
+        # Re-open local quest NPC after kill attempt
+        if self.brain.need_quest_unlock:
+            cleared = self.quests.clear_exhausted(local_only=True)
+            logger.info("Local recover: cleared exhausted NPCs=%d", cleared)
         if self.settings.farm.auto_travel and not self.brain.need_quest_unlock:
             moved = await self._try_area_progress()
             if moved:
@@ -1196,6 +1321,13 @@ async def main() -> None:
             settings=bot.settings,
             on_cookies_json=bot.apply_cookie_json,
             on_report_fn=bot.build_report,
+            admin_fns={
+                "diagnose": bot.admin_diagnose,
+                "recover": bot.admin_recover,
+                "hunt": bot.admin_force_hunt,
+                "heal": bot.admin_trigger_heal,
+                "restart": bot.admin_restart_service,
+            },
         )
         bot.bind_telegram(tg_handler)
         tg_task = asyncio.ensure_future(tg_handler.start())

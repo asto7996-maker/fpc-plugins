@@ -134,6 +134,8 @@ _REPLY_MAP = {
     "⚙️ Настройки": "settings",
     "📋 Лог": "log",
     "🍪 Куки": "cookies",
+    "🔬 Диагноз": "diagnose",
+    "🛠 Recover": "recover",
     "⏸ Пауза": "stop",
     "▶️ Старт": "resume",
 }
@@ -144,9 +146,9 @@ def _reply_keyboard() -> dict:
     rows = [
         ["🏠 Меню", "📊 Статус", "🧠 План"],
         ["🧙 Персонаж", "🤖 Автопилот", "⚔️ Бои"],
-        ["📜 Квесты", "🗺 Локация", "📈 Отчёты"],
-        ["🔔 Уведомления", "⚙️ Настройки", "📋 Лог"],
-        ["🍪 Куки", "⏸ Пауза", "▶️ Старт"],
+        ["📜 Квесты", "🗺 Локация", "🔬 Диагноз"],
+        ["🛠 Recover", "🍪 Куки", "📋 Лог"],
+        ["⏸ Пауза", "▶️ Старт", "⚙️ Настройки"],
     ]
     return {
         "keyboard": [[{"text": t} for t in row] for row in rows],
@@ -174,11 +176,12 @@ def _menu_inline() -> dict:
         [_btn("🧙 Персонаж", "stats"), _btn("🤖 Автопилот", "autopilot")],
         [_btn("⚔️ Бои", "combat"), _btn("📜 Квесты", "quests")],
         [_btn("🗺 Локация", "area"), _btn("🎒 Рюкзак", "inventory")],
-        [_btn("⏱ Таймеры", "timers"), _btn("✨ Эффекты", "effects")],
-        [_btn("🔔 Уведомления", "notify"), _btn("📈 Отчёты", "reports")],
-        [_btn("📋 Лог", "log"), _btn("🍪 Куки", "cookies")],
-        [_btn("🛡 Сессия", "session"), _btn("ℹ️ Помощь", "help")],
+        [_btn("🔬 Диагноз", "diagnose"), _btn("🛠 Recover", "recover")],
+        [_btn("🏹 Охота", "hunt"), _btn("🔧 Heal", "heal")],
+        [_btn("♻️ Restart", "restart"), _btn("📋 Лог", "log")],
+        [_btn("🍪 Куки", "cookies"), _btn("🛡 Сессия", "session")],
         [_btn("⏸ Пауза", "stop"), _btn("▶️ Старт", "resume")],
+        [_btn("ℹ️ Помощь", "help")],
     ])
 
 
@@ -291,6 +294,7 @@ class TelegramBotHandler:
         on_cookies_json: Optional[Callable[[str], Coroutine]] = None,
         on_report_fn: Optional[Callable[[], Coroutine]] = None,
         notify_fn: Optional[Callable[[str], Coroutine]] = None,
+        admin_fns: Optional[dict[str, Callable[..., Coroutine]]] = None,
     ) -> None:
         self._api = TelegramAPI(token, owner_chat_id)
         self._get_status = get_status_fn
@@ -301,6 +305,7 @@ class TelegramBotHandler:
         self._on_cookies_json = on_cookies_json
         self._on_report_fn = on_report_fn
         self._notify_fn = notify_fn
+        self._admin = admin_fns or {}
         self._running = True
         self._paused = False
         self._cookie_buffer: list[str] = []
@@ -327,6 +332,12 @@ class TelegramBotHandler:
             {"command": "session", "description": "🛡 Сессия / куки"},
             {"command": "log", "description": "📋 Последний лог"},
             {"command": "cookies", "description": "🍪 Обновить куки"},
+            {"command": "diagnose", "description": "🔬 Полная диагностика"},
+            {"command": "recover", "description": "🛠 Локальный recover"},
+            {"command": "hunt", "description": "🏹 Форс-охота (Крэтс)"},
+            {"command": "heal", "description": "🔧 Cursor auto-heal"},
+            {"command": "errors", "description": "🧯 История ошибок"},
+            {"command": "restart", "description": "♻️ Restart сервиса"},
             {"command": "farm_on", "description": "✅ Включить весь фарм"},
             {"command": "farm_off", "description": "⛔ Выключить весь фарм"},
             {"command": "stop", "description": "⏸ Пауза игрового цикла"},
@@ -489,6 +500,12 @@ class TelegramBotHandler:
             "session": self._cmd_session,
             "log": self._cmd_log,
             "cookies": self._cmd_cookies,
+            "diagnose": self._cmd_diagnose,
+            "recover": self._cmd_recover,
+            "hunt": self._cmd_hunt,
+            "heal": self._cmd_heal,
+            "errors": self._cmd_errors,
+            "restart": self._cmd_restart,
             "farm_on": self._cmd_farm_all_on,
             "farm_off": self._cmd_farm_all_off,
             "farm_all_on": self._cmd_farm_all_on,
@@ -648,6 +665,13 @@ class TelegramBotHandler:
             "<b>Уведомления и отчёты</b>\n"
             "/notify — бои, квесты, лут, план…\n"
             "/reports — авто-отчёты · /report — отчёт сейчас\n\n"
+            "<b>Управление кодом / ошибками</b>\n"
+            "/diagnose — сессия, fight_id, recovery\n"
+            "/recover — локальный геймплей recover\n"
+            "/hunt — убить Крэтса (hunt_farm)\n"
+            "/heal — Cursor auto-heal сейчас\n"
+            "/errors — история классификации ошибок\n"
+            "/restart — systemctl restart\n\n"
             "<b>Управление</b>\n"
             "/stop · /resume · /settings · /menu\n\n"
             "🍪 Куки: Cookie Editor → Export JSON → пришли сюда."
@@ -664,24 +688,23 @@ class TelegramBotHandler:
         now = prog.get("now") or "—"
         chosen = focus.get("title") or "—"
         power = prog.get("power_score", 0)
+        rec = st.get("recovery") or {}
         text = (
             f"<b>📊 Статус</b>\n\n"
-            f"{icon} Цикл: <b>{'Работает' if st.get('running') else 'Пауза'}</b>\n"
+            f"{icon} Цикл: <b>{'Работает' if st.get('running') else 'Пауза'}</b> "
+            f"· state <code>{_esc(st.get('bot_state','?'))}</code>\n"
             f"🔑 Токен: {token} · sess <code>{_esc(st.get('sess_sid','?'))}…</code>\n"
+            f"⚔️ fight_id=<code>{st.get('fight_id',0)}</code> · "
+            f"unlock={st.get('need_quest_unlock')}\n"
             f"🔄 Тик: {st.get('iteration', 0)} · ⏱ {st.get('uptime','?')}\n"
             f"📍 {_esc(st.get('area_title') or 'area')} ({st.get('area_id','?')})\n\n"
             f"<b>🧠 Сейчас:</b> {_esc(now)}\n"
             f"<b>👉 Выбрано:</b> {_esc(chosen)}\n"
             f"<b>Сила:</b> {power:.0f}/100\n\n"
-            f"<b>Автопилот</b>\n"
-            f"🚀 Макс-фарм {self._settings.on_off(f.max_farm)} · "
-            f"🎁 Лут {self._settings.on_off(f.auto_loot)}\n"
-            f"📜 Квесты {self._settings.on_off(f.auto_quests)} · "
-            f"⚔️ Бои {self._settings.on_off(f.auto_combat)}\n"
-            f"🗺 Переходы {self._settings.on_off(f.auto_travel)} · "
-            f"🧪 Heal {self._settings.on_off(f.auto_heal)}\n\n"
-            f"⚔️ Боёв: {st.get('battles',0)} · 📜 Диалогов: {st.get('dialogues',0)} · "
-            f"🎁 {st.get('loot_claimed',0)}"
+            f"<b>Recover:</b> last={_esc(rec.get('last_kind') or '—')} "
+            f"cursor={rec.get('cursor_heals',0)}\n"
+            f"⚔️ W/L {st.get('wins',0)}/{st.get('losses',0)} · "
+            f"📜 {st.get('dialogues',0)} · 🎁 {st.get('loot_claimed',0)}"
         )
         kb = _inline([
             [_btn("🧠 План", "progress"), _btn("📄 Отчёт", "report_now")],
@@ -925,6 +948,63 @@ class TelegramBotHandler:
             "Нужен <code>mycom</code> (access_token). "
             "<code>sess_sid</code> бот создаст сам."
         )
+        await self._api.send(chat_id, text)
+
+    async def _cmd_diagnose(self, chat_id: str, message_id: Optional[int] = None) -> None:
+        fn = self._admin.get("diagnose")
+        if not fn:
+            await self._api.send(chat_id, "diagnose недоступен")
+            return
+        text = await fn()
+        await self._reply(chat_id, text, _menu_inline(), message_id)
+
+    async def _cmd_recover(self, chat_id: str, message_id: Optional[int] = None) -> None:
+        fn = self._admin.get("recover")
+        if not fn:
+            await self._api.send(chat_id, "recover недоступен")
+            return
+        await self._api.send(chat_id, "🛠 Local recover…")
+        text = await fn()
+        await self._api.send(chat_id, text)
+
+    async def _cmd_hunt(self, chat_id: str, message_id: Optional[int] = None) -> None:
+        fn = self._admin.get("hunt")
+        if not fn:
+            await self._api.send(chat_id, "hunt недоступен")
+            return
+        await self._api.send(chat_id, "🏹 Охота…")
+        text = await fn()
+        await self._api.send(chat_id, text)
+
+    async def _cmd_heal(self, chat_id: str, message_id: Optional[int] = None) -> None:
+        fn = self._admin.get("heal")
+        if not fn:
+            await self._api.send(chat_id, "heal недоступен")
+            return
+        await self._api.send(chat_id, "🔧 Запускаю Cursor heal…")
+        text = await fn()
+        await self._api.send(chat_id, text)
+
+    async def _cmd_errors(self, chat_id: str, message_id: Optional[int] = None) -> None:
+        st = await self._get_status()
+        rec = st.get("recovery") or {}
+        lines = [
+            "<b>🧯 Ошибки / recover</b>",
+            f"last=<code>{_esc(rec.get('last_kind') or '—')}</code>",
+            f"auth={rec.get('auth_waits', 0)} net={rec.get('network_retries', 0)} "
+            f"proto={rec.get('protocol_recovers', 0)}",
+            f"stag={rec.get('stagnation_local', 0)} cursor={rec.get('cursor_heals', 0)}",
+        ]
+        for h in (rec.get("history") or [])[-10:]:
+            lines.append(f"• <code>{_esc(h)}</code>")
+        await self._reply(chat_id, "\n".join(lines), _menu_inline(), message_id)
+
+    async def _cmd_restart(self, chat_id: str, message_id: Optional[int] = None) -> None:
+        fn = self._admin.get("restart")
+        if not fn:
+            await self._api.send(chat_id, "restart недоступен")
+            return
+        text = await fn()
         await self._api.send(chat_id, text)
 
     async def _cmd_report_now(self, chat_id: str, message_id: Optional[int] = None) -> None:
