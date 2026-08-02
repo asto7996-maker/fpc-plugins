@@ -1328,24 +1328,11 @@ async def _run_test(message: Message) -> None:
                     uname = f"@{me.username}" if me.username else me.first_name
                     from pyrogram import raw
 
-                    # ResolveUsername / resolve_peer — иначе CHANNEL_INVALID на холодной сессии
-                    chat_id: str | int = dst
+                    # resolve через poster: dialogs + access_hash для закрытых каналов
                     try:
-                        from links import normalize_channel, to_channel_chat_id
+                        from poster import _resolve_chat
 
-                        normalized = normalize_channel(dst)
-                        username = normalized.lstrip("@")
-                        if username.lstrip("-").isdigit():
-                            chat_id = int(to_channel_chat_id(username))
-                            await _bridge.auth.client.resolve_peer(chat_id)
-                        else:
-                            r = await _bridge.auth.client.invoke(
-                                raw.functions.contacts.ResolveUsername(
-                                    username=username
-                                )
-                            )
-                            if hasattr(r.peer, "channel_id"):
-                                chat_id = int(f"-100{r.peer.channel_id}")
+                        chat_id = await _resolve_chat(_bridge.auth.client, dst)
                     except Exception as e:
                         return (
                             f"❌ канал не найден: <code>{e}</code>\n"

@@ -81,6 +81,9 @@ class FakeClient:
         self.window_skips = 0
         self.fail_next: Optional[BaseException] = None
         self.fail_always: Optional[BaseException] = None
+        self.resolve_fail: Optional[BaseException] = None
+        self.publish_fail: Optional[BaseException] = None
+        self.dialogs: list[Any] = []
         self._next_target_id = 1000
 
     # ---------------------------------------------------------------- helpers
@@ -95,6 +98,11 @@ class FakeClient:
             error = self.fail_next
             self.fail_next = None
             raise error
+
+    def _raise_publish(self) -> None:
+        self._raise_if_needed()
+        if self.publish_fail is not None:
+            raise self.publish_fail
 
     def _new_target_message(self, **kwargs: Any) -> Message:
         self._next_target_id += 1
@@ -153,7 +161,7 @@ class FakeClient:
         caption: Optional[str] = None,
         parse_mode: Any = None,
     ):
-        self._raise_if_needed()
+        self._raise_publish()
         source = self.messages[message_id]
         self.published.append(
             {
@@ -172,7 +180,7 @@ class FakeClient:
         from_chat_id: int | str,
         message_id: int,
     ):
-        self._raise_if_needed()
+        self._raise_publish()
         group = await self.get_media_group(from_chat_id, message_id)
         self.published.append(
             {"kind": "album", "source_id": message_id, "size": len(group)}
@@ -185,12 +193,12 @@ class FakeClient:
         text: str,
         parse_mode: Any = None,
     ):
-        self._raise_if_needed()
+        self._raise_publish()
         self.published.append({"kind": "text", "text": text})
         return self._new_target_message(text=text)
 
     async def send_media_group(self, chat_id: int | str, media: list):
-        self._raise_if_needed()
+        self._raise_publish()
         caption = next((getattr(m, "caption", None) for m in media if getattr(m, "caption", None)), None)
         self.published.append(
             {"kind": "album", "size": len(media), "caption": caption}
@@ -214,11 +222,19 @@ class FakeClient:
         return True
 
     async def get_chat(self, chat_id):
+        if self.resolve_fail is not None:
+            raise self.resolve_fail
         return make_chat(int(chat_id) if str(chat_id).lstrip("-").isdigit() else SOURCE_ID)
 
     async def resolve_peer(self, peer_id):
         """Прогрев peer для закрытых каналов (числовой id)."""
+        if self.resolve_fail is not None:
+            raise self.resolve_fail
         return int(peer_id) if str(peer_id).lstrip("-").isdigit() else peer_id
+
+    async def get_dialogs(self):
+        for d in self.dialogs:
+            yield d
 
     async def invoke(self, *args, **kwargs):
         raise RuntimeError("resolve not supported in tests")

@@ -17,7 +17,7 @@ _LINK_PUBLIC = re.compile(
 # https://t.me/c/123456789  |  https://t.me/c/123456789/500 (как ссылка на канал)
 _CHANNEL_PRIVATE = re.compile(
     r"(?:https?://)?(?:www\.)?(?:t\.me|telegram\.me|telegram\.dog)/c/(\d+)"
-    r"(?:/\d+)?(?:\?.*)?$",
+    r"(?:/\d+)?/??(?:\?.*)?$",
     re.IGNORECASE,
 )
 # https://t.me/channel_username  |  @https://t.me/channel_username/...
@@ -38,11 +38,12 @@ def to_channel_chat_id(value: str | int) -> str:
     Примеры:
       35839961           → -10035839961   (id из ссылки t.me/c/35839961/…)
       -10035839961       → -10035839961
+      10035839961        → -10035839961   (Bot API id без минуса)
       -123456789         → -123456789     (уже отрицательный — как есть)
     """
     if isinstance(value, int):
         if value > 0:
-            return f"-100{value}"
+            return to_channel_chat_id(str(value))
         return str(value)
 
     raw = str(value).strip()
@@ -51,6 +52,9 @@ def to_channel_chat_id(value: str | int) -> str:
 
     if raw.startswith("-"):
         return raw
+    # Уже полный Bot API id без минуса: 100 + internal
+    if re.fullmatch(r"100\d{6,}", raw):
+        return f"-{raw}"
     return f"-100{raw}"
 
 

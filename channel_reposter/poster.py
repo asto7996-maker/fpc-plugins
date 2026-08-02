@@ -26,6 +26,7 @@ from pyrogram.errors import (
     ChatWriteForbidden,
     FloodWait,
     MessageIdInvalid,
+    PeerIdInvalid,
     RPCError,
 )
 from pyrogram.types import (
@@ -38,7 +39,10 @@ from pyrogram.types import (
 
 import config
 from database import Database
-from links import normalize_channel, parse_post_link
+from links import normalize_channel, parse_post_link, to_channel_chat_id
+
+# Ошибки доступа к закрытому каналу — останавливаем цикл, не «прожигаем» progress
+_CHANNEL_ACCESS_ERRORS = (ChannelPrivate, ChannelInvalid, PeerIdInvalid)
 
 logger = logging.getLogger(__name__)
 
@@ -110,8 +114,9 @@ class CycleResult:
 
 
 def _chat_ref(value: str | int) -> str | int:
+    """Нормализовать ссылку на канал: @username или int chat_id (-100…)."""
     if isinstance(value, int):
-        return value
+        return int(to_channel_chat_id(value))
     raw = normalize_channel(value)
     if not raw:
         raise ValueError("Канал не задан")
@@ -120,33 +125,69 @@ def _chat_ref(value: str | int) -> str | int:
     return raw
 
 
+# После get_dialogs peer'ы закрытых каналов появляются в сессии (access_hash).
+# Без этого resolve_peer(-100…) на холодной сессии (no_updates) падает.
+_dialogs_warmed_clients: set[int] = set()
+
+
+async def _warm_dialogs(client: Client) -> None:
+    """Подтянуть диалоги, чтобы access_hash закрытых каналов попал в сессию."""
+    key = id(client)
+    if key in _dialogs_warmed_clients:
+        return
+    try:
+        count = 0
+        async for _ in client.get_dialogs():
+            count += 1
+            # Достаточно первого экрана; полный скан всех чатов не нужен
+            if count >= 300:
+                break
+        logger.info("Диалоги прогреты для закрытых каналов (%s шт.)", count)
+    except Exception as e:
+        logger.warning("Не удалось прогреть диалоги: %s", e)
+        return
+    _dialogs_warmed_clients.add(key)
+
+
+async def _resolve_numeric_chat(client: Client, chat_id: int) -> int:
+    """Открыть закрытый/числовой канал: resolve_peer → dialogs → get_chat."""
+    try:
+        await client.resolve_peer(chat_id)
+        return chat_id
+    except Exception as e:
+        logger.debug("resolve_peer(%s): %s", chat_id, e)
+
+    await _warm_dialogs(client)
+    try:
+        await client.resolve_peer(chat_id)
+        return chat_id
+    except Exception as e:
+        logger.debug("resolve_peer(%s) после dialogs: %s", chat_id, e)
+
+    try:
+        chat = await client.get_chat(chat_id)
+        return int(chat.id)
+    except Exception as e:
+        raise RuntimeError(
+            f"Закрытый канал {chat_id} недоступен: {e}. "
+            "Юзербот должен уже состоять в канале "
+            "(источник — подписчик, назначение — админ). "
+            "Проверьте id: короткий из t.me/c/<id>/… "
+            "(например 35839961) или полный -100…"
+        ) from e
+
+
 async def _resolve_chat(client: Client, value: str | int) -> int:
     """
     Вернуть числовой chat_id.
 
     Для @username — ResolveUsername (access_hash в сессии).
-    Для числового id закрытого канала (-100…) — resolve_peer / get_chat,
-    чтобы peer был «прогрет» (иначе CHANNEL_INVALID / ChannelPrivate).
+    Для числового id закрытого канала (-100…) — resolve_peer / dialogs / get_chat.
     Юзербот должен уже состоять в закрытом канале.
     """
     ref = _chat_ref(value)
     if isinstance(ref, int):
-        try:
-            await client.resolve_peer(ref)
-            return ref
-        except Exception as e:
-            logger.debug("resolve_peer(%s): %s — пробуем get_chat", ref, e)
-        try:
-            chat = await client.get_chat(ref)
-            return int(chat.id)
-        except Exception as e:
-            logger.warning(
-                "Не удалось открыть канал %s: %s "
-                "(для закрытого канала юзербот должен быть подписан / админом)",
-                ref,
-                e,
-            )
-            raise
+        return await _resolve_numeric_chat(client, ref)
 
     username = str(ref).lstrip("@")
     try:
@@ -646,18 +687,36 @@ class ChannelPoster:
         if not settings.is_running and not force:
             return CycleResult(reason=REASON_PAUSED, progress_id=settings.progress_id)
 
-        source = await _rpc(
-            _resolve_chat(
-                self.client, settings.source_channel or config.SOURCE_CHANNEL
-            ),
-            label="resolve_source",
-        )
-        target = await _rpc(
-            _resolve_chat(
-                self.client, settings.target_channel or config.TARGET_CHANNEL
-            ),
-            label="resolve_target",
-        )
+        try:
+            source = await _rpc(
+                _resolve_chat(
+                    self.client, settings.source_channel or config.SOURCE_CHANNEL
+                ),
+                label="resolve_source",
+            )
+            target = await _rpc(
+                _resolve_chat(
+                    self.client, settings.target_channel or config.TARGET_CHANNEL
+                ),
+                label="resolve_target",
+            )
+        except _CHANNEL_ACCESS_ERRORS as e:
+            return CycleResult(
+                reason=REASON_FATAL,
+                fatal_text=(
+                    f"закрытый канал недоступен: {e}. "
+                    "Юзербот должен быть подписан на источник и админом "
+                    "в назначении; укажите id вида 35839961 или -100…"
+                ),
+                progress_id=settings.progress_id,
+            )
+        except RuntimeError as e:
+            # Не удалось прогреть peer закрытого канала
+            return CycleResult(
+                reason=REASON_FATAL,
+                fatal_text=str(e),
+                progress_id=settings.progress_id,
+            )
         if settings.progress_id < 0:
             logger.warning("progress_id не задан")
             return CycleResult(reason=REASON_NO_START)
@@ -796,7 +855,7 @@ class ChannelPoster:
                     "(добавьте юзербота админом с правом «Публикация сообщений»)"
                 )
                 break
-            except (ChannelPrivate, ChannelInvalid) as e:
+            except _CHANNEL_ACCESS_ERRORS as e:
                 logger.error("Канал недоступен (источник/назначение): %s", e)
                 result.reason = REASON_FATAL
                 result.fatal_text = (
@@ -1035,11 +1094,16 @@ class ChannelPoster:
             raise
         except ChatWriteForbidden:
             raise
+        except _CHANNEL_ACCESS_ERRORS:
+            # Нельзя «прожечь» progress: иначе очередь сгорает как up_to_date
+            raise
         except _NETWORK_ERRORS:
             raise
         except (RPCError, ValueError) as e:
             err = str(e).upper()
             if "WRITE_FORBIDDEN" in err or "CHAT_WRITE" in err:
+                raise
+            if any(name in err for name in ("CHANNEL_PRIVATE", "CHANNEL_INVALID", "PEER_ID_INVALID")):
                 raise
             logger.error("publish %s: %s", msg.id, e)
             self.db.add_history(msg.id, status="error", error=str(e))
@@ -1104,12 +1168,18 @@ class ChannelPoster:
             raise
         except ChatWriteForbidden:
             raise
+        except _CHANNEL_ACCESS_ERRORS:
+            self._seen_grouped.discard(gid)
+            raise
         except _NETWORK_ERRORS:
             self._seen_grouped.discard(gid)
             raise
         except (RPCError, ValueError) as e:
             err = str(e).upper()
             if "WRITE_FORBIDDEN" in err or "CHAT_WRITE" in err:
+                raise
+            if any(name in err for name in ("CHANNEL_PRIVATE", "CHANNEL_INVALID", "PEER_ID_INVALID")):
+                self._seen_grouped.discard(gid)
                 raise
             logger.error("album %s: %s", gid, e)
             self.db.add_history(anchor.id, grouped_id=gid, status="error", error=str(e))

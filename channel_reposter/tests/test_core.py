@@ -118,6 +118,7 @@ class NormalizeChannelTests(unittest.TestCase):
         self.assertEqual(normalize_channel("35839961"), "-10035839961")
         self.assertEqual(normalize_channel(35839961), "-10035839961")
         self.assertEqual(normalize_channel("-10035839961"), "-10035839961")
+        self.assertEqual(normalize_channel("10035839961"), "-10035839961")
         self.assertEqual(normalize_channel("-100123"), "-100123")
         self.assertEqual(to_channel_chat_id("35839961"), "-10035839961")
         self.assertEqual(to_channel_chat_id(-10035839961), "-10035839961")
@@ -125,6 +126,9 @@ class NormalizeChannelTests(unittest.TestCase):
     def test_private_channel_url(self) -> None:
         self.assertEqual(
             normalize_channel("https://t.me/c/35839961"), "-10035839961"
+        )
+        self.assertEqual(
+            normalize_channel("https://t.me/c/35839961/"), "-10035839961"
         )
         self.assertEqual(
             normalize_channel("https://t.me/c/35839961/500"), "-10035839961"
