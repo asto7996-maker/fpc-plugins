@@ -181,7 +181,7 @@ class TimersManager:
                 return timers
 
             import urllib.parse
-            par = dict(urllib.parse.parse_qsl(urllib.parse.unquote(par_m.group(1))))
+            par = dict(urllib.parse.parse_qsl(par_m.group(1), keep_blank_values=True))
 
             # Online time bonus
             bonus = par.get("time_bonus_online")
@@ -307,17 +307,24 @@ class TimersManager:
     async def _event_poll_loop(self) -> None:
         while True:
             try:
+                if getattr(self._client, "auth_blocked", False):
+                    await asyncio.sleep(30)
+                    continue
                 await self.scrape_event_timers()
                 await asyncio.sleep(TIMERS.profession_recheck_interval)
             except asyncio.CancelledError:
                 break
             except Exception as exc:
+                # Swallow TokenExpiredError from background — main loop handles it
                 logger.debug("event poll error: %s", exc)
                 await asyncio.sleep(60)
 
     async def _area_poll_loop(self) -> None:
         while True:
             try:
+                if getattr(self._client, "auth_blocked", False):
+                    await asyncio.sleep(30)
+                    continue
                 await self.scrape_area_timers()
                 await self.sync_server_time()
                 await asyncio.sleep(TIMERS.craft_poll_interval * 4)

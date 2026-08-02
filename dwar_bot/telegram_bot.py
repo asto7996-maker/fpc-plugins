@@ -156,6 +156,8 @@ class TelegramBotHandler:
         Async callables to stop/resume the game loop.
     log_path:
         Path to the bot log file.
+    on_cookies_json:
+        Optional async callable(raw_json: str) -> str to accept Cookie Editor paste.
     """
 
     def __init__(
@@ -166,14 +168,17 @@ class TelegramBotHandler:
         stop_fn: Callable[[], Coroutine],
         resume_fn: Callable[[], Coroutine],
         log_path: Path,
+        on_cookies_json: Optional[Callable[[str], Coroutine]] = None,
     ) -> None:
         self._api = TelegramAPI(token, owner_chat_id)
         self._get_status = get_status_fn
         self._stop_fn = stop_fn
         self._resume_fn = resume_fn
         self._log_path = log_path
+        self._on_cookies_json = on_cookies_json
         self._running = True
         self._paused = False
+        self._cookie_buffer: list[str] = []
 
     async def start(self) -> None:
         """Register commands with Telegram and start the polling loop."""
@@ -231,7 +236,21 @@ class TelegramBotHandler:
             await self._dispatch_command(chat_id, f"/{data}")
 
     async def _dispatch_command(self, chat_id: str, text: str) -> None:
-        cmd = text.split()[0].lower().lstrip("/").split("@")[0]
+        # Cookie Editor JSON paste (single message or multi-part)
+        stripped = text.strip()
+        if self._looks_like_cookie_json(stripped) or (
+            self._cookie_buffer and (stripped.startswith("[") or stripped.startswith("{")
+                                     or stripped.startswith('"') or stripped.endswith("]")
+                                     or "mycom" in stripped or "sess_" in stripped)
+        ):
+            await self._handle_cookie_paste(chat_id, stripped)
+            return
+
+        # If user sends a command while buffering cookies — cancel buffer
+        if self._cookie_buffer and stripped.startswith("/"):
+            self._cookie_buffer.clear()
+
+        cmd = text.split()[0].lower().lstrip("/").split("@")[0] if text else ""
         handlers = {
             "start":     self._cmd_start,
             "status":    self._cmd_status,
@@ -253,7 +272,48 @@ class TelegramBotHandler:
             await handler(chat_id)
         else:
             await self._api.send(chat_id,
-                "❓ Неизвестная команда. Используй /start для меню.")
+                "❓ Неизвестная команда. Используй /start для меню.\n"
+                "Чтобы обновить сессию — пришли Cookie Editor JSON.")
+
+    @staticmethod
+    def _looks_like_cookie_json(text: str) -> bool:
+        t = text.lstrip()
+        if t.startswith("```"):
+            t = t.strip("`")
+            if t.lower().startswith("json"):
+                t = t[4:].lstrip()
+        return t.startswith("[") and ("mycom" in t or "sess_sid" in t or '"name"' in t[:200])
+
+    async def _handle_cookie_paste(self, chat_id: str, chunk: str) -> None:
+        if not self._on_cookies_json:
+            await self._api.send(chat_id, "⚠️ Приём куков не настроен.")
+            return
+
+        cleaned = chunk.strip()
+        if cleaned.startswith("```"):
+            cleaned = cleaned.strip("`")
+            if cleaned.lower().startswith("json"):
+                cleaned = cleaned[4:].lstrip()
+
+        self._cookie_buffer.append(cleaned)
+        combined = "\n".join(self._cookie_buffer).strip()
+
+        # Wait for a complete JSON array
+        if not (combined.startswith("[") and combined.endswith("]")):
+            await self._api.send(
+                chat_id,
+                f"🍪 Получен фрагмент JSON ({len(self._cookie_buffer)}). "
+                "Пришли оставшуюся часть — соберу целиком.",
+            )
+            return
+
+        self._cookie_buffer.clear()
+        await self._api.send(chat_id, "🍪 Принимаю куки, обновляю сессию…")
+        try:
+            result = await self._on_cookies_json(combined)
+        except Exception as exc:
+            result = f"❌ Ошибка обработки куков: {exc}"
+        await self._api.send(chat_id, result, reply_markup=_main_keyboard())
 
     # ------------------------------------------------------------------
     # Command handlers
@@ -280,9 +340,10 @@ class TelegramBotHandler:
             f"<b>📊 Статус DwarBot</b>\n\n"
             f"{state_icon} Цикл: {'Работает' if st.get('running') else ('Пауза' if self._paused else 'Остановлен')}\n"
             f"🔑 Токен: {'✅ Действителен' if token_ok else '❌ Истёк — нужны новые куки'}\n"
+            f"🪪 sess: <code>{st.get('sess_sid','?') or '?'}…</code>\n"
             f"🔄 Итераций: {st.get('iteration', 0)}\n"
             f"⏱ Время работы: {st.get('uptime','?')}\n"
-            f"📍 Локация: area_id={st.get('area_id','?')}\n"
+            f"📍 Локация: {st.get('area_title') or 'area'} ({st.get('area_id','?')})\n"
         )
         await self._api.send(chat_id, text, reply_markup=_main_keyboard())
 
@@ -421,15 +482,12 @@ class TelegramBotHandler:
 
     async def _cmd_cookies(self, chat_id: str) -> None:
         text = (
-            "<b>🍪 Обновление куков (токен истёк)</b>\n\n"
-            "1️⃣ Открой <b>https://w1.dwar.ru</b> в браузере и войди в игру\n\n"
-            "2️⃣ Установи расширение <b>Cookie Editor</b>\n\n"
-            "3️⃣ Нажми расширение → <b>Export → Export as JSON</b>\n\n"
-            "4️⃣ Скопируй JSON и пришли его <b>сюда в чат</b> — "
-            "бот обновится автоматически\n\n"
-            "Или через SSH:\n"
-            "<code>scp cookies.json root@31.76.30.135:"
-            "/root/dwar_bot/cookies/session_cookies.json</code>"
+            "<b>🍪 Обновление куков</b>\n\n"
+            "1️⃣ Открой <b>https://w1.dwar.ru</b> и войди в игру\n"
+            "2️⃣ Cookie Editor → <b>Export as JSON</b>\n"
+            "3️⃣ Пришли JSON <b>прямо сюда</b> — сессия обновится без рестарта\n\n"
+            "Нужны куки <code>mycom</code> (access_token). "
+            "<code>sess_sid</code> бот создаст сам через OAuth."
         )
         await self._api.send(chat_id, text)
 

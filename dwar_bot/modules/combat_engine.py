@@ -374,9 +374,88 @@ class CombatEngine:
             await asyncio.sleep(random.uniform(30, 90))
             return BattleResult.NO_BATTLE
 
-        # 5. Look for a fight: front first, then arena
+        # 5. Look for a fight: front → arena → area combat hotspots
         result = await self.try_join_front()
         if result == BattleResult.JOINED:
             return result
 
+        result = await self.try_arena()
+        if result == BattleResult.JOINED:
+            return result
+
+        result = await self.try_area_combat()
+        if result == BattleResult.JOINED:
+            return result
+
+        return BattleResult.NO_BATTLE
+
+    async def try_area_combat(self) -> BattleResult:
+        """
+        Trigger combat-capable area hotspots (e.g. Расселина) and hunt events.
+
+        Newbie villages often gate PvE behind an AREA action_id rather than fronts.
+        """
+        try:
+            area = await self._client.get_area_info()
+            for item in area.items:
+                itype = (item.item_type or "").lower()
+                name = (item.name or "").lower()
+                # Skip pure travel / NPC nodes
+                if itype == "npc":
+                    continue
+                if itype == "area" and item.code in ("COME_IN", "GO", "MOVE"):
+                    continue
+                if item.action_id or itype == "action" or any(
+                    kw in name for kw in ("расселин", "охот", "пещер", "арен", "тренир", "бой")
+                ):
+                    obj_id = item.object_id or area.area_id
+                    act_id = item.action_id
+                    if not act_id:
+                        continue
+                    logger.info(
+                        "Пробую боевую точку '%s' (action_id=%s).",
+                        item.name, act_id,
+                    )
+                    resp = await self._client.run_area_action(
+                        object_id=obj_id,
+                        action_id=act_id,
+                        link_id=item.link_id,
+                        object_class=item.object_class or "AREA",
+                    )
+                    # After the action, check if we entered a fight
+                    if await self.is_in_battle():
+                        self.session.battles_joined += 1
+                        self.session.consecutive_battles += 1
+                        logger.info("Бой начат через точку '%s'.", item.name)
+                        return BattleResult.JOINED
+                    err = str(resp.redirect_error or resp.error or "")
+                    if err and err.lower() not in ("false", "none", ""):
+                        logger.debug("area combat '%s': %s", item.name, err)
+                    await asyncio.sleep(random.uniform(1.0, 2.0))
+
+            # Global arena NPC from hunt_conf (id 817 etc.)
+            hunt = await self._client.get_hunt_conf()
+            for npc in hunt.get("npcs", []):
+                title = str(npc.get("title", "")).lower()
+                if "арен" not in title and "battleground" not in title:
+                    continue
+                npc_id = str(npc.get("npc_id", ""))
+                url = str(npc.get("url", ""))
+                hash_flag = ""
+                if "npc.php?" in url:
+                    # trailing bare hash flag in hunt URL
+                    parts = url.split("&")
+                    for p in parts:
+                        if "=" not in p and p and "npc.php" not in p:
+                            hash_flag = p
+                logger.info("Арена NPC '%s' (id=%s).", npc.get("title"), npc_id)
+                await self._client.join_arena(int(npc_id), hash_flag)
+                # Try chaotic confirm after opening arena NPC
+                arena = await self.try_arena()
+                if arena == BattleResult.JOINED:
+                    return arena
+                break
+
+        except Exception as exc:
+            logger.debug("try_area_combat error: %s", exc)
         return BattleResult.NO_BATTLE
