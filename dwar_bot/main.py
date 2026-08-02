@@ -741,7 +741,7 @@ class DwarBot:
                     return True
                 # Empty / flavor-only → honor cooldown so we don't spam
                 if loot_n <= 0:
-                    cd = int(payload.get("ltime") or 0) or 30
+                    cd = max(int(payload.get("ltime") or 0), 30)
                     self.brain.mark_cooldown(name, cd)
                     # Also try action_run.php once (Flash client path)
                     link_href = str(payload.get("link_href") or "")

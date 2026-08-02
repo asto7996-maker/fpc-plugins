@@ -206,13 +206,17 @@ class LogWatcher:
     async def _loop(self) -> None:
         asyncio.create_task(self._ensure_cli(), name="log_watcher_cli_boot")
 
-        # Boot scan — catch crash that caused previous restart
+        # Boot scan once — then always advance offset to EOF so the same
+        # historical crash cannot re-trigger heal after service restart.
         boot = self._boot_scan_tail()
         if boot and self._is_actionable(boot):
-            logger.info("LogWatcher: boot-scan found recent errors — healing.")
-            await self._handle_chunk(boot)
-        else:
-            self._seek_end()
+            # Only heal boot errors that look fresh (< 15 min by timestamp if present)
+            if _boot_error_is_fresh(boot):
+                logger.info("LogWatcher: boot-scan found fresh errors — healing.")
+                await self._handle_chunk(boot)
+            else:
+                logger.info("LogWatcher: boot-scan errors are stale — skipping.")
+        self._seek_end()
 
         await asyncio.sleep(min(20, self.interval_seconds))
 
@@ -229,6 +233,21 @@ class LogWatcher:
             except Exception as exc:
                 logger.exception("LogWatcher loop error: %s", exc)
             await asyncio.sleep(self.interval_seconds)
+
+
+def _boot_error_is_fresh(chunk: str, max_age_sec: int = 900) -> bool:
+    """Return True if the newest timestamp in chunk is within max_age_sec."""
+    import datetime as _dt
+    stamps = re.findall(r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})", chunk)
+    if not stamps:
+        return True  # unknown age — allow once
+    try:
+        latest = _dt.datetime.strptime(stamps[-1], "%Y-%m-%d %H:%M:%S")
+        # Assume log timestamps are local server time
+        age = (_dt.datetime.now() - latest).total_seconds()
+        return age <= max_age_sec
+    except ValueError:
+        return True
 
 
 async def start_log_monitoring(
