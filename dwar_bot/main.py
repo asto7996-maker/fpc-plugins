@@ -546,6 +546,10 @@ async def main() -> None:
                 (client._session.get("sess_sid") or "")[:8],
             )
             persist_session_cookies(client._session, cookie_path)
+            try:
+                client._cookie_mtime = cookie_path.stat().st_mtime
+            except OSError:
+                pass
             break
         except TokenExpiredError as exc:
             await bot._handle_token_expired(str(exc))
