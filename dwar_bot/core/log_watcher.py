@@ -229,7 +229,8 @@ class LogWatcher:
 
         while self._running:
             try:
-                if get_bot_state() == BotState.HEALING:
+                # Never compete with an in-flight heal
+                if get_bot_state() in (BotState.HEALING, BotState.PAUSED):
                     await asyncio.sleep(3)
                     continue
                 chunk = self._read_new()

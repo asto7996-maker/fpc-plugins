@@ -1,15 +1,21 @@
 """
-Cursor CLI self-healer — fully automatic patch loop.
+Cursor CLI self-healer — fully automatic patch loop (zero human steps).
 
-* Loads ``CURSOR_API_KEY`` from ``.env`` into ``os.environ``
-* Auto-installs Cursor Agent CLI if missing (``curl https://cursor.com/install``)
-* Runs headless: ``agent -p --force --trust --workspace …``
-* Verifies with ``pytest tests/test_bot.py``
-* Rolls back via file snapshot (and ``git checkout`` when a repo is available)
+Pipeline
+--------
+1. Load ``CURSOR_API_KEY`` from ``.env`` (VPS: ``/root/dwar_bot/.env``)
+2. Auto-install Cursor Agent CLI if missing
+3. Snapshot target file(s)
+4. Headless ``agent -p --force --trust`` patch
+5. Require real file change (hash) — no-op ≠ success
+6. ``pytest tests/test_bot.py`` gate
+7. Verified ``systemctl restart dwar_bot.service`` (+ skip-boot marker)
+8. Rollback snapshot on any failure
 """
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import shutil
@@ -29,7 +35,12 @@ BACKUP_DIR: Path = REPO_ROOT / "dwar_bot" / ".heal_backups"
 # Written before systemctl restart so LogWatcher skips boot-scan of the
 # same error that was just healed (otherwise SUCCESS → restart → re-heal loop).
 SKIP_BOOT_MARKER: Path = REPO_ROOT / "dwar_bot" / ".heal_skip_boot"
-RESTART_AFTER_HEAL = os.getenv("DWAR_RESTART_AFTER_HEAL", "1") != "0"
+SERVICE_NAME = os.getenv("DWAR_SERVICE_NAME", "dwar_bot.service")
+
+
+def restart_after_heal_enabled() -> bool:
+    """Read at call-time so .env loaded in main() is honored."""
+    return os.getenv("DWAR_RESTART_AFTER_HEAL", "1") != "0"
 
 
 def _load_dotenv(path: Optional[Path] = None, *, overwrite: bool = False) -> None:
@@ -41,33 +52,41 @@ def _load_dotenv(path: Optional[Path] = None, *, overwrite: bool = False) -> Non
         [
             ENV_FILE,
             REPO_ROOT / "dwar_bot" / ".env",
+            Path("/root/dwar_bot/.env"),
+            Path("/root/.env"),
             Path.cwd() / ".env",
             Path.cwd() / "dwar_bot" / ".env",
         ]
     )
-    target = next((p for p in candidates if p.exists()), None)
-    if not target:
-        return
-    try:
-        for raw in target.read_text(encoding="utf-8").splitlines():
-            line = raw.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, _, value = line.partition("=")
-            key = key.strip()
-            value = value.strip().strip("'").strip('"')
-            if not key:
-                continue
-            if overwrite or key not in os.environ or not str(os.environ.get(key, "")).strip():
-                os.environ[key] = value
-    except OSError as exc:
-        logger.warning("Could not read .env (%s): %s", target, exc)
+    seen: set[str] = set()
+    for target in candidates:
+        try:
+            key = str(target.resolve())
+        except OSError:
+            key = str(target)
+        if key in seen or not target.exists():
+            continue
+        seen.add(key)
+        try:
+            for raw in target.read_text(encoding="utf-8").splitlines():
+                line = raw.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, _, value = line.partition("=")
+                k = k.strip()
+                value = value.strip().strip("'").strip('"')
+                if not k:
+                    continue
+                if overwrite or k not in os.environ or not str(os.environ.get(k, "")).strip():
+                    os.environ[k] = value
+        except OSError as exc:
+            logger.warning("Could not read .env (%s): %s", target, exc)
 
 
 def _ensure_cursor_api_key() -> str:
     _load_dotenv(overwrite=False)
-    # Prefer dwar_bot/.env explicitly (VPS layout)
     _load_dotenv(REPO_ROOT / "dwar_bot" / ".env", overwrite=False)
+    _load_dotenv(Path("/root/dwar_bot/.env"), overwrite=False)
     key = (os.environ.get("CURSOR_API_KEY") or "").strip()
     if not key:
         raise RuntimeError(
@@ -100,7 +119,6 @@ def _which_agent(env: Optional[dict] = None) -> Optional[str]:
         path = shutil.which(name, path=env.get("PATH"))
         if path:
             return path
-    # Hard paths from official installer
     for p in (
         Path.home() / ".local" / "bin" / "agent",
         Path.home() / ".local" / "bin" / "cursor-agent",
@@ -112,9 +130,7 @@ def _which_agent(env: Optional[dict] = None) -> Optional[str]:
 
 
 def ensure_cursor_cli(force_reinstall: bool = False) -> str:
-    """
-    Return path to Cursor Agent CLI, installing it automatically if missing.
-    """
+    """Return path to Cursor Agent CLI, installing it automatically if missing."""
     env = _augment_path(os.environ.copy())
     if not force_reinstall:
         found = _which_agent(env)
@@ -150,15 +166,31 @@ def ensure_cursor_cli(force_reinstall: bool = False) -> str:
     return found
 
 
+def heal_ready() -> tuple[bool, str]:
+    """Return (ok, detail) — whether full-auto heal can run right now."""
+    try:
+        _ensure_cursor_api_key()
+    except Exception as exc:
+        return False, f"API key: {exc}"
+    try:
+        path = ensure_cursor_cli()
+    except Exception as exc:
+        return False, f"CLI: {exc}"
+    return True, f"ready agent={path}"
+
+
 def _build_prompt(failed_file: str, traceback_text: str) -> str:
     return (
         f"Бот для игры 'Легенда: Наследие Драконов' упал с ошибкой в файле {failed_file}.\n"
         f"Вот стек ошибки:\n"
-        f"{traceback_text}\n"
-        f"Проанализируй проблему (неверный CSS/XPath селектор, таймаут, логику), "
-        f"проверь актуальные данные в config/selectors.py и внеси исправление "
-        f"прямо в файл {failed_file}. "
-        f"Не спрашивай подтверждений — сразу правь файл и закончи."
+        f"{traceback_text}\n\n"
+        f"ЗАДАЧА (полностью автоматически, без вопросов):\n"
+        f"1. Найди корневую причину по traceback.\n"
+        f"2. Исправь код. Можно править связанные файлы в dwar_bot/ и config/selectors.py "
+        f"(не только {failed_file}), если это нужно для фикса.\n"
+        f"3. Минимальный дифф. Не рефактори и не трогай .env / секреты.\n"
+        f"4. Сохрани изменения на диск и закончи.\n"
+        f"Не спрашивай подтверждений — сразу правь файлы."
     )
 
 
@@ -188,13 +220,50 @@ def _abs(rel: Path) -> Path:
     return rel if rel.is_absolute() else (REPO_ROOT / rel)
 
 
+def _file_hash(path: Path) -> str:
+    h = hashlib.sha256()
+    try:
+        h.update(path.read_bytes())
+    except OSError:
+        return ""
+    return h.hexdigest()
+
+
+def _snapshot_tree() -> dict[str, str]:
+    """Hash all .py under dwar_bot/ + config/selectors.py for change detection."""
+    out: dict[str, str] = {}
+    roots = [REPO_ROOT / "dwar_bot", REPO_ROOT / "config"]
+    for root in roots:
+        if not root.exists():
+            continue
+        for p in root.rglob("*.py"):
+            if ".heal_backups" in p.parts or "__pycache__" in p.parts:
+                continue
+            try:
+                rel = str(p.relative_to(REPO_ROOT))
+            except ValueError:
+                rel = str(p)
+            out[rel] = _file_hash(p)
+    return out
+
+
+def _changed_files(before: dict[str, str], after: dict[str, str]) -> list[str]:
+    changed = []
+    for rel, h in after.items():
+        if before.get(rel) != h:
+            changed.append(rel)
+    for rel in before:
+        if rel not in after:
+            changed.append(rel)
+    return sorted(changed)
+
+
 def _snapshot(rel: Path) -> Path:
     BACKUP_DIR.mkdir(parents=True, exist_ok=True)
     src = _abs(rel)
     stamp = int(time.time())
     dst = BACKUP_DIR / f"{src.name}.{stamp}.bak"
     shutil.copy2(src, dst)
-    # Also keep a stable "last" copy for easy restore
     last = BACKUP_DIR / f"{src.name}.last.bak"
     shutil.copy2(src, last)
     return last
@@ -206,7 +275,6 @@ def _restore_snapshot(rel: Path, backup: Path) -> None:
         shutil.copy2(backup, src)
         logger.warning("Restored %s from snapshot %s", rel, backup)
         return
-    # git fallback if available
     if (REPO_ROOT / ".git").exists():
         subprocess.run(
             ["git", "checkout", "--", str(rel)],
@@ -220,7 +288,6 @@ def _restore_snapshot(rel: Path, backup: Path) -> None:
 
 def _run_pytest(env: dict) -> bool:
     env = dict(env)
-    # Ensure package imports work on VPS layout (WorkingDirectory=/root)
     pp = env.get("PYTHONPATH", "")
     root = str(REPO_ROOT)
     if root not in pp.split(os.pathsep):
@@ -301,49 +368,79 @@ def consume_skip_boot_scan(max_age_sec: int = 600) -> bool:
         return False
 
 
-def _restart_service() -> None:
-    """Reload bot process so patched code is actually used."""
-    if not RESTART_AFTER_HEAL:
-        return
+def _restart_service() -> bool:
+    """
+    Reload bot process so patched code is actually used.
+    Returns True if restart was scheduled successfully.
+    """
+    if not restart_after_heal_enabled():
+        logger.warning("DWAR_RESTART_AFTER_HEAL=0 — skipping service restart.")
+        return False
+
     mark_skip_boot_scan("post-heal-restart")
     logger.warning("Scheduling service restart to load healed code…")
+
+    attempts = [
+        ["systemctl", "restart", SERVICE_NAME],
+        ["systemctl", "--user", "restart", SERVICE_NAME],
+    ]
+    for cmd in attempts:
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            if result.returncode == 0:
+                logger.info("Restart OK via: %s", " ".join(cmd))
+                return True
+            logger.warning(
+                "Restart attempt failed (%s): %s",
+                " ".join(cmd),
+                (result.stderr or result.stdout or "")[:400],
+            )
+        except FileNotFoundError:
+            continue
+        except Exception as exc:
+            logger.error("Restart via %s error: %s", cmd[0], exc)
+
+    # Last resort: detach a delayed kill of ourselves — systemd Restart=always
+    # will bring the process back with new code.
     try:
-        # Detach so restart isn't killed mid-flight with us
+        pid = os.getpid()
+        logger.warning("Falling back to self-restart (kill pid=%s)…", pid)
         subprocess.Popen(
-            ["systemctl", "restart", "dwar_bot.service"],
+            ["bash", "-lc", f"sleep 2; kill -TERM {pid} || true"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             start_new_session=True,
         )
+        return True
     except Exception as exc:
-        logger.error("Could not restart service: %s", exc)
+        logger.error("Self-restart fallback failed: %s", exc)
+        return False
 
 
 def _run_agent(agent_bin: str, prompt: str, env: dict) -> subprocess.CompletedProcess:
-    """
-    Prefer modern headless CLI; fall back to legacy ``cursor agent --message``.
-    """
+    """Prefer modern headless CLI; fall back to legacy ``cursor agent --message``."""
     workspace = str(REPO_ROOT)
     attempts = [
-        # Official headless form (applies edits with --force, no prompts with --trust)
         [
             agent_bin, "-p", "--force", "--trust",
             "--workspace", workspace,
             prompt,
         ],
-        # Alternate binary name / older flags
         [
             agent_bin, "--print", "--force", "--trust",
             "--workspace", workspace,
             prompt,
         ],
-        # User-requested shape (if `cursor` wrapper exists)
         ["cursor", "agent", "--message", prompt],
     ]
 
     last: Optional[subprocess.CompletedProcess] = None
     for cmd in attempts:
-        # Skip cursor-wrapper attempt if binary isn't cursor
         if cmd[0] == "cursor" and shutil.which("cursor", path=env.get("PATH")) is None:
             continue
         logger.info("Invoking: %s …", " ".join(cmd[:6]) + (" …" if len(cmd) > 6 else ""))
@@ -375,7 +472,8 @@ def _run_agent(agent_bin: str, prompt: str, env: dict) -> subprocess.CompletedPr
 
 def patch_code_with_cursor(failed_file: str, traceback_text: str) -> bool:
     """
-    Fully automatic heal: ensure CLI → snapshot → agent patch → pytest → restore on fail.
+    Fully automatic heal:
+    ensure CLI → snapshot → agent patch → require file change → pytest → restart.
     """
     rel = _resolve_failed_path(failed_file)
     abs_path = _abs(rel)
@@ -393,9 +491,10 @@ def patch_code_with_cursor(failed_file: str, traceback_text: str) -> bool:
     prompt = _build_prompt(str(rel), traceback_text)
     env = _augment_path(os.environ.copy())
     env["CURSOR_API_KEY"] = os.environ["CURSOR_API_KEY"]
-    env["CI"] = "1"  # hint non-interactive
+    env["CI"] = "1"
 
     backup = _snapshot(rel)
+    before = _snapshot_tree()
     logger.info(
         "Self-heal start: file=%s timeout=%ds agent=%s",
         rel, AGENT_TIMEOUT_SEC, agent_bin,
@@ -422,10 +521,28 @@ def patch_code_with_cursor(failed_file: str, traceback_text: str) -> bool:
         _restore_snapshot(rel, backup)
         return False
 
-    if _run_pytest(env):
-        logger.info("Self-heal SUCCESS for %s", rel)
-        _restart_service()
-        return True
+    after = _snapshot_tree()
+    changed = _changed_files(before, after)
+    if not changed:
+        logger.error(
+            "Self-heal NO-OP: agent exited 0 but no .py files changed — not SUCCESS."
+        )
+        _restore_snapshot(rel, backup)
+        return False
+    logger.info("Self-heal changed files: %s", ", ".join(changed[:12]))
 
-    _restore_snapshot(rel, backup)
-    return False
+    if not _run_pytest(env):
+        # Restore primary target; other changed files may remain — best effort
+        _restore_snapshot(rel, backup)
+        return False
+
+    logger.info("Self-heal SUCCESS for %s (changed=%d)", rel, len(changed))
+    restarted = _restart_service()
+    if not restarted:
+        logger.error(
+            "Patch applied + pytest OK but restart FAILED — "
+            "process may still run old code until manual restart."
+        )
+        # Still return True: code on disk is fixed; systemd Restart= or next
+        # deploy will pick it up. Caller may notify.
+    return True

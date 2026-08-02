@@ -54,7 +54,7 @@ from dwar_bot.modules.progression_brain import (
     GameOption,
     ProgressionBrain,
 )
-from dwar_bot.core.bot_state import BotState, set_bot_state
+from dwar_bot.core.bot_state import BotState, get_bot_state, set_bot_state
 from dwar_bot.core.log_watcher import start_log_monitoring
 from dwar_bot.core.cursor_self_healer import ensure_cursor_cli, _augment_path
 from dwar_bot.core.auto_healer import bind_auto_healer, get_auto_healer
@@ -247,10 +247,17 @@ class DwarBot:
             await self.notify("▶️ Автопилот возобновлён.", "heartbeat")
 
     async def pause_for_heal(self) -> None:
-        await self.pause(quiet=True)
+        """Pause gameplay for heal WITHOUT overwriting BotState.HEALING."""
+        self._paused = True
+        # Keep HEALING if already set by AutoHealer; else mark paused quietly
+        if get_bot_state() != BotState.HEALING:
+            set_bot_state(BotState.HEALING)
+        logger.info("Game loop paused (heal).")
 
     async def resume_after_heal(self) -> None:
-        await self.resume_game(quiet=True)
+        self._paused = False
+        set_bot_state(BotState.RUNNING)
+        logger.info("Game loop resumed (heal).")
 
     async def apply_cookie_json(self, raw_json: str) -> str:
         """
@@ -618,9 +625,8 @@ class DwarBot:
             result = await self.combat.try_area_combat()
             if result == BattleResult.JOINED:
                 return True
-        # Last resort: soft-clear only GLOBAL event NPCs, never local story
-        # (local type=2 failures stay exhausted)
-        return self.brain.farm_push_active()
+        # farm_push alone is NOT real progress — let Cursor escalate
+        return False
 
     async def _process_loot_response(self, resp, label: str = "") -> int:
         """Log / notify bonus_text + artifact macros from an API response."""
@@ -1110,7 +1116,7 @@ async def main() -> None:
         await bot.notify(text, "errors")
 
     # Bind global auto-healer (exceptions + stagnation + log watcher)
-    bind_auto_healer(
+    healer = bind_auto_healer(
         notify_fn=_notify_plain,
         pause_fn=bot.pause_for_heal,
         resume_fn=bot.resume_after_heal,
@@ -1139,20 +1145,21 @@ async def main() -> None:
         tg_task = asyncio.ensure_future(tg_handler.start())
         logger.info("Telegram control panel started (chat_id=%s).", tg_chatid)
 
-    # Pre-install / verify CLI without blocking the game loop
-    async def _boot_cli() -> None:
+    # Pre-install / verify CLI + API key (full-auto readiness)
+    async def _boot_heal_ready() -> None:
         try:
             path = await asyncio.to_thread(ensure_cursor_cli)
             logger.info("Cursor Agent CLI ready: %s", path)
         except Exception as exc:
             logger.error("Cursor CLI bootstrap failed (will retry on heal): %s", exc)
+        await healer.ensure_ready()
 
-    asyncio.create_task(_boot_cli(), name="cursor_cli_boot")
+    asyncio.create_task(_boot_heal_ready(), name="cursor_cli_boot")
 
-    # Log watcher every 60s (boot-scan + ANSI-aware + AutoHealer)
+    # Log watcher every 45s (boot-scan + ANSI-aware + AutoHealer)
     log_watcher_task = asyncio.create_task(
         start_log_monitoring(
-            60,
+            45,
             log_path=LOG_FILE,
             notify_fn=_notify_plain,
             pause_fn=bot.pause_for_heal,
@@ -1160,8 +1167,20 @@ async def main() -> None:
         ),
         name="log_watcher",
     )
+    # Periodic readiness re-check (reinstall CLI / reload .env if needed)
+    async def _heal_watchdog() -> None:
+        while not _shutdown_event.is_set():
+            await asyncio.sleep(900)
+            if get_bot_state() == BotState.HEALING:
+                continue
+            try:
+                await healer.ensure_ready()
+            except Exception as exc:
+                logger.debug("heal watchdog: %s", exc)
+
+    asyncio.create_task(_heal_watchdog(), name="heal_watchdog")
     logger.info(
-        "AutoHealer + LogWatcher FULL-AUTO (60s) · CURSOR_API_KEY=%s",
+        "AutoHealer + LogWatcher FULL-AUTO (45s) · CURSOR_API_KEY=%s",
         "set" if os.getenv("CURSOR_API_KEY") else "MISSING",
     )
 
@@ -1192,6 +1211,11 @@ async def main() -> None:
             await bot._handle_token_expired(str(exc))
         except Exception as exc:
             log_exception(logger, "Fatal startup error", exc)
+            try:
+                await healer.handle_exception(exc, where="startup")
+            except Exception as heal_exc:
+                logger.error("Startup auto-heal failed: %s", heal_exc)
+            # systemd Restart=always will bring us back with patched code
             sys.exit(2)
 
     bot.timers.start_background_tasks()

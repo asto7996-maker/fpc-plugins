@@ -1,0 +1,23 @@
+[Unit]
+Description=DwarBot — Легенда: Наследие Драконов browser automation bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root
+ExecStart=/opt/dwar_start.sh
+Restart=always
+RestartSec=30
+StartLimitIntervalSec=0
+StandardOutput=append:/root/dwar_bot/logs/systemd_stdout.log
+StandardError=append:/root/dwar_bot/logs/systemd_stderr.log
+MemoryMax=1400M
+CPUQuota=90%
+EnvironmentFile=-/root/dwar_bot/.env
+# Auto-healer calls: systemctl restart dwar_bot.service
+# Keep Restart=always so self-kill fallback also recovers.
+
+[Install]
+WantedBy=multi-user.target

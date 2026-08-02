@@ -60,6 +60,7 @@ def test_healer_prompt_mentions_selectors():
     prompt = _build_prompt("dwar_bot/main.py", "Traceback: boom")
     assert "config/selectors.py" in prompt
     assert "dwar_bot/main.py" in prompt
+    assert "dwar_bot/" in prompt  # multi-file allowed
 
 
 def test_healer_path_augment_and_snapshot_dir():
@@ -69,6 +70,49 @@ def test_healer_path_augment_and_snapshot_dir():
     assert ".local/bin" in env.get("PATH", "") or "local" in env.get("PATH", "")
     assert REPO_ROOT.exists()
     assert BACKUP_DIR.name == ".heal_backups"
+
+
+def test_heal_change_detection_and_restart_flag():
+    from dwar_bot.core.cursor_self_healer import (
+        _changed_files,
+        _snapshot_tree,
+        restart_after_heal_enabled,
+    )
+
+    before = _snapshot_tree()
+    assert before  # dwar_bot/*.py hashed
+    after = dict(before)
+    # Simulate no-op
+    assert _changed_files(before, after) == []
+    # Simulate change
+    any_key = next(iter(after))
+    after[any_key] = "deadbeef"
+    assert any_key in _changed_files(before, after)
+    assert restart_after_heal_enabled() is True
+
+
+def test_pause_for_heal_keeps_healing_state():
+    import asyncio
+    from dwar_bot.core.bot_state import BotState, get_bot_state, set_bot_state
+    from dwar_bot.main import DwarBot
+    from dwar_bot.modules.bot_settings import BotSettings
+
+    class _DummyClient:
+        _world_url = "https://w1.dwar.ru"
+        _session = {}
+
+    set_bot_state(BotState.HEALING)
+    bot = DwarBot(_DummyClient(), settings=BotSettings())  # type: ignore[arg-type]
+
+    async def _run() -> None:
+        await bot.pause_for_heal()
+        assert get_bot_state() == BotState.HEALING
+        assert bot._paused is True
+        await bot.resume_after_heal()
+        assert get_bot_state() == BotState.RUNNING
+        assert bot._paused is False
+
+    asyncio.run(_run())
 
 
 def test_log_watcher_actionable_filter():
