@@ -393,7 +393,7 @@ class QuestTracker:
             from_point = str(child.get("from_point_id") or pt.get("point_id") or "")
 
             if to_point:
-                # Advance by opening the destination point, then acknowledging it
+                # Message transition (type=2): try opening destination + answer variants
                 raw = await self._client.npc_point(
                     npc_id,
                     quest_id=quest_id,
@@ -404,7 +404,6 @@ class QuestTracker:
                     subpoint_id=to_point,
                 )
                 nxt_pt = raw.get("npc|point") or {}
-                # Also try answer on the destination / with message id
                 raw_ans = await self._client.npc_answer(
                     npc_id,
                     quest_id=quest_id,
@@ -414,7 +413,6 @@ class QuestTracker:
                     f_id=f_id,
                     subpoint_id=to_point,
                 )
-                # Fallback: answer current point (works for some type=0 dialogs)
                 if int((raw_ans.get("npc|answer") or {}).get("status", 0) or 0) != STATUS_OK:
                     raw_ans = await self._client.npc_answer(
                         npc_id,
@@ -425,9 +423,23 @@ class QuestTracker:
                         f_id=f_id,
                         subpoint_id=child_id,
                     )
-                raw = raw_ans if (raw_ans.get("npc|point") or {}).get("point") else raw
-                if not (raw.get("npc|point") or {}).get("point") and (nxt_pt.get("point") or {}).get("title"):
-                    raw = {"npc|point": nxt_pt, "npc|answer": {"status": STATUS_OK}}
+                ans_ok = int(
+                    (raw_ans.get("npc|answer") or {}).get("status", 0) or 0
+                ) == STATUS_OK
+                # Prefer answer payload only when the server accepted it
+                if ans_ok and (raw_ans.get("npc|point") or {}).get("point"):
+                    raw = raw_ans
+                elif ans_ok:
+                    raw = raw_ans
+                else:
+                    # Opening to_point often returns empty done=true — not real progress
+                    logger.info(
+                        "Ответ type=2 отклонён (msg %s → %s) — нужен другой триггер квеста.",
+                        child_id, to_point,
+                    )
+                    self._answered_points.add(child_id)
+                    self._exhausted_dialogues.add(key)
+                    break
             else:
                 # Prefer answering the CURRENT point for subdialogs; answering the
                 # child id itself often yields "Этап не может иметь корня!".
@@ -461,10 +473,25 @@ class QuestTracker:
                 if not (raw.get("npc|point") or {}).get("point"):
                     break
 
+            new_pt = raw.get("npc|point") or {}
+            new_pid = str(new_pt.get("point_id") or "")
+            old_pid = str(pt.get("point_id") or "")
+            moved = bool(new_pid) and new_pid != old_pid and not new_pt.get("done")
+            ans_ok = int(ans.get("status", 0) or 0) == STATUS_OK
+
+            if not moved and not ans_ok:
+                logger.info(
+                    "NPC %s: диалог не сдвинулся с точки %s.",
+                    npc_id, old_pid or "?",
+                )
+                self._answered_points.add(child_id)
+                self._exhausted_dialogues.add(key)
+                break
+
             self._answered_points.add(child_id)
             self.session.dialogues_handled += 1
             steps += 1
-            if quest_id:
+            if quest_id and ans_ok:
                 self.session.quests_accepted += 1
 
             awards = (raw.get("npc|point") or {}).get("award_list") or []
@@ -474,9 +501,6 @@ class QuestTracker:
             await asyncio.sleep(random.uniform(0.8, 2.0))
 
             # Refresh quests if the answer didn't return a new point
-            new_pt = raw.get("npc|point") or {}
-            new_pid = str(new_pt.get("point_id") or "")
-            old_pid = str(pt.get("point_id") or "")
             if not new_pt.get("point") or new_pid == old_pid:
                 raw = await self._client.npc_quests(
                     npc_id,
@@ -498,6 +522,7 @@ class QuestTracker:
                             "NPC %s: диалог не сдвинулся (возможно, нужно выполнить цель квеста).",
                             npc_id,
                         )
+                        self._exhausted_dialogues.add(key)
                         break
 
         if steps == 0:
