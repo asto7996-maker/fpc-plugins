@@ -180,6 +180,17 @@ class ProgressionBrain:
         self._loot_seen: set[str] = set()
         # action_key → consecutive empty/no-progress results
         self._stale: dict[str, int] = {}
+        # hotspot name → unix ts when usable again (client-side CD)
+        self._cooldowns: dict[str, float] = {}
+
+    def mark_cooldown(self, name: str, seconds: float) -> None:
+        if seconds <= 0:
+            return
+        self._cooldowns[name] = time.time() + float(seconds)
+        logger.info("Brain CD: '%s' for %.0fs", name, seconds)
+
+    def clear_cooldowns(self) -> None:
+        self._cooldowns.clear()
 
     def note_result(self, option: Optional[GameOption], *, progressed: bool) -> None:
         """Feed back whether the chosen action produced progress (loot/fight/dialog)."""
@@ -356,6 +367,18 @@ class ProgressionBrain:
                 continue
 
             if item.action_id and (farm.farm_area or farm.auto_loot):
+                # Respect server cooldown (dtime) + client-side CD after empty clicks
+                cd_until = self._cooldowns.get(name, 0)
+                if item.on_cooldown or (cd_until and time.time() < cd_until):
+                    left = item.cooldown_left or max(0, int(cd_until - time.time()))
+                    options.append(GameOption(
+                        ActionType.IDLE,
+                        f"КД: {name}",
+                        score=5,
+                        detail=f"через {left}с",
+                        goal=GoalKind.IDLE,
+                    ))
+                    continue
                 # Hotspots like Расселина — XP + loot + quest progress
                 combatish = any(
                     kw in name.lower()
@@ -379,6 +402,9 @@ class ProgressionBrain:
                         "link_id": item.link_id,
                         "object_class": item.object_class or "AREA",
                         "name": name,
+                        "link_href": item.link_href,
+                        "ltime": item.ltime,
+                        "dtime": item.dtime,
                     },
                     goal=GoalKind.LOOT if empty_bag else (
                         GoalKind.COMBAT if combatish else GoalKind.LOOT

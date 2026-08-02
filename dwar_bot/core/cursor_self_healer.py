@@ -23,9 +23,10 @@ logger = logging.getLogger(__name__)
 REPO_ROOT: Path = Path(__file__).resolve().parents[2]
 ENV_FILE: Path = REPO_ROOT / ".env"
 TEST_TARGET = "tests/test_bot.py"
-AGENT_TIMEOUT_SEC = 180
+AGENT_TIMEOUT_SEC = 300
 INSTALL_TIMEOUT_SEC = 180
 BACKUP_DIR: Path = REPO_ROOT / "dwar_bot" / ".heal_backups"
+RESTART_AFTER_HEAL = os.getenv("DWAR_RESTART_AFTER_HEAL", "1") != "0"
 
 
 def _load_dotenv(path: Optional[Path] = None, *, overwrite: bool = False) -> None:
@@ -215,11 +216,13 @@ def _restore_snapshot(rel: Path, backup: Path) -> None:
 
 
 def _run_pytest(env: dict) -> bool:
-    pythons = [
-        shutil.which("pytest", path=env.get("PATH")),
-        None,  # python -m pytest
-    ]
-    # Prefer project venv if present
+    env = dict(env)
+    # Ensure package imports work on VPS layout (WorkingDirectory=/root)
+    pp = env.get("PYTHONPATH", "")
+    root = str(REPO_ROOT)
+    if root not in pp.split(os.pathsep):
+        env["PYTHONPATH"] = root + (os.pathsep + pp if pp else "")
+
     for venv_py in (
         Path("/opt/dwar_venv/bin/python"),
         REPO_ROOT / ".venv" / "bin" / "python",
@@ -228,8 +231,9 @@ def _run_pytest(env: dict) -> bool:
             cmd = [str(venv_py), "-m", "pytest", TEST_TARGET, "-q", "--tb=short"]
             break
     else:
-        if pythons[0]:
-            cmd = [pythons[0], TEST_TARGET, "-q", "--tb=short"]
+        pytest_bin = shutil.which("pytest", path=env.get("PATH"))
+        if pytest_bin:
+            cmd = [pytest_bin, TEST_TARGET, "-q", "--tb=short"]
         else:
             cmd = ["python3", "-m", "pytest", TEST_TARGET, "-q", "--tb=short"]
 
@@ -260,6 +264,23 @@ def _run_pytest(env: dict) -> bool:
         (result.stderr or "")[-1500:],
     )
     return False
+
+
+def _restart_service() -> None:
+    """Reload bot process so patched code is actually used."""
+    if not RESTART_AFTER_HEAL:
+        return
+    logger.warning("Scheduling service restart to load healed code…")
+    try:
+        # Detach so restart isn't killed mid-flight with us
+        subprocess.Popen(
+            ["systemctl", "restart", "dwar_bot.service"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except Exception as exc:
+        logger.error("Could not restart service: %s", exc)
 
 
 def _run_agent(agent_bin: str, prompt: str, env: dict) -> subprocess.CompletedProcess:
@@ -367,6 +388,7 @@ def patch_code_with_cursor(failed_file: str, traceback_text: str) -> bool:
 
     if _run_pytest(env):
         logger.info("Self-heal SUCCESS for %s", rel)
+        _restart_service()
         return True
 
     _restore_snapshot(rel, backup)

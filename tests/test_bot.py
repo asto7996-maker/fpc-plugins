@@ -66,12 +66,19 @@ def test_log_watcher_actionable_filter():
 
     assert LogWatcher._is_actionable("Traceback (most recent call last):\n  File")
     assert LogWatcher._is_actionable("CRITICAL — boom")
-    assert not LogWatcher._is_actionable("INFO something ERROR-ish but soft")
-    # Soft ERROR alone without exception — not actionable
+    assert LogWatcher._is_actionable("\x1b[31mERROR\x1b[0m | dwar_bot.main\nError in tick #5")
+    assert LogWatcher._is_actionable("STAGNATION / DOM-Desync: stuck")
+    assert not LogWatcher._is_actionable("INFO something fine")
     assert not LogWatcher._is_actionable("| ERROR | httpx timeout retry")
-    assert LogWatcher._is_actionable(
-        "| ERROR | dwar_bot.main\nValueError: boom\n"
-    )
+
+
+def test_auto_healer_import():
+    from dwar_bot.core.auto_healer import get_auto_healer, HealRequest
+
+    h = get_auto_healer()
+    assert h is not None
+    req = HealRequest("dwar_bot/main.py", "Traceback", reason="test")
+    assert req.failed_file.endswith("main.py")
 
 
 @pytest.mark.parametrize(

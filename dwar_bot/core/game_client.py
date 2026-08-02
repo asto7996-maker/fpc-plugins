@@ -122,7 +122,23 @@ class AreaItem:
     object_id: str = ""
     object_class: str = ""
     link_href: str = ""
+    # Cooldown / visibility (from area_conf items)
+    hidden: bool = False
+    ltime: int = 0          # cooldown length (sec)
+    dtime: int = 0          # unix ts when action becomes available again
     raw: dict = field(default_factory=dict)
+
+    @property
+    def on_cooldown(self) -> bool:
+        if self.dtime and self.dtime > int(__import__("time").time()):
+            return True
+        return False
+
+    @property
+    def cooldown_left(self) -> int:
+        if not self.dtime:
+            return 0
+        return max(0, int(self.dtime) - int(__import__("time").time()))
 
 
 @dataclass
@@ -829,6 +845,14 @@ class DwarGameClient:
                     link_id = str(item.get("link_id", "") or "")
 
                 name = urllib.parse.unquote_plus(str(item.get("name", "") or ""))
+                try:
+                    dtime = int(item.get("dtime", 0) or 0)
+                except (TypeError, ValueError):
+                    dtime = 0
+                try:
+                    ltime = int(item.get("ltime", 0) or 0)
+                except (TypeError, ValueError):
+                    ltime = 0
                 area.items.append(AreaItem(
                     item_id=str(item.get("id", "")),
                     name=name,
@@ -843,6 +867,9 @@ class DwarGameClient:
                     object_id=object_id,
                     object_class=object_class,
                     link_href=str(item.get("link_href", "") or ""),
+                    hidden=bool(int(item.get("hidden", 0) or item.get("hide", 0) or 0)),
+                    ltime=ltime,
+                    dtime=dtime,
                     raw=item if isinstance(item, dict) else {},
                 ))
             return area

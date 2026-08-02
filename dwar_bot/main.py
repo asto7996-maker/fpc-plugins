@@ -56,7 +56,8 @@ from dwar_bot.modules.progression_brain import (
 )
 from dwar_bot.core.bot_state import BotState, set_bot_state
 from dwar_bot.core.log_watcher import start_log_monitoring
-from dwar_bot.core.cursor_self_healer import ensure_cursor_cli, _load_dotenv, _augment_path
+from dwar_bot.core.cursor_self_healer import ensure_cursor_cli, _augment_path
+from dwar_bot.core.auto_healer import bind_auto_healer, get_auto_healer
 from dwar_bot.config import COMBAT
 
 logger = logging.getLogger("dwar_bot.main")
@@ -335,6 +336,11 @@ class DwarBot:
                         f"❌ Ошибка тика #{self._iteration}: {exc}",
                         "errors",
                     )
+                # Immediate auto-heal (don't wait for log watcher)
+                try:
+                    await get_auto_healer().handle_exception(exc, where=f"tick#{self._iteration}")
+                except Exception as heal_exc:
+                    logger.debug("inline heal failed: %s", heal_exc)
                 if self._errors_in_row >= MAX_RETRIES:
                     logger.critical("%d consecutive errors — pausing 5min.", MAX_RETRIES)
                     await asyncio.sleep(300)
@@ -559,6 +565,12 @@ class DwarBot:
         )
         self.brain.note_result(focus, progressed=progressed)
 
+        # Stagnation → local recover / Cursor auto-heal
+        try:
+            await get_auto_healer().note_progress(focus_key, progressed)
+        except Exception as exc:
+            logger.debug("stagnation watch: %s", exc)
+
         if not acted and focus.action != ActionType.IDLE:
             if farm.auto_quests and focus.action == ActionType.QUEST_NPC:
                 logger.info("Квест-действие без прогресса — помечаю NPC исчерпанным.")
@@ -574,6 +586,24 @@ class DwarBot:
                     ),
                 )
             await _sleep(8.0, 18.0)
+
+    async def _local_recover_stagnation(self, focus_key: str) -> bool:
+        """Gameplay recovery without Cursor — clear exhausted NPCs, skip CD spam."""
+        logger.warning("Local recover for stagnation: %s", focus_key)
+        cleared = self.quests.clear_exhausted(local_only=True)
+        self.brain._stale.clear()
+        # Don't hammer Rasselina — put a short CD even if server dtime is 0
+        if "расселин" in focus_key.lower() or "combat_area" in focus_key.lower():
+            self.brain.mark_cooldown("Расселина", 45)
+        if cleared:
+            logger.info("Re-enabled %d local NPC dialogues.", cleared)
+            return True
+        # Try travel once
+        if self.settings.farm.auto_travel:
+            moved = await self._try_area_progress()
+            if moved:
+                return True
+        return cleared > 0
 
     async def _process_loot_response(self, resp, label: str = "") -> int:
         """Log / notify bonus_text + artifact macros from an API response."""
@@ -709,9 +739,20 @@ class DwarBot:
                     await self.notify(f"⚔️ Бой через <b>{name}</b>!", "battles")
                     await _sleep(3.0, 6.0)
                     return True
+                # Empty / flavor-only → honor cooldown so we don't spam
+                if loot_n <= 0:
+                    cd = int(payload.get("ltime") or 0) or 30
+                    self.brain.mark_cooldown(name, cd)
+                    # Also try action_run.php once (Flash client path)
+                    link_href = str(payload.get("link_href") or "")
+                    if link_href and "action_run.php" in link_href:
+                        try:
+                            ar = await self._client._get(link_href)
+                            logger.debug("action_run.php → %s len=%d", ar.status_code, len(ar.text or ""))
+                        except Exception:
+                            pass
                 await _sleep(1.5, 3.5)
-                # Flavor-only / empty OK → report acted but caller marks stale
-                return loot_n > 0 or resp.status == STATUS_OK or (not err)
+                return loot_n > 0
 
             if action == ActionType.COMBAT_ARENA:
                 result = await self.combat.try_arena()
@@ -1007,6 +1048,17 @@ async def main() -> None:
     bot = DwarBot(client, settings=BotSettings.load())
     set_bot_state(BotState.RUNNING)
 
+    async def _notify_plain(text: str) -> None:
+        await bot.notify(text, "errors")
+
+    # Bind global auto-healer (exceptions + stagnation + log watcher)
+    bind_auto_healer(
+        notify_fn=_notify_plain,
+        pause_fn=bot.pause_for_heal,
+        resume_fn=bot.resume_after_heal,
+        on_local_recover=bot._local_recover_stagnation,
+    )
+
     tg_token = os.getenv("TELEGRAM_BOT_TOKEN", TELEGRAM_BOT_TOKEN)
     tg_chatid = os.getenv("TELEGRAM_CHAT_ID", TELEGRAM_CHAT_ID)
     tg_task: asyncio.Task | None = None
@@ -1029,10 +1081,6 @@ async def main() -> None:
         tg_task = asyncio.ensure_future(tg_handler.start())
         logger.info("Telegram control panel started (chat_id=%s).", tg_chatid)
 
-    # Background auto-debug: scan bot.log every 300s → Cursor healer (fully automatic)
-    async def _notify_plain(text: str) -> None:
-        await bot.notify(text, "errors")
-
     # Pre-install / verify CLI without blocking the game loop
     async def _boot_cli() -> None:
         try:
@@ -1043,9 +1091,10 @@ async def main() -> None:
 
     asyncio.create_task(_boot_cli(), name="cursor_cli_boot")
 
+    # Log watcher every 60s (boot-scan + ANSI-aware + AutoHealer)
     log_watcher_task = asyncio.create_task(
         start_log_monitoring(
-            300,
+            60,
             log_path=LOG_FILE,
             notify_fn=_notify_plain,
             pause_fn=bot.pause_for_heal,
@@ -1054,7 +1103,7 @@ async def main() -> None:
         name="log_watcher",
     )
     logger.info(
-        "LogWatcher FULL-AUTO (300s) · CURSOR_API_KEY=%s",
+        "AutoHealer + LogWatcher FULL-AUTO (60s) · CURSOR_API_KEY=%s",
         "set" if os.getenv("CURSOR_API_KEY") else "MISSING",
     )
 

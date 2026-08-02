@@ -139,6 +139,20 @@ class QuestTracker:
     ) -> None:
         self._exhausted_dialogues.add(f"{global_npc}:{npc_id}:{link_id}")
 
+    def clear_exhausted(self, *, local_only: bool = False) -> int:
+        """Re-enable NPC dialogues. Returns how many keys were cleared."""
+        if not local_only:
+            n = len(self._exhausted_dialogues)
+            self._exhausted_dialogues.clear()
+            self._answered_points.clear()
+            return n
+        keep = {k for k in self._exhausted_dialogues if str(k).startswith("1:")}
+        n = len(self._exhausted_dialogues) - len(keep)
+        self._exhausted_dialogues = keep
+        # Allow local message answers again
+        self._answered_points.clear()
+        return n
+
     # ------------------------------------------------------------------
     # NPC discovery
     # ------------------------------------------------------------------
