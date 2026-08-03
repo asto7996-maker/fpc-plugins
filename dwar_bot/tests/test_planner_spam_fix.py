@@ -99,7 +99,15 @@ def test_flash_only_allows_hunt_execute():
     main = (ROOT / "main.py").read_text(encoding="utf-8")
     assert "Hunt while flash_only" in main
     assert "Точка '%s' пропущена — flash_only" in main
-    assert "Idle 3–5 мин" in main
+    assert "Idle 45–90с" in main
+    assert "flash_only medicine wait is intentional" in main or "Flash-only medicine wait" in main
+    assert "quiet hunt/idle" in main
+
+
+def test_autohealer_ignores_flash_idle():
+    src = (ROOT / "core" / "auto_healer.py").read_text(encoding="utf-8")
+    assert "снадоб" in src
+    assert "Intentional Flash medicine wait" in src
 
 
 def test_heal_wounded_flash_cooldown():

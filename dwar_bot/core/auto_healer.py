@@ -142,6 +142,15 @@ class AutoHealer:
 
     async def note_progress(self, focus_key: str, progressed: bool) -> None:
         self._last_focus_key = focus_key
+        key_l = (focus_key or "").lower()
+        # Intentional Flash medicine wait — never escalate as stagnation
+        if (
+            "снадоб" in key_l
+            or "flash" in key_l
+            or key_l.startswith("idle:ждать")
+        ):
+            self._stagnation_count = 0
+            return
         if progressed:
             self._stagnation_count = 0
             return

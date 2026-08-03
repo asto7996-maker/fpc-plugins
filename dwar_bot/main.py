@@ -1025,6 +1025,18 @@ class DwarBot:
                 and focus.action == ActionType.QUEST_NPC
                 and self.quests.has_world_objective()
             )
+            # Flash-only medicine wait is intentional — not stagnation
+            or (
+                acted
+                and focus.action == ActionType.IDLE
+                and bool((self.quests.pending_world_objective or {}).get("flash_only"))
+            )
+            # Skipping Расселина under flash_only is also intentional
+            or (
+                acted
+                and focus.action in (ActionType.COMBAT_AREA, ActionType.AREA_ACTION)
+                and bool((self.quests.pending_world_objective or {}).get("flash_only"))
+            )
         )
         self.brain.note_result(focus, progressed=progressed)
 
@@ -1188,9 +1200,36 @@ class DwarBot:
                 "Local recover: бой уже идёт (_fight_busy) — не стартую второй WS."
             )
             return False
-        # World objective (heal_wounded): skip was intentional — do NOT hunt-spam
+
+        wo = self.quests.pending_world_objective or {}
+        # Flash-only heal_wounded: intentional wait — try light hunt, never escalate TG spam
+        if wo.get("flash_only"):
+            kind = wo.get("kind") or "world"
+            logger.info(
+                "Local recover: flash_only '%s' — quiet hunt/idle (no AutoHealer spam).",
+                kind,
+            )
+            if "снадоб" in focus_key.lower() or "flash" in focus_key.lower():
+                self.brain.mark_cooldown("Ждать снадобье / Flash", 120)
+            if self.settings.farm.farm_area and self.settings.farm.auto_combat:
+                if await self.combat.is_in_battle():
+                    result = await self.combat.finish_fight()
+                    return result in (
+                        BattleResult.WIN, BattleResult.LOSE, BattleResult.ONGOING,
+                    )
+                result = await self.combat.try_hunt_attack(name_substr="")
+                if result in (
+                    BattleResult.WIN, BattleResult.JOINED,
+                    BattleResult.ONGOING, BattleResult.LOSE,
+                ):
+                    logger.info("Local recover flash hunt → %s", result.name)
+                    return True
+            # Consumed — caller must NOT treat this as a loud "fixed stagnation"
+            return False
+
+        # World objective (non-flash): pursue once, no hunt storm
         if self.quests.has_world_objective():
-            kind = (self.quests.pending_world_objective or {}).get("kind")
+            kind = wo.get("kind")
             logger.info(
                 "Local recover: world objective '%s' — pursue / idle, no hunt storm.",
                 kind,
@@ -1200,10 +1239,9 @@ class DwarBot:
                     return True
             except Exception as exc:
                 logger.debug("local recover pursue_wo: %s", exc)
-            # Soft idle — mark focus as cooled so brain picks area/hunt lightly
             if "quest_npc" in focus_key.lower() or "816" in focus_key or "817" in focus_key:
                 self.brain.mark_cooldown(focus_key.split(":", 1)[-1][:40], 600)
-            return True  # consumed stagnation without false hunt
+            return True
         self.brain.push_farm(600.0)
         if "расселин" in focus_key.lower() or "combat_area" in focus_key.lower():
             self.brain.mark_cooldown("Расселина", 180)
@@ -1659,11 +1697,12 @@ class DwarBot:
             if action == ActionType.IDLE:
                 wo = self.quests.pending_world_objective or {}
                 if wo.get("flash_only"):
+                    # Short pause — next tick can pick hunt when free bots appear
                     logger.info(
-                        "Idle 3–5 мин — мир-цель '%s' ждёт Flash/клик по раненым.",
+                        "Idle 45–90с — мир-цель '%s' ждёт Flash; охота на след. тике.",
                         wo.get("kind"),
                     )
-                    await _sleep(180.0, 300.0)
+                    await _sleep(45.0, 90.0)
                     return True
                 return False
 
