@@ -1,9 +1,7 @@
-.heal_backups/
 data/backups/*.bak_*
-__pycache__/
-*.pyc
-*.pyo
-*.pyd
+data/*.db
+data/knowledge_*.db
+!.gitkeep
 .env
 .env.*
 !.env.example
@@ -11,4 +9,9 @@ cookies/
 logs/
 screenshots/
 state.json
+.heal_backups/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
 

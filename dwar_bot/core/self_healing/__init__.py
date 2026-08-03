@@ -10,9 +10,10 @@ Modules
 
 from __future__ import annotations
 
+from dwar_bot.core.master_controller import MasterController
 from dwar_bot.core.self_healing.ast_checker import validate_python_code
 from dwar_bot.core.self_healing.cursor_engine import apply_patch_via_cursor
-from dwar_bot.core.self_healing.watcher import AutonomousLogWatcher, MasterController
+from dwar_bot.core.self_healing.watcher import AutonomousLogWatcher
 
 __all__ = [
     "validate_python_code",

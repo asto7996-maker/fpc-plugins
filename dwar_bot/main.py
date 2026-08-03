@@ -64,7 +64,14 @@ from dwar_bot.core.bot_state import BotState, get_bot_state, set_bot_state
 from dwar_bot.core.cursor_self_healer import ensure_cursor_cli, _augment_path
 from dwar_bot.core.auto_healer import bind_auto_healer, get_auto_healer
 from dwar_bot.core.error_recovery import get_recovery_stats
-from dwar_bot.core.self_healing import AutonomousLogWatcher, MasterController
+from dwar_bot.core.self_healing import AutonomousLogWatcher
+from dwar_bot.core.master_controller import (
+    StrategicDirective,
+    bind_master_controller,
+    get_master_controller,
+)
+from dwar_bot.core.game_knowledge_base import get_knowledge_base
+from dwar_bot.modules.leveling_engine import LevelingEngine
 from dwar_bot.config import COMBAT, STATE_FILE
 
 logger = logging.getLogger("dwar_bot.main")
@@ -105,6 +112,18 @@ class DwarBot:
         self.quests = QuestTracker(client)
         self.timers = TimersManager(client)
         self.brain = ProgressionBrain(self.settings)
+        # Level-Up strategic stack (per-account KB file when account_id set)
+        kb_path = None
+        if account_id and account_id != "default":
+            from pathlib import Path as _P
+            kb_path = _P(__file__).resolve().parent.parent / "data" / f"knowledge_{account_id}.db"
+        self.knowledge = get_knowledge_base(kb_path) if kb_path else get_knowledge_base()
+        self.controller = get_master_controller()
+        self.leveling = LevelingEngine(
+            knowledge=self.knowledge,
+            controller=self.controller,
+            account_id=self.account_id,
+        )
 
         self._iteration = 0
         self._errors_in_row = 0
@@ -207,6 +226,15 @@ class DwarBot:
                 "max_farm": f.max_farm,
             },
             "progress": self.brain.last.to_dict(),
+            "leveling": {
+                "mode": self.leveling.progress.mode,
+                "level": self.leveling.progress.level,
+                "exp_pct": self.leveling.progress.exp_pct,
+                "exp_per_hour": self.leveling.progress.exp_per_hour,
+                "eta_seconds": self.leveling.progress.eta_seconds,
+                "priority": self.leveling.progress.priority_title,
+                "directive": self.controller.directive_summary(),
+            },
             "loot_claimed": self._loot_claimed,
             "settings": self.settings.to_dict(),
             "bot_state": get_bot_state().name,
@@ -695,6 +723,22 @@ class DwarBot:
         if not self._profile.inventory and not self.brain.farm_push_active():
             if self._iteration <= 2 and self.brain.empty_streak("Расселина") >= 2:
                 self.brain.push_farm(180.0)
+
+        # Knowledge Base 24/7 ingest (mobs from hunt_farm)
+        hunt_bots: list = []
+        try:
+            hunt_bots = await self._client.get_hunt_bots(self._state.area_id or "")
+        except Exception as exc:
+            logger.debug("get_hunt_bots: %s", exc)
+        self.leveling.observe_world(
+            profile=self._profile,
+            area_id=str(self._state.area_id or ""),
+            area_title=self._area_title,
+            hunt_bots=hunt_bots,
+            npc_id=str(getattr(story_npc, "npc_id", "") or ""),
+            event_timers=event_timers,
+        )
+
         snap = self.brain.analyze(
             profile=self._profile,
             area=area,
@@ -706,13 +750,38 @@ class DwarBot:
             exhausted_npcs=self.quests.exhausted_npc_ids(),
         )
 
+        # Level-Up Decision Tree → MasterController + optional focus override
+        decision = self.leveling.decide(
+            profile=self._profile,
+            brain_focus=snap.focus,
+            brain_options=snap.options,
+            area_id=str(self._state.area_id or ""),
+            pending_hunt_mob=self.brain.pending_hunt_mob or self.quests.pending_hunt_mob,
+            awaiting_turnin=self.brain.awaiting_quest_turnin,
+            need_quest_unlock=self.brain.need_quest_unlock,
+            in_battle=in_battle,
+        )
+        await self.leveling.apply(decision)
+        if decision.focus_override is not None:
+            # Prefer strategic override when it clearly beats idle / weak focus
+            ov = decision.focus_override
+            if (
+                snap.focus is None
+                or ov.score >= (snap.focus.score - 50)
+                or decision.directive.priority <= 1
+                or decision.boost_needed
+            ):
+                snap.focus = ov
+                snap.now = f"Level-Up: {ov.title}"
+
         focus = snap.focus
         focus_key = (
             f"{focus.action.value}:{focus.title}" if focus else "none"
         )
         logger.info(
-            "🧠 Сейчас: %s | сила=%.0f | вариантов=%d",
+            "🧠 Сейчас: %s | сила=%.0f | вариантов=%d | LV↑ %s (%.0f exp/h)",
             snap.now, snap.power_score, len(snap.options),
+            decision.directive.state.name, decision.progress.exp_per_hour,
         )
         if focus:
             logger.info(
@@ -765,6 +834,54 @@ class DwarBot:
             )
         )
         self.brain.note_result(focus, progressed=progressed)
+
+        # Feed LevelingEngine kill / quest samples
+        if self.combat.session.wins > wins_before:
+            mob_name = (
+                focus.payload.get("mob_name")
+                if focus and isinstance(focus.payload, dict)
+                else ""
+            ) or self.brain.pending_hunt_mob or self.quests.pending_hunt_mob or focus.title
+            self.leveling.note_kill(
+                mob_name=str(mob_name),
+                area_id=str(self._state.area_id or ""),
+                fight_sec=40.0,
+                level=self._char.level,
+            )
+        if self.quests.session.dialogues_handled > dialogues_before:
+            self.leveling.note_quest_progress(title=focus.title if focus else "")
+        if focus and focus.action == ActionType.BUFF and acted:
+            self.leveling.mark_boost_used()
+
+        # Idle multitasking while regenerating / between fights
+        if decision.idle_tasks and (
+            focus.action == ActionType.WAIT_REGEN
+            or self._char.hp_percent < 55
+        ):
+            try:
+                await self.controller.apply_directive(
+                    StrategicDirective(
+                        state=BotState.IDLE_TASKS,
+                        priority=4,
+                        title="Idle multitasking",
+                        reason=",".join(decision.idle_tasks),
+                        area_id=str(self._state.area_id or ""),
+                        exp_per_hour=decision.progress.exp_per_hour,
+                    )
+                )
+                done = await self.leveling.run_idle_tasks(self, decision.idle_tasks)
+                if done:
+                    logger.info("Level-Up idle tasks: %s", ", ".join(done))
+            except Exception as exc:
+                logger.debug("idle multitasking: %s", exc)
+
+        # Periodic Telegram Level-Up Update
+        if self.leveling.should_report() and self.settings.notify.level_up:
+            try:
+                await self.notify(self.leveling.build_level_up_update(), "level_up")
+                self.leveling.mark_reported()
+            except Exception as exc:
+                logger.debug("level-up update: %s", exc)
 
         # Stagnation → local recover / Cursor auto-heal
         try:
@@ -1473,6 +1590,15 @@ async def main() -> None:
         on_local_recover=bot._local_recover_stagnation,
     )
 
+    # Shared MasterController for LevelingEngine + AutonomousLogWatcher
+    master_controller = bind_master_controller(
+        pause_fn=bot.pause_for_heal,
+        resume_fn=bot.resume_after_heal,
+        notify_fn=_notify_plain,
+    )
+    bot.controller = master_controller
+    bot.leveling.controller = master_controller
+
     tg_task: asyncio.Task | None = None
     if tg_token:
         tg_handler = TelegramBotHandler(
@@ -1500,10 +1626,6 @@ async def main() -> None:
     asyncio.create_task(_boot_heal_ready(), name="cursor_cli_boot")
 
     # Industrial 300s self-healing orchestrator (AST + Cursor CLI + Circuit Breaker)
-    master_controller = MasterController(
-        pause_fn=bot.pause_for_heal,
-        resume_fn=bot.resume_after_heal,
-    )
     autonomous_watcher = AutonomousLogWatcher(
         log_path=LOG_FILE,
         interval_seconds=300,
@@ -1527,7 +1649,7 @@ async def main() -> None:
 
     asyncio.create_task(_heal_watchdog(), name="heal_watchdog")
     logger.info(
-        "Self-Healing: AutonomousLogWatcher(300s) + AutoHealer · CURSOR_API_KEY=%s",
+        "Self-Healing(300s) + LevelingEngine + KnowledgeBase · CURSOR_API_KEY=%s",
         "set" if os.getenv("CURSOR_API_KEY") else "MISSING",
     )
 

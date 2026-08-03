@@ -17,6 +17,7 @@ from typing import Awaitable, Callable, Optional
 
 from dwar_bot.config import LOG_FILE
 from dwar_bot.core.bot_state import BotState, get_bot_state, set_bot_state
+from dwar_bot.core.master_controller import MasterController
 from dwar_bot.core.self_healing.cursor_engine import apply_patch_via_cursor
 
 logger = logging.getLogger(__name__)
@@ -41,58 +42,12 @@ NotifyFn = Callable[[str], Awaitable[None]]
 PauseFn = Callable[[], Awaitable[None]]
 ResumeFn = Callable[[], Awaitable[None]]
 
+# Re-export for callers that imported MasterController from watcher
+__all__ = ("AutonomousLogWatcher", "MasterController", "MAX_PATCH_ATTEMPTS")
+
 
 def _strip_ansi(text: str) -> str:
     return _ANSI_RE.sub("", text or "")
-
-
-class MasterController:
-    """
-    Thin façade over BotState + optional pause/resume callbacks.
-
-    Used by ``AutonomousLogWatcher`` so the orchestrator can pause the farm
-    loop without depending on a concrete bot class.
-    """
-
-    def __init__(
-        self,
-        *,
-        pause_fn: Optional[PauseFn] = None,
-        resume_fn: Optional[ResumeFn] = None,
-    ) -> None:
-        self._pause_fn = pause_fn
-        self._resume_fn = resume_fn
-
-    @property
-    def state(self) -> BotState:
-        return get_bot_state()
-
-    async def pause(self, reason: str = "self-heal") -> None:
-        set_bot_state(BotState.PAUSED)
-        if self._pause_fn:
-            try:
-                await self._pause_fn()
-            except Exception as exc:
-                logger.warning("MasterController.pause callback failed: %s", exc)
-        logger.warning("MasterController → PAUSED (%s)", reason)
-
-    async def resume(self, reason: str = "self-heal-ok") -> None:
-        set_bot_state(BotState.RUNNING)
-        if self._resume_fn:
-            try:
-                await self._resume_fn()
-            except Exception as exc:
-                logger.warning("MasterController.resume callback failed: %s", exc)
-        logger.info("MasterController → RUNNING (%s)", reason)
-
-    async def enter_healing(self) -> None:
-        set_bot_state(BotState.HEALING)
-        if self._pause_fn:
-            try:
-                await self._pause_fn()
-                set_bot_state(BotState.HEALING)
-            except Exception as exc:
-                logger.warning("MasterController.enter_healing pause failed: %s", exc)
 
 
 class AutonomousLogWatcher:
