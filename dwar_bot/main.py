@@ -114,6 +114,15 @@ class DwarBot:
         self.stats = StatsParser(client)
         self.combat = CombatEngine(client, self.stats)
         self.quests = QuestTracker(client)
+        try:
+            if self.quests.load_world_objective():
+                logger.info(
+                    "Restored world objective '%s' (flash_only=%s)",
+                    (self.quests.pending_world_objective or {}).get("kind"),
+                    bool((self.quests.pending_world_objective or {}).get("flash_only")),
+                )
+        except Exception as exc:
+            logger.debug("load_world_objective: %s", exc)
         self.timers = TimersManager(client)
         self.brain = ProgressionBrain(self.settings)
         # Level-Up strategic stack (per-account KB file when account_id set)
@@ -1278,12 +1287,11 @@ class DwarBot:
             if action == ActionType.HUNT_MOB:
                 wo = self.quests.pending_world_objective or {}
                 if wo.get("flash_only"):
+                    # Heal is Flash-only — village hunt still OK for Exp while waiting
                     logger.info(
-                        "Hunt skipped — flash_only '%s' (снадобье только в клиенте).",
+                        "Hunt while flash_only '%s' — Exp farm, снадобье в клиенте.",
                         wo.get("kind"),
                     )
-                    await _sleep(45.0, 90.0)
-                    return True
                 mob_name = str(payload.get("name") or self.brain.pending_hunt_mob or "")
                 self._telemetry_battle_begin(source="hunt", mob_name=mob_name)
                 if self.brain.pending_hunt_mob or self.quests.pending_hunt_mob:
@@ -1484,6 +1492,16 @@ class DwarBot:
                 return False
 
             if action in (ActionType.COMBAT_AREA, ActionType.AREA_ACTION):
+                wo = self.quests.pending_world_objective or {}
+                if wo.get("flash_only"):
+                    logger.info(
+                        "Точка '%s' пропущена — flash_only '%s' (нужен клик по раненым).",
+                        payload.get("name") or "?",
+                        wo.get("kind"),
+                    )
+                    self.brain.mark_cooldown(str(payload.get("name") or "точка"), 300)
+                    await _sleep(20.0, 40.0)
+                    return True
                 name = str(payload.get("name") or "точка")
                 obj_id = str(payload.get("object_id") or self._state.area_id or "0")
                 act_id = str(payload.get("action_id") or "")

@@ -16,12 +16,14 @@ Also discovers NPCs from:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import random
 import re
 import time
 import urllib.parse
 from dataclasses import dataclass, field
+from pathlib import Path
 from enum import Enum, auto
 from typing import Any, Optional
 
@@ -137,6 +139,76 @@ class QuestTracker:
         self.pending_world_objective = {}
         self._world_objective_keys.clear()
         self._world_obj_last_try = 0.0
+        self._persist_world_objective()
+
+    def _world_objective_state_path(self) -> Path:
+        from dwar_bot.config import STATE_FILE
+        return Path(STATE_FILE)
+
+    def _persist_world_objective(self) -> None:
+        """Save pending world objective into state.json (survives restarts)."""
+        try:
+            path = self._world_objective_state_path()
+            data: dict[str, Any] = {}
+            if path.is_file():
+                raw = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(raw, dict):
+                    data = raw
+            data["world_objective"] = dict(self.pending_world_objective or {})
+            data["world_objective_keys"] = sorted(self._world_objective_keys)
+            data["world_objective_bans"] = {
+                k: v for k, v in self._soft_ban_until.items()
+                if k in self._world_objective_keys
+            }
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(
+                json.dumps(data, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except Exception as exc:
+            logger.debug("persist world objective: %s", exc)
+
+    def load_world_objective(self) -> bool:
+        """Restore world objective after process restart. Returns True if restored."""
+        try:
+            path = self._world_objective_state_path()
+            if not path.is_file():
+                return False
+            data = json.loads(path.read_text(encoding="utf-8"))
+            wo = data.get("world_objective") if isinstance(data, dict) else None
+            if not isinstance(wo, dict) or not wo.get("kind"):
+                return False
+            self.pending_world_objective = dict(wo)
+            keys = data.get("world_objective_keys") or []
+            self._world_objective_keys = {str(k) for k in keys}
+            bans = data.get("world_objective_bans") or {}
+            now = time.time()
+            for k, until in bans.items():
+                try:
+                    u = float(until)
+                except (TypeError, ValueError):
+                    u = now + 1800.0
+                self._soft_ban_until[str(k)] = max(u, now + 300.0)
+                self._exhausted_dialogues.add(str(k))
+            npc = str(wo.get("npc_id") or "")
+            if npc and wo.get("flash_only"):
+                ban_key = f"global:{npc}"
+                self._world_objective_keys.add(ban_key)
+                self._exhausted_dialogues.add(ban_key)
+                self._soft_ban_until[ban_key] = max(
+                    float(self._soft_ban_until.get(ban_key) or 0),
+                    now + 1800.0,
+                )
+            logger.warning(
+                "World objective RESTORED kind=%s flash_only=%s npc=%s",
+                wo.get("kind"),
+                bool(wo.get("flash_only")),
+                npc or "—",
+            )
+            return True
+        except Exception as exc:
+            logger.debug("load world objective: %s", exc)
+            return False
 
     def has_world_objective(self, kind: str = "") -> bool:
         if not self.pending_world_objective:
@@ -188,14 +260,15 @@ class QuestTracker:
     ) -> None:
         # World goals are outside dialogue — kill-gate / type=2 no longer apply.
         self.clear_hunt_gate()
+        prev = dict(self.pending_world_objective or {})
         self.pending_world_objective = {
             "kind": kind,
-            "title": title,
-            "npc_id": str(npc_id or ""),
-            "artikul_id": str(artikul_id or ""),
-            "artifact_title": artifact_title,
-            "quest_id": str(quest_id or ""),
-            "area_id": str(area_id or ""),
+            "title": title or prev.get("title") or "",
+            "npc_id": str(npc_id or prev.get("npc_id") or ""),
+            "artikul_id": str(artikul_id or prev.get("artikul_id") or ""),
+            "artifact_title": artifact_title or prev.get("artifact_title") or "",
+            "quest_id": str(quest_id or prev.get("quest_id") or ""),
+            "area_id": str(area_id or prev.get("area_id") or ""),
             "set_at": time.time(),
         }
         if ban_key:
@@ -204,9 +277,19 @@ class QuestTracker:
             self._soft_ban_until[ban_key] = time.time() + max(120.0, ban_sec)
         if kind == "heal_wounded":
             # Known: wounded targets are not in HTML area / hunt_farm (Flash/canvas).
-            # Mark early so planner idles instead of hunting until first USE confirms.
             self.pending_world_objective["flash_only"] = True
-            self.pending_world_objective["flash_notified"] = False
+            if prev.get("kind") == kind:
+                for k in (
+                    "flash_notified",
+                    "tg_flash_sent",
+                    "protocol_fail_until",
+                    "artifact_title",
+                ):
+                    if k in prev:
+                        self.pending_world_objective[k] = prev[k]
+            else:
+                self.pending_world_objective["flash_notified"] = False
+        self._persist_world_objective()
         logger.warning(
             "World objective SET kind=%s title=%r artikul=%s npc=%s ban=%ss",
             kind, title, artikul_id or "—", npc_id or "—", int(ban_sec),
@@ -297,6 +380,7 @@ class QuestTracker:
                 "heal_wounded: HTTP USE rejected (%s) — cooldown %ds.",
                 (err or "empty")[:80], int(cooldown),
             )
+        self._persist_world_objective()
         return False
 
     def has_pending_type2(self) -> bool:
