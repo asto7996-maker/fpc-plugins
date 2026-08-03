@@ -23,6 +23,14 @@ def test_combat_engine_has_fight_lock():
     assert "_fight_lock" in src
     assert "_finish_fight_unlocked" in src
     assert "_try_hunt_attack_unlocked" in src
+    assert "SUIS hunt fallback" in src
+    assert "pin absent" in src
+
+
+def test_voenachalnik_block_farms_at_lv3():
+    src = (ROOT / "main.py").read_text(encoding="utf-8")
+    assert "Выход закрыт военачальником — Lv%d farm in village" in src
+    assert "farm_open" in src
 
 
 def test_fight_client_reconnect_marker():

@@ -1748,17 +1748,27 @@ class DwarBot:
                         if dropped:
                             return True
                     if "военачальник" in err.lower() or "покинуть селение" in err.lower():
-                        self.brain.need_quest_unlock = True
-                        self.brain.awaiting_quest_turnin = False
-                        # Soft nudge — story NPC first, hunt only if type=2 asks
-                        self.brain.push_farm(120.0)
-                        if self.quests.has_world_objective():
+                        wo = self.quests.pending_world_objective or {}
+                        farm_open = bool(
+                            wo.get("farm_open")
+                            or int(getattr(self._char, "level", 1) or 1) >= 3
+                        )
+                        if farm_open or self.quests.has_world_objective():
+                            # Exit still story-gated — farm in village with Lv3 pin
+                            self.brain.need_quest_unlock = False
+                            self.brain.push_farm(600.0)
+                            if not self.brain.pending_hunt_mob:
+                                self.brain.pending_hunt_mob = self._level_hunt_mob()
                             logger.info(
-                                "Нужен приказ военачальника, но мир-цель '%s' активна "
-                                "— NPC не открываю.",
-                                self.quests.pending_world_objective.get("kind"),
+                                "Выход закрыт военачальником — Lv%d farm in village "
+                                "('%s'), сюжетный приказ позже.",
+                                int(getattr(self._char, "level", 1) or 1),
+                                self.brain.pending_hunt_mob or "any",
                             )
                         else:
+                            self.brain.need_quest_unlock = True
+                            self.brain.awaiting_quest_turnin = False
+                            self.brain.push_farm(120.0)
                             cleared = self.quests.clear_exhausted(local_only=True)
                             logger.info(
                                 "Нужен приказ военачальника — возвращаюсь к сюжету "

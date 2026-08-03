@@ -955,6 +955,39 @@ class CombatEngine:
                 if art and str(b.get("artikul_id") or "") != art:
                     continue
                 candidates.append(b)
+            # Preferred pin missing on map (e.g. Зигред-воин in village 932) —
+            # walk SUIS level list, then any free bot so Lv3 farm is not stuck.
+            if not candidates and needle and not art:
+                try:
+                    from dwar_bot.modules.suis_knowledge import hunt_names_for_level
+                    profile = self._stats.get_cached_profile()
+                    lvl = int(getattr(getattr(profile, "char", None), "level", 1) or 1)
+                    for prefer in hunt_names_for_level(lvl, pad=2):
+                        pref_l = prefer.lower()
+                        if pref_l == needle:
+                            continue
+                        alt = [
+                            b for b in bots
+                            if pref_l in str(b.get("name") or "").lower()
+                        ]
+                        if alt:
+                            logger.info(
+                                "SUIS hunt fallback '%s' → '%s' (pin absent)",
+                                name_substr, prefer,
+                            )
+                            candidates = alt
+                            needle = pref_l
+                            break
+                except Exception as exc:
+                    logger.debug("suis hunt fallback: %s", exc)
+            if not candidates and not art:
+                candidates = list(bots)
+                if needle and candidates:
+                    logger.info(
+                        "SUIS hunt fallback → any free bot (no match for %r)",
+                        name_substr,
+                    )
+                    needle = ""
             if not candidates and not needle and not art:
                 candidates = list(bots)
             if not candidates:
