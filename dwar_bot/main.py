@@ -71,7 +71,7 @@ from dwar_bot.core.master_controller import (
     get_master_controller,
 )
 from dwar_bot.core.game_knowledge_base import get_knowledge_base
-from dwar_bot.core.telemetry_engine import TelemetryEngine, LootItem
+from dwar_bot.core.telemetry_engine import TelemetryEngine
 from dwar_bot.core.rich_notifications import RichNotifications
 from dwar_bot.modules.leveling_engine import LevelingEngine
 from dwar_bot.modules.analytics_reporter import AnalyticsReporter
