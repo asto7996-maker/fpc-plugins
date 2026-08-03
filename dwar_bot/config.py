@@ -285,6 +285,14 @@ TELEGRAM_ALLOW_GROUPS: bool = os.getenv("TELEGRAM_ALLOW_GROUPS", "0").lower() in
 )
 # Minimum log level to forward to Telegram: "INFO", "WARNING", "ERROR", "CRITICAL"
 TELEGRAM_MIN_LEVEL: str = os.getenv("TELEGRAM_MIN_LEVEL", "WARNING")
+
+# ---------------------------------------------------------------------------
+# AI healing (Gemini auditor + Cursor executor)
+# ---------------------------------------------------------------------------
+CURSOR_API_KEY: str = os.getenv("CURSOR_API_KEY", "")
+GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
+GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+HEALING_AUDIT_INTERVAL_SEC: int = int(os.getenv("HEALING_AUDIT_INTERVAL_SEC", "120"))
 # Maximum messages per minute to avoid Telegram rate-limits
 TELEGRAM_RATE_LIMIT: int = 20
 

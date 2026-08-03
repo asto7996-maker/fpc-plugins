@@ -1,0 +1,309 @@
+"""
+GeminiAuditor — Level-1 health analyst (Gemini API).
+
+Every orchestrator tick sends a log slice + telemetry summary and expects
+a strict JSON verdict for Cursor (Level-2).
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import re
+from pathlib import Path
+from typing import Any, Optional
+
+logger = logging.getLogger(__name__)
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
+
+_ISSUE_TYPES = frozenset({"CRASH", "STUCK_NO_PROGRESS", "DOM_CHANGED"})
+
+_DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+
+
+def _load_dotenv() -> None:
+    try:
+        from dwar_bot.core.cursor_self_healer import _load_dotenv as _shared
+
+        _shared(overwrite=False)
+        return
+    except Exception:
+        pass
+    for target in (
+        REPO_ROOT / ".env",
+        REPO_ROOT / "dwar_bot" / ".env",
+        Path("/root/dwar_bot/.env"),
+        Path("/root/.env"),
+    ):
+        if not target.exists():
+            continue
+        try:
+            for raw in target.read_text(encoding="utf-8").splitlines():
+                line = raw.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, value = line.partition("=")
+                key = key.strip()
+                value = value.strip().strip("'").strip('"')
+                if key and not str(os.environ.get(key, "")).strip():
+                    os.environ[key] = value
+        except OSError:
+            continue
+
+
+def _gemini_api_key() -> str:
+    _load_dotenv()
+    return (os.environ.get("GEMINI_API_KEY") or "").strip()
+
+
+_PROMPT_TEMPLATE = """Ты — Главный Архитектор бота для 'Легенды: Наследие Драконов'. Проанализируй состояние бота за последние 120 секунд.
+
+ВХОДНЫЕ ДАННЫЕ:
+- Текущий статус: {current_state}
+- Лог событий: {log_slice}
+- Телеметрия (прогресс Exp/Gold/HP): {telemetry_summary}
+
+КРИТЕРИИ АНАЛИЗА:
+1. Есть ли явные Traceback / Python ошибки / TimeoutError / DOM-Desync?
+2. Есть ли ЗАВИСАНИЕ или ОТСУТСТВИЕ ПРОГРЕССА (например, за 120 секунд опыт не вырос, персонаж стоит на месте или зациклился клик по кнопке)?
+
+ОТВЕТ ВЕРНИ СТРОГО В JSON ФОРМАТЕ (без markdown):
+{{
+  "issue_detected": true/false,
+  "issue_type": "CRASH" / "STUCK_NO_PROGRESS" / "DOM_CHANGED",
+  "target_file": "относительный путь к файлу (например, modules/combat_engine.py)",
+  "cursor_prompt": "Детальная инструкция для Cursor AI: что именно сломалось, где застрял бот и как это исправить."
+}}
+"""
+
+
+def _extract_json(text: str) -> Optional[dict[str, Any]]:
+    if not text:
+        return None
+    raw = text.strip()
+    fence = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", raw, re.S | re.I)
+    if fence:
+        raw = fence.group(1)
+    else:
+        start = raw.find("{")
+        end = raw.rfind("}")
+        if start >= 0 and end > start:
+            raw = raw[start : end + 1]
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    return data
+
+
+def _normalize_verdict(data: dict[str, Any]) -> Optional[dict[str, Any]]:
+    detected = bool(data.get("issue_detected"))
+    issue_type = str(data.get("issue_type") or "STUCK_NO_PROGRESS").upper()
+    if issue_type not in _ISSUE_TYPES:
+        issue_type = "STUCK_NO_PROGRESS"
+    target = str(data.get("target_file") or "dwar_bot/main.py").strip()
+    # Prefer dwar_bot/… paths
+    if target.startswith("modules/") or target.startswith("core/"):
+        target = f"dwar_bot/{target}"
+    prompt = str(data.get("cursor_prompt") or "").strip()
+    if detected and not prompt:
+        prompt = (
+            f"Исправь проблему типа {issue_type} в файле {target}. "
+            "Минимальный дифф, без рефакторинга и без правок .env."
+        )
+    return {
+        "issue_detected": detected,
+        "issue_type": issue_type,
+        "target_file": target,
+        "cursor_prompt": prompt,
+    }
+
+
+def _heuristic_audit(
+    log_slice: str,
+    telemetry_summary: dict,
+    current_state: str,
+) -> Optional[dict[str, Any]]:
+    """Offline / no-key fallback so orchestrator still works."""
+    blob = (log_slice or "").lower()
+    tel = telemetry_summary or {}
+
+    crash_markers = (
+        "traceback",
+        "timeouterror",
+        "exception:",
+        "syntaxerror",
+        "attributeerror",
+        "typeerror",
+        "keyerror",
+        "dom-desync",
+        "dom desync",
+        "selector not found",
+    )
+    stuck_markers = (
+        "local recover for stagnation",
+        "завис",
+        "одни и те же",
+        "world objective set",
+        "диалог не сдвинулся",
+        "npc 409 — поговорить об излечении",
+        "soft recheck failed",
+        "stagnation",
+    )
+    dom_markers = ("dom_changed", "selector", "iframe", "playwright", "locator.")
+
+    if any(m in blob for m in crash_markers):
+        target = "dwar_bot/main.py"
+        if "combat" in blob or "fight" in blob:
+            target = "dwar_bot/modules/combat_engine.py"
+        elif "quest" in blob or "npc" in blob:
+            target = "dwar_bot/modules/quest_tracker.py"
+        elif "game_client" in blob or "entry_point" in blob:
+            target = "dwar_bot/core/game_client.py"
+        return {
+            "issue_detected": True,
+            "issue_type": "CRASH",
+            "target_file": target,
+            "cursor_prompt": (
+                f"В логах за 120с обнаружен crash/traceback при state={current_state}. "
+                f"Исправь корневую ошибку в {target}. Лог:\n{log_slice[-2500:]}"
+            ),
+        }
+
+    if any(m in blob for m in dom_markers) and (
+        "failed" in blob or "error" in blob or "timeout" in blob
+    ):
+        return {
+            "issue_detected": True,
+            "issue_type": "DOM_CHANGED",
+            "target_file": "config/selectors.py",
+            "cursor_prompt": (
+                "Похоже на DOM/selector drift. Сверь selectors.py с актуальным "
+                f"UI и поправь хрупкие локаторы. state={current_state}. "
+                f"Лог:\n{log_slice[-2000:]}"
+            ),
+        }
+
+    exp_delta = float(tel.get("exp_delta") or tel.get("exp_gained") or 0)
+    gold_delta = float(tel.get("gold_delta") or 0)
+    same_focus = int(tel.get("same_focus_ticks") or 0)
+    no_progress = (
+        exp_delta <= 0
+        and gold_delta <= 0
+        and (
+            any(m in blob for m in stuck_markers)
+            or same_focus >= 3
+            or str(tel.get("progress") or "").lower() in ("none", "stuck", "0")
+        )
+    )
+    if no_progress and current_state.upper() not in ("PAUSED", "HEALING"):
+        target = "dwar_bot/modules/quest_tracker.py"
+        if "hunt" in blob or "combat" in blob or "расселин" in blob:
+            target = "dwar_bot/modules/progression_brain.py"
+        return {
+            "issue_detected": True,
+            "issue_type": "STUCK_NO_PROGRESS",
+            "target_file": target,
+            "cursor_prompt": (
+                "Бот без прогресса Exp/Gold за окно аудита (STUCK_NO_PROGRESS). "
+                f"state={current_state} telemetry={tel}. "
+                f"Устрани зацикливание действий. Лог:\n{log_slice[-2500:]}"
+            ),
+        }
+
+    return {
+        "issue_detected": False,
+        "issue_type": "STUCK_NO_PROGRESS",
+        "target_file": "dwar_bot/main.py",
+        "cursor_prompt": "",
+    }
+
+
+class GeminiAuditor:
+    """Level-1 analyst: Gemini API with heuristic fallback."""
+
+    def __init__(
+        self,
+        *,
+        api_key: str = "",
+        model: str = "",
+        allow_heuristic_fallback: bool = True,
+    ) -> None:
+        self.api_key = (api_key or _gemini_api_key()).strip()
+        self.model = (model or _DEFAULT_MODEL).strip()
+        self.allow_heuristic_fallback = allow_heuristic_fallback
+        self._client = None
+
+    def _ensure_client(self) -> Any:
+        if self._client is not None:
+            return self._client
+        if not self.api_key:
+            raise RuntimeError("GEMINI_API_KEY is empty — add it to .env")
+        try:
+            from google import genai
+        except ImportError as exc:
+            raise RuntimeError(
+                "google-genai is not installed — pip install google-genai"
+            ) from exc
+        self._client = genai.Client(api_key=self.api_key)
+        return self._client
+
+    def audit_bot_health(
+        self,
+        log_slice: str,
+        telemetry_summary: dict,
+        current_state: str,
+    ) -> Optional[dict]:
+        """
+        Ask Gemini (or heuristic fallback) for a JSON health verdict.
+
+        Returns normalized dict or ``None`` on total failure.
+        """
+        prompt = _PROMPT_TEMPLATE.format(
+            current_state=current_state or "UNKNOWN",
+            log_slice=(log_slice or "")[-8000:] or "(empty)",
+            telemetry_summary=json.dumps(
+                telemetry_summary or {}, ensure_ascii=False, default=str,
+            )[:4000],
+        )
+
+        if self.api_key:
+            try:
+                client = self._ensure_client()
+                response = client.models.generate_content(
+                    model=self.model,
+                    contents=prompt,
+                )
+                text = getattr(response, "text", None) or ""
+                if not text and getattr(response, "candidates", None):
+                    # Best-effort extract from candidates
+                    try:
+                        parts = response.candidates[0].content.parts
+                        text = "".join(getattr(p, "text", "") or "" for p in parts)
+                    except Exception:
+                        text = str(response)
+                parsed = _extract_json(text)
+                if parsed is not None:
+                    verdict = _normalize_verdict(parsed)
+                    logger.info(
+                        "GeminiAuditor: issue_detected=%s type=%s file=%s",
+                        verdict.get("issue_detected"),
+                        verdict.get("issue_type"),
+                        verdict.get("target_file"),
+                    )
+                    return verdict
+                logger.warning(
+                    "GeminiAuditor: non-JSON response, falling back. raw=%s",
+                    (text or "")[:300],
+                )
+            except Exception as exc:
+                logger.warning("GeminiAuditor API failed: %s", exc)
+
+        if not self.allow_heuristic_fallback:
+            return None
+        logger.info("GeminiAuditor: using heuristic fallback (no Gemini / bad JSON).")
+        return _heuristic_audit(log_slice, telemetry_summary, current_state)

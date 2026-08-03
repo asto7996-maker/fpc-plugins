@@ -24,5 +24,8 @@ tenacity>=8.3.0
 python-dotenv>=1.0.0
 pytest>=8.0.0
 
+# Gemini auditor (Level-1 AI healing)
+google-genai>=1.0.0
+
 # Rich terminal output (optional, for development/debug)
 rich>=13.7.0

@@ -65,6 +65,7 @@ from dwar_bot.core.cursor_self_healer import ensure_cursor_cli, _augment_path
 from dwar_bot.core.auto_healer import bind_auto_healer, get_auto_healer
 from dwar_bot.core.error_recovery import get_recovery_stats
 from dwar_bot.core.self_healing import AutonomousLogWatcher
+from dwar_bot.core.ai_healing import HealingOrchestrator
 from dwar_bot.core.master_controller import (
     StrategicDirective,
     bind_master_controller,
@@ -1872,6 +1873,27 @@ async def main() -> None:
         name="autonomous_log_watcher_300s",
     )
 
+    # Level-1 Gemini auditor (120s) → Level-2 Cursor executor
+    async def _orch_pause() -> None:
+        await bot.pause(quiet=True)
+
+    async def _orch_resume() -> None:
+        await bot.resume_game(quiet=True)
+
+    healing_orchestrator = HealingOrchestrator(
+        log_path=LOG_FILE,
+        interval_seconds=120,
+        notify_fn=_notify_plain,
+        pause_fn=_orch_pause,
+        resume_fn=_orch_resume,
+    )
+    healing_orch_task = asyncio.create_task(
+        healing_orchestrator.run_forever(),
+        name="gemini_healing_orchestrator_120s",
+    )
+    # Equivalent one-liner form:
+    # asyncio.create_task(start_healing_orchestrator(120, notify_fn=_notify_plain, ...))
+
     async def _heal_watchdog() -> None:
         while not _shutdown_event.is_set():
             await asyncio.sleep(900)
@@ -1884,8 +1906,10 @@ async def main() -> None:
 
     asyncio.create_task(_heal_watchdog(), name="heal_watchdog")
     logger.info(
-        "Self-Healing(300s) + LevelingEngine + KnowledgeBase · CURSOR_API_KEY=%s",
+        "Self-Healing(300s) + GeminiAudit(120s) + LevelingEngine · "
+        "CURSOR_API_KEY=%s GEMINI_API_KEY=%s",
         "set" if os.getenv("CURSOR_API_KEY") else "MISSING",
+        "set" if os.getenv("GEMINI_API_KEY") else "MISSING",
     )
 
     await accounts.start_all()
@@ -1921,6 +1945,13 @@ async def main() -> None:
             log_watcher_task.cancel()
             try:
                 await log_watcher_task
+            except asyncio.CancelledError:
+                pass
+        if not healing_orch_task.done():
+            healing_orchestrator.stop()
+            healing_orch_task.cancel()
+            try:
+                await healing_orch_task
             except asyncio.CancelledError:
                 pass
         if tg_task:
