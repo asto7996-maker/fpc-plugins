@@ -1485,16 +1485,16 @@ async def get_main_menu_text(user, texts, db: AsyncSession):
 
     tagline = texts.t(
         'MAIN_MENU_TAGLINE',
-        'Ваш надежный инструмент для защиты приватности и безопасного интернет-соединения.',
-    )
+        'Приватный и быстрый VPN.',
+    ).strip()
 
+    # Compact card: one welcome line + balance/tariff on one row (+ optional short tagline).
     base_text = (
         f'{pe("⭐️")} <b>Добро пожаловать!</b>\n'
-        f'{pe("👤")} Ваш профиль:\n'
-        f'{pe("💳")} Баланс: {html.escape(balance)}\n'
-        f'{pe("📈")} Тариф: {tariff_line}\n\n'
-        f'{pe("💡")} {html.escape(tagline)}'
+        f'{pe("💳")} {html.escape(balance)}  ·  {pe("📈")} {tariff_line}'
     )
+    if tagline:
+        base_text = f'{base_text}\n{pe("💡")} {html.escape(tagline)}'
 
     info_sections: list[str] = []
     try:
