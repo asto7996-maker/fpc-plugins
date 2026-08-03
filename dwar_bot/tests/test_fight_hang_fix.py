@@ -29,7 +29,8 @@ def test_combat_engine_has_fight_lock():
 
 def test_voenachalnik_block_farms_at_lv3():
     src = (ROOT / "main.py").read_text(encoding="utf-8")
-    assert "Выход закрыт военачальником — Lv%d farm in village" in src
+    assert "need_quest_unlock=ON" in src
+    assert "farm_open story refresh" in src
     assert "farm_open" in src
 
 

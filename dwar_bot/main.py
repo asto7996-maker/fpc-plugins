@@ -917,10 +917,18 @@ class DwarBot:
 
         # Quest type=2 kill gate → prefer hunt_farm mob (one kill, then turn-in)
         if self.quests.has_world_objective():
-            # Outside-dialogue goal: stop NPC/hunt-gate spam
+            wo = self.quests.pending_world_objective or {}
+            farm_open = bool(
+                wo.get("farm_open")
+                or int(getattr(self._char, "level", 1) or 1) >= 3
+            )
+            # Keep story unlock flag under farm_open (военачальник gate)
+            keep_unlock = bool(farm_open and self.brain.need_quest_unlock)
             self.brain.clear_hunt_gate()
             self.quests.clear_hunt_gate()
             self.brain.awaiting_quest_turnin = False
+            if keep_unlock:
+                self.brain.need_quest_unlock = True
         elif self.quests.pending_hunt_mob:
             self.brain.pending_hunt_mob = self.quests.pending_hunt_mob
             if not self.brain.awaiting_quest_turnin:
@@ -933,6 +941,18 @@ class DwarBot:
 
         # Attempt world objective (medicine USE etc.) before planning
         if self.quests.has_world_objective():
+            wo = self.quests.pending_world_objective or {}
+            # Every few ticks under farm_open: unban local story NPCs for dialogue
+            if (
+                (wo.get("farm_open") or int(getattr(self._char, "level", 1) or 1) >= 3)
+                and self._iteration % 4 == 1
+            ):
+                cleared = self.quests.clear_exhausted(local_only=True)
+                if cleared:
+                    logger.info(
+                        "farm_open story refresh: cleared %d local NPC bans.",
+                        cleared,
+                    )
             try:
                 done = await self.quests.pursue_world_objective()
                 if done:
@@ -1826,23 +1846,29 @@ class DwarBot:
                             wo.get("farm_open")
                             or int(getattr(self._char, "level", 1) or 1) >= 3
                         )
+                        # Always clear local exhausted so Вождь / Военачальник can talk
+                        cleared = self.quests.clear_exhausted(local_only=True)
+                        self.brain.mark_cooldown(f"Переход: {name}", 600)
                         if farm_open or self.quests.has_world_objective():
-                            # Exit still story-gated — farm in village with Lv3 pin
-                            self.brain.need_quest_unlock = False
-                            self.brain.push_farm(600.0)
+                            # Exit gated by story — prioritize NPC dialogue over hunt
+                            self.brain.need_quest_unlock = True
+                            self.brain.awaiting_quest_turnin = False
+                            self.brain.farm_push_until = min(
+                                self.brain.farm_push_until,
+                                time.time() + 90.0,
+                            )
                             if not self.brain.pending_hunt_mob:
-                                self.brain.pending_hunt_mob = self._level_hunt_mob()
+                                self.brain.pending_hunt_mob = ""
                             logger.info(
-                                "Выход закрыт военачальником — Lv%d farm in village "
-                                "('%s'), сюжетный приказ позже.",
+                                "Выход закрыт военачальником — сюжетный диалог "
+                                "(cleared=%d, need_quest_unlock=ON, Lv%d).",
+                                cleared,
                                 int(getattr(self._char, "level", 1) or 1),
-                                self.brain.pending_hunt_mob or "any",
                             )
                         else:
                             self.brain.need_quest_unlock = True
                             self.brain.awaiting_quest_turnin = False
                             self.brain.push_farm(120.0)
-                            cleared = self.quests.clear_exhausted(local_only=True)
                             logger.info(
                                 "Нужен приказ военачальника — возвращаюсь к сюжету "
                                 "(снято exhausted: %d).",

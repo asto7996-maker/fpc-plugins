@@ -332,8 +332,8 @@ class LevelingEngine:
                     ActionType.AREA_ACTION,
                 ):
                     if flash_open:
-                        # Loot points OK at Lv3+ — capped so they don't spam over story/gear
-                        o.score = min(max(float(o.score), 380.0), 560.0)
+                        # Loot points OK at Lv3+ — beat capped hunt (~480)
+                        o.score = min(max(float(o.score), 500.0), 620.0)
                         o.detail = f"lv{level} loot · {o.detail}"
                     else:
                         continue
@@ -372,7 +372,8 @@ class LevelingEngine:
                     o.detail = f"lv{level} gear · {o.detail}"
                 if flash_open and o.action == ActionType.QUEST_NPC:
                     # Local story (Вождь / Военачальник) — keep competitive vs hunt
-                    o.score = min(max(float(o.score), 700.0), 980.0)
+                    # need_quest_unlock path already ~1000–1050 from brain
+                    o.score = min(max(float(o.score), 880.0), 1100.0)
                     o.detail = f"lv{level} story · {o.detail}"
                 filtered.append(o)
             options = filtered
