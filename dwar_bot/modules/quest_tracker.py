@@ -223,7 +223,15 @@ class QuestTracker:
         return False
 
     async def _try_heal_wounded(self, obj: dict[str, Any]) -> bool:
-        """Best-effort: use quest medicine on bots / via common USE."""
+        """Best-effort medicine use — fail fast, never storm the API.
+
+        HEAL_WOUNDED_SAFE_GUARD_V2
+        """
+        # Circuit: after a failed protocol, wait before retrying
+        fail_until = float(obj.get("protocol_fail_until") or 0)
+        if fail_until and time.time() < fail_until:
+            return False
+
         artikul = str(obj.get("artikul_id") or "18209")
         art_id = ""
         try:
@@ -239,64 +247,38 @@ class QuestTracker:
                 break
         if not art_id:
             logger.warning(
-                "heal_wounded: medicine artikul=%s not in bag — keep farming / wait.",
+                "heal_wounded: medicine artikul=%s not in bag — farm / wait.",
                 artikul,
             )
             return False
 
-        attempts: list[tuple[str, dict[str, Any]]] = [
-            ("USE", {"artifact_id": art_id}),
-            ("DRINK", {"artifact_id": art_id}),
-        ]
+        # Only one safe probe: USE artifact alone. Do NOT target random hunt bots
+        # (that yields empty JSON + 4× exponential retries and freezes the tick).
         try:
-            st = await self._client.get_state()
-            bots = await self._client.get_hunt_bots(st.area_id or obj.get("area_id") or "")
-        except Exception:
-            bots = []
-        for bot in bots[:6]:
-            bid = str(bot.get("id") or "")
-            if not bid:
-                continue
-            name = str(bot.get("name") or "")
-            # Prefer non-aggressive / wounded-looking targets if labeled
-            attempts.append((
-                "USE",
-                {
-                    "artifact_id": art_id,
-                    "object_class": "BOT",
-                    "object_id": bid,
-                    "bot_id": bid,
-                },
-            ))
-            logger.debug("heal target candidate bot=%s %s", bid, name[:40])
+            resp = await self._client.common_action("USE", {"artifact_id": art_id})
+        except Exception as exc:
+            logger.info("heal_wounded USE exception: %s", exc)
+            obj["protocol_fail_until"] = time.time() + 600.0
+            self.pending_world_objective = dict(obj)
+            return False
 
-        for code, extra in attempts:
-            try:
-                resp = await self._client.common_action(code, extra)
-            except Exception as exc:
-                logger.debug("heal_wounded %s failed: %s", code, exc)
-                continue
-            err = str(resp.error or getattr(resp, "redirect_error", "") or "")
-            logger.info(
-                "heal_wounded %s %s → status=%s err=%s",
-                code, {k: extra[k] for k in extra if k != "artifact_id"},
-                resp.status, (err or "—")[:80],
-            )
-            if resp.status == STATUS_OK and not (
-                err and err.lower() not in ("false", "none", "")
-                and "не задано" in err.lower()
-            ):
-                # Ambiguous OK without error — treat as progress signal
-                if not err or err.lower() in ("false", "none", ""):
-                    logger.warning("heal_wounded: USE accepted — clearing objective.")
-                    self.clear_world_objective("medicine_used")
-                    return True
-            await asyncio.sleep(random.uniform(0.3, 0.7))
-
+        err = str(resp.error or getattr(resp, "redirect_error", "") or "")
         logger.info(
-            "heal_wounded: HTTP USE not accepted yet (Flash-only?). "
-            "NPC %s stays banned; farming until turn-in possible.",
-            obj.get("npc_id") or "?",
+            "heal_wounded USE artifact=%s → status=%s err=%s",
+            art_id, resp.status, (err or "—")[:100],
+        )
+        err_l = err.lower()
+        if resp.status == STATUS_OK and err_l in ("", "false", "none"):
+            logger.warning("heal_wounded: USE accepted — clearing objective.")
+            self.clear_world_objective("medicine_used")
+            return True
+
+        # Protocol unknown / Flash-only — cool down 10 min, keep NPC banned, farm
+        obj["protocol_fail_until"] = time.time() + 600.0
+        self.pending_world_objective = dict(obj)
+        logger.warning(
+            "heal_wounded: HTTP USE rejected (%s) — cooldown 600s, farm without NPC spam.",
+            (err or "empty")[:80],
         )
         return False
 

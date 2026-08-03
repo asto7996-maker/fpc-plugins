@@ -184,7 +184,8 @@ class HealingOrchestrator:
             "patches_fail": 0,
         }
         self._started_at = time.time()
-        self._warmup_sec = 90.0  # avoid boot-time false positives from old log tails
+        self._warmup_sec = 25.0  # short warm-up; still skip boot false-positives
+        self._resume_on_failure = True  # never leave farm paused forever
 
 
     async def _notify(self, text: str) -> None:
@@ -239,7 +240,7 @@ class HealingOrchestrator:
         return verdict
 
     async def handle_issue(self, verdict: dict[str, Any]) -> bool:
-        """Pause → Cursor patch → resume or stay paused. Returns success."""
+        """Pause → local fix / Cursor patch → resume (always try to unpause)."""
         if self._busy:
             self.queue.append(verdict)
             logger.info("HealingOrchestrator: queued issue (%d)", len(self.queue))
@@ -264,6 +265,27 @@ class HealingOrchestrator:
                 f"(<code>{issue_type}</code>) в файле <code>{target}</code>. "
                 "Передаю ТЗ в Cursor AI…"
             )
+
+            # Level-1.5: deterministic local fixer (instant, no CLI hang)
+            local_path = None
+            try:
+                from dwar_bot.core.ai_healing.local_fixer import try_local_fix
+
+                local_path = await asyncio.to_thread(
+                    try_local_fix, verdict, raw_error,
+                )
+            except Exception as exc:
+                logger.debug("local_fixer: %s", exc)
+
+            if local_path:
+                self.stats["patches_ok"] += 1
+                await self._resume_bot()
+                await self._notify(
+                    "✅ <b>Local Patch Applied:</b> "
+                    f"<code>{local_path}</code> (без Cursor). Бот возобновил работу."
+                )
+                return True
+
             ok = await asyncio.to_thread(
                 self.executor.execute_patch,
                 target,
@@ -282,20 +304,40 @@ class HealingOrchestrator:
 
             self.stats["patches_fail"] += 1
             self._last_failure_at = time.time()
-            # Stay paused on failure
-            set_bot_state(BotState.PAUSED)
             err = getattr(self.executor, "last_error", "") or "unknown"
-            await self._notify(
-                "🚨 <b>Cursor Patch FAILED</b>\n"
-                f"Файл: <code>{target}</code>\n"
-                f"Тип: <code>{issue_type}</code>\n"
-                f"Бот остаётся на <b>PAUSED</b>.\n"
-                f"Ошибка: <code>{err[:500]}</code>\n"
-                "Нужна ручная проверка разработчика."
-            )
+            # CRITICAL: do not leave the bot PAUSED forever — farm must continue
+            if self._resume_on_failure:
+                await self._resume_bot()
+                await self._notify(
+                    "🚨 <b>Cursor Patch FAILED</b> — бот <b>снят с паузы</b>, "
+                    "фарм продолжается.\n"
+                    f"Файл: <code>{target}</code>\n"
+                    f"Тип: <code>{issue_type}</code>\n"
+                    f"Ошибка: <code>{err[:400]}</code>\n"
+                    "Повтор через cooldown."
+                )
+            else:
+                set_bot_state(BotState.PAUSED)
+                await self._notify(
+                    "🚨 <b>Cursor Patch FAILED</b>\n"
+                    f"Файл: <code>{target}</code>\n"
+                    f"Тип: <code>{issue_type}</code>\n"
+                    f"Бот остаётся на <b>PAUSED</b>.\n"
+                    f"Ошибка: <code>{err[:500]}</code>"
+                )
             return False
         finally:
             self._busy = False
+            # Safety net: if we somehow stayed paused after handle_issue
+            if (
+                self._resume_on_failure
+                and get_bot_state() == BotState.PAUSED
+                and not self._busy
+            ):
+                try:
+                    await self._resume_bot()
+                except Exception:
+                    set_bot_state(BotState.RUNNING)
 
     async def run_forever(self) -> None:
         logger.info(

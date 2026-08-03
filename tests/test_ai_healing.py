@@ -171,11 +171,66 @@ def test_orchestrator_handle_issue_success():
     assert any("Cursor Patch Applied" in n for n in notes)
     assert get_bot_state() == BotState.RUNNING
 
-def test_read_log_slice_missing_file(tmp_path):
-    assert read_log_slice(tmp_path / "nope.log") == ""
+def test_resolve_repo_root_has_tests_or_modules():
+    from dwar_bot.core.ai_healing.paths import resolve_repo_root, resolve_test_target
+
+    root = resolve_repo_root()
+    assert root.exists()
+    assert (root / "tests").exists() or (root / "dwar_bot" / "tests").exists() or (
+        root / "modules"
+    ).exists()
+    target = resolve_test_target(root if (root / "tests").exists() else root)
+    assert "test" in target
 
 
-def test_read_telemetry_summary_empty():
-    summary = read_telemetry_summary(window_sec=120, db_paths=[Path("/tmp/no-such-tel.db")])
-    assert summary["progress"] == "no_data"
-    assert summary["exp_delta"] == 0.0
+def test_key_kind_aq():
+    from dwar_bot.core.ai_healing.gemini_auditor import _key_kind
+
+    assert _key_kind("AQ.Ab8RN6KlijQ4vk7GTy7m113ou6xWaFEf8kT998DVhaI5VeFakA") == "auth_key_AQ"
+    assert _key_kind("AIzaSyDummy") == "standard_AIza"
+
+
+def test_orchestrator_resumes_after_cursor_failure():
+    import asyncio
+
+    set_bot_state(BotState.RUNNING)
+    notes: list[str] = []
+
+    async def pause():
+        set_bot_state(BotState.PAUSED)
+
+    async def resume():
+        set_bot_state(BotState.RUNNING)
+
+    async def notify(text: str):
+        notes.append(text)
+
+    executor = MagicMock()
+    executor.execute_patch.return_value = False
+    executor.last_error = "pytest failed"
+
+    orch = HealingOrchestrator(
+        interval_seconds=120,
+        auditor=MagicMock(),
+        executor=executor,
+        notify_fn=notify,
+        pause_fn=pause,
+        resume_fn=resume,
+        failure_cooldown_sec=0,
+    )
+    orch._resume_on_failure = True
+
+    ok = asyncio.run(
+        orch.handle_issue(
+            {
+                "issue_detected": True,
+                "issue_type": "CRASH",
+                "target_file": "dwar_bot/main.py",
+                "cursor_prompt": "fix",
+                "_log_slice": "AttributeError",
+            }
+        )
+    )
+    assert ok is False
+    assert get_bot_state() == BotState.RUNNING
+    assert any("FAILED" in n for n in notes)

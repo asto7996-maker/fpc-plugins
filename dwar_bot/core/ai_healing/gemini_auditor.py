@@ -65,7 +65,26 @@ def _load_dotenv() -> None:
 
 def _gemini_api_key() -> str:
     _load_dotenv()
-    return (os.environ.get("GEMINI_API_KEY") or "").strip()
+    # New Auth keys (AQ.) and legacy Standard keys (AIza) both use these env vars.
+    # google-genai prefers GOOGLE_API_KEY when both are set — keep them in sync.
+    key = (
+        (os.environ.get("GEMINI_API_KEY") or "").strip()
+        or (os.environ.get("GOOGLE_API_KEY") or "").strip()
+    )
+    if key:
+        os.environ["GEMINI_API_KEY"] = key
+        # Mirror so Client() auto-detect and either env name work for AQ. auth keys
+        if not (os.environ.get("GOOGLE_API_KEY") or "").strip():
+            os.environ["GOOGLE_API_KEY"] = key
+    return key
+
+
+def _key_kind(key: str) -> str:
+    if key.startswith("AQ."):
+        return "auth_key_AQ"
+    if key.startswith("AIza"):
+        return "standard_AIza"
+    return "unknown"
 
 
 _PROMPT_TEMPLATE = """Ты — Главный Архитектор бота для 'Легенды: Наследие Драконов'. Проанализируй состояние бота за последние 120 секунд.
@@ -269,6 +288,11 @@ class GeminiAuditor:
         self.model = _preferred_model(model)
         self.allow_heuristic_fallback = allow_heuristic_fallback
         self._client = None
+        if self.api_key:
+            logger.info(
+                "GeminiAuditor ready key_kind=%s model=%s",
+                _key_kind(self.api_key), self.model,
+            )
 
     def _ensure_client(self) -> Any:
         if self._client is not None:
@@ -279,10 +303,53 @@ class GeminiAuditor:
             from google import genai
         except ImportError as exc:
             raise RuntimeError(
-                "google-genai is not installed — pip install google-genai"
+                "google-genai is not installed — pip install -U google-genai"
             ) from exc
+        # Explicit api_key works for both AQ. (auth) and AIza (standard) keys
         self._client = genai.Client(api_key=self.api_key)
         return self._client
+
+    def _generate_text(self, client: Any, model_name: str, prompt: str) -> str:
+        """Try generate_content, then Interactions API (recommended for new keys)."""
+        # 1) Classic generateContent
+        try:
+            response = client.models.generate_content(
+                model=model_name,
+                contents=prompt,
+            )
+            text = getattr(response, "text", None) or ""
+            if not text and getattr(response, "candidates", None):
+                try:
+                    parts = response.candidates[0].content.parts
+                    text = "".join(getattr(p, "text", "") or "" for p in parts)
+                except Exception:
+                    text = ""
+            if text:
+                return text
+        except Exception as exc:
+            logger.debug("generate_content(%s) failed: %s", model_name, exc)
+
+        # 2) Interactions API (GA) — preferred path for Auth keys (AQ.)
+        try:
+            interaction = client.interactions.create(
+                model=model_name,
+                input=prompt,
+            )
+            text = getattr(interaction, "output_text", None) or ""
+            if text:
+                return text
+            # Fallback walk steps
+            for step in getattr(interaction, "steps", None) or []:
+                out = getattr(step, "model_output", None) or getattr(step, "ModelOutput", None)
+                if not out:
+                    continue
+                for content in getattr(out, "content", None) or []:
+                    t = getattr(content, "text", None)
+                    if t:
+                        return str(getattr(t, "text", t) or "")
+        except Exception as exc:
+            raise RuntimeError(f"interactions+generate_content failed: {exc}") from exc
+        return ""
 
     def audit_bot_health(
         self,
@@ -295,6 +362,9 @@ class GeminiAuditor:
 
         Returns normalized dict or ``None`` on total failure.
         """
+        # Refresh key each call (AQ. keys may be rotated in .env without restart)
+        if not self.api_key:
+            self.api_key = _gemini_api_key()
         prompt = _PROMPT_TEMPLATE.format(
             current_state=current_state or "UNKNOWN",
             log_slice=(log_slice or "")[-8000:] or "(empty)",
@@ -313,19 +383,7 @@ class GeminiAuditor:
                 last_exc: Optional[Exception] = None
                 for model_name in models_try:
                     try:
-                        response = client.models.generate_content(
-                            model=model_name,
-                            contents=prompt,
-                        )
-                        text = getattr(response, "text", None) or ""
-                        if not text and getattr(response, "candidates", None):
-                            try:
-                                parts = response.candidates[0].content.parts
-                                text = "".join(
-                                    getattr(p, "text", "") or "" for p in parts
-                                )
-                            except Exception:
-                                text = str(response)
+                        text = self._generate_text(client, model_name, prompt)
                         if text:
                             if model_name != self.model:
                                 logger.info(
