@@ -798,7 +798,38 @@ class CombatEngine:
                 await asyncio.sleep(random.uniform(20, 40))
                 return BattleResult.NO_BATTLE
 
-            bots = await self._client.get_hunt_bots(area_id=area_id, free_only=True)
+            # GameBots «Скрывать занятые»: fetch all, filter free, log free/busy
+            raw_bots = await self._client.get_hunt_bots(
+                area_id=area_id, free_only=False,
+            )
+            gb_on = getattr(COMBAT, "gamebots_enabled", True)
+            skip_occ = bool(getattr(COMBAT, "gamebots_skip_occupied", True))
+            if gb_on:
+                try:
+                    from dwar_bot.modules.gamebots_knowledge import (
+                        filter_hunt_targets,
+                        summarize_targets,
+                    )
+                    logger.info(
+                        "GameBots map filter: %s",
+                        summarize_targets(raw_bots),
+                    )
+                    bots = filter_hunt_targets(
+                        raw_bots,
+                        skip_occupied=skip_occ,
+                        skip_hidden=True,
+                    )
+                except Exception as exc:
+                    logger.debug("gamebots filter: %s", exc)
+                    bots = [
+                        b for b in raw_bots
+                        if str(b.get("fight_id", "0") or "0") in ("0", "")
+                    ]
+            else:
+                bots = [
+                    b for b in raw_bots
+                    if str(b.get("fight_id", "0") or "0") in ("0", "")
+                ]
             if not bots:
                 logger.debug("hunt_farm: no free bots")
                 return BattleResult.NO_BATTLE
@@ -826,87 +857,121 @@ class CombatEngine:
                     logger.debug("suis hunt priority: %s", exc)
 
             art = str(artikul_id or "")
-            chosen = None
+            candidates: list = []
             for b in bots:
                 nm = str(b.get("name") or "").lower()
                 if needle and needle not in nm:
                     continue
                 if art and str(b.get("artikul_id") or "") != art:
                     continue
-                chosen = b
-                break
-            if chosen is None and not needle and not art:
-                chosen = bots[0]
-            if chosen is None:
+                candidates.append(b)
+            if not candidates and not needle and not art:
+                candidates = list(bots)
+            if not candidates:
                 logger.debug(
                     "hunt_farm: no bot matching name=%r artikul=%r among %d",
                     name_substr, artikul_id, len(bots),
                 )
                 return BattleResult.NO_BATTLE
 
-            bot_id = str(chosen.get("id") or "")
-            bot_name = str(chosen.get("name") or "?")
-            if not bot_id:
-                return BattleResult.ERROR
+            retries = int(getattr(COMBAT, "gamebots_occupied_retry", 2) or 0)
+            if not gb_on:
+                retries = 0
+            max_tries = min(len(candidates), 1 + max(0, retries))
 
-            logger.info(
-                "Нападаю на охотничьего моба '%s' (id=%s, artikul=%s)…",
-                bot_name, bot_id, chosen.get("artikul_id"),
-            )
             # BotMek share macros: drink гнев/мощь before the pull
             try:
                 await self.prepare_botmek_prebuff(self._stats.get_cached_profile())
             except Exception as exc:
                 logger.debug("botmek prebuff skip: %s", exc)
-            resp = await self._client.attack_bot(bot_id)
-            err = str(resp.redirect_error or resp.error or "")
-            logger.info(
-                "ATTACK_BOT(%s) → status=%s %s",
-                bot_id, resp.status, err[:140],
-            )
 
-            # Confirm dialog path — retry with confirmed=1 already default
-            if resp.data.get("param_confirm"):
-                resp = await self._client.attack_bot(bot_id, confirmed=1)
-                err = str(resp.redirect_error or resp.error or "")
+            last_err = ""
+            for attempt, chosen in enumerate(candidates[:max_tries]):
+                bot_id = str(chosen.get("id") or "")
+                bot_name = str(chosen.get("name") or "?")
+                if not bot_id:
+                    continue
+
                 logger.info(
-                    "ATTACK_BOT confirm(%s) → status=%s %s",
+                    "Нападаю на охотничьего моба '%s' (id=%s, artikul=%s)%s…",
+                    bot_name, bot_id, chosen.get("artikul_id"),
+                    f" try={attempt + 1}/{max_tries}" if max_tries > 1 else "",
+                )
+                resp = await self._client.attack_bot(bot_id)
+                err = str(resp.redirect_error or resp.error or "")
+                last_err = err
+                logger.info(
+                    "ATTACK_BOT(%s) → status=%s %s",
                     bot_id, resp.status, err[:140],
                 )
 
-            await asyncio.sleep(random.uniform(0.6, 1.4))
-            if not await self.is_in_battle():
-                # Server may enter fight despite a soft error text
+                if resp.data.get("param_confirm"):
+                    resp = await self._client.attack_bot(bot_id, confirmed=1)
+                    err = str(resp.redirect_error or resp.error or "")
+                    last_err = err
+                    logger.info(
+                        "ATTACK_BOT confirm(%s) → status=%s %s",
+                        bot_id, resp.status, err[:140],
+                    )
+
+                await asyncio.sleep(random.uniform(0.6, 1.4))
+                if await self.is_in_battle():
+                    self.session.battles_joined += 1
+                    self.session.consecutive_battles += 1
+                    self.session.attacks_made += 1
+                    result = await self._finish_fight_unlocked()
+                    if result == BattleResult.WIN:
+                        return BattleResult.WIN
+                    if result == BattleResult.LOSE:
+                        return BattleResult.LOSE
+                    return BattleResult.JOINED if result != BattleResult.ERROR else result
+
                 redir = str(resp.redirect_url or "")
                 err_l = err.lower()
                 if "fight" in redir.lower() or "бой" in err_l or "сражен" in err_l:
                     logger.info(
                         "ATTACK_BOT soft-miss but fight signals present — finish_fight."
                     )
-                elif err and (
+                    if await self.is_in_battle():
+                        self.session.battles_joined += 1
+                        self.session.consecutive_battles += 1
+                        self.session.attacks_made += 1
+                        return await self._finish_fight_unlocked()
+
+                occupied = False
+                try:
+                    from dwar_bot.modules.gamebots_knowledge import error_looks_occupied
+                    occupied = error_looks_occupied(err)
+                except Exception:
+                    occupied = "занят" in err_l
+
+                if occupied and attempt + 1 < max_tries:
+                    logger.info(
+                        "GameBots: цель занята ('%s') — следующий свободный моб.",
+                        bot_name,
+                    )
+                    continue
+
+                if err and (
                     "нельзя" in err_l
                     or "напад" in err_l
-                    or "занят" in err_l
+                    or occupied
                 ):
-                    # Already fighting / action blocked — recheck once
                     await asyncio.sleep(0.8)
                     if await self.is_in_battle():
                         return await self._finish_fight_unlocked()
                     return BattleResult.ERROR
-                else:
-                    return BattleResult.NO_BATTLE
 
-            self.session.battles_joined += 1
-            self.session.consecutive_battles += 1
-            self.session.attacks_made += 1
-            result = await self._finish_fight_unlocked()
-            if result == BattleResult.WIN:
-                return BattleResult.WIN
-            if result == BattleResult.LOSE:
-                return BattleResult.LOSE
-            return BattleResult.JOINED if result != BattleResult.ERROR else result
+                if attempt + 1 < max_tries:
+                    continue
+                return BattleResult.NO_BATTLE
+
+            if last_err:
+                logger.debug("hunt_farm: all candidates failed (%s)", last_err[:80])
+            return BattleResult.NO_BATTLE
         except Exception as exc:
             logger.warning("try_hunt_attack error: %s", exc)
+            self._suis_error_ops += 1
             return BattleResult.ERROR
 
     async def try_area_combat(self) -> BattleResult:

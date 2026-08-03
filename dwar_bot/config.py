@@ -279,6 +279,12 @@ class CombatConfig:
     suis_post_battle_food: bool = True
     # Skip food when HP% above this (SUIS «Не употреблять еду, если HP > N%»)
     suis_food_skip_above: float = 75.0
+    # GameBots / Оповещатор v8 (yougame.biz/threads/184351) — skip occupied targets
+    gamebots_enabled: bool = True
+    # «Скрывать занятые» — only attack free hunt bots
+    gamebots_skip_occupied: bool = True
+    # Retry next free mob when server says target is busy
+    gamebots_occupied_retry: int = 2
 
 
 COMBAT: CombatConfig = CombatConfig()
