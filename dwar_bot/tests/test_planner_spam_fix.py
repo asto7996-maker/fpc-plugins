@@ -243,6 +243,8 @@ def test_flash_only_allows_hunt_execute():
     assert "Idle 45–90с" in main
     assert "flash_only medicine wait is intentional" in main or "Flash-only medicine wait" in main
     assert "quiet hunt/idle" in main
+    assert "_wo_farm_open" in main
+    assert "open-farm" in main or "Continuous open farm" in main or "push_farm(180" in main
 
 
 def test_autohealer_ignores_flash_idle():

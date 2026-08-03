@@ -29,7 +29,7 @@ class NotifySettings:
     errors: bool = True
     effects: bool = False
     area: bool = True
-    gear: bool = False
+    gear: bool = True
     heartbeat: bool = False
     loot: bool = True
     plan: bool = True

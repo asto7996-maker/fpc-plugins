@@ -300,11 +300,20 @@ class LevelingEngine:
         # World objective (heal wounded etc.) — never force story-NPC re-entry
         if world_objective_kind:
             notes.append(f"world_obj={world_objective_kind}")
-            awaiting_turnin = False
-            need_quest_unlock = False
-            pending_hunt_mob = ""
-            # Lv3+: Flash medicine no longer hard-locks village farm / exit
-            flash_open = bool(world_objective_flash_only and level >= 3)
+            # Lv3+ / farm_open: keep unlock & hunt pin for war-chief / type=2
+            try:
+                from dwar_bot.modules.suis_knowledge import is_farm_open
+                flash_open = is_farm_open(
+                    {"flash_only": world_objective_flash_only, "farm_open": False},
+                    level=level,
+                ) or (world_objective_flash_only and level >= 3)
+            except Exception:
+                flash_open = bool(world_objective_flash_only and level >= 3)
+            # Prefer explicit farm_open from options notes / caller: level+flash is enough
+            if not flash_open:
+                awaiting_turnin = False
+                need_quest_unlock = False
+                pending_hunt_mob = ""
             if flash_open:
                 notes.append("flash_farm_open_lv3+")
             filtered: list[GameOption] = []
@@ -490,8 +499,6 @@ class LevelingEngine:
             need_quest_unlock=need_quest_unlock,
             blocked_npc_ids=blocked,
         )
-        if world_objective_kind:
-            quest_opt = None  # hard-skip P1 while world goal is open
         urgent_quest = None if world_objective_kind else self._best_kb_quest(
             level=level, area_id=area_id,
         )
@@ -510,7 +517,7 @@ class LevelingEngine:
                     title=f"Квест-охота: {pending_hunt_mob}",
                     score=950,
                     detail="P1 Level-Up: kill gate",
-                    payload={"mob_name": pending_hunt_mob},
+                    payload={"name": pending_hunt_mob, "mob_name": pending_hunt_mob},
                     goal=GoalKind.QUEST,
                 )
             elif not focus and urgent_quest:

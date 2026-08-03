@@ -340,6 +340,27 @@ def flash_farm_open_for_level(level: int, *, min_level: int = 3) -> bool:
     return int(level or 1) >= int(min_level)
 
 
+def is_farm_open(
+    world_objective: Optional[dict] = None,
+    *,
+    level: int = 1,
+    min_level: int = 3,
+) -> bool:
+    """
+    Unified farm-open gate for Flash side-quests.
+
+    True when persisted ``farm_open`` is set, or flash_only + level ≥ min_level.
+    """
+    wo = world_objective or {}
+    if not wo:
+        return False
+    if wo.get("farm_open"):
+        return True
+    if wo.get("flash_only") and flash_farm_open_for_level(level, min_level=min_level):
+        return True
+    return False
+
+
 def resources_for_skill(skill: int, profession: str = "geologist") -> list[str]:
     return [
         r.name for r in SUIS_RESOURCES

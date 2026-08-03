@@ -27,11 +27,29 @@ def test_combat_engine_has_fight_lock():
     assert "pin absent" in src
 
 
+def test_casual_hunt_win_keeps_open_farm():
+    from dwar_bot.modules.bot_settings import BotSettings
+    from dwar_bot.modules.progression_brain import ProgressionBrain
+
+    brain = ProgressionBrain(BotSettings())
+    brain.push_farm(300.0)
+    brain.mark_hunt_kill_done(quest_gate=False)
+    assert brain.awaiting_quest_turnin is False
+    assert brain.farm_push_active() is True
+    brain.need_quest_unlock = True
+    brain.pending_hunt_mob = "Крэтс"
+    brain.mark_hunt_kill_done(quest_gate=True)
+    assert brain.awaiting_quest_turnin is True
+    assert brain.farm_push_active() is False
+
+
 def test_voenachalnik_block_farms_at_lv3():
     src = (ROOT / "main.py").read_text(encoding="utf-8")
     assert "need_quest_unlock=ON" in src
     assert "farm_open story refresh" in src
     assert "farm_open" in src
+    assert "_wo_farm_open" in src
+    assert "quest_gate=gated" in src or "quest_gate=bool" in src or "mark_hunt_kill_done(quest_gate=" in src
 
 
 def test_fight_client_reconnect_marker():

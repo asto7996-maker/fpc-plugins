@@ -638,14 +638,10 @@ class QuestTracker:
         # Under farm_open, do not treat the world-objective giver (e.g. Торгор 409)
         # as permanently exhausted — story must continue.
         wo = self.pending_world_objective or {}
-        farm_open = bool(
-            wo.get("farm_open")
-            or (wo.get("flash_only") and False)  # level checked by caller via farm_open flag
-        )
-        if not farm_open:
+        # Only persisted farm_open lifts the story-NPC ban (set at Lv3+ adapt)
+        if not wo.get("farm_open"):
             out.update(self.world_objective_npc_ids())
         else:
-            # Keep other bans, but allow the story NPC id through
             wo_npc = str(wo.get("npc_id") or "")
             if wo_npc:
                 out.discard(wo_npc)

@@ -143,6 +143,16 @@ def test_catalog_roundtrip(tmp_path: Path):
     assert "operator_defaults" in data
 
 
+def test_is_farm_open_helper():
+    from dwar_bot.modules.suis_knowledge import is_farm_open, flash_farm_open_for_level
+    assert flash_farm_open_for_level(3) is True
+    assert flash_farm_open_for_level(2) is False
+    assert is_farm_open({"farm_open": True}, level=1) is True
+    assert is_farm_open({"flash_only": True}, level=3) is True
+    assert is_farm_open({"flash_only": True}, level=2) is False
+    assert is_farm_open({}, level=5) is False
+
+
 def test_repo_catalog_exists():
     cat = ROOT / "data" / "suis_catalog.json"
     if not cat.is_file():
