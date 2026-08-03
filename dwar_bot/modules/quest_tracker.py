@@ -202,6 +202,11 @@ class QuestTracker:
             self._world_objective_keys.add(ban_key)
             self._exhausted_dialogues.add(ban_key)
             self._soft_ban_until[ban_key] = time.time() + max(120.0, ban_sec)
+        if kind == "heal_wounded":
+            # Known: wounded targets are not in HTML area / hunt_farm (Flash/canvas).
+            # Mark early so planner idles instead of hunting until first USE confirms.
+            self.pending_world_objective["flash_only"] = True
+            self.pending_world_objective["flash_notified"] = False
         logger.warning(
             "World objective SET kind=%s title=%r artikul=%s npc=%s ban=%ss",
             kind, title, artikul_id or "—", npc_id or "—", int(ban_sec),
