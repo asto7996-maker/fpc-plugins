@@ -25,7 +25,6 @@ from dwar_bot.modules.battle_strategy import (
     BOTTOM_ATTACK_ID,
     MIDDLE_ATTACK_ID,
     TOP_ATTACK_ID,
-    parse_hit_list,
 )
 
 logger = logging.getLogger(__name__)
