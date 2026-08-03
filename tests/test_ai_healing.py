@@ -46,7 +46,7 @@ def test_extract_json_from_fence():
 
 def test_heuristic_detects_traceback():
     verdict = _heuristic_audit(
-        "Traceback (most recent call last):\n  File combat_engine.py\nTimeoutError: boom",
+        "Traceback (most recent call last):\n  File combat_engine.py\nAttributeError: boom",
         {"exp_delta": 0, "gold_delta": 0},
         "FARMING",
     )
@@ -55,6 +55,17 @@ def test_heuristic_detects_traceback():
     assert verdict["issue_type"] == "CRASH"
     assert "combat_engine" in verdict["target_file"]
 
+
+def test_heuristic_ignores_token_expired():
+    verdict = _heuristic_audit(
+        "WARNING | TokenExpiredError: OAuth access_token expired — waiting for fresh cookies.\n"
+        "Traceback (most recent call last):\n  File stats_parser.py\n"
+        "dwar_bot.core.game_client.TokenExpiredError: waiting for fresh cookies",
+        {"exp_delta": 0, "gold_delta": 0, "progress": "no_data"},
+        "RUNNING",
+    )
+    assert verdict is not None
+    assert verdict["issue_detected"] is False
 
 def test_heuristic_healthy_when_no_signals():
     verdict = _heuristic_audit(

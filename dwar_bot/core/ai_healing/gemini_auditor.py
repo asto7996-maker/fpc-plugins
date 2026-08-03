@@ -132,35 +132,57 @@ def _heuristic_audit(
     blob = (log_slice or "").lower()
     tel = telemetry_summary or {}
 
+    # Auth / cookie waits are operational, not code crashes
+    auth_only = (
+        "token expired" in blob
+        or "waiting for fresh cookies" in blob
+        or "waiting for cookies" in blob
+        or "oauth access_token" in blob
+    ) and not any(
+        m in blob
+        for m in ("syntaxerror", "attributeerror", "typeerror", "nameerror", "importerror")
+    )
+    if auth_only:
+        return {
+            "issue_detected": False,
+            "issue_type": "STUCK_NO_PROGRESS",
+            "target_file": "dwar_bot/main.py",
+            "cursor_prompt": "",
+        }
+
     crash_markers = (
-        "traceback",
-        "timeouterror",
-        "exception:",
         "syntaxerror",
         "attributeerror",
         "typeerror",
         "keyerror",
+        "nameerror",
+        "importerror",
         "dom-desync",
         "dom desync",
         "selector not found",
+    )
+    # Full Traceback only if not auth-related
+    has_real_crash = any(m in blob for m in crash_markers) or (
+        "traceback (most recent call last)" in blob
+        and "tokenexpirederror" not in blob
+        and "authrequirederror" not in blob
+        and "waiting for fresh cookies" not in blob
     )
     stuck_markers = (
         "local recover for stagnation",
         "завис",
         "одни и те же",
-        "world objective set",
         "диалог не сдвинулся",
         "npc 409 — поговорить об излечении",
-        "soft recheck failed",
         "stagnation",
     )
-    dom_markers = ("dom_changed", "selector", "iframe", "playwright", "locator.")
+    dom_markers = ("dom_changed", "selector not found", "iframe", "playwright timeout")
 
-    if any(m in blob for m in crash_markers):
+    if has_real_crash:
         target = "dwar_bot/main.py"
-        if "combat" in blob or "fight" in blob:
+        if "combat_engine" in blob or "fight_client" in blob:
             target = "dwar_bot/modules/combat_engine.py"
-        elif "quest" in blob or "npc" in blob:
+        elif "quest_tracker" in blob or "walk_npc" in blob:
             target = "dwar_bot/modules/quest_tracker.py"
         elif "game_client" in blob or "entry_point" in blob:
             target = "dwar_bot/core/game_client.py"

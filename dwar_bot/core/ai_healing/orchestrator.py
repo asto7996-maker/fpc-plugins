@@ -183,6 +183,9 @@ class HealingOrchestrator:
             "patches_ok": 0,
             "patches_fail": 0,
         }
+        self._started_at = time.time()
+        self._warmup_sec = 90.0  # avoid boot-time false positives from old log tails
+
 
     async def _notify(self, text: str) -> None:
         if not self.notify_fn:
@@ -322,14 +325,24 @@ class HealingOrchestrator:
                                     verdict.get("issue_type"),
                                 )
                         else:
-                            verdict = await self.audit_once()
-                            if verdict and verdict.get("issue_detected"):
-                                logger.warning(
-                                    "Gemini issue: %s → %s",
-                                    verdict.get("issue_type"),
-                                    verdict.get("target_file"),
-                                )
-                                await self.handle_issue(verdict)
+                            # Warm-up: collect audits but do not pause/patch yet
+                            if time.time() - self._started_at < self._warmup_sec:
+                                verdict = await self.audit_once()
+                                if verdict and verdict.get("issue_detected"):
+                                    logger.info(
+                                        "HealingOrchestrator warm-up skip: %s (%s)",
+                                        verdict.get("issue_type"),
+                                        verdict.get("target_file"),
+                                    )
+                            else:
+                                verdict = await self.audit_once()
+                                if verdict and verdict.get("issue_detected"):
+                                    logger.warning(
+                                        "Gemini issue: %s → %s",
+                                        verdict.get("issue_type"),
+                                        verdict.get("target_file"),
+                                    )
+                                    await self.handle_issue(verdict)
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
