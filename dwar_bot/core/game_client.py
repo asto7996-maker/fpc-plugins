@@ -1240,53 +1240,57 @@ class DwarGameClient:
         link_id: str | int = 0,
         f_id: str | int = 0,
         href: str = "",
-    ) -> tuple[bool, str]:
+        answer_url: str = "",
+    ) -> tuple[bool, str, str]:
         """
         Answer a type=2 dialogue *message* via HTML npc.php.
 
         Flash/HTML clients use ``action=answer&ref=<message_id>&<hash>``.
         JSON ``npc|answer`` with ``subpoint_id=<message_id>`` returns status=2
         and never advances these phrases (e.g. award claim / enlistment).
+
+        Returns ``(ok, result_html, redirect_or_final_url)``.
         """
         import re
         from urllib.parse import urlparse
 
         ref_s = str(ref)
-        page = await self.open_npc_page(
-            npc_id,
-            global_npc=global_npc,
-            link_id=link_id,
-            f_id=f_id,
-            href=href,
-        )
-        if not page or len(page) < 200:
-            return False, "npc page empty/redirect"
-
-        answer_urls: list[str] = []
-        for m in re.finditer(
-            r'(?:data-url|href)=["\']([^"\']*npc\.php[^"\']*action=answer[^"\']*)["\']',
-            page,
-            re.I,
-        ):
-            answer_urls.append(m.group(1))
-        for m in re.finditer(
-            r"location\.href\s*=\s*['\"](npc\.php[^'\"]*action=answer[^'\"]*)['\"]",
-            page,
-            re.I,
-        ):
-            answer_urls.append(m.group(1))
-
-        chosen = ""
-        for u in answer_urls:
-            if re.search(rf"[?&]ref={re.escape(ref_s)}(?:&|$)", u):
-                chosen = u
-                break
-        if not chosen and answer_urls:
-            # Single visible answer — take it
-            if len(answer_urls) == 1:
-                chosen = answer_urls[0]
+        chosen = (answer_url or "").strip()
         if not chosen:
-            return False, f"no HTML answer url for ref={ref_s}"
+            page = await self.open_npc_page(
+                npc_id,
+                global_npc=global_npc,
+                link_id=link_id,
+                f_id=f_id,
+                href=href,
+            )
+            if not page or len(page) < 200:
+                return False, "npc page empty/redirect", ""
+
+            answer_urls: list[str] = []
+            for m in re.finditer(
+                r'(?:data-url|href)=["\']([^"\']*npc\.php[^"\']*action=answer[^"\']*)["\']',
+                page,
+                re.I,
+            ):
+                answer_urls.append(m.group(1))
+            for m in re.finditer(
+                r"location\.href\s*=\s*['\"](npc\.php[^'\"]*action=answer[^'\"]*)['\"]",
+                page,
+                re.I,
+            ):
+                answer_urls.append(m.group(1))
+
+            for u in answer_urls:
+                if re.search(rf"[?&]ref={re.escape(ref_s)}(?:&|$)", u):
+                    chosen = u
+                    break
+            if not chosen and answer_urls:
+                # Single visible answer — take it
+                if len(answer_urls) == 1:
+                    chosen = answer_urls[0]
+            if not chosen:
+                return False, f"no HTML answer url for ref={ref_s}", ""
 
         path = chosen if chosen.startswith("/") else "/" + chosen.lstrip("/")
         resp = await self._get(path)
@@ -1298,16 +1302,92 @@ class DwarGameClient:
                 follow = parsed.path + (("?" + parsed.query) if parsed.query else "")
             else:
                 follow = loc if loc.startswith("/") else "/" + loc.lstrip("/")
+            # Leaving NPC (area.php) = dialogue closed / objective accepted
+            if "npc.php" not in follow.lower():
+                return True, resp.text or "", follow
             resp2 = await self._get(follow)
             body = resp2.text or ""
-            return True, body
+            return True, body, follow
         body = resp.text or ""
         # 200 with new dialogue, or tiny redirect script
         if resp.status_code == 200 and len(body) > 500:
-            return True, body
+            return True, body, path
         if "npc.php" in body.lower() or "quest-description" in body.lower():
-            return True, body
-        return False, f"unexpected answer response status={resp.status_code} len={len(body)}"
+            return True, body, path
+        return False, f"unexpected answer response status={resp.status_code} len={len(body)}", ""
+
+    async def walk_npc_html(
+        self,
+        npc_id: str | int,
+        *,
+        global_npc: int = 0,
+        link_id: str | int = 0,
+        f_id: str | int = 0,
+        href: str = "",
+        max_steps: int = 8,
+    ) -> tuple[int, str]:
+        """
+        Drive NPC dialogue purely through HTML answer links.
+
+        Returns ``(steps, last_redirect)``. last_redirect may be ``area.php``
+        when the quest objective was accepted and dialogue closed.
+        """
+        page = await self.open_npc_page(
+            npc_id,
+            global_npc=global_npc,
+            link_id=link_id,
+            f_id=f_id,
+            href=href,
+        )
+        if not page or len(page) < 200:
+            return 0, ""
+
+        steps = 0
+        last_redir = ""
+        for _ in range(max_steps):
+            urls = re.findall(
+                r'data-url=["\']([^"\']*npc\.php[^"\']*action=answer[^"\']*)["\']',
+                page,
+                re.I,
+            )
+            if not urls:
+                urls = re.findall(
+                    r"location\.href\s*=\s*['\"](npc\.php[^'\"]*action=answer[^'\"]*)['\"]",
+                    page,
+                    re.I,
+                )
+            if not urls:
+                break
+
+            chosen = urls[0]
+            ref_m = re.search(r"[?&]ref=(\d+)", chosen)
+            ref = ref_m.group(1) if ref_m else "0"
+            ok, body, redir = await self.npc_html_answer(
+                npc_id,
+                ref,
+                global_npc=global_npc,
+                link_id=link_id,
+                f_id=f_id,
+                href=href,
+                answer_url=chosen,
+            )
+            if not ok:
+                break
+            steps += 1
+            last_redir = redir or last_redir
+            logger.info(
+                "HTML NPC %s step#%s ref=%s → %s",
+                npc_id, steps, ref, (redir or "")[:80],
+            )
+            if redir and "npc.php" not in redir.lower():
+                # Dialogue closed — objective accepted / returned to area
+                break
+            page = body or ""
+            if "action=answer" not in page:
+                break
+            await asyncio.sleep(0.4)
+
+        return steps, last_redir
 
     # ------------------------------------------------------------------
     # Specific game actions

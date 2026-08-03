@@ -159,10 +159,9 @@ class QuestTracker:
         href = str(pending.get("href") or "")
         try:
             # Prefer HTML ref= answer — same path as live dialogue for type=2 messages
-            html_ok = False
             if child_id:
                 try:
-                    html_ok, _ = await self._client.npc_html_answer(
+                    html_ok, _, redir = await self._client.npc_html_answer(
                         npc_id,
                         child_id,
                         global_npc=global_npc,
@@ -170,13 +169,16 @@ class QuestTracker:
                         f_id=f_id,
                         href=href,
                     )
+                    if html_ok:
+                        self.session.dialogues_handled += 1
+                        self.clear_hunt_gate()
+                        logger.info(
+                            "type=2 принят (HTML%s) — охота больше не нужна.",
+                            f" → {redir[:40]}" if redir else "",
+                        )
+                        return 1
                 except Exception as exc:
                     logger.debug("retry_pending_type2 html: %s", exc)
-            if html_ok:
-                self.session.dialogues_handled += 1
-                self.clear_hunt_gate()
-                logger.info("type=2 принят (HTML) — охота больше не нужна для этого этапа.")
-                return 1
 
             raw_ans = await self._client.npc_answer(
                 npc_id,
@@ -637,27 +639,41 @@ class QuestTracker:
             moved = False
 
             if to_point:
-                # Message phrases (type=2): JSON npc|answer(ref as subpoint) fails
-                # with status=2. HTML npc.php?action=answer&ref=<id>&hash works.
-                html_ok = False
+                # Message phrases: JSON npc|answer fails (status=2). Chain HTML
+                # answers — award claim → next quest → accept objective → area.php.
                 try:
-                    html_ok, html_body = await self._client.npc_html_answer(
+                    html_steps, last_redir = await self._client.walk_npc_html(
                         npc_id,
-                        child_id,
                         global_npc=global_npc,
                         link_id=link_id,
                         f_id=f_id,
                         href=npc_href,
+                        max_steps=max(4, max_steps - steps),
                     )
                 except Exception as exc:
-                    logger.debug("npc_html_answer(%s ref=%s): %s", npc_id, child_id, exc)
-                    html_ok, html_body = False, str(exc)
+                    logger.debug("walk_npc_html(%s): %s", npc_id, exc)
+                    html_steps, last_redir = 0, ""
 
-                if html_ok:
+                if html_steps:
                     logger.info(
-                        "HTML-ответ ref=%s принят (msg → %s).",
-                        child_id, to_point,
+                        "HTML-диалог NPC %s: %d шаг(ов), last=%s",
+                        npc_id, html_steps, (last_redir or "")[:80],
                     )
+                    self.session.dialogues_handled += html_steps
+                    steps += html_steps
+                    self.clear_hunt_gate()
+                    if quest_id:
+                        self.session.quests_accepted += 1
+                    # Dialogue closed to area → objective is active (e.g. лава)
+                    if last_redir and "npc.php" not in last_redir.lower():
+                        self._exhausted_dialogues.add(key)
+                        self._soft_ban_until[key] = time.time() + 120.0
+                        logger.info(
+                            "Квест принят / диалог закрыт → %s (выполняю цель в мире).",
+                            last_redir.split("?")[0],
+                        )
+                        return steps
+                    # Still on NPC — refresh JSON view and continue
                     raw = await self._client.npc_quests(
                         npc_id,
                         global_npc=global_npc,
@@ -667,64 +683,8 @@ class QuestTracker:
                     )
                     quests_block = raw.get("npc|quests") or {}
                     point_list = quests_block.get("point_list") or []
-                    new_pt = raw.get("npc|point") or {}
-                    new_pid = str(new_pt.get("point_id") or "")
-                    moved = bool(new_pid) and new_pid != old_pid
-                    ans_ok = True
-                    ans = {"status": STATUS_OK}
-                    # Capture hashed href from redirect page if present
-                    if html_body and "npc.php" in html_body:
-                        m_href = re.search(
-                            r'location\.href=[\'"]([^\'"]*npc\.php[^\'"]+)[\'"]',
-                            html_body,
-                            re.I,
-                        )
-                        if m_href:
-                            npc_href = m_href.group(1)
-                    if not moved and new_pid == old_pid:
-                        # Same point id but different children still counts
-                        new_kids = {
-                            str(x.get("id"))
-                            for x in self._as_child_list(new_pt.get("child_list"))
-                        }
-                        old_kids = {str(x.get("id")) for x in children}
-                        if new_kids != old_kids:
-                            moved = True
-                    if ans_ok or moved:
-                        self._answered_points.add(child_id)
-                        self.session.dialogues_handled += 1
-                        steps += 1
-                        self.clear_hunt_gate()
-                        if quest_id:
-                            self.session.quests_accepted += 1
-                        awards = new_pt.get("award_list") or []
-                        for a in awards[:5]:
-                            logger.info("  Награда: %s", a)
-                        # macros in award_message
-                        macros = new_pt.get("macros_list") or {}
-                        if isinstance(macros, dict):
-                            for mid, meta in list(macros.items())[:4]:
-                                if isinstance(meta, dict):
-                                    logger.info(
-                                        "  Макрос: %s %s",
-                                        meta.get("name"),
-                                        (meta.get("data") or {}).get("title"),
-                                    )
-                        await asyncio.sleep(random.uniform(0.8, 2.0))
-                        if not moved and str(new_pt.get("point_id") or "") == old_pid:
-                            same = {
-                                str(x.get("id"))
-                                for x in self._as_child_list(new_pt.get("child_list"))
-                            }
-                            if child_id in same:
-                                logger.info(
-                                    "NPC %s: HTML-ответ не сдвинул диалог — "
-                                    "возможно, нужна цель квеста.",
-                                    npc_id,
-                                )
-                                self._exhausted_dialogues.add(key)
-                                break
-                        continue
+                    await asyncio.sleep(random.uniform(0.5, 1.2))
+                    continue
 
                 # Fallback: JSON answer variants (works for some points)
                 raw = await self._client.npc_point(
