@@ -415,6 +415,78 @@ def _is_support_enabled() -> bool:
         return settings.SUPPORT_MENU_ENABLED
 
 
+# Long admin/custom labels → short mobile-friendly text (case-insensitive).
+_COMPACT_MENU_LABELS: dict[str, str] = {
+    'личный кабинет': 'Кабинет',
+    'реферальная система': 'Рефералы',
+    'реферальная программа': 'Рефералы',
+    'политика конфиденциальности': 'Приватность',
+    'конфиденциальность': 'Приватность',
+    'публичная оферта': 'Соглашение',
+    'пользовательское соглашение': 'Соглашение',
+    'правила сервиса': 'Правила',
+    'моя подписка': 'Подписка',
+    'мои подписки': 'Подписки',
+}
+
+
+def _compact_menu_label(text: str) -> str:
+    """Shorten known verbose menu labels so paired buttons fit small screens."""
+    if not text:
+        return text
+    key = text.strip().casefold()
+    # Strip a leading emoji/symbol run before lookup.
+    bare = key.lstrip(
+        ' \t⭐✨👤👥💰💳💎⚡️⚡🔒📄📖✅❌⚠️↗️🔄💼💻💬📦ℹ️🏠👋📱🤝🛠️🛠⚙➡️⬅️➕🔎❓📌📍🗓🕔👀❤️🚀🎁🟢🔴🟡⚫⏳📜✍️🎫📂📋📈📊📞🛟🛡️🛡🎯📚🔖📰⛔🔧🔥⏰📅👛🧪🌍🔗'
+    ).strip()
+    short = _COMPACT_MENU_LABELS.get(key) or _COMPACT_MENU_LABELS.get(bare)
+    return short if short else text
+
+
+def _compact_main_menu_rows(
+    rows: list[list[InlineKeyboardButton]],
+) -> list[list[InlineKeyboardButton]]:
+    """Pack consecutive single-button rows into pairs for smaller screens.
+
+    Keeps the first row full-width (primary CTA — usually Cabinet) and does not
+    merge admin/moderation rows. Already-paired rows are left untouched.
+    """
+    if len(rows) < 2:
+        return rows
+
+    compacted: list[list[InlineKeyboardButton]] = []
+    pending: list[InlineKeyboardButton] | None = None
+
+    def _is_adminish(row: list[InlineKeyboardButton]) -> bool:
+        for btn in row:
+            data = getattr(btn, 'callback_data', None) or ''
+            if data in {'admin_panel', 'moderator_panel'}:
+                return True
+            text = (getattr(btn, 'text', None) or '').lower()
+            if 'админ' in text or 'модерац' in text:
+                return True
+        return False
+
+    for index, row in enumerate(rows):
+        if index == 0 or len(row) != 1 or _is_adminish(row):
+            if pending is not None:
+                compacted.append(pending)
+                pending = None
+            compacted.append(row)
+            continue
+
+        if pending is None:
+            pending = row
+            continue
+
+        compacted.append([pending[0], row[0]])
+        pending = None
+
+    if pending is not None:
+        compacted.append(pending)
+    return compacted
+
+
 def _build_cabinet_main_menu_keyboard(
     language: str,
     texts,
@@ -452,6 +524,7 @@ def _build_cabinet_main_menu_keyboard(
         icon_custom_emoji_id: str | None = None,
     ) -> InlineKeyboardButton:
         url = build_cabinet_url(path)
+        text = _compact_menu_label(text)
         if url:
             section = CALLBACK_TO_SECTION.get(callback_fallback)
             section_cfg = cached_styles.get(section or '', {}) if section else {}
@@ -497,7 +570,7 @@ def _build_cabinet_main_menu_keyboard(
                 custom_cfg = custom_buttons_cfg.get(btn_id)
                 if not custom_cfg or not custom_cfg.get('url') or not custom_cfg.get('enabled', True):
                     continue
-                custom_text = (
+                custom_text = _compact_menu_label(
                     custom_cfg.get('labels', {}).get(language, '')
                     or custom_cfg.get('labels', {}).get('ru', '')
                     or 'Link'
@@ -531,7 +604,7 @@ def _build_cabinet_main_menu_keyboard(
                     if not section_cfg.get('enabled', True):
                         continue
                     home_text = section_cfg.get('labels', {}).get(language, '') or texts.t(
-                        'MENU_PROFILE', '👤 Личный кабинет'
+                        'MENU_PROFILE', 'Кабинет'
                     )
                     row_buttons.append(_cabinet_button(home_text, '/', 'menu_profile_unavailable'))
 
@@ -617,7 +690,9 @@ def _build_cabinet_main_menu_keyboard(
     if is_moderator and not is_admin:
         keyboard_rows.append([InlineKeyboardButton(text='🧑‍⚖️ Модерация', callback_data='moderator_panel')])
 
-    return InlineKeyboardMarkup(inline_keyboard=keyboard_rows)
+    # Even if admin layout uses max_per_row=1 for every action, pack secondary
+    # rows into pairs so /start fits common phone viewports without scrolling.
+    return InlineKeyboardMarkup(inline_keyboard=_compact_main_menu_rows(keyboard_rows))
 
 
 def get_main_menu_keyboard(
@@ -909,33 +984,33 @@ def get_info_menu_keyboard(
             ]
         )
 
+    legal_row: list = []
     if show_privacy_policy:
-        buttons.append(
-            [
-                premium_button(
-                    texts.t('MENU_PRIVACY_POLICY', 'Политика конфиденциальности'),
-                    icon='privacy',
-                    callback_data='menu_privacy_policy',
-                )
-            ]
+        legal_row.append(
+            premium_button(
+                texts.t('MENU_PRIVACY_POLICY', 'Приватность'),
+                icon='privacy',
+                callback_data='menu_privacy_policy',
+            )
         )
-
     if show_public_offer:
-        buttons.append(
-            [
-                premium_button(
-                    texts.t('MENU_PUBLIC_OFFER', 'Публичная оферта'),
-                    icon='offer',
-                    callback_data='menu_public_offer',
-                )
-            ]
+        legal_row.append(
+            premium_button(
+                texts.t('MENU_PUBLIC_OFFER', 'Соглашение'),
+                icon='offer',
+                callback_data='menu_public_offer',
+            )
         )
+    if legal_row:
+        # One compact row on phones; split only if somehow >2 legal CTAs.
+        for i in range(0, len(legal_row), 2):
+            buttons.append(legal_row[i : i + 2])
 
     if show_rules:
         buttons.append(
             [
                 premium_button(
-                    texts.t('MENU_RULES', 'Правила сервиса'),
+                    texts.t('MENU_RULES', 'Правила'),
                     icon='rules',
                     callback_data='menu_rules',
                 )

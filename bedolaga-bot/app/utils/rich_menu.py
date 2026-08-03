@@ -445,14 +445,13 @@ async def build_main_menu_rich_html(user: User, texts, db: AsyncSession) -> str:
 
     tagline = texts.t(
         'MAIN_MENU_TAGLINE',
-        'Ваш надежный инструмент для защиты приватности и безопасного интернет-соединения.',
-    )
+        'Приватный и быстрый VPN.',
+    ).strip()
 
     blocks.append(f'<h4>{pe("⭐️")} <b>Добро пожаловать!</b></h4>')
-    blocks.append(f'<p>{pe("👤")} Ваш профиль:</p>')
-    blocks.append(f'<p>{pe("💳")} Баланс: {balance}</p>')
-    blocks.append(f'<p>{pe("📈")} Тариф: {tariff_line}</p>')
-    blocks.append(f'<p>{pe("💡")} {html.escape(tagline)}</p>')
+    blocks.append(f'<p>{pe("💳")} {balance}  ·  {pe("📈")} {tariff_line}</p>')
+    if tagline:
+        blocks.append(f'<p>{pe("💡")} {html.escape(tagline)}</p>')
 
     hint_sections: list[str] = []
     try:

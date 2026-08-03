@@ -57,7 +57,9 @@ _logo_path_valid = _validate_logo_path(LOGO_PATH)
 # by Telegram anyway, so we resize down to that and re-encode to keep the file
 # under the limit (Telegram bug #339184 — Pillow's `convert+thumbnail` keeps
 # the aspect ratio so even a 1980×1267 logo lands on ≤1280×820).
-_LOGO_MAX_DIMENSION = 1280
+# Keep banners short so /start fits one phone screen with the keyboard.
+_LOGO_MAX_DIMENSION = 960
+_LOGO_MAX_HEIGHT = 280
 _LOGO_MAX_BYTES = 5 * 1024 * 1024  # 5 MB — give ourselves a margin under the 10 MB hard cap
 _LOGO_RESIZED_SUFFIX = '.bot_resized.png'
 _logo_send_path: Path | None = None  # filled lazily by _prepare_logo_for_send
@@ -77,7 +79,10 @@ def _prepare_logo_for_send(path: Path) -> Path:
         with Image.open(path) as img:
             width, height = img.size
             needs_resize = (
-                size > _LOGO_MAX_BYTES or max(width, height) > _LOGO_MAX_DIMENSION or (width + height) > 10000
+                size > _LOGO_MAX_BYTES
+                or width > _LOGO_MAX_DIMENSION
+                or height > _LOGO_MAX_HEIGHT
+                or (width + height) > 10000
             )
             if not needs_resize:
                 return path
@@ -104,7 +109,8 @@ def _prepare_logo_for_send(path: Path) -> Path:
                     resized = resized.convert('RGBA')
             else:
                 resized = resized.convert('RGB')
-            resized.thumbnail((_LOGO_MAX_DIMENSION, _LOGO_MAX_DIMENSION), Image.Resampling.LANCZOS)
+            # Prefer a short wide banner: fit into 960×280 so /start stays above the fold.
+            resized.thumbnail((_LOGO_MAX_DIMENSION, _LOGO_MAX_HEIGHT), Image.Resampling.LANCZOS)
             resized.save(resized_path, format='PNG', optimize=True)
             logger.info(
                 'Resized logo for Telegram send',
