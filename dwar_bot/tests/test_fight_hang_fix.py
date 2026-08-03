@@ -30,6 +30,8 @@ def test_fight_client_reconnect_marker():
     assert "FIGHT_WS_SERIAL_V1" in src
     assert "Fight stall nudge" in src
     assert "reconnect" in src.lower()
+    assert "FIGHT_STRATEGY_DWARBOT_V1" in src
+    assert "FightBrain" in src
 
 
 def test_local_recover_skips_when_fight_busy():

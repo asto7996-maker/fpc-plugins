@@ -21,7 +21,16 @@ import logging
 from dataclasses import dataclass
 from typing import Any, Optional
 
+from dwar_bot.config import COMBAT
 from dwar_bot.core.game_client import DwarGameClient
+from dwar_bot.modules.battle_strategy import (
+    DEFAULT_HIT_SEQ,
+    FS_SCCL_CHANGE_MODE,
+    MIDDLE_ATTACK_ID,
+    TO_FS_PF_DEFENDED,
+    FightBrain,
+    pick_hit_sequence,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -45,9 +54,10 @@ FS_PE_ATTACKWAIT = 104
 FS_PE_ATTACK = 105
 FS_PE_ATTACKTIMEOUT = 106
 FS_PE_FIGHTOVER = 108
+FS_PE_DAMAGE = 112
 
-# Hit zones (TOP/MIDDLE/BOTTOM)
-MIDDLE_ATTACK_ID = 2
+# Marker: DwarBOT-adapted hit seq + block + damage telemetry
+FIGHT_STRATEGY_DWARBOT_V1 = True
 
 _SPRINTF_ARR = [
     "", "", "", "",
@@ -147,6 +157,10 @@ class FightOutcome:
     error: str = ""
     attacks: int = 0
     url_finish: str = ""
+    damage_dealt: int = 0
+    damage_taken: int = 0
+    blocks_toggled: int = 0
+    hit_seq: str = ""
 
 
 class FightClient:
@@ -155,11 +169,39 @@ class FightClient:
     def __init__(self, client: DwarGameClient) -> None:
         self._client = client
 
+    def _build_brain(
+        self,
+        conf: dict,
+        *,
+        pers_id: int = 0,
+        hit_zone: Optional[int] = None,
+    ) -> FightBrain:
+        """DwarBOT-adapted brain: combo/hit seq + block thresholds."""
+        configured = getattr(COMBAT, "hit_list", None)
+        if hit_zone is not None and hit_zone in (1, 2, 3):
+            # Legacy single-zone override (tests / callers)
+            seq = [int(hit_zone)]
+        elif getattr(COMBAT, "prefer_fight_combo", True):
+            seq = pick_hit_sequence(conf, configured=configured)
+        else:
+            seq = pick_hit_sequence(None, configured=configured)
+        brain = FightBrain(
+            hit_seq=list(seq or DEFAULT_HIT_SEQ),
+            block_hp_percent=float(getattr(COMBAT, "hp_block_threshold", 45.0)),
+            unblock_hp_percent=float(getattr(COMBAT, "hp_unblock_threshold", 60.0)),
+            unblock_before_finisher=bool(
+                getattr(COMBAT, "unblock_before_finisher", True)
+            ),
+            pers_id=int(pers_id or 0),
+        )
+        return brain
+
     async def complete_current_fight(
         self,
         *,
         timeout: float = 180.0,
-        hit_zone: int = MIDDLE_ATTACK_ID,
+        hit_zone: Optional[int] = None,
+        brain: Optional[FightBrain] = None,
     ) -> FightOutcome:
         # FIGHT_WS_SERIAL_V1 — one reconnect if WS drops mid-fight
         st = await self._client.get_state()
@@ -170,12 +212,38 @@ class FightClient:
         if not vars_:
             return FightOutcome(error="no fight conf vars")
 
+        pers_id = int(vars_.get("pers_id") or 0)
+        if brain is None:
+            brain = self._build_brain(conf, pers_id=pers_id, hit_zone=hit_zone)
+        else:
+            brain.pers_id = int(pers_id or brain.pers_id or 0)
+            # Upgrade sequence from live fight combos, keep HP seed / block state
+            if hit_zone is None and getattr(COMBAT, "prefer_fight_combo", True):
+                try:
+                    brain.hit_seq = pick_hit_sequence(
+                        conf, configured=getattr(COMBAT, "hit_list", None),
+                    )
+                except Exception:
+                    pass
+            elif hit_zone in (1, 2, 3):
+                brain.hit_seq = [int(hit_zone)]
+            brain.block_hp_percent = float(
+                getattr(COMBAT, "hp_block_threshold", brain.block_hp_percent)
+            )
+            brain.unblock_hp_percent = float(
+                getattr(COMBAT, "hp_unblock_threshold", brain.unblock_hp_percent)
+            )
+
         last = FightOutcome(error="fight not started")
         attempts = 2
         per_try = max(45.0, float(timeout) / attempts)
         for attempt in range(1, attempts + 1):
             last = await self.run_fight(
-                vars_, timeout=per_try, hit_zone=hit_zone,
+                vars_,
+                timeout=per_try,
+                hit_zone=hit_zone,
+                brain=brain,
+                conf=conf,
             )
             if last.finished:
                 return last
@@ -208,7 +276,9 @@ class FightClient:
         vars_: dict,
         *,
         timeout: float = 180.0,
-        hit_zone: int = MIDDLE_ATTACK_ID,
+        hit_zone: Optional[int] = None,
+        brain: Optional[FightBrain] = None,
+        conf: Optional[dict] = None,
     ) -> FightOutcome:
         try:
             import websockets
@@ -225,9 +295,21 @@ class FightClient:
         if not fight_id or not pers_id or not akey:
             return FightOutcome(error="missing fight auth fields")
 
+        if brain is None:
+            brain = self._build_brain(
+                conf or {"swf_fight_vars": vars_},
+                pers_id=pers_id,
+                hit_zone=hit_zone,
+            )
+        else:
+            brain.pers_id = brain.pers_id or pers_id
+
         ws_url = f"wss://{ws_host}"
-        outcome = FightOutcome(url_finish=url_finish)
-        our_team_win: Optional[int] = None
+        outcome = FightOutcome(
+            url_finish=url_finish,
+            hit_seq=",".join(str(z) for z in brain.hit_seq),
+        )
+        win_team: Optional[int] = None
         cookie_hdr = "; ".join(
             f"{k}={v}" for k, v in (self._client._session or {}).items() if v
         )
@@ -241,9 +323,48 @@ class FightClient:
         }
 
         logger.info(
-            "Fight WS connect fight_id=%s pers_id=%s via %s → %s:%s",
-            fight_id, pers_id, ws_url, fs_host, fs_port,
+            "Fight WS connect fight_id=%s pers_id=%s via %s → %s:%s seq=%s",
+            fight_id, pers_id, ws_url, fs_host, fs_port, outcome.hit_seq,
         )
+
+        async def _attack(ws, zone: int) -> None:
+            await self._send_pak(
+                ws,
+                pack_params([
+                    (0, PT_INT, FS_SCCL_ATTACK),
+                    (0, PT_INT, int(zone)),
+                    (0, PT_INT, 0),
+                ]),
+            )
+
+        async def _set_block(ws, enabled: bool) -> None:
+            # changeMode(flag=TO_FS_PF_DEFENDED, switcher=1|0)
+            await self._send_pak(
+                ws,
+                pack_params([
+                    (0, PT_INT, FS_SCCL_CHANGE_MODE),
+                    (0, PT_INT, TO_FS_PF_DEFENDED),
+                    (0, PT_INT, 1 if enabled else 0),
+                ]),
+            )
+
+        async def _do_turn(ws, *, now: float, reason: str) -> None:
+            decision = brain.decide_turn(now=now)
+            if decision.set_block is not None:
+                await _set_block(ws, decision.set_block)
+                brain.apply_block_result(decision.set_block, now=now)
+                logger.info(
+                    "Fight: block %s (hp≈%.0f%%) before %s",
+                    "ON" if decision.set_block else "OFF",
+                    brain.hp_percent, reason,
+                )
+            await _attack(ws, decision.hit_zone)
+            outcome.attacks += 1
+            logger.info(
+                "Fight: %s → zone=%s/%s (#%d)%s",
+                reason, decision.zone_name, decision.hit_zone, outcome.attacks,
+                " finisher" if decision.is_finisher else "",
+            )
 
         try:
             # websockets>=12: additional_headers; older: extra_headers
@@ -301,18 +422,9 @@ class FightClient:
                             ws, pack_params([(0, PT_INT, FS_SCCL_STATE)])
                         )
                         if idle_attacks < (8 if stalled else 4):
-                            await self._send_pak(
-                                ws,
-                                pack_params([
-                                    (0, PT_INT, FS_SCCL_ATTACK),
-                                    (0, PT_INT, hit_zone),
-                                    (0, PT_INT, 0),
-                                ]),
-                            )
-                            outcome.attacks += 1
+                            await _do_turn(ws, now=now, reason="stall-nudge")
                             idle_attacks += 1
                             if stalled and idle_attacks % 3 == 0:
-                                # Skip turn to unstick server turn state
                                 await self._send_pak(
                                     ws,
                                     pack_params([(0, PT_INT, FS_SCCL_SKIP_TURN)]),
@@ -331,33 +443,44 @@ class FightClient:
                         if cmd == FS_SC_NONE and len(vals) > 1:
                             ev = int(vals[1]) if isinstance(vals[1], int) else -1
                             if ev == FS_PE_ATTACKNOW:
-                                await self._send_pak(
-                                    ws,
-                                    pack_params([
-                                        (0, PT_INT, FS_SCCL_ATTACK),
-                                        (0, PT_INT, hit_zone),
-                                        (0, PT_INT, 0),
-                                    ]),
-                                )
-                                outcome.attacks += 1
+                                now = asyncio.get_event_loop().time()
+                                await _do_turn(ws, now=now, reason="ATTACKNOW")
                                 idle_attacks = 0
-                                last_progress = asyncio.get_event_loop().time()
-                                logger.info(
-                                    "Fight: ATTACKNOW → hit zone=%s (#%d)",
-                                    hit_zone, outcome.attacks,
-                                )
+                                last_progress = now
                             elif ev == FS_PE_FIGHTOVER:
                                 outcome.finished = True
                                 if len(vals) > 2 and isinstance(vals[2], int):
-                                    our_team_win = vals[2]
+                                    win_team = vals[2]
                                 logger.info(
-                                    "Fight: FIGHTOVER win_team=%s attacks=%d",
-                                    our_team_win, outcome.attacks,
+                                    "Fight: FIGHTOVER win_team=%s attacks=%d "
+                                    "dmg=%d/%d blocks=%d",
+                                    win_team, outcome.attacks,
+                                    brain.damage_dealt, brain.damage_taken,
+                                    brain.blocks_toggled,
                                 )
                                 break
-                            elif ev in (FS_PE_ATTACKWAIT, FS_PE_ATTACK, FS_PE_ATTACKTIMEOUT):
+                            elif ev == FS_PE_DAMAGE:
+                                # vals: cmd, ev, persId, dmg, dmgType, crit, absorb, …
+                                if len(vals) > 3 and isinstance(vals[2], int):
+                                    dmg = vals[3] if isinstance(vals[3], int) else 0
+                                    brain.note_damage(vals[2], dmg)
                                 idle_attacks = 0
                                 last_progress = asyncio.get_event_loop().time()
+                            elif ev in (
+                                FS_PE_ATTACKWAIT, FS_PE_ATTACK, FS_PE_ATTACKTIMEOUT,
+                            ):
+                                idle_attacks = 0
+                                last_progress = asyncio.get_event_loop().time()
+                        elif cmd == FS_SCCL_STATE:
+                            # STATE reply: params[9]=hp, [10]=hp_max (canvas MCmd.state)
+                            if len(vals) > 10:
+                                try:
+                                    hp = int(vals[9])  # type: ignore[arg-type]
+                                    hp_max = int(vals[10])  # type: ignore[arg-type]
+                                    if hp_max > 0:
+                                        brain.note_state_hp(hp, hp_max)
+                                except (TypeError, ValueError):
+                                    pass
                         elif cmd == FS_SCCL_INIT:
                             # status in vals[1]; 0 == OK
                             status = vals[1] if len(vals) > 1 else None
@@ -383,7 +506,15 @@ class FightClient:
                 error=str(exc),
                 url_finish=url_finish,
                 attacks=outcome.attacks,
+                damage_dealt=brain.damage_dealt,
+                damage_taken=brain.damage_taken,
+                blocks_toggled=brain.blocks_toggled,
+                hit_seq=outcome.hit_seq,
             )
+
+        outcome.damage_dealt = brain.damage_dealt
+        outcome.damage_taken = brain.damage_taken
+        outcome.blocks_toggled = brain.blocks_toggled
 
         if outcome.finished and url_finish:
             try:
@@ -401,20 +532,28 @@ class FightClient:
             except Exception:
                 pass
 
+        def _won_from_team() -> bool:
+            # Canvas: win if winTeam == persTeam. Fallback: team 1 (common PvE).
+            if win_team is None:
+                return True
+            if brain.pers_team is not None:
+                return int(win_team) == int(brain.pers_team)
+            return int(win_team) == 1
+
         # Confirm we left the fight
         try:
             st = await self._client.get_state()
             if not st.fight_id:
                 outcome.finished = True
-                outcome.won = True if our_team_win in (None, 1) else bool(outcome.won)
+                outcome.won = _won_from_team()
                 outcome.error = ""
             elif outcome.finished:
-                outcome.won = our_team_win == 1
+                outcome.won = _won_from_team()
         except Exception:
             pass
 
         if outcome.finished and not outcome.error:
-            outcome.won = True if our_team_win in (None, 1) else (our_team_win == 1)
+            outcome.won = _won_from_team()
         return outcome
 
     @staticmethod

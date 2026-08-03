@@ -86,6 +86,9 @@ class CombatEngine:
         self._fight_lock = asyncio.Lock()
         self._fight_busy = False
         self.last_fight_attacks: int = 0
+        self.last_fight_damage_dealt: int = 0
+        self.last_fight_damage_taken: int = 0
+        self.last_fight_hit_seq: str = ""
 
     # ------------------------------------------------------------------
     # State detection
@@ -493,19 +496,57 @@ class CombatEngine:
     async def _finish_fight_unlocked(self, *, timeout: float = 180.0) -> BattleResult:
         self._fight_busy = True
         try:
+            # Seed HP into fight brain from last known profile (DwarBOT block/elixir)
+            brain = None
+            try:
+                from dwar_bot.modules.battle_strategy import FightBrain, pick_hit_sequence
+                profile = self._stats.get_cached_profile()
+                seq = pick_hit_sequence(
+                    None,
+                    configured=getattr(COMBAT, "hit_list", None),
+                )
+                brain = FightBrain(
+                    hit_seq=seq,
+                    block_hp_percent=float(getattr(COMBAT, "hp_block_threshold", 45.0)),
+                    unblock_hp_percent=float(getattr(COMBAT, "hp_unblock_threshold", 60.0)),
+                    unblock_before_finisher=bool(
+                        getattr(COMBAT, "unblock_before_finisher", True)
+                    ),
+                )
+                if profile and profile.char.hp_max > 0:
+                    brain.seed_hp(int(profile.char.hp), int(profile.char.hp_max))
+            except Exception as exc:
+                logger.debug("fight brain seed: %s", exc)
+                brain = None
+
             outcome: FightOutcome = await self._fight.complete_current_fight(
                 timeout=timeout,
+                brain=brain,
             )
             self.last_fight_attacks = int(outcome.attacks or 0)
+            self.last_fight_damage_dealt = int(outcome.damage_dealt or 0)
+            self.last_fight_damage_taken = int(outcome.damage_taken or 0)
+            self.last_fight_hit_seq = str(outcome.hit_seq or "")
             if outcome.finished:
                 if outcome.won:
                     self.session.wins += 1
                     logger.info(
-                        "Бой выигран (ударов=%d).", outcome.attacks,
+                        "Бой выигран (ударов=%d dmg=%d/%d seq=%s).",
+                        outcome.attacks,
+                        outcome.damage_dealt,
+                        outcome.damage_taken,
+                        outcome.hit_seq or "?",
                     )
+                    if getattr(COMBAT, "post_battle_heal", True):
+                        await self._post_battle_refresh()
                     return BattleResult.WIN
                 self.session.losses += 1
-                logger.info("Бой проигран (ударов=%d).", outcome.attacks)
+                logger.info(
+                    "Бой проигран (ударов=%d dmg=%d/%d).",
+                    outcome.attacks, outcome.damage_dealt, outcome.damage_taken,
+                )
+                if getattr(COMBAT, "post_battle_heal", True):
+                    await self._post_battle_refresh()
                 return BattleResult.LOSE
             if outcome.error:
                 logger.warning("finish_fight: %s", outcome.error)
@@ -519,6 +560,21 @@ class CombatEngine:
             return BattleResult.ERROR
         finally:
             self._fight_busy = False
+
+    async def _post_battle_refresh(self) -> None:
+        """DwarBOT post_battle_refresh analogue — top up HP after a fight."""
+        try:
+            profile = await self._stats.read_full_profile()
+        except Exception as exc:
+            logger.debug("post_battle profile: %s", exc)
+            return
+        try:
+            healed = await self.heal_if_needed(profile)
+            if healed:
+                logger.info("Post-battle heal: potion used.")
+            await self.restore_mana_if_needed(profile)
+        except Exception as exc:
+            logger.debug("post_battle_refresh: %s", exc)
 
     async def try_hunt_attack(
         self,

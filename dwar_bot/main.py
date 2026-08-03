@@ -219,6 +219,8 @@ class DwarBot:
                 + max(0, int(getattr(self.combat, "last_fight_attacks", 0) or 0) - 1)
             ),
             hits=int(getattr(self.combat, "last_fight_attacks", 0) or 0) or None,
+            damage_dealt=int(getattr(self.combat, "last_fight_damage_dealt", 0) or 0) or None,
+            damage_taken=int(getattr(self.combat, "last_fight_damage_taken", 0) or 0) or None,
         )
         if bt and mob_name and not bt.mob_name:
             bt.mob_name = mob_name

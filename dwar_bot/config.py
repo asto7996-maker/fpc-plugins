@@ -247,6 +247,19 @@ class CombatConfig:
     hp_retreat_threshold: float = 15.0
     # Whether to auto-loot after each battle
     auto_loot: bool = True
+    # DwarBOT-adapted physical hit sequence (names or 1/2/3 zone ids).
+    # Default matches DwarBOT config.ini: forward, down, down, up, forward
+    hit_list: str = "forward, down, down, up, forward"
+    # Prefer longest combo from fight|conf when available
+    prefer_fight_combo: bool = True
+    # Enter block (FS_PF_DEFENDED) when HP% falls below this
+    hp_block_threshold: float = 45.0
+    # Leave block when HP% rises above this
+    hp_unblock_threshold: float = 60.0
+    # Exit block before the last hit of the combo cycle (суперудар)
+    unblock_before_finisher: bool = True
+    # Heal with potion / food after a finished fight (DwarBOT post_battle_refresh)
+    post_battle_heal: bool = True
 
 
 COMBAT: CombatConfig = CombatConfig()
