@@ -340,10 +340,10 @@ def test_world_objective_persist_roundtrip(tmp_path, monkeypatch):
 
 def test_farm_open_unbans_story_npc():
     qt = QuestTracker(client=None)  # type: ignore[arg-type]
+    # Without http lock, farm_open lifts giver from exhausted set
     qt.pending_world_objective = {
-        "kind": "heal_wounded",
+        "kind": "gather",
         "npc_id": "409",
-        "flash_only": True,
         "farm_open": True,
     }
     qt._world_objective_keys.add("global:409")
@@ -352,3 +352,16 @@ def test_farm_open_unbans_story_npc():
     n = qt.clear_world_objective_npc_ban("409")
     assert n >= 1
     assert "global:409" not in qt._world_objective_keys
+
+
+def test_flash_locked_keeps_giver_exhausted():
+    qt = QuestTracker(client=None)  # type: ignore[arg-type]
+    qt.pending_world_objective = {
+        "kind": "heal_wounded",
+        "npc_id": "409",
+        "flash_only": True,
+        "http_impossible": True,
+        "farm_open": True,
+    }
+    qt._world_objective_keys.add("global:409")
+    assert "409" in qt.exhausted_npc_ids()

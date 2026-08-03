@@ -334,8 +334,8 @@ class LevelingEngine:
                     and npc
                     and blocked
                     and npc in blocked
-                    and not flash_open
                 ):
+                    # Flash heal giver: no HTTP progress — never prefer over hunt/loot
                     continue
                 if world_objective_flash_only and o.action in (
                     ActionType.COMBAT_AREA,
