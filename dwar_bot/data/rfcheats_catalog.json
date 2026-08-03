@@ -1,0 +1,39 @@
+{
+  "source": "https://www.rf-cheats.ru/forum/showthread.php?t=403608",
+  "title": "АвтоБан за самописного бота в Дваре",
+  "fetched_at": 1785788688.1666436,
+  "defaults": {
+    "max_continuous_minutes": 180,
+    "max_daily_minutes": 480,
+    "burst_minutes": 45,
+    "break_min_minutes": 8.0,
+    "break_max_minutes": 20.0,
+    "action_delay_min": 0.3,
+    "action_delay_max": 0.9,
+    "think_pause_chance": 0.12,
+    "think_pause_min": 2.0,
+    "think_pause_max": 8.0,
+    "daily_exhausted_break_minutes": 45.0
+  },
+  "lessons": [
+    "BitBlt + SetCursorPos pixel bots are high-risk even with Random()",
+    "Sleep(300+Random(600)) alone is not enough for long sessions",
+    "Frontend may track mousemove — click-without-move is a tell",
+    "Avoid 5–12h unbroken farm; take human breaks",
+    "Prefer normal client/API patterns over custom Chromium wrappers",
+    "Simulate operator pauses (away from PC), not only micro-jitter"
+  ],
+  "op_failed_anti_detect_snippet": "SetCursorPos(502 + Random(15), 560 + Random(3)); Sleep(300 + Random(600));",
+  "op_runtime_profile": "1–12 hours/day for ~3–4 months before autoban",
+  "community_tells": [
+    "mousemove tracking / click-without-move",
+    "click heatmaps",
+    "custom Chromium fingerprint vs game client",
+    "google-analytics in game client (suspected)"
+  ],
+  "integration": {
+    "hygiene_tracker": true,
+    "no_pixel_bot": true,
+    "no_crack": true
+  }
+}

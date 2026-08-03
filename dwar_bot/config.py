@@ -285,6 +285,11 @@ class CombatConfig:
     gamebots_skip_occupied: bool = True
     # Retry next free mob when server says target is busy
     gamebots_occupied_retry: int = 2
+    # RF-Cheats t=403608 — session hygiene after autoban discussion
+    rfcheats_hygiene_enabled: bool = True
+    rfcheats_max_continuous_minutes: int = 180
+    rfcheats_max_daily_minutes: int = 480
+    rfcheats_burst_minutes: int = 45
 
 
 COMBAT: CombatConfig = CombatConfig()

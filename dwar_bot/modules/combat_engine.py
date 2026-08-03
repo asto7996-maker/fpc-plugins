@@ -94,6 +94,7 @@ class CombatEngine:
         self._suis_session_kills: int = 0
         self._suis_error_ops: int = 0
         self._suis_failed_ops: int = 0
+        self._hygiene = None
         if getattr(COMBAT, "suis_enabled", True):
             try:
                 from dwar_bot.modules.suis_knowledge import apply_suis_defaults_to_combat_dict
@@ -108,6 +109,49 @@ class CombatEngine:
                 )
             except Exception as exc:
                 logger.debug("SUIS defaults: %s", exc)
+        if getattr(COMBAT, "rfcheats_hygiene_enabled", True):
+            try:
+                from dwar_bot.modules.rfcheats_knowledge import (
+                    HygieneTracker,
+                    RfCheatsDefaults,
+                    RFCHEATS_DEFAULTS,
+                )
+                d = RfCheatsDefaults(
+                    max_continuous_minutes=int(
+                        getattr(
+                            COMBAT,
+                            "rfcheats_max_continuous_minutes",
+                            RFCHEATS_DEFAULTS.max_continuous_minutes,
+                        )
+                        or RFCHEATS_DEFAULTS.max_continuous_minutes
+                    ),
+                    max_daily_minutes=int(
+                        getattr(
+                            COMBAT,
+                            "rfcheats_max_daily_minutes",
+                            RFCHEATS_DEFAULTS.max_daily_minutes,
+                        )
+                        or RFCHEATS_DEFAULTS.max_daily_minutes
+                    ),
+                    burst_minutes=int(
+                        getattr(
+                            COMBAT,
+                            "rfcheats_burst_minutes",
+                            RFCHEATS_DEFAULTS.burst_minutes,
+                        )
+                        or RFCHEATS_DEFAULTS.burst_minutes
+                    ),
+                )
+                self._hygiene = HygieneTracker(defaults=d)
+                logger.info(
+                    "RF-Cheats hygiene: continuous≤%dmin daily≤%dmin burst≤%dmin",
+                    d.max_continuous_minutes,
+                    d.max_daily_minutes,
+                    d.burst_minutes,
+                )
+            except Exception as exc:
+                logger.debug("RF-Cheats hygiene: %s", exc)
+                self._hygiene = None
 
     # ------------------------------------------------------------------
     # State detection
@@ -588,6 +632,7 @@ class CombatEngine:
                 if outcome.won:
                     self.session.wins += 1
                     self._suis_note_kill()
+                    self._rfcheats_note_fight(won=True)
                     logger.info(
                         "Бой выигран (ударов=%d dmg=%d/%d seq=%s).",
                         outcome.attacks,
@@ -600,6 +645,7 @@ class CombatEngine:
                     return BattleResult.WIN
                 self.session.losses += 1
                 self._suis_failed_ops += 1
+                self._rfcheats_note_fight(won=False)
                 logger.info(
                     "Бой проигран (ударов=%d dmg=%d/%d).",
                     outcome.attacks, outcome.damage_dealt, outcome.damage_taken,
@@ -662,6 +708,47 @@ class CombatEngine:
         self._suis_session_kills = 0
         self._suis_error_ops = 0
         self._suis_failed_ops = 0
+
+    async def _rfcheats_before_hunt(self) -> bool:
+        """
+        RF-Cheats hygiene gate. Returns True if hunt may proceed.
+        On required break: sleeps and returns False (caller → NO_BATTLE).
+        """
+        if not getattr(COMBAT, "rfcheats_hygiene_enabled", True):
+            return True
+        hy = self._hygiene
+        if hy is None:
+            return True
+        try:
+            decision = hy.check()
+            if decision.should_pause and decision.sleep_sec > 0:
+                logger.info(
+                    "RF-Cheats hygiene pause (%s) — %.0fs",
+                    decision.reason, decision.sleep_sec,
+                )
+                hy.note_break(decision.sleep_sec)
+                # Cap single sleep so the main loop can still heartbeat
+                await asyncio.sleep(min(float(decision.sleep_sec), 120.0))
+                return False
+            think = hy.maybe_think_pause_sec()
+            if think > 0:
+                logger.debug("RF-Cheats think pause %.1fs", think)
+                await asyncio.sleep(think)
+            delay = hy.action_delay_sec()
+            await asyncio.sleep(delay)
+        except Exception as exc:
+            logger.debug("rfcheats before hunt: %s", exc)
+        return True
+
+    def _rfcheats_note_fight(self, *, won: bool) -> None:
+        hy = self._hygiene
+        if hy is None or not getattr(COMBAT, "rfcheats_hygiene_enabled", True):
+            return
+        try:
+            # Rough active time per finished fight
+            hy.note_activity(45.0 if won else 30.0)
+        except Exception as exc:
+            logger.debug("rfcheats note fight: %s", exc)
 
     async def prepare_botmek_prebuff(self, profile: Optional[FullProfile] = None) -> int:
         """
@@ -796,6 +883,9 @@ class CombatEngine:
             if self.suis_session_exhausted():
                 self.reset_suis_session()
                 await asyncio.sleep(random.uniform(20, 40))
+                return BattleResult.NO_BATTLE
+
+            if not await self._rfcheats_before_hunt():
                 return BattleResult.NO_BATTLE
 
             # GameBots «Скрывать занятые»: fetch all, filter free, log free/busy
