@@ -244,9 +244,11 @@ class CursorExecutor:
         # and tests reference paths like dwar_bot/core/...
         if self.repo_root.name == "dwar_bot":
             cwd = self.repo_root.parent
-            test_target = "dwar_bot/tests/test_bot.py"
+            # test_bot.py assumes monorepo REPO/dwar_bot/... paths; on VPS
+            # tests live under dwar_bot/tests so prefer the AI-healing suite.
+            test_target = "dwar_bot/tests/test_ai_healing.py"
             if not (cwd / test_target).exists():
-                test_target = "dwar_bot/tests/test_ai_healing.py"
+                test_target = "dwar_bot/tests/test_bot.py"
             py_roots = [str(cwd), str(self.repo_root)]
         else:
             cwd = self.repo_root
