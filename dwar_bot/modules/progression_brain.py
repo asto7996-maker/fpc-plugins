@@ -580,7 +580,19 @@ class ProgressionBrain:
         # Hunt farm — ONLY when quest type=2 needs a kill, or light XP between story beats.
         # Endless Крэтс farming is NOT the goal — story → kill objective → turn-in → loot → gear.
         if farm.auto_combat and farm.farm_area:
-            mob = self.pending_hunt_mob or ("Крэтс" if self.need_quest_unlock else "")
+            lvl = int(getattr(char, "level", 1) or 1)
+            default_mob = ""
+            try:
+                from dwar_bot.modules.suis_knowledge import default_hunt_mob
+                default_mob = default_hunt_mob(lvl)
+            except Exception:
+                default_mob = "Крэтс" if lvl <= 2 else "Зигред-воин"
+            mob = self.pending_hunt_mob or (
+                default_mob if self.need_quest_unlock else ""
+            )
+            # Open farm (max_farm / farm_push / empty bag): pin level-appropriate mob
+            if not mob and (self.farm_push_active() or empty_bag or max_farm):
+                mob = default_mob
             if self.awaiting_quest_turnin:
                 # Already killed — do NOT hunt again until NPC dialogue advances
                 hunt_score = 80
@@ -590,11 +602,13 @@ class ProgressionBrain:
                 hunt_score = 700
             elif self.farm_push_active() or empty_bag:
                 hunt_score = 420  # light farm, never above story NPC (~800+)
+            elif max_farm and lvl >= 3:
+                hunt_score = 480  # Lv3+ intentional open farm
             else:
                 hunt_score = 320
             # Cap spam: after several hunts without turn-in, demote hard
             if self._hunt_streak >= 2 and not self.need_quest_unlock:
-                hunt_score = min(hunt_score, 200)
+                hunt_score = min(hunt_score, 200 if lvl < 3 else 360)
             if self._hunt_streak >= 1 and self.awaiting_quest_turnin:
                 hunt_score = 40
             options.append(GameOption(
@@ -604,7 +618,7 @@ class ProgressionBrain:
                 detail=(
                     "квестовое убийство (type=2)"
                     if (self.need_quest_unlock and not self.awaiting_quest_turnin)
-                    else "hunt_farm — слабый приоритет vs сюжет"
+                    else f"hunt_farm lv{lvl} — {mob or 'any'}"
                 ),
                 payload={"name": mob, "area_id": str(state.area_id or "")},
                 goal=GoalKind.COMBAT,

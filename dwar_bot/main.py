@@ -575,6 +575,61 @@ class DwarBot:
                     logger.info("Idle pause: %.0fs.", s)
                     await asyncio.sleep(s)
 
+    def _level_hunt_mob(self, fallback: str = "") -> str:
+        """SUIS-aware default hunt pin for current character level."""
+        try:
+            from dwar_bot.modules.suis_knowledge import default_hunt_mob
+            lvl = int(getattr(self._char, "level", 1) or 1)
+            return default_hunt_mob(lvl)
+        except Exception:
+            return fallback or "Крэтс"
+
+    def _on_level_up_adapt_farm(self, new_level: int) -> None:
+        """Retarget hunt / unlock travel after a level-up (esp. Lv3+ village exit)."""
+        lvl = int(new_level or 1)
+        try:
+            from dwar_bot.modules.suis_knowledge import default_hunt_mob
+            mob = default_hunt_mob(lvl)
+        except Exception:
+            mob = "Крэтс" if lvl <= 2 else "Зигред-воин"
+        # Drop stale village pin (Крэтс) once we outgrew the newbie bracket
+        qmob = (self.quests.pending_hunt_mob or "").strip()
+        qlow = qmob.lower()
+        village_stale = qlow in {"крэтс", "крейтс", "krats"} or qlow == "крейт"
+        try:
+            has_t2 = bool(self.quests.has_pending_type2())
+        except Exception:
+            has_t2 = False
+        if lvl >= 3 and village_stale and not has_t2:
+            self.quests.pending_hunt_mob = ""
+            qmob = ""
+            self.brain.need_quest_unlock = False
+        # Pin level-appropriate open-farm target
+        if qmob and not (lvl >= 3 and village_stale):
+            self.brain.pending_hunt_mob = qmob
+        else:
+            self.brain.pending_hunt_mob = mob
+        self.brain.push_farm(600.0 if lvl >= 3 else 300.0)
+        self.brain.mark_cooldown("Расселина", 300)
+        logger.info(
+            "Level-up adapt farm → Lv%d prefer '%s', farm-push ON.",
+            lvl, self.brain.pending_hunt_mob or mob,
+        )
+        wo = self.quests.pending_world_objective or {}
+        if wo.get("kind") == "heal_wounded" and wo.get("flash_only") and lvl >= 3:
+            wo = dict(wo)
+            wo["farm_open"] = True
+            wo["flash_notified"] = True
+            self.quests.pending_world_objective = wo
+            try:
+                self.quests._persist_world_objective()
+            except Exception:
+                pass
+            logger.info(
+                "Lv%d: heal_wounded stays soft (farm_open) — hunt/exit unlocked.",
+                lvl,
+            )
+
     async def _maybe_send_report(self) -> None:
         try:
             await self.analytics.maybe_send_heartbeat()
@@ -583,12 +638,23 @@ class DwarBot:
 
     async def _emit_state_notifications(self) -> None:
         """Compare with previous snapshot and push Telegram alerts."""
-        # Level up
+        # Level up — adapt farm priorities for the new bracket
         if self._prev_level and self._char.level > self._prev_level:
+            new_lv = int(self._char.level or 0)
             await self.notify(
-                f"⬆️ Уровень! <b>{self._char.nick}</b> теперь Lv{self._char.level}",
+                f"⬆️ Уровень! <b>{self._char.nick}</b> теперь Lv{new_lv}",
                 "level_up",
             )
+            try:
+                self._on_level_up_adapt_farm(new_lv)
+            except Exception as exc:
+                logger.debug("level_up farm adapt: %s", exc)
+        elif not self._prev_level and int(self._char.level or 0) >= 3:
+            # Already Lv3+ at start / after restart — unlock open farm once
+            try:
+                self._on_level_up_adapt_farm(int(self._char.level))
+            except Exception as exc:
+                logger.debug("startup farm adapt: %s", exc)
         self._prev_level = self._char.level or self._prev_level
 
         # Money change (significant)
@@ -1152,7 +1218,12 @@ class DwarBot:
         return "\n".join(lines)
 
     async def admin_force_hunt(self, mob: str = "") -> str:
-        mob = mob or self.brain.pending_hunt_mob or self.quests.pending_hunt_mob or "Крэтс"
+        mob = (
+            mob
+            or self.brain.pending_hunt_mob
+            or self.quests.pending_hunt_mob
+            or self._level_hunt_mob()
+        )
         self.brain.mark_hunt_for_quest(mob)
         if await self.combat.is_in_battle():
             result = await self.combat.finish_fight()
@@ -1255,12 +1326,24 @@ class DwarBot:
         if self.settings.farm.farm_area and self.settings.farm.auto_combat:
             # World objective / no live type=2 gate → light farm only, not forced Крэтс
             if self.quests.has_world_objective():
-                mob = ""
+                # Lv3+ open farm under flash_only — prefer level mob, not empty/Крэтс
+                wo = self.quests.pending_world_objective or {}
+                if int(getattr(self._char, "level", 1) or 1) >= 3 or wo.get("farm_open"):
+                    mob = (
+                        self.brain.pending_hunt_mob
+                        or self.quests.pending_hunt_mob
+                        or self._level_hunt_mob()
+                    )
+                else:
+                    mob = ""
             else:
                 mob = (
                     self.brain.pending_hunt_mob
                     or self.quests.pending_hunt_mob
-                    or ("Крэтс" if self.brain.need_quest_unlock else "")
+                    or (
+                        "Крэтс" if self.brain.need_quest_unlock
+                        else self._level_hunt_mob()
+                    )
                 )
             result = await self.combat.try_hunt_attack(name_substr=mob)
             if result in (
@@ -1330,7 +1413,12 @@ class DwarBot:
                         "Hunt while flash_only '%s' — Exp farm, снадобье в клиенте.",
                         wo.get("kind"),
                     )
-                mob_name = str(payload.get("name") or self.brain.pending_hunt_mob or "")
+                mob_name = str(
+                    payload.get("name")
+                    or self.brain.pending_hunt_mob
+                    or self.quests.pending_hunt_mob
+                    or self._level_hunt_mob()
+                )
                 self._telemetry_battle_begin(source="hunt", mob_name=mob_name)
                 if self.brain.pending_hunt_mob or self.quests.pending_hunt_mob:
                     self._telemetry_quest_begin(
@@ -1340,7 +1428,7 @@ class DwarBot:
                     result = await self.combat.finish_fight()
                 else:
                     result = await self.combat.try_hunt_attack(
-                        name_substr=str(payload.get("name") or ""),
+                        name_substr=mob_name,
                         area_id=str(payload.get("area_id") or ""),
                     )
                 if result == BattleResult.WIN:

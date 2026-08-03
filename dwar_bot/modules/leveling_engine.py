@@ -303,7 +303,10 @@ class LevelingEngine:
             awaiting_turnin = False
             need_quest_unlock = False
             pending_hunt_mob = ""
-            # Drop junk global NPC options; Flash-only → no Расселина spam
+            # Lv3+: Flash medicine no longer hard-locks village farm / exit
+            flash_open = bool(world_objective_flash_only and level >= 3)
+            if flash_open:
+                notes.append("flash_farm_open_lv3+")
             filtered: list[GameOption] = []
             for o in options:
                 title_l = (o.title or "").lower()
@@ -316,50 +319,88 @@ class LevelingEngine:
                     or "зной" in title_l
                 ):
                     continue
+                if (
+                    world_objective_flash_only
+                    and o.action == ActionType.QUEST_NPC
+                    and npc
+                    and blocked
+                    and npc in blocked
+                ):
+                    continue
                 if world_objective_flash_only and o.action in (
                     ActionType.COMBAT_AREA,
                     ActionType.AREA_ACTION,
                 ):
-                    # Расселина / hotspots do not heal ополченцев — skip spam
                     continue
                 if o.action == ActionType.HUNT_MOB:
-                    if world_objective_flash_only:
-                        # Light village farm for Exp while user clicks Flash
+                    if world_objective_flash_only and not flash_open:
                         o.score = min(max(float(o.score), 200.0), 350.0)
                         o.detail = f"flash wait · hunt ok · {o.detail}"
+                    elif flash_open:
+                        o.score = min(max(float(o.score), 420.0), 700.0)
+                        o.detail = f"lv{level} farm · {o.detail}"
                     else:
                         o.score = min(float(o.score), 120.0)
                         o.detail = f"world_obj cap · {o.detail}"
-                if o.action == ActionType.TRAVEL and world_objective_flash_only:
-                    # Village exit gated until war-chief order after heal
-                    o.score = min(float(o.score), 40.0)
-                    o.detail = f"blocked until heal · {o.detail}"
+                if o.action == ActionType.TRAVEL:
+                    if world_objective_flash_only and not flash_open:
+                        o.score = min(float(o.score), 40.0)
+                        o.detail = f"blocked until heal · {o.detail}"
+                    elif flash_open:
+                        low = title_l
+                        boost = 520.0 if any(
+                            kw in low for kw in ("сопк", "дымн", "охот", "лес", "поле")
+                        ) else 380.0
+                        o.score = max(float(o.score), boost)
+                        o.detail = f"lv{level} exit ok · {o.detail}"
                 if o.action == ActionType.COMBAT_FRONT and world_objective_flash_only:
-                    o.score = min(float(o.score), 30.0)
+                    if flash_open:
+                        o.score = max(float(o.score), 300.0)
+                    else:
+                        o.score = min(float(o.score), 30.0)
                 filtered.append(o)
             options = filtered
             idle_opt = next((o for o in options if o.action == ActionType.IDLE), None)
             if idle_opt is None:
                 idle_opt = GameOption(
                     ActionType.IDLE,
-                    title="Ждать снадобье / Flash",
-                    score=150.0 if world_objective_flash_only else 50.0,
-                    detail="heal_wounded flash-only — no Расселина spam",
+                    title=(
+                        "Пауза (Flash side-quest)"
+                        if flash_open
+                        else "Ждать снадобье / Flash"
+                    ),
+                    score=80.0 if flash_open else (
+                        150.0 if world_objective_flash_only else 50.0
+                    ),
+                    detail=(
+                        "lv3+ farm open — Flash heal optional"
+                        if flash_open
+                        else "heal_wounded flash-only — no Расселина spam"
+                    ),
                     goal=GoalKind.IDLE,
                 )
             elif world_objective_flash_only:
-                idle_opt.score = max(float(idle_opt.score), 150.0)
-                idle_opt.title = "Ждать снадобье / Flash"
-                idle_opt.detail = "HTTP USE недоступен — охота или пауза"
+                if flash_open:
+                    idle_opt.score = min(float(idle_opt.score), 80.0)
+                    idle_opt.title = "Пауза (Flash side-quest)"
+                    idle_opt.detail = "lv3+ — охота/выход важнее idle"
+                else:
+                    idle_opt.score = max(float(idle_opt.score), 150.0)
+                    idle_opt.title = "Ждать снадобье / Flash"
+                    idle_opt.detail = "HTTP USE недоступен — охота или пауза"
             hunt_opt = None
-            if world_objective_flash_only:
-                hunt_candidates = [
-                    o for o in options if o.action == ActionType.HUNT_MOB
-                ]
-                if hunt_candidates:
-                    hunt_opt = max(hunt_candidates, key=lambda o: float(o.score))
-            # Flash-only: hunt for Exp if available, else idle — NEVER Расселина
-            if world_objective_flash_only:
+            hunt_candidates = [o for o in options if o.action == ActionType.HUNT_MOB]
+            if hunt_candidates:
+                hunt_opt = max(hunt_candidates, key=lambda o: float(o.score))
+            travel_opt = None
+            travel_candidates = [o for o in options if o.action == ActionType.TRAVEL]
+            if travel_candidates:
+                travel_opt = max(travel_candidates, key=lambda o: float(o.score))
+
+            if world_objective_flash_only and flash_open:
+                candidates = [c for c in (travel_opt, hunt_opt, idle_opt) if c]
+                focus_wo = max(candidates, key=lambda o: float(o.score))
+            elif world_objective_flash_only:
                 focus_wo = hunt_opt or idle_opt
             else:
                 area_opt = next(
@@ -375,22 +416,23 @@ class LevelingEngine:
                     None,
                 )
                 focus_wo = area_opt or idle_opt
+            reason_tag = " capped"
+            if world_objective_flash_only and flash_open:
+                if focus_wo and focus_wo.action == ActionType.TRAVEL:
+                    reason_tag = " FLASH-exit"
+                elif focus_wo and focus_wo.action == ActionType.HUNT_MOB:
+                    reason_tag = " FLASH-farm-lv3"
+                else:
+                    reason_tag = " FLASH-open"
+            elif world_objective_flash_only and hunt_opt:
+                reason_tag = " FLASH-hunt"
+            elif world_objective_flash_only:
+                reason_tag = " FLASH-idle"
             directive = StrategicDirective(
                 state=BotState.FARMING,
                 priority=2,
                 title=f"Мир-цель: {world_objective_kind}",
-                reason=(
-                    f"P2-world: {world_objective_kind}"
-                    + (
-                        " FLASH-hunt"
-                        if world_objective_flash_only and hunt_opt
-                        else (
-                            " FLASH-idle"
-                            if world_objective_flash_only
-                            else " capped"
-                        )
-                    )
-                ),
+                reason=f"P2-world: {world_objective_kind}{reason_tag}",
                 area_id=area_id,
                 exp_per_hour=self.progress.exp_per_hour,
             )
@@ -403,7 +445,7 @@ class LevelingEngine:
                 notes=notes + [
                     "priority=WORLD_OBJECTIVE",
                     "flash_only" if world_objective_flash_only else "http",
-                    "flash_hunt" if (world_objective_flash_only and hunt_opt) else "",
+                    "flash_farm_open" if flash_open else "",
                 ],
             )
 

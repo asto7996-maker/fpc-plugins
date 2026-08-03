@@ -45,14 +45,14 @@ class SuisMob:
 SUIS_MOBS: tuple[SuisMob, ...] = (
     SuisMob(1, "Крэтс", hunt_default=True),
     SuisMob(1, "Шальной пес", hunt_default=True),
-    SuisMob(2, "Бешеный пес"),
+    SuisMob(2, "Бешеный пес", hunt_default=True),
     SuisMob(2, "Дряхлый скелет"),
-    SuisMob(2, "Зигред"),
+    SuisMob(2, "Зигред", hunt_default=True),
     SuisMob(2, "Крэтс-лидер"),
     SuisMob(2, "Огненный паук"),
-    SuisMob(3, "Зигред-воин"),
-    SuisMob(3, "Крэтс-вожак"),
-    SuisMob(3, "Неистовый пес"),
+    SuisMob(3, "Зигред-воин", hunt_default=True),
+    SuisMob(3, "Крэтс-вожак", hunt_default=True),
+    SuisMob(3, "Неистовый пес", hunt_default=True),
     SuisMob(3, "Огненная паучиха"),
     SuisMob(3, "Пепельный паук"),
     SuisMob(3, "Пес-демон"),
@@ -296,17 +296,48 @@ def expand_suis_cycle(raw: str, *, hits_needed: int = 12) -> list[int]:
 # ---------------------------------------------------------------------------
 
 def hunt_names_for_level(level: int, *, pad: int = 1) -> list[str]:
-    """Mobs whose level is within [level-pad, level+pad], hunt_default first."""
+    """
+    Mobs for hunt priority at *level*.
+
+    Order: exact-level hunt_default → exact-level others → near band (±pad)
+    by distance, then hunt_default, then name. So Lv3 prefers Зигред-воин /
+    Крэтс-вожак over leftover Крэтс from the village.
+    """
     lvl = max(1, int(level or 1))
     band = [m for m in SUIS_MOBS if abs(m.level - lvl) <= pad]
-    band.sort(key=lambda m: (0 if m.hunt_default else 1, m.level, m.name))
     if not band:
-        band = sorted(SUIS_MOBS, key=lambda m: (abs(m.level - lvl), m.level))
+        band = list(SUIS_MOBS)
+    band.sort(
+        key=lambda m: (
+            0 if m.level == lvl else 1,
+            abs(m.level - lvl),
+            0 if m.hunt_default else 1,
+            m.level,
+            m.name,
+        )
+    )
     return [m.name for m in band]
+
+
+def default_hunt_mob(level: int = 1) -> str:
+    """Best single mob name pin for the current level (SUIS-aware)."""
+    names = hunt_names_for_level(level, pad=0)
+    if names:
+        return names[0]
+    names = hunt_names_for_level(level, pad=1)
+    return names[0] if names else "Крэтс"
 
 
 def default_hunt_list() -> list[str]:
     return [m.name for m in SUIS_MOBS if m.hunt_default] or ["Крэтс"]
+
+
+def flash_farm_open_for_level(level: int, *, min_level: int = 3) -> bool:
+    """
+    After Lv3+, keep flash heal as a soft side-goal: allow open farm / travel
+    instead of locking the village forever on HTTP-impossible medicine.
+    """
+    return int(level or 1) >= int(min_level)
 
 
 def resources_for_skill(skill: int, profession: str = "geologist") -> list[str]:

@@ -2,7 +2,7 @@
   "source": "https://dwar.browsergamebots.com/",
   "screenshots": "https://dwar.browsergamebots.com/screenshots/",
   "version_noted": "5.12",
-  "fetched_at": 1785786023.4470286,
+  "fetched_at": 1785789760.1093,
   "combat_defaults": {
     "hp_elixir_percent": 20.0,
     "hp_scroll_percent": 40.0,
@@ -63,7 +63,7 @@
     {
       "level": 2,
       "name": "Бешеный пес",
-      "hunt_default": false
+      "hunt_default": true
     },
     {
       "level": 2,
@@ -73,7 +73,7 @@
     {
       "level": 2,
       "name": "Зигред",
-      "hunt_default": false
+      "hunt_default": true
     },
     {
       "level": 2,
@@ -88,17 +88,17 @@
     {
       "level": 3,
       "name": "Зигред-воин",
-      "hunt_default": false
+      "hunt_default": true
     },
     {
       "level": 3,
       "name": "Крэтс-вожак",
-      "hunt_default": false
+      "hunt_default": true
     },
     {
       "level": 3,
       "name": "Неистовый пес",
-      "hunt_default": false
+      "hunt_default": true
     },
     {
       "level": 3,

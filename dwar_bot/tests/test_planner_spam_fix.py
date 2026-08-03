@@ -70,7 +70,63 @@ def test_flash_only_prefers_hunt_not_rasselina():
     assert decision.directive.state == BotState.FARMING
 
 
-def test_flash_only_idle_when_no_hunt():
+def test_flash_only_lv3_prefers_travel_or_hunt():
+    eng = LevelingEngine()
+    profile = FullProfile(char=CharStats(level=3, hp=147, hp_max=147))
+    options = [
+        GameOption(
+            ActionType.TRAVEL,
+            title="Дымные сопки",
+            score=200,
+            payload={"area_id": "100"},
+            goal=GoalKind.TRAVEL,
+        ),
+        GameOption(
+            ActionType.HUNT_MOB,
+            title="Зигред-воин",
+            score=180,
+            payload={"name": "Зигред-воин"},
+            goal=GoalKind.COMBAT,
+        ),
+        GameOption(
+            ActionType.COMBAT_AREA,
+            title="Расселина",
+            score=795,
+            payload={"action_id": "4696"},
+            goal=GoalKind.COMBAT,
+        ),
+        GameOption(
+            ActionType.IDLE,
+            title="Ждать",
+            score=10,
+            goal=GoalKind.IDLE,
+        ),
+    ]
+    decision = eng.decide(
+        profile=profile,
+        brain_focus=None,
+        brain_options=options,
+        area_id="932",
+        world_objective_kind="heal_wounded",
+        world_objective_flash_only=True,
+        blocked_npc_ids={"409"},
+    )
+    assert decision.focus_override is not None
+    assert decision.focus_override.action in (ActionType.TRAVEL, ActionType.HUNT_MOB)
+    assert decision.focus_override.action != ActionType.COMBAT_AREA
+    assert "FLASH-exit" in decision.directive.reason or "FLASH-farm-lv3" in decision.directive.reason
+    assert "flash_farm_open" in decision.notes
+
+
+def test_infer_hunt_mob_level3_aliases():
+    qt = QuestTracker(client=None)  # type: ignore[arg-type]
+    assert qt._infer_hunt_mob_name("Повергни Зигред-воина") == "Зигред-воин"
+    assert qt._infer_hunt_mob_name("Убей Крэтс-вожака") == "Крэтс-вожак"
+    assert qt._infer_hunt_mob_name("Повергни Крэтса") == "Крэтс"
+    assert qt._infer_hunt_mob_name("Примите меня в отряд") == ""
+
+
+def test_flash_only_does_not_prefer_rasselina():
     eng = LevelingEngine()
     profile = FullProfile(char=CharStats(level=2, hp=100, hp_max=100))
     options = [

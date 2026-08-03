@@ -95,9 +95,24 @@ def test_food_ladder_with_skip():
 
 def test_hunt_priority_level2():
     names = hunt_names_for_level(2)
-    assert "Крэтс" in names or "Бешеный пес" in names
+    assert "Крэтс" in names or "Бешеный пес" in names or "Зигред" in names
     assert any(m.name == "Крэтс-вожак" for m in SUIS_MOBS)
     assert any(m.hunt_default for m in SUIS_MOBS if m.name == "Крэтс")
+
+
+def test_hunt_priority_level3_prefers_same_level():
+    names = hunt_names_for_level(3)
+    assert names[0] in {
+        "Зигред-воин", "Крэтс-вожак", "Неистовый пес",
+        "Огненная паучиха", "Пепельный паук", "Пес-демон", "Скелет-воин",
+    }
+    # Exact L3 band (±1) excludes village Крэтс (L1); wider pad still ranks L3 first
+    assert "Крэтс" not in names
+    wide = hunt_names_for_level(3, pad=2)
+    assert wide.index("Зигред-воин") < wide.index("Крэтс")
+    from dwar_bot.modules.suis_knowledge import default_hunt_mob
+    assert default_hunt_mob(3) == names[0]
+    assert default_hunt_mob(1) == "Крэтс"
 
 
 def test_resources_geologist():
