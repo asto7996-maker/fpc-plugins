@@ -230,10 +230,10 @@ class ProgressionBrain:
         """
         After a hunt win.
 
-        Only real kill-gates (pending mob / type=2) arm NPC turn-in.
-        ``need_quest_unlock`` alone means «talk to Военачальник», not turn-in.
+        Only arm NPC turn-in when caller passes quest_gate=True (real type=2).
+        Soft open-farm pins must NOT set pending_hunt_mob / quest_gate.
         """
-        gated = bool(quest_gate or self.pending_hunt_mob)
+        gated = bool(quest_gate)
         self._hunt_streak = 0
         if not gated:
             return
@@ -622,10 +622,13 @@ class ProgressionBrain:
                 score=hunt_score,
                 detail=(
                     "квестовое убийство (type=2)"
-                    if (self.need_quest_unlock and not self.awaiting_quest_turnin)
+                    if (
+                        self.pending_hunt_mob
+                        and not self.awaiting_quest_turnin
+                    )
                     else f"hunt_farm lv{lvl} — {mob or 'any'}"
                 ),
-                payload={"name": mob, "area_id": str(state.area_id or "")},
+                payload={"name": mob, "mob_name": mob, "area_id": str(state.area_id or "")},
                 goal=GoalKind.COMBAT,
             ))
 

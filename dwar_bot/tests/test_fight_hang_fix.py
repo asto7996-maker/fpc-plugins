@@ -34,6 +34,7 @@ def test_casual_hunt_win_keeps_open_farm():
     brain = ProgressionBrain(BotSettings())
     brain.push_farm(300.0)
     brain.need_quest_unlock = True  # war-chief gate alone must NOT arm turn-in
+    brain.pending_hunt_mob = "Зигред-воин"  # soft pin must NOT arm without quest_gate
     brain.mark_hunt_kill_done(quest_gate=False)
     assert brain.awaiting_quest_turnin is False
     assert brain.farm_push_active() is True
@@ -49,7 +50,9 @@ def test_voenachalnik_block_farms_at_lv3():
     assert "farm_open story refresh" in src
     assert "farm_open" in src
     assert "_wo_farm_open" in src
-    assert "quest_gate=gated" in src or "quest_gate=bool" in src or "mark_hunt_kill_done(quest_gate=" in src
+    assert "_quest_kill_gated" in src
+    assert "quest_gate=gated" in src or "mark_hunt_kill_done(quest_gate=" in src
+    assert "via farm_push" in src  # level-up adapt must not pin pending_hunt_mob
 
 
 def test_fight_client_reconnect_marker():

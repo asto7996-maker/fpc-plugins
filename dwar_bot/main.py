@@ -566,11 +566,12 @@ class DwarBot:
                     except Exception:
                         pass
                 await _sleep(DELAY_MAIN_LOOP.min, DELAY_MAIN_LOOP.max)
-                # No long idle while max-farm / farm-push (efficiency)
+                # No long idle while max-farm / farm-push / open farm (efficiency)
                 if (
                     self.settings.farm.idle_pauses
                     and not self.settings.farm.max_farm
                     and not self.brain.farm_push_active()
+                    and not self._wo_farm_open()
                     and random.random() < IDLE_PAUSE_PROBABILITY
                 ):
                     s = random.uniform(DELAY_IDLE.min, DELAY_IDLE.max)
@@ -604,6 +605,19 @@ class DwarBot:
                 )
             )
 
+    def _quest_kill_gated(self) -> bool:
+        """True only for real type=2 / quest hunt pin — not open-farm soft targets."""
+        try:
+            if self.quests.has_pending_type2():
+                return True
+        except Exception:
+            pass
+        qmob = (self.quests.pending_hunt_mob or "").strip()
+        if qmob:
+            return True
+        # brain.pending_hunt_mob alone is NOT a gate (open-farm uses farm_push)
+        return False
+
     def _on_level_up_adapt_farm(self, new_level: int) -> None:
         """Retarget hunt / unlock travel after a level-up (esp. Lv3+ village exit)."""
         lvl = int(new_level or 1)
@@ -624,16 +638,19 @@ class DwarBot:
             self.quests.pending_hunt_mob = ""
             qmob = ""
             self.brain.need_quest_unlock = False
-        # Pin level-appropriate open-farm target
-        if qmob and not (lvl >= 3 and village_stale):
+        # Real quest kill pin only — never arm open-farm as pending_hunt_mob
+        # (pending_hunt_mob → every WIN arms turn-in and stalls casual farm).
+        if has_t2 and qmob and not (lvl >= 3 and village_stale):
             self.brain.pending_hunt_mob = qmob
         else:
-            self.brain.pending_hunt_mob = mob
+            self.brain.pending_hunt_mob = ""
+            if not has_t2:
+                self.brain.awaiting_quest_turnin = False
         self.brain.push_farm(600.0 if lvl >= 3 else 300.0)
         self.brain.mark_cooldown("Расселина", 300)
         logger.info(
-            "Level-up adapt farm → Lv%d prefer '%s', farm-push ON.",
-            lvl, self.brain.pending_hunt_mob or mob,
+            "Level-up adapt farm → Lv%d prefer '%s' via farm_push (quest_pin=%s).",
+            lvl, mob, self.brain.pending_hunt_mob or "—",
         )
         wo = self.quests.pending_world_objective or {}
         if wo.get("kind") == "heal_wounded" and wo.get("flash_only") and lvl >= 3:
@@ -737,11 +754,7 @@ class DwarBot:
             if result == BattleResult.WIN:
                 self.combat.session.battles_joined += 1
                 self.quests.clear_exhausted(local_only=True)
-                gated = bool(
-                    self.brain.pending_hunt_mob
-                    or self.quests.pending_hunt_mob
-                    or self.quests.has_pending_type2()
-                )
+                gated = self._quest_kill_gated()
                 self.brain.mark_hunt_kill_done(quest_gate=gated)
                 if gated:
                     try:
@@ -751,6 +764,8 @@ class DwarBot:
                             self.quests.clear_hunt_gate()
                     except Exception as exc:
                         logger.debug("fight-first turn-in: %s", exc)
+                elif not self.brain.farm_push_active():
+                    self.brain.push_farm(180.0)
             await _sleep(1.0, 2.5)
             return
 
@@ -785,15 +800,19 @@ class DwarBot:
                 if result == BattleResult.WIN:
                     self.combat.session.battles_joined += 1
                     self.quests.clear_exhausted(local_only=True)
-                    self.brain.mark_hunt_kill_done()
-                    try:
-                        turned = await self.quests.retry_pending_type2()
-                        if turned:
-                            self.brain.clear_hunt_gate()
-                            self.quests.clear_hunt_gate()
-                            logger.info("After fight recover: type=2 turn-in OK")
-                    except Exception as exc:
-                        logger.debug("turn-in after recover: %s", exc)
+                    gated = self._quest_kill_gated()
+                    self.brain.mark_hunt_kill_done(quest_gate=gated)
+                    if gated:
+                        try:
+                            turned = await self.quests.retry_pending_type2()
+                            if turned:
+                                self.brain.clear_hunt_gate()
+                                self.quests.clear_hunt_gate()
+                                logger.info("After fight recover: type=2 turn-in OK")
+                        except Exception as exc:
+                            logger.debug("turn-in after recover: %s", exc)
+                    elif not self.brain.farm_push_active():
+                        self.brain.push_farm(180.0)
                 # Re-read profile after fight unlocks user.php
                 self._profile = await self.stats.read_full_profile()
                 self._char = self._profile.char
@@ -823,14 +842,18 @@ class DwarBot:
                         if result == BattleResult.WIN:
                             self.combat.session.battles_joined += 1
                             self.quests.clear_exhausted(local_only=True)
-                            self.brain.mark_hunt_kill_done()
-                            try:
-                                turned = await self.quests.retry_pending_type2()
-                                if turned:
-                                    self.brain.clear_hunt_gate()
-                                    self.quests.clear_hunt_gate()
-                            except Exception as exc:
-                                logger.debug("turn-in after deferred fight: %s", exc)
+                            gated = self._quest_kill_gated()
+                            self.brain.mark_hunt_kill_done(quest_gate=gated)
+                            if gated:
+                                try:
+                                    turned = await self.quests.retry_pending_type2()
+                                    if turned:
+                                        self.brain.clear_hunt_gate()
+                                        self.quests.clear_hunt_gate()
+                                except Exception as exc:
+                                    logger.debug("turn-in after deferred fight: %s", exc)
+                            elif not self.brain.farm_push_active():
+                                self.brain.push_farm(180.0)
                         self._profile = await self.stats.read_full_profile()
                         self._char = self._profile.char
                         self._state = self._profile.state
@@ -940,18 +963,26 @@ class DwarBot:
         # fight_id / flags already on state from profile — no extra dummy round-trip
         in_battle = bool(self._state.flags & 0x1) or bool(self._state.fight_id)
 
-        # Quest type=2 kill gate → prefer hunt_farm mob (one kill, then turn-in)
+        # Quest type=2 kill gate ↔ world objective
         if self.quests.has_world_objective():
             wo = self.quests.pending_world_objective or {}
-            farm_open = bool(
-                wo.get("farm_open")
-                or int(getattr(self._char, "level", 1) or 1) >= 3
-            )
-            # Keep story unlock flag under farm_open (военачальник gate)
+            farm_open = self._wo_farm_open(wo)
             keep_unlock = bool(farm_open and self.brain.need_quest_unlock)
-            self.brain.clear_hunt_gate()
-            self.quests.clear_hunt_gate()
-            self.brain.awaiting_quest_turnin = False
+            has_t2 = False
+            try:
+                has_t2 = bool(self.quests.has_pending_type2())
+            except Exception:
+                has_t2 = False
+            if farm_open and has_t2:
+                # Real story kill under open farm — keep quest pin
+                if self.quests.pending_hunt_mob:
+                    self.brain.pending_hunt_mob = self.quests.pending_hunt_mob
+            else:
+                # Soft WO / flash wait: drop false open-farm hunt pins
+                self.brain.clear_hunt_gate()
+                if not has_t2:
+                    self.quests.clear_hunt_gate()
+                self.brain.awaiting_quest_turnin = False
             if keep_unlock:
                 self.brain.need_quest_unlock = True
         elif self.quests.pending_hunt_mob:
@@ -959,8 +990,8 @@ class DwarBot:
             if not self.brain.awaiting_quest_turnin:
                 self.brain.need_quest_unlock = True
         elif not self.brain.awaiting_quest_turnin:
-            # No live quest kill request — don't keep farming last mob forever
-            if self.brain.pending_hunt_mob and self.brain._hunt_streak >= 1:
+            # No live quest kill — drop soft brain pin so open farm stays ungated
+            if self.brain.pending_hunt_mob:
                 self.brain.pending_hunt_mob = ""
                 self.brain.need_quest_unlock = False
 
@@ -1271,6 +1302,9 @@ class DwarBot:
             if wo.get("flash_only") and not farm_open:
                 # Hard flash wait — no open farm yet
                 await _sleep(45.0, 90.0)
+            elif farm_open or farm.max_farm:
+                # Open farm: don't freeze the loop on idle ticks
+                await _sleep(0.8, 2.0)
             else:
                 await _sleep(8.0, 18.0)
 
@@ -1520,12 +1554,7 @@ class DwarBot:
                     )
                 if result == BattleResult.WIN:
                     await self._telemetry_battle_end(result, mob_name=mob_name)
-                    gated = bool(
-                        self.brain.need_quest_unlock
-                        or self.brain.pending_hunt_mob
-                        or self.quests.pending_hunt_mob
-                        or self.quests.has_pending_type2()
-                    )
+                    gated = self._quest_kill_gated()
                     self.brain.mark_hunt_kill_done(quest_gate=gated)
                     self.quests.clear_exhausted(local_only=True)
                     # Wear/repair loot before next pull — gear first, then story
@@ -1573,9 +1602,8 @@ class DwarBot:
                         return True
                     if self.quests.pending_hunt_mob:
                         self.brain.pending_hunt_mob = self.quests.pending_hunt_mob
-                    # Soft story nudge only when exit is story-gated
-                    wo = self.quests.pending_world_objective or {}
-                    if gated or self.brain.need_quest_unlock:
+                    # Soft story nudge only for real kill-gate; else keep open farm
+                    if gated:
                         self.brain.farm_push_until = min(
                             self.brain.farm_push_until,
                             time.time() + 45.0,
@@ -1584,10 +1612,9 @@ class DwarBot:
                             "Post-hunt quest-gate: cleared NPCs + gear — check сюжет."
                         )
                     else:
-                        # Continuous open farm: keep farm-push alive briefly
                         if not self.brain.farm_push_active():
                             self.brain.push_farm(180.0)
-                        logger.debug("Post-hunt open-farm: gear done, continue pulls.")
+                        logger.info("Post-hunt open-farm: gear done, continue pulls.")
                     return True
                 if result in (BattleResult.JOINED, BattleResult.ONGOING, BattleResult.LOSE):
                     if result == BattleResult.LOSE:
@@ -1831,7 +1858,7 @@ class DwarBot:
                     # Quest gather (e.g. ведро лавы) — return to story NPC ASAP
                     self.quests.clear_exhausted(local_only=True)
                     self.brain.pending_hunt_mob = ""
-                    self.brain.mark_hunt_kill_done()  # reuse turn-in priority
+                    self.brain.mark_hunt_kill_done(quest_gate=True)
                     logger.info("📦 Добыча с точки — сдаём сюжетному NPC.")
                     await _sleep(1.0, 2.0)
                     return True
@@ -1964,13 +1991,17 @@ class DwarBot:
 
             if action == ActionType.IDLE:
                 wo = self.quests.pending_world_objective or {}
-                if wo.get("flash_only"):
-                    # Short pause — next tick can pick hunt when free bots appear
+                farm_open = self._wo_farm_open(wo)
+                if wo.get("flash_only") and not farm_open:
                     logger.info(
                         "Idle 45–90с — мир-цель '%s' ждёт Flash; охота на след. тике.",
                         wo.get("kind"),
                     )
                     await _sleep(45.0, 90.0)
+                    return True
+                if farm_open or farm.max_farm:
+                    # Flash side-quest soft: replan immediately for hunt/story
+                    await _sleep(0.4, 1.2)
                     return True
                 return False
 

@@ -278,7 +278,7 @@ def test_story_turnin_outranks_hunt_after_kill():
     brain = ProgressionBrain(BotSettings())
     brain.need_quest_unlock = True
     brain.pending_hunt_mob = "Крэтс"
-    brain.mark_hunt_kill_done()
+    brain.mark_hunt_kill_done(quest_gate=True)
     profile = FullProfile(
         char=CharStats(nick="t", level=2, hp=100, hp_max=100),
         state=GameState(area_id="932", level=2),
