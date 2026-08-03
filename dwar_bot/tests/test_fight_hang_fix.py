@@ -33,10 +33,10 @@ def test_casual_hunt_win_keeps_open_farm():
 
     brain = ProgressionBrain(BotSettings())
     brain.push_farm(300.0)
+    brain.need_quest_unlock = True  # war-chief gate alone must NOT arm turn-in
     brain.mark_hunt_kill_done(quest_gate=False)
     assert brain.awaiting_quest_turnin is False
     assert brain.farm_push_active() is True
-    brain.need_quest_unlock = True
     brain.pending_hunt_mob = "Крэтс"
     brain.mark_hunt_kill_done(quest_gate=True)
     assert brain.awaiting_quest_turnin is True

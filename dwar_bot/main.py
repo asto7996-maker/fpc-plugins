@@ -738,8 +738,7 @@ class DwarBot:
                 self.combat.session.battles_joined += 1
                 self.quests.clear_exhausted(local_only=True)
                 gated = bool(
-                    self.brain.need_quest_unlock
-                    or self.brain.pending_hunt_mob
+                    self.brain.pending_hunt_mob
                     or self.quests.pending_hunt_mob
                     or self.quests.has_pending_type2()
                 )

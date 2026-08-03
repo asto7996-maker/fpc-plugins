@@ -230,19 +230,14 @@ class ProgressionBrain:
         """
         After a hunt win.
 
-        Quest-gated kills (type=2 / need_quest_unlock) → force NPC turn-in next.
-        Casual open-farm wins → keep farm_push, do NOT arm false turn-in.
+        Only real kill-gates (pending mob / type=2) arm NPC turn-in.
+        ``need_quest_unlock`` alone means «talk to Военачальник», not turn-in.
         """
-        gated = bool(
-            quest_gate
-            or self.need_quest_unlock
-            or self.pending_hunt_mob
-        )
+        gated = bool(quest_gate or self.pending_hunt_mob)
         self._hunt_streak = 0
         if not gated:
             return
         self.awaiting_quest_turnin = True
-        # Soften farm-push so story NPC wins
         self.farm_push_until = 0.0
 
     def clear_hunt_gate(self) -> None:
@@ -272,13 +267,8 @@ class ProgressionBrain:
             ):
                 self.farm_push_until = 0.0
             if option.action == ActionType.HUNT_MOB:
-                # Only arm turn-in when a real quest kill gate is active
-                self.mark_hunt_kill_done(
-                    quest_gate=bool(self.need_quest_unlock or self.pending_hunt_mob),
-                )
+                self.mark_hunt_kill_done(quest_gate=bool(self.pending_hunt_mob))
             elif option.action == ActionType.QUEST_NPC:
-                # Dialogue moved — hunt gate may be cleared by caller;
-                # at least stop forcing more kills until type=2 asks again.
                 self.awaiting_quest_turnin = False
                 self._hunt_streak = 0
             elif option.action == ActionType.TRAVEL:
