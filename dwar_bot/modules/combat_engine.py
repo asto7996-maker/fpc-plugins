@@ -89,6 +89,25 @@ class CombatEngine:
         self.last_fight_damage_dealt: int = 0
         self.last_fight_damage_taken: int = 0
         self.last_fight_hit_seq: str = ""
+        # SUIS session soft-limits (dwar.browsergamebots.com)
+        self._suis_session_started: float = 0.0
+        self._suis_session_kills: int = 0
+        self._suis_error_ops: int = 0
+        self._suis_failed_ops: int = 0
+        if getattr(COMBAT, "suis_enabled", True):
+            try:
+                from dwar_bot.modules.suis_knowledge import apply_suis_defaults_to_combat_dict
+                for k, v in apply_suis_defaults_to_combat_dict().items():
+                    if hasattr(COMBAT, k):
+                        setattr(COMBAT, k, v)
+                logger.info(
+                    "SUIS defaults applied: elixir=%.0f%% block=%.0f/%.0f",
+                    COMBAT.hp_elixir_threshold,
+                    COMBAT.hp_block_threshold,
+                    COMBAT.hp_unblock_threshold,
+                )
+            except Exception as exc:
+                logger.debug("SUIS defaults: %s", exc)
 
     # ------------------------------------------------------------------
     # State detection
@@ -502,6 +521,10 @@ class CombatEngine:
             try:
                 from dwar_bot.modules.battle_strategy import FightBrain, pick_hit_sequence
                 from dwar_bot.modules.botmek_presets import build_fight_plan
+                from dwar_bot.modules.suis_knowledge import (
+                    default_suis_sequence,
+                    suis_sequence_to_hit_list,
+                )
 
                 profile = self._stats.get_cached_profile()
                 if profile and getattr(profile.char, "level", None):
@@ -519,11 +542,22 @@ class CombatEngine:
                         botmek_fb = plan.fallback_hit_seq()
                         botmek_name = plan.preset.name
                         want_magic = bool(plan.enter_magic_stance)
+
+                suis_fb = None
+                suis_label = ""
+                if getattr(COMBAT, "suis_enabled", True):
+                    raw_seq = str(getattr(COMBAT, "suis_sequence", "") or "").strip()
+                    if not raw_seq:
+                        raw_seq = default_suis_sequence(level)
+                    suis_fb = suis_sequence_to_hit_list(raw_seq)
+                    suis_label = f"suis:{raw_seq}"
+
                 seq = pick_hit_sequence(
                     None,
                     configured=getattr(COMBAT, "hit_list", None),
                     botmek_fallback=botmek_fb,
-                    source_label=botmek_name,
+                    suis_fallback=suis_fb,
+                    source_label=suis_label or botmek_name,
                 )
                 brain = FightBrain(
                     hit_seq=seq,
@@ -533,7 +567,7 @@ class CombatEngine:
                         getattr(COMBAT, "unblock_before_finisher", True)
                     ),
                     want_magic_stance=want_magic,
-                    botmek_preset=botmek_name,
+                    botmek_preset=botmek_name or suis_label,
                 )
                 if profile and profile.char.hp_max > 0:
                     brain.seed_hp(int(profile.char.hp), int(profile.char.hp_max))
@@ -553,6 +587,7 @@ class CombatEngine:
             if outcome.finished:
                 if outcome.won:
                     self.session.wins += 1
+                    self._suis_note_kill()
                     logger.info(
                         "Бой выигран (ударов=%d dmg=%d/%d seq=%s).",
                         outcome.attacks,
@@ -564,6 +599,7 @@ class CombatEngine:
                         await self._post_battle_refresh()
                     return BattleResult.WIN
                 self.session.losses += 1
+                self._suis_failed_ops += 1
                 logger.info(
                     "Бой проигран (ударов=%d dmg=%d/%d).",
                     outcome.attacks, outcome.damage_dealt, outcome.damage_taken,
@@ -573,6 +609,7 @@ class CombatEngine:
                 return BattleResult.LOSE
             if outcome.error:
                 logger.warning("finish_fight: %s", outcome.error)
+                self._suis_error_ops += 1
                 # Still in fight? treat as ongoing
                 if await self.is_in_battle():
                     return BattleResult.ONGOING
@@ -580,9 +617,51 @@ class CombatEngine:
             return BattleResult.ONGOING
         except Exception as exc:
             logger.warning("finish_fight error: %s", exc)
+            self._suis_error_ops += 1
             return BattleResult.ERROR
         finally:
             self._fight_busy = False
+
+    def _suis_note_kill(self) -> None:
+        if not getattr(COMBAT, "suis_enabled", True):
+            return
+        import time as _time
+        if not self._suis_session_started:
+            self._suis_session_started = _time.time()
+        self._suis_session_kills += 1
+
+    def suis_session_exhausted(self) -> bool:
+        """SUIS session soft-limits: time / kills / error budget."""
+        if not getattr(COMBAT, "suis_enabled", True):
+            return False
+        import time as _time
+        from dwar_bot.modules.suis_knowledge import SUIS_DEFAULTS
+        mins = int(getattr(COMBAT, "suis_session_minutes", SUIS_DEFAULTS.session_minutes) or 0)
+        kills = int(getattr(COMBAT, "suis_session_kill_limit", SUIS_DEFAULTS.session_kill_limit) or 0)
+        if self._suis_session_started and mins > 0:
+            if (_time.time() - self._suis_session_started) >= mins * 60:
+                logger.info("SUIS: лимит сессии %d мин достигнут.", mins)
+                return True
+        if kills > 0 and self._suis_session_kills >= kills:
+            logger.info("SUIS: лимит убийств %d достигнут.", kills)
+            return True
+        if self._suis_error_ops >= SUIS_DEFAULTS.max_error_ops:
+            logger.warning(
+                "SUIS: слишком много ошибочных операций (%d).", self._suis_error_ops,
+            )
+            return True
+        if self._suis_failed_ops >= SUIS_DEFAULTS.max_failed_ops:
+            logger.warning(
+                "SUIS: слишком много неудач (%d).", self._suis_failed_ops,
+            )
+            return True
+        return False
+
+    def reset_suis_session(self) -> None:
+        self._suis_session_started = 0.0
+        self._suis_session_kills = 0
+        self._suis_error_ops = 0
+        self._suis_failed_ops = 0
 
     async def prepare_botmek_prebuff(self, profile: Optional[FullProfile] = None) -> int:
         """
@@ -625,7 +704,7 @@ class CombatEngine:
         return used
 
     async def _post_battle_refresh(self) -> None:
-        """DwarBOT post_battle_refresh analogue — top up HP after a fight."""
+        """DwarBOT/SUIS post-battle — potion + food ladder."""
         try:
             profile = await self._stats.read_full_profile()
         except Exception as exc:
@@ -636,8 +715,49 @@ class CombatEngine:
             if healed:
                 logger.info("Post-battle heal: potion used.")
             await self.restore_mana_if_needed(profile)
+            if getattr(COMBAT, "suis_post_battle_food", True) and getattr(
+                COMBAT, "suis_enabled", True
+            ):
+                await self._suis_eat_after_battle(profile)
         except Exception as exc:
             logger.debug("post_battle_refresh: %s", exc)
+
+    async def _suis_eat_after_battle(self, profile: FullProfile) -> bool:
+        """SUIS «Еда после боя» ladder by HP% (fallback to next food if missing)."""
+        from dwar_bot.modules.suis_knowledge import (
+            SUIS_DEFAULTS,
+            food_ladder_candidates,
+        )
+
+        hp_pct = float(profile.char.hp_percent)
+        skip = float(
+            getattr(COMBAT, "suis_food_skip_above", SUIS_DEFAULTS.food_skip_above_hp)
+            or SUIS_DEFAULTS.food_skip_above_hp
+        )
+        candidates = food_ladder_candidates(hp_pct, skip_above=skip)
+        if not candidates:
+            return False
+        for name in candidates:
+            food = await self._stats.find_food(
+                [name.lower(), name.split()[0].lower()]
+            )
+            if food is None:
+                for part in name.lower().split():
+                    if len(part) >= 4:
+                        food = await self._stats.find_food([part])
+                        if food:
+                            break
+            if food is None:
+                continue
+            ok = await self.use_potion(food)
+            if ok:
+                logger.info(
+                    "SUIS post-battle food '%s' (wanted %s, hp=%.0f%%)",
+                    food.title, name, hp_pct,
+                )
+                return True
+        logger.debug("SUIS food ladder miss bag (hp=%.0f%% want=%s)", hp_pct, candidates)
+        return False
 
     async def try_hunt_attack(
         self,
@@ -673,12 +793,38 @@ class CombatEngine:
             if await self.is_in_battle():
                 return await self._finish_fight_unlocked()
 
+            if self.suis_session_exhausted():
+                self.reset_suis_session()
+                await asyncio.sleep(random.uniform(20, 40))
+                return BattleResult.NO_BATTLE
+
             bots = await self._client.get_hunt_bots(area_id=area_id, free_only=True)
             if not bots:
                 logger.debug("hunt_farm: no free bots")
                 return BattleResult.NO_BATTLE
 
             needle = (name_substr or "").lower()
+            # SUIS hunt priority when caller didn't pin a specific mob
+            if (
+                not needle
+                and getattr(COMBAT, "suis_enabled", True)
+                and getattr(COMBAT, "suis_hunt_priority", True)
+            ):
+                try:
+                    from dwar_bot.modules.suis_knowledge import hunt_names_for_level
+                    profile = self._stats.get_cached_profile()
+                    lvl = int(getattr(getattr(profile, "char", None), "level", 1) or 1)
+                    for prefer in hunt_names_for_level(lvl):
+                        for b in bots:
+                            if prefer.lower() in str(b.get("name") or "").lower():
+                                needle = prefer.lower()
+                                logger.info("SUIS hunt priority → '%s'", prefer)
+                                break
+                        if needle:
+                            break
+                except Exception as exc:
+                    logger.debug("suis hunt priority: %s", exc)
+
             art = str(artikul_id or "")
             chosen = None
             for b in bots:

@@ -322,5 +322,15 @@ class StatsParser:
     async def find_mp_potion(self) -> Optional[Artifact]:
         return await self.find_potion(["ман", "магии", "мп", "энерг"])
 
+    async def find_food(self, keywords: list[str]) -> Optional[Artifact]:
+        """Find edible item by title keywords (SUIS post-battle food ladder)."""
+        profile = self._last_profile or await self.read_full_profile()
+        needles = [k.lower() for k in keywords if k]
+        for art in profile.inventory:
+            title = (art.title or "").lower()
+            if title and any(n in title for n in needles):
+                return art
+        return None
+
     def get_cached_profile(self) -> Optional[FullProfile]:
         return self._last_profile

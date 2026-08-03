@@ -183,6 +183,8 @@ class FightClient:
         botmek_fb = None
         botmek_name = ""
         want_magic = False
+        suis_fb = None
+        suis_label = ""
         if getattr(COMBAT, "botmek_enabled", True):
             try:
                 from dwar_bot.modules.botmek_presets import build_fight_plan
@@ -197,6 +199,19 @@ class FightClient:
                     want_magic = bool(plan.enter_magic_stance)
             except Exception as exc:
                 logger.debug("botmek plan: %s", exc)
+        if getattr(COMBAT, "suis_enabled", True):
+            try:
+                from dwar_bot.modules.suis_knowledge import (
+                    default_suis_sequence,
+                    suis_sequence_to_hit_list,
+                )
+                raw_seq = str(getattr(COMBAT, "suis_sequence", "") or "").strip()
+                if not raw_seq:
+                    raw_seq = default_suis_sequence(level)
+                suis_fb = suis_sequence_to_hit_list(raw_seq)
+                suis_label = f"suis:{raw_seq}"
+            except Exception as exc:
+                logger.debug("suis seq: %s", exc)
 
         if hit_zone is not None and hit_zone in (1, 2, 3):
             seq = [int(hit_zone)]
@@ -205,14 +220,16 @@ class FightClient:
                 conf,
                 configured=configured,
                 botmek_fallback=botmek_fb,
-                source_label=botmek_name,
+                suis_fallback=suis_fb,
+                source_label=suis_label or botmek_name,
             )
         else:
             seq = pick_hit_sequence(
                 None,
                 configured=configured,
                 botmek_fallback=botmek_fb,
-                source_label=botmek_name,
+                suis_fallback=suis_fb,
+                source_label=suis_label or botmek_name,
             )
         brain = FightBrain(
             hit_seq=list(seq or DEFAULT_HIT_SEQ),
@@ -223,10 +240,13 @@ class FightClient:
             ),
             pers_id=int(pers_id or 0),
             want_magic_stance=want_magic,
-            botmek_preset=botmek_name,
+            botmek_preset=botmek_name or suis_label,
         )
-        if botmek_name:
-            logger.info("Fight brain BotMek preset=%s magic=%s", botmek_name, want_magic)
+        if botmek_name or suis_label:
+            logger.info(
+                "Fight brain BotMek=%s SUIS=%s magic=%s",
+                botmek_name or "-", suis_label or "-", want_magic,
+            )
         return brain
 
     async def complete_current_fight(

@@ -266,6 +266,19 @@ class CombatConfig:
     botmek_preset: str = ""
     # Drink BotMek-style combat elixirs (гнев/мощь) before hunt attack
     botmek_prebuff: bool = True
+    # SUIS (dwar.browsergamebots.com) — apply public UI defaults + formula
+    suis_enabled: bool = True
+    # Optional SUIS fight string, e.g. «Б+ГНБ-Г» or «ГНТНГ» (empty = auto)
+    suis_sequence: str = ""
+    # Prefer SUIS hunt mob names for current level when picking targets
+    suis_hunt_priority: bool = True
+    # Session soft limits from SUIS (0 = disabled)
+    suis_session_minutes: int = 60
+    suis_session_kill_limit: int = 50
+    # Post-battle food ladder (Еда после боя)
+    suis_post_battle_food: bool = True
+    # Skip food when HP% above this (SUIS «Не употреблять еду, если HP > N%»)
+    suis_food_skip_above: float = 75.0
 
 
 COMBAT: CombatConfig = CombatConfig()

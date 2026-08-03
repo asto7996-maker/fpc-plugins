@@ -147,11 +147,12 @@ def pick_hit_sequence(
     *,
     configured: str | Sequence[str | int] | None = None,
     botmek_fallback: Sequence[int] | None = None,
+    suis_fallback: Sequence[int] | None = None,
     source_label: str = "",
 ) -> list[int]:
     """
     Prefer longest combo from fight conf (like canvas ComboView.getLongestCombo),
-    else BotMek fallback / configured / DwarBOT default sequence.
+    else SUIS formula / BotMek fallback / configured / DwarBOT default.
     """
     combos = extract_combo_sequences(conf)
     if combos:
@@ -161,6 +162,15 @@ def pick_hit_sequence(
             best[0], best[1], [ZONE_NAME.get(z, z) for z in best[2]],
         )
         return list(best[2])
+    if suis_fallback:
+        seq = [int(z) for z in suis_fallback if int(z) in (1, 2, 3)]
+        if seq:
+            logger.info(
+                "Battle strategy: hit seq=%s (SUIS%s)",
+                [ZONE_NAME.get(z, z) for z in seq],
+                f"/{source_label}" if source_label else "",
+            )
+            return seq
     if botmek_fallback:
         seq = [int(z) for z in botmek_fallback if int(z) in (1, 2, 3)]
         if seq:
