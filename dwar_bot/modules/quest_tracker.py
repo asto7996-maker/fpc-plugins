@@ -273,13 +273,25 @@ class QuestTracker:
             self.clear_world_objective("medicine_used")
             return True
 
-        # Protocol unknown / Flash-only — cool down 10 min, keep NPC banned, farm
-        obj["protocol_fail_until"] = time.time() + 600.0
+        # Protocol unknown / Flash-only — long cool-down, keep NPC banned, light farm
+        # (wounded soldiers are not in HTML area.php / hunt_farm — canvas/Flash target).
+        cooldown = 1800.0
+        obj["protocol_fail_until"] = time.time() + cooldown
+        obj["flash_only"] = True
         self.pending_world_objective = dict(obj)
-        logger.warning(
-            "heal_wounded: HTTP USE rejected (%s) — cooldown 600s, farm without NPC spam.",
-            (err or "empty")[:80],
-        )
+        if not obj.get("flash_notified"):
+            obj["flash_notified"] = True
+            self.pending_world_objective = dict(obj)
+            logger.warning(
+                "heal_wounded: FLASH-ONLY target (HTTP '%s') — cooldown %ds. "
+                "Нужен клик по раненым в клиенте; бот не спамит USE/NPC.",
+                (err or "empty")[:60], int(cooldown),
+            )
+        else:
+            logger.warning(
+                "heal_wounded: HTTP USE rejected (%s) — cooldown %ds.",
+                (err or "empty")[:80], int(cooldown),
+            )
         return False
 
     def has_pending_type2(self) -> bool:

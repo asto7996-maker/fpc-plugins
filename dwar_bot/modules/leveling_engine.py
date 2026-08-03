@@ -302,6 +302,52 @@ class LevelingEngine:
             awaiting_turnin = False
             need_quest_unlock = False
             pending_hunt_mob = ""
+            # Drop junk global NPC options + demote endless hunt while Flash goal is open
+            filtered: list[GameOption] = []
+            for o in options:
+                title_l = (o.title or "").lower()
+                npc = str((o.payload or {}).get("npc_id") or "")
+                if o.action == ActionType.QUEST_NPC and (
+                    npc in {"816", "817"}
+                    or "летопис" in title_l
+                    or "сезонн" in title_l
+                    or "арену" in title_l
+                    or "зной" in title_l
+                ):
+                    continue
+                if o.action == ActionType.HUNT_MOB:
+                    o.score = min(float(o.score), 180.0)
+                    o.detail = f"world_obj cap · {o.detail}"
+                filtered.append(o)
+            options = filtered
+            # Prefer area hotspot / idle over farm override
+            area_opt = next(
+                (
+                    o for o in options
+                    if o.action in (ActionType.COMBAT_AREA, ActionType.AREA_ACTION, ActionType.USE_ITEM)
+                ),
+                None,
+            )
+            idle_opt = next((o for o in options if o.action == ActionType.IDLE), None)
+            focus_wo = area_opt or idle_opt or next(
+                (o for o in options if o.action == ActionType.HUNT_MOB), None,
+            )
+            directive = StrategicDirective(
+                state=BotState.FARMING,
+                priority=2,
+                title=f"Мир-цель: {world_objective_kind}",
+                reason=f"P2-world: {world_objective_kind} (no junk NPC / capped hunt)",
+                area_id=area_id,
+                exp_per_hour=self.progress.exp_per_hour,
+            )
+            self.progress.priority_title = directive.title
+            self.progress.mode = "world_objective"
+            return LevelingDecision(
+                directive=directive,
+                focus_override=focus_wo,
+                progress=self.progress,
+                notes=notes + ["priority=WORLD_OBJECTIVE"],
+            )
 
         # --- Priority 1: urgent / doable quests ---
         quest_opt = self._pick_quest_option(

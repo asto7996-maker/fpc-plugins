@@ -366,9 +366,19 @@ class ProgressionBrain:
             ))
 
         # --- Story / quests ---
+        # Junk global NPCs (seasonal chronicle / long-CD arena) — never "story"
+        _JUNK_NPC_IDS = {"816", "817"}
+        _JUNK_TITLE_KW = ("летопис", "сезонн", "арену - зной", "адский зверинец")
+
+        def _is_junk_npc(npc_id: str = "", title: str = "") -> bool:
+            if str(npc_id or "") in _JUNK_NPC_IDS:
+                return True
+            tl = (title or "").lower()
+            return any(k in tl for k in _JUNK_TITLE_KW)
+
         if farm.auto_quests and story_npc and story_npc.get("npc_id"):
             sid = str(story_npc["npc_id"])
-            if sid not in exhausted:
+            if sid not in exhausted and not _is_junk_npc(sid, str(story_npc.get("title") or "")):
                 raw_g = story_npc.get("global_npc", 1)
                 is_global = int(0 if raw_g in (0, "0", False) else (raw_g or 1)) == 1
                 # Global seasonal NPCs must not outrank village story
@@ -401,12 +411,17 @@ class ProgressionBrain:
                 break
             if str(npc.npc_id) in exhausted:
                 continue
+            if _is_junk_npc(str(npc.npc_id), str(npc.title or "")):
+                continue
             # Level-up / village story NPCs always beat casual hunt/arena
             qscore = 950 if not npc.is_global else 520
             if self.awaiting_quest_turnin and not npc.is_global:
                 qscore = 1250
             elif self.need_quest_unlock and not npc.is_global:
                 qscore = 1000
+            # Long arena CD — do not offer as quest
+            if npc.is_global and int(getattr(npc, "time_left", 0) or 0) > 120:
+                continue
             options.append(GameOption(
                 ActionType.QUEST_NPC,
                 f"NPC: {npc.title}",

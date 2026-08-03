@@ -85,6 +85,7 @@ class CombatEngine:
         # a second WebSocket on the same fight (hangs: no ATTACKNOW / no win).
         self._fight_lock = asyncio.Lock()
         self._fight_busy = False
+        self.last_fight_attacks: int = 0
 
     # ------------------------------------------------------------------
     # State detection
@@ -495,6 +496,7 @@ class CombatEngine:
             outcome: FightOutcome = await self._fight.complete_current_fight(
                 timeout=timeout,
             )
+            self.last_fight_attacks = int(outcome.attacks or 0)
             if outcome.finished:
                 if outcome.won:
                     self.session.wins += 1

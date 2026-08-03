@@ -214,7 +214,11 @@ class DwarBot:
         bt = self.telemetry.end_battle(
             result=result.name,
             potions_total=self.combat.session.potions_used,
-            attacks_total=self.combat.session.attacks_made,
+            attacks_total=(
+                self.combat.session.attacks_made
+                + max(0, int(getattr(self.combat, "last_fight_attacks", 0) or 0) - 1)
+            ),
+            hits=int(getattr(self.combat, "last_fight_attacks", 0) or 0) or None,
         )
         if bt and mob_name and not bt.mob_name:
             bt.mob_name = mob_name
@@ -852,6 +856,17 @@ class DwarBot:
                     logger.info("World objective completed this tick.")
                     await _sleep(1.0, 2.0)
                     return
+                wo = self.quests.pending_world_objective or {}
+                if wo.get("flash_only") and wo.get("flash_notified") and not wo.get("tg_flash_sent"):
+                    wo["tg_flash_sent"] = True
+                    self.quests.pending_world_objective = dict(wo)
+                    await self.notify(
+                        "🧪 <b>Снадобье — только Flash/клиент</b>\n"
+                        "HTTP USE не принимает цель «раненые».\n"
+                        "Кликните раненых ополченцев в игре, либо дождитесь "
+                        "обновления протокола. Бот не спамит NPC #816/#817.",
+                        "quests",
+                    )
             except Exception as exc:
                 logger.debug("pursue_world_objective: %s", exc)
 
@@ -943,10 +958,15 @@ class DwarBot:
                     " → ".join(s.title for s in snap.plan[:4]),
                 )
 
-        # Notify on plan change (not every tick)
+        # Notify on plan change (not every tick) — suppress hunt spam
         if focus_key != self._last_focus_key and focus and focus.action != ActionType.IDLE:
+            prev = self._last_focus_key
             self._last_focus_key = focus_key
-            if self.settings.notify.plan:
+            same_hunt = (
+                focus.action == ActionType.HUNT_MOB
+                and prev.startswith("hunt_mob:")
+            )
+            if self.settings.notify.plan and not same_hunt:
                 await self.notify(
                     f"🧠 <b>{focus.title}</b>\n"
                     f"<i>{snap.now}</i>\n"
@@ -980,6 +1000,12 @@ class DwarBot:
                     ActionType.HEAL, ActionType.WAIT_REGEN, ActionType.HUNT_MOB,
                 )
                 and acted
+            )
+            # Intentional world-objective NPC skip must not trigger Local recover
+            or (
+                acted
+                and focus.action == ActionType.QUEST_NPC
+                and self.quests.has_world_objective()
             )
         )
         self.brain.note_result(focus, progressed=progressed)
@@ -1140,6 +1166,22 @@ class DwarBot:
                 "Local recover: бой уже идёт (_fight_busy) — не стартую второй WS."
             )
             return False
+        # World objective (heal_wounded): skip was intentional — do NOT hunt-spam
+        if self.quests.has_world_objective():
+            kind = (self.quests.pending_world_objective or {}).get("kind")
+            logger.info(
+                "Local recover: world objective '%s' — pursue / idle, no hunt storm.",
+                kind,
+            )
+            try:
+                if await self.quests.pursue_world_objective():
+                    return True
+            except Exception as exc:
+                logger.debug("local recover pursue_wo: %s", exc)
+            # Soft idle — mark focus as cooled so brain picks area/hunt lightly
+            if "quest_npc" in focus_key.lower() or "816" in focus_key or "817" in focus_key:
+                self.brain.mark_cooldown(focus_key.split(":", 1)[-1][:40], 600)
+            return True  # consumed stagnation without false hunt
         self.brain.push_farm(600.0)
         if "расселин" in focus_key.lower() or "combat_area" in focus_key.lower():
             self.brain.mark_cooldown("Расселина", 180)
@@ -1328,7 +1370,8 @@ class DwarBot:
                             global_npc=int(payload.get("global_npc", 0) or 0),
                             link_id=str(payload.get("link_id") or "0"),
                         )
-                        return False
+                        # Intentional skip — do NOT count as stagnation
+                        return True
                 if npc_id in self.quests.world_objective_npc_ids():
                     logger.info(
                         "Skip NPC %s — world objective '%s' still pending.",
