@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 
 REPO = Path(__file__).resolve().parents[1]
-DWAR = REPO / "dwar_bot"
+DWAR = REPO / "dwar_bot" if (REPO / "dwar_bot" / "core").is_dir() else REPO
 
 
 def test_core_modules_importable():
@@ -163,17 +163,17 @@ def test_auto_healer_import():
 @pytest.mark.parametrize(
     "path",
     [
-        "dwar_bot/core/cursor_self_healer.py",
-        "dwar_bot/core/log_watcher.py",
-        "dwar_bot/core/bot_state.py",
-        "dwar_bot/core/account_manager.py",
-        "dwar_bot/modules/combat_engine.py",
-        "dwar_bot/modules/quest_tracker.py",
-        "dwar_bot/modules/fight_client.py",
+        "core/cursor_self_healer.py",
+        "core/log_watcher.py",
+        "core/bot_state.py",
+        "core/account_manager.py",
+        "modules/combat_engine.py",
+        "modules/quest_tracker.py",
+        "modules/fight_client.py",
     ],
 )
 def test_critical_files_parse(path: str):
-    target = REPO / path
+    target = DWAR / path
     assert target.exists()
     ast.parse(target.read_text(encoding="utf-8"))
 

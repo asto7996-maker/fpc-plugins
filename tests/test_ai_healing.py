@@ -23,16 +23,18 @@ from dwar_bot.core.bot_state import BotState, get_bot_state, set_bot_state
 
 
 REPO = Path(__file__).resolve().parents[1]
+# Monorepo: REPO/dwar_bot/...  |  VPS: REPO is already dwar_bot package
+DWAR = REPO / "dwar_bot" if (REPO / "dwar_bot" / "core").is_dir() else REPO
 
 
 def test_ai_healing_modules_syntax():
     for rel in (
-        "dwar_bot/core/ai_healing/__init__.py",
-        "dwar_bot/core/ai_healing/gemini_auditor.py",
-        "dwar_bot/core/ai_healing/cursor_executor.py",
-        "dwar_bot/core/ai_healing/orchestrator.py",
+        "core/ai_healing/__init__.py",
+        "core/ai_healing/gemini_auditor.py",
+        "core/ai_healing/cursor_executor.py",
+        "core/ai_healing/orchestrator.py",
     ):
-        src = (REPO / rel).read_text(encoding="utf-8")
+        src = (DWAR / rel).read_text(encoding="utf-8")
         ast.parse(src)
 
 
@@ -90,7 +92,7 @@ def test_gemini_auditor_fallback_without_key():
 
 def test_cursor_executor_rollback_on_pytest_fail(tmp_path, monkeypatch):
     # Work inside repo so paths resolve; mock CLI + pytest
-    target = REPO / "dwar_bot" / "core" / "ai_healing" / "__init__.py"
+    target = DWAR / "core" / "ai_healing" / "__init__.py"
     original = target.read_text(encoding="utf-8")
     exe = CursorExecutor(timeout_sec=5)
 
