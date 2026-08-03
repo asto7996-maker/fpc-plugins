@@ -325,6 +325,7 @@ class LevelingEngine:
                     and npc
                     and blocked
                     and npc in blocked
+                    and not flash_open
                 ):
                     continue
                 if world_objective_flash_only and o.action in (

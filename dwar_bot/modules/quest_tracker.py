@@ -635,8 +635,44 @@ class QuestTracker:
             parts = str(key).split(":")
             if len(parts) >= 2 and parts[1]:
                 out.add(parts[1])
-        out.update(self.world_objective_npc_ids())
+        # Under farm_open, do not treat the world-objective giver (e.g. Торгор 409)
+        # as permanently exhausted — story must continue.
+        wo = self.pending_world_objective or {}
+        farm_open = bool(
+            wo.get("farm_open")
+            or (wo.get("flash_only") and False)  # level checked by caller via farm_open flag
+        )
+        if not farm_open:
+            out.update(self.world_objective_npc_ids())
+        else:
+            # Keep other bans, but allow the story NPC id through
+            wo_npc = str(wo.get("npc_id") or "")
+            if wo_npc:
+                out.discard(wo_npc)
         return out
+
+    def clear_world_objective_npc_ban(self, npc_id: str = "") -> int:
+        """Lift soft-ban for story NPC when farm_open unlocks dialogue again."""
+        needle = str(npc_id or (self.pending_world_objective or {}).get("npc_id") or "")
+        if not needle:
+            return 0
+        cleared = 0
+        for key in list(self._exhausted_dialogues):
+            parts = str(key).split(":")
+            if len(parts) >= 2 and parts[1] == needle:
+                self._exhausted_dialogues.discard(key)
+                self._soft_ban_until.pop(key, None)
+                cleared += 1
+        before = len(self._world_objective_keys)
+        self._world_objective_keys = {
+            k for k in self._world_objective_keys
+            if not (
+                k == f"global:{needle}"
+                or (len(str(k).split(":")) >= 2 and str(k).split(":")[1] == needle)
+            )
+        }
+        cleared += before - len(self._world_objective_keys)
+        return cleared
 
     def mark_npc_exhausted(
         self,

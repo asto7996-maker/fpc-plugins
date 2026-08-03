@@ -947,10 +947,19 @@ class DwarBot:
                 (wo.get("farm_open") or int(getattr(self._char, "level", 1) or 1) >= 3)
                 and self._iteration % 4 == 1
             ):
+                if not wo.get("farm_open"):
+                    wo = dict(wo)
+                    wo["farm_open"] = True
+                    self.quests.pending_world_objective = wo
+                    try:
+                        self.quests._persist_world_objective()
+                    except Exception:
+                        pass
                 cleared = self.quests.clear_exhausted(local_only=True)
+                cleared += self.quests.clear_world_objective_npc_ban()
                 if cleared:
                     logger.info(
-                        "farm_open story refresh: cleared %d local NPC bans.",
+                        "farm_open story refresh: cleared %d NPC ban(s) incl. world-obj giver.",
                         cleared,
                     )
             try:
@@ -1589,7 +1598,9 @@ class DwarBot:
                     )
                 )
                 wo_npcs = self.quests.world_objective_npc_ids()
-                if npc_id in wo_npcs:
+                # Under farm_open, story NPC (often same id as heal_wounded giver, e.g. 409)
+                # must be talkable again — Flash heal stays soft side-quest.
+                if npc_id in wo_npcs and not farm_open:
                     logger.info(
                         "Skip NPC %s — world objective '%s' still pending.",
                         npc_id,
@@ -1608,6 +1619,14 @@ class DwarBot:
                     self.quests._exhausted_dialogues.add(key)
                     self.quests._soft_ban_until[key] = time.time() + 1800.0
                     return False
+                if npc_id in wo_npcs and farm_open:
+                    logger.info(
+                        "Allow story NPC %s under farm_open (was world-obj ban) — "
+                        "сюжет важнее soft Flash '%s'.",
+                        npc_id,
+                        wo.get("kind"),
+                    )
+                    self.quests.clear_world_objective_npc_ban(npc_id)
                 if self.quests.has_world_objective() and not farm_open:
                     logger.info(
                         "Skip NPC %s — active world objective '%s' (only %s).",
@@ -1846,8 +1865,8 @@ class DwarBot:
                             wo.get("farm_open")
                             or int(getattr(self._char, "level", 1) or 1) >= 3
                         )
-                        # Always clear local exhausted so Вождь / Военачальник can talk
                         cleared = self.quests.clear_exhausted(local_only=True)
+                        cleared += self.quests.clear_world_objective_npc_ban()
                         self.brain.mark_cooldown(f"Переход: {name}", 600)
                         if farm_open or self.quests.has_world_objective():
                             # Exit gated by story — prioritize NPC dialogue over hunt

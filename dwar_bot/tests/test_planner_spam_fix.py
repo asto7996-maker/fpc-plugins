@@ -284,3 +284,19 @@ def test_world_objective_persist_roundtrip(tmp_path, monkeypatch):
     assert qt2.pending_world_objective.get("kind") == "heal_wounded"
     assert qt2.pending_world_objective.get("flash_only") is True
     assert "409" in qt2.world_objective_npc_ids()
+
+
+def test_farm_open_unbans_story_npc():
+    qt = QuestTracker(client=None)  # type: ignore[arg-type]
+    qt.pending_world_objective = {
+        "kind": "heal_wounded",
+        "npc_id": "409",
+        "flash_only": True,
+        "farm_open": True,
+    }
+    qt._world_objective_keys.add("global:409")
+    qt._exhausted_dialogues.add("0:409:0")
+    assert "409" not in qt.exhausted_npc_ids()
+    n = qt.clear_world_objective_npc_ban("409")
+    assert n >= 1
+    assert "global:409" not in qt._world_objective_keys
