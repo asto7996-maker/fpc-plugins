@@ -1,0 +1,193 @@
+{
+  "source": "https://botmek.ru/share/?group=%D0%9B%D0%B5%D0%B3%D0%B5%D0%BD%D0%B4%D0%B0%3A%20%D0%9D%D0%B0%D1%81%D0%BB%D0%B5%D0%B4%D0%B8%D0%B5%20%D0%94%D1%80%D0%B0%D0%BA%D0%BE%D0%BD%D0%BE%D0%B2&sort=statisticsdesc",
+  "fetched_at": 1785785305.196824,
+  "macros": [
+    {
+      "file_id": "N5ECHpxFMBL4ZvE",
+      "name": "лабиринт",
+      "description": "двар лабиринт для прохождения инста лабиринт в игре легенда наследие драконов, поможет при прохождении обычного заслона",
+      "downloads": 920,
+      "source_url": "https://botmek.ru/share/?file=N5ECHpxFMBL4ZvE"
+    },
+    {
+      "file_id": "4RtlDRw6zHhtNiR",
+      "name": "Воин Ракхари [18]",
+      "description": "В бой входим в магической стойке\nH - Мощная разящая стрела (на крит)\nА - Гипнотика\nTab - Переходим в физическую стойку\nT - Включаем пелену\n1 - Экстракт Мощи\nW - Удар\n\nС таймингами для второго удара сколько не играл, \nне получается очень не стабильный ответ, поэтому второй удар делаем ручками\nТем более 2 добивающий может быть как с мощью, так и с вампом, от ситуации воздаяния.",
+      "downloads": 631,
+      "source_url": "https://botmek.ru/share/?file=4RtlDRw6zHhtNiR"
+    },
+    {
+      "file_id": "nZHEK41sianySmg",
+      "name": "верка",
+      "description": "Ярость Верциды или  Сила радуги  на 16 лвл  пинаем ниферто   удар ,одним  кликом  мышки .что входит в этот удар - сила гнева, ,эликсир  гнева ,переход с пелены ,сама пелена ,стрела  на Крит и сам удар  -стоит вниз ,ставим на правую кнопку мыши. нападаем на моба и  нажимаем  на мышке правую кнопку  тем самым одним  ударом делам 6 действий   надо так же в настройках игры заранее поставить -вход в бой- в магической стойке ,переставить  в луке  критический удар на букву  H (анг)",
+      "downloads": 271,
+      "source_url": "https://botmek.ru/share/?file=nZHEK41sianySmg"
+    },
+    {
+      "file_id": "N6PgPrigd5hBwDk",
+      "name": "Обитель видений",
+      "description": "Инстанс Обитель видений для персонажей 16-го уровня, подходящий для фарма теней. Макрос совмещает 5 действий: «Сила гнева», переход в физическую стойку, включение пелены, использование стрелы для критического удара и сам удар.",
+      "downloads": 267,
+      "source_url": "https://botmek.ru/share/?file=N6PgPrigd5hBwDk"
+    },
+    {
+      "file_id": "jjiswARy9lNkJ4m",
+      "name": "верка кадики",
+      "description": "пинаем  мобов  Кадхас.  благословение  Ярость Верциды или  Сила радуги.  мобы бьются 1 ударом -сила гнева,эликсир гнева,и сам удар(язык пламени) тем самым заменяя три нажатия на одно .Ставим на правую кнопку мыши  и после нападения тыкаем бой 3-5 сек вместо 7-10 сек  подходит как для 11 так и для 12 лвл",
+      "downloads": 253,
+      "source_url": "https://botmek.ru/share/?file=jjiswARy9lNkJ4m"
+    }
+  ],
+  "presets": [
+    {
+      "file_id": "N5ECHpxFMBL4ZvE",
+      "name": "лабиринт",
+      "downloads": 920,
+      "min_level": 10,
+      "max_level": 99,
+      "stance": "any",
+      "hit_zone": 2,
+      "hit_seq": [
+        2
+      ],
+      "prebuff_keywords": [],
+      "burst_steps": [
+        "hotbar_1",
+        "hotbar_2",
+        "veil",
+        "hotbar_3",
+        "confirm"
+      ],
+      "description": "Инст «Лабиринт» / заслон — цепочка хоткеев.",
+      "source_url": "https://botmek.ru/share/?file=N5ECHpxFMBL4ZvE"
+    },
+    {
+      "file_id": "4RtlDRw6zHhtNiR",
+      "name": "Воин Ракхари [18]",
+      "downloads": 631,
+      "min_level": 16,
+      "max_level": 22,
+      "stance": "magic",
+      "hit_zone": 2,
+      "hit_seq": [
+        2
+      ],
+      "prebuff_keywords": [
+        "мощ",
+        "экстракт"
+      ],
+      "burst_steps": [
+        "crit_arrow",
+        "hypnotic",
+        "stance_physical",
+        "veil",
+        "power_extract",
+        "hit"
+      ],
+      "description": "Маг. стойка → H крит-стрела → A гипнотика → Tab физ → T пелена → 1 экстракт мощи → W удар.",
+      "source_url": "https://botmek.ru/share/?file=4RtlDRw6zHhtNiR"
+    },
+    {
+      "file_id": "nZHEK41sianySmg",
+      "name": "верка",
+      "downloads": 271,
+      "min_level": 14,
+      "max_level": 20,
+      "stance": "magic",
+      "hit_zone": 3,
+      "hit_seq": [
+        3
+      ],
+      "prebuff_keywords": [
+        "гнев",
+        "ярость",
+        "радуг"
+      ],
+      "burst_steps": [
+        "anger_power",
+        "anger_elixir",
+        "stance_from_veil",
+        "veil",
+        "crit_arrow",
+        "hit_down"
+      ],
+      "description": "Сила гнева + эликсир гнева + пелена + крит-стрела + удар вниз (Ниферто / one-shot).",
+      "source_url": "https://botmek.ru/share/?file=nZHEK41sianySmg"
+    },
+    {
+      "file_id": "N6PgPrigd5hBwDk",
+      "name": "Обитель видений",
+      "downloads": 267,
+      "min_level": 15,
+      "max_level": 20,
+      "stance": "magic",
+      "hit_zone": 3,
+      "hit_seq": [
+        3
+      ],
+      "prebuff_keywords": [
+        "гнев"
+      ],
+      "burst_steps": [
+        "anger_power",
+        "stance_physical",
+        "veil",
+        "crit_arrow",
+        "hit_down"
+      ],
+      "description": "Фарм теней 16 lvl: сила гнева → физ → пелена → крит → удар.",
+      "source_url": "https://botmek.ru/share/?file=N6PgPrigd5hBwDk"
+    },
+    {
+      "file_id": "jjiswARy9lNkJ4m",
+      "name": "верка кадики",
+      "downloads": 253,
+      "min_level": 11,
+      "max_level": 14,
+      "stance": "magic",
+      "hit_zone": 3,
+      "hit_seq": [
+        3
+      ],
+      "prebuff_keywords": [
+        "гнев",
+        "ярость",
+        "радуг"
+      ],
+      "burst_steps": [
+        "anger_power",
+        "anger_elixir",
+        "flame_tongue"
+      ],
+      "description": "Кадхас one-shot: сила гнева + эликсир гнева + язык пламени.",
+      "source_url": "https://botmek.ru/share/?file=jjiswARy9lNkJ4m"
+    },
+    {
+      "file_id": "local-low-phys",
+      "name": "newbie physical (BotMek-inspired)",
+      "downloads": 0,
+      "min_level": 1,
+      "max_level": 10,
+      "stance": "physical",
+      "hit_zone": 3,
+      "hit_seq": [
+        3,
+        2,
+        3,
+        1,
+        3
+      ],
+      "prebuff_keywords": [
+        "гнев",
+        "мощ",
+        "сил"
+      ],
+      "burst_steps": [
+        "prebuff",
+        "hit_down"
+      ],
+      "description": "Адаптация паттерна «удар вниз» с botmek.ru для низких уровней; комбо с сервера всё ещё приоритетнее.",
+      "source_url": "https://botmek.ru/share/?group=%D0%9B%D0%B5%D0%B3%D0%B5%D0%BD%D0%B4%D0%B0%3A%20%D0%9D%D0%B0%D1%81%D0%BB%D0%B5%D0%B4%D0%B8%D0%B5%20%D0%94%D1%80%D0%B0%D0%BA%D0%BE%D0%BD%D0%BE%D0%B2&sort=statisticsdesc"
+    }
+  ]
+}

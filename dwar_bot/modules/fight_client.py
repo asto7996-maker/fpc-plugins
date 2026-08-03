@@ -28,6 +28,7 @@ from dwar_bot.modules.battle_strategy import (
     FS_SCCL_CHANGE_MODE,
     MIDDLE_ATTACK_ID,
     TO_FS_PF_DEFENDED,
+    TO_FS_PF_MAGIC,
     FightBrain,
     pick_hit_sequence,
 )
@@ -175,16 +176,44 @@ class FightClient:
         *,
         pers_id: int = 0,
         hit_zone: Optional[int] = None,
+        level: int = 1,
     ) -> FightBrain:
-        """DwarBOT-adapted brain: combo/hit seq + block thresholds."""
+        """DwarBOT + BotMek-adapted brain: combo/hit seq + block + stance."""
         configured = getattr(COMBAT, "hit_list", None)
+        botmek_fb = None
+        botmek_name = ""
+        want_magic = False
+        if getattr(COMBAT, "botmek_enabled", True):
+            try:
+                from dwar_bot.modules.botmek_presets import build_fight_plan
+                plan = build_fight_plan(
+                    level=level,
+                    enabled=True,
+                    preset_name=str(getattr(COMBAT, "botmek_preset", "") or ""),
+                )
+                if plan:
+                    botmek_fb = plan.fallback_hit_seq()
+                    botmek_name = plan.preset.name
+                    want_magic = bool(plan.enter_magic_stance)
+            except Exception as exc:
+                logger.debug("botmek plan: %s", exc)
+
         if hit_zone is not None and hit_zone in (1, 2, 3):
-            # Legacy single-zone override (tests / callers)
             seq = [int(hit_zone)]
         elif getattr(COMBAT, "prefer_fight_combo", True):
-            seq = pick_hit_sequence(conf, configured=configured)
+            seq = pick_hit_sequence(
+                conf,
+                configured=configured,
+                botmek_fallback=botmek_fb,
+                source_label=botmek_name,
+            )
         else:
-            seq = pick_hit_sequence(None, configured=configured)
+            seq = pick_hit_sequence(
+                None,
+                configured=configured,
+                botmek_fallback=botmek_fb,
+                source_label=botmek_name,
+            )
         brain = FightBrain(
             hit_seq=list(seq or DEFAULT_HIT_SEQ),
             block_hp_percent=float(getattr(COMBAT, "hp_block_threshold", 45.0)),
@@ -193,7 +222,11 @@ class FightClient:
                 getattr(COMBAT, "unblock_before_finisher", True)
             ),
             pers_id=int(pers_id or 0),
+            want_magic_stance=want_magic,
+            botmek_preset=botmek_name,
         )
+        if botmek_name:
+            logger.info("Fight brain BotMek preset=%s magic=%s", botmek_name, want_magic)
         return brain
 
     async def complete_current_fight(
@@ -202,6 +235,7 @@ class FightClient:
         timeout: float = 180.0,
         hit_zone: Optional[int] = None,
         brain: Optional[FightBrain] = None,
+        level: int = 1,
     ) -> FightOutcome:
         # FIGHT_WS_SERIAL_V1 — one reconnect if WS drops mid-fight
         st = await self._client.get_state()
@@ -214,14 +248,36 @@ class FightClient:
 
         pers_id = int(vars_.get("pers_id") or 0)
         if brain is None:
-            brain = self._build_brain(conf, pers_id=pers_id, hit_zone=hit_zone)
+            brain = self._build_brain(
+                conf, pers_id=pers_id, hit_zone=hit_zone, level=level,
+            )
         else:
             brain.pers_id = int(pers_id or brain.pers_id or 0)
             # Upgrade sequence from live fight combos, keep HP seed / block state
+            botmek_fb = None
+            botmek_name = brain.botmek_preset
+            if getattr(COMBAT, "botmek_enabled", True):
+                try:
+                    from dwar_bot.modules.botmek_presets import build_fight_plan
+                    plan = build_fight_plan(
+                        level=level,
+                        enabled=True,
+                        preset_name=str(getattr(COMBAT, "botmek_preset", "") or ""),
+                    )
+                    if plan:
+                        botmek_fb = plan.fallback_hit_seq()
+                        botmek_name = plan.preset.name
+                        brain.want_magic_stance = bool(plan.enter_magic_stance)
+                        brain.botmek_preset = botmek_name
+                except Exception:
+                    pass
             if hit_zone is None and getattr(COMBAT, "prefer_fight_combo", True):
                 try:
                     brain.hit_seq = pick_hit_sequence(
-                        conf, configured=getattr(COMBAT, "hit_list", None),
+                        conf,
+                        configured=getattr(COMBAT, "hit_list", None),
+                        botmek_fallback=botmek_fb,
+                        source_label=botmek_name,
                     )
                 except Exception:
                     pass
@@ -348,8 +404,26 @@ class FightClient:
                 ]),
             )
 
+        async def _set_magic_stance(ws, enabled: bool = True) -> None:
+            # BotMek «вход в бой в магической стойке»
+            await self._send_pak(
+                ws,
+                pack_params([
+                    (0, PT_INT, FS_SCCL_CHANGE_MODE),
+                    (0, PT_INT, TO_FS_PF_MAGIC),
+                    (0, PT_INT, 1 if enabled else 0),
+                ]),
+            )
+
         async def _do_turn(ws, *, now: float, reason: str) -> None:
             decision = brain.decide_turn(now=now)
+            if decision.set_magic_stance is not None:
+                await _set_magic_stance(ws, decision.set_magic_stance)
+                logger.info(
+                    "Fight: BotMek magic stance %s (%s)",
+                    "ON" if decision.set_magic_stance else "OFF",
+                    brain.botmek_preset or "preset",
+                )
             if decision.set_block is not None:
                 await _set_block(ws, decision.set_block)
                 brain.apply_block_result(decision.set_block, now=now)

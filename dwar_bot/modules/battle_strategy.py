@@ -146,10 +146,12 @@ def pick_hit_sequence(
     conf: dict[str, Any] | None = None,
     *,
     configured: str | Sequence[str | int] | None = None,
+    botmek_fallback: Sequence[int] | None = None,
+    source_label: str = "",
 ) -> list[int]:
     """
     Prefer longest combo from fight conf (like canvas ComboView.getLongestCombo),
-    else configured / DwarBOT default sequence.
+    else BotMek fallback / configured / DwarBOT default sequence.
     """
     combos = extract_combo_sequences(conf)
     if combos:
@@ -159,6 +161,15 @@ def pick_hit_sequence(
             best[0], best[1], [ZONE_NAME.get(z, z) for z in best[2]],
         )
         return list(best[2])
+    if botmek_fallback:
+        seq = [int(z) for z in botmek_fallback if int(z) in (1, 2, 3)]
+        if seq:
+            logger.info(
+                "Battle strategy: hit seq=%s (BotMek%s)",
+                [ZONE_NAME.get(z, z) for z in seq],
+                f"/{source_label}" if source_label else "",
+            )
+            return seq
     seq = parse_hit_list(configured)
     logger.info(
         "Battle strategy: hit seq=%s (DwarBOT-adapted)",
@@ -174,12 +185,14 @@ class TurnDecision:
     set_block: Optional[bool] = None  # True=on, False=off, None=unchanged
     is_finisher: bool = False
     zone_name: str = ""
+    # BotMek: switch to magic stance once at fight start
+    set_magic_stance: Optional[bool] = None
 
 
 @dataclass
 class FightBrain:
     """
-    Stateful fight controller (DwarBOT fight() loop → WS decisions).
+    Stateful fight controller (DwarBOT fight() loop + BotMek burst hints).
     """
     hit_seq: list[int] = field(default_factory=lambda: list(DEFAULT_HIT_SEQ))
     # HP % below which we enter block (DwarBOT max_hp_without_block analogue, %)
@@ -190,11 +203,15 @@ class FightBrain:
     unblock_before_finisher: bool = True
     # Block toggle cooldown (canvas uses 5s)
     block_cooldown_s: float = 5.0
+    # BotMek: request magic stance on first turn
+    want_magic_stance: bool = False
+    botmek_preset: str = ""
 
     # Runtime
     _step: int = 0
     block_active: bool = False
     _last_block_toggle_at: float = 0.0
+    _magic_stance_sent: bool = False
     pers_id: int = 0
     pers_team: Optional[int] = None
     hp: int = 0
@@ -243,6 +260,7 @@ class FightBrain:
 
         Finisher (last in cycle): force leave block so the combo lands hard.
         Other hits: enter/leave block from HP thresholds.
+        BotMek: optional magic stance on the first turn.
         """
         n = len(self.hit_seq) or 1
         pos = self._step % n
@@ -263,14 +281,24 @@ class FightBrain:
             elif self._want_unblock_by_hp() and self.block_active and can_toggle:
                 set_block = False
 
+        set_magic: Optional[bool] = None
+        if self.want_magic_stance and not self._magic_stance_sent:
+            set_magic = True
+            self._magic_stance_sent = True
+
         return TurnDecision(
             hit_zone=zone,
             set_block=set_block,
             is_finisher=is_finisher,
             zone_name=ZONE_NAME.get(zone, str(zone)),
+            set_magic_stance=set_magic,
         )
 
     def apply_block_result(self, enabled: bool, *, now: float) -> None:
         self.block_active = bool(enabled)
         self._last_block_toggle_at = now
         self.blocks_toggled += 1
+
+
+# Re-export BotMek stance flag for fight_client CHANGE_MODE
+TO_FS_PF_MAGIC = 1

@@ -498,12 +498,32 @@ class CombatEngine:
         try:
             # Seed HP into fight brain from last known profile (DwarBOT block/elixir)
             brain = None
+            level = 1
             try:
                 from dwar_bot.modules.battle_strategy import FightBrain, pick_hit_sequence
+                from dwar_bot.modules.botmek_presets import build_fight_plan
+
                 profile = self._stats.get_cached_profile()
+                if profile and getattr(profile.char, "level", None):
+                    level = int(profile.char.level or 1)
+                botmek_fb = None
+                botmek_name = ""
+                want_magic = False
+                if getattr(COMBAT, "botmek_enabled", True):
+                    plan = build_fight_plan(
+                        level=level,
+                        enabled=True,
+                        preset_name=str(getattr(COMBAT, "botmek_preset", "") or ""),
+                    )
+                    if plan:
+                        botmek_fb = plan.fallback_hit_seq()
+                        botmek_name = plan.preset.name
+                        want_magic = bool(plan.enter_magic_stance)
                 seq = pick_hit_sequence(
                     None,
                     configured=getattr(COMBAT, "hit_list", None),
+                    botmek_fallback=botmek_fb,
+                    source_label=botmek_name,
                 )
                 brain = FightBrain(
                     hit_seq=seq,
@@ -512,6 +532,8 @@ class CombatEngine:
                     unblock_before_finisher=bool(
                         getattr(COMBAT, "unblock_before_finisher", True)
                     ),
+                    want_magic_stance=want_magic,
+                    botmek_preset=botmek_name,
                 )
                 if profile and profile.char.hp_max > 0:
                     brain.seed_hp(int(profile.char.hp), int(profile.char.hp_max))
@@ -522,6 +544,7 @@ class CombatEngine:
             outcome: FightOutcome = await self._fight.complete_current_fight(
                 timeout=timeout,
                 brain=brain,
+                level=level,
             )
             self.last_fight_attacks = int(outcome.attacks or 0)
             self.last_fight_damage_dealt = int(outcome.damage_dealt or 0)
@@ -560,6 +583,46 @@ class CombatEngine:
             return BattleResult.ERROR
         finally:
             self._fight_busy = False
+
+    async def prepare_botmek_prebuff(self, profile: Optional[FullProfile] = None) -> int:
+        """
+        BotMek-style pre-fight drinks (гнев / мощь / ярость) before ATTACK_BOT.
+
+        Returns number of potions consumed.
+        """
+        if not getattr(COMBAT, "botmek_enabled", True):
+            return 0
+        if not getattr(COMBAT, "botmek_prebuff", True):
+            return 0
+        used = 0
+        try:
+            from dwar_bot.modules.botmek_presets import build_fight_plan
+            level = 1
+            if profile and getattr(profile.char, "level", None):
+                level = int(profile.char.level or 1)
+            plan = build_fight_plan(
+                level=level,
+                enabled=True,
+                preset_name=str(getattr(COMBAT, "botmek_preset", "") or ""),
+            )
+            if not plan or not plan.prebuff_keywords:
+                return 0
+            for kw in plan.prebuff_keywords:
+                pot = await self._stats.find_potion([kw])
+                if pot is None:
+                    continue
+                if await self.use_potion(pot):
+                    used += 1
+                    logger.info(
+                        "BotMek prebuff '%s' via '%s' (preset=%s)",
+                        kw, pot.title, plan.preset.name,
+                    )
+                    await asyncio.sleep(random.uniform(0.3, 0.7))
+                if used >= 2:
+                    break
+        except Exception as exc:
+            logger.debug("prepare_botmek_prebuff: %s", exc)
+        return used
 
     async def _post_battle_refresh(self) -> None:
         """DwarBOT post_battle_refresh analogue — top up HP after a fight."""
@@ -644,6 +707,11 @@ class CombatEngine:
                 "Нападаю на охотничьего моба '%s' (id=%s, artikul=%s)…",
                 bot_name, bot_id, chosen.get("artikul_id"),
             )
+            # BotMek share macros: drink гнев/мощь before the pull
+            try:
+                await self.prepare_botmek_prebuff(self._stats.get_cached_profile())
+            except Exception as exc:
+                logger.debug("botmek prebuff skip: %s", exc)
             resp = await self._client.attack_bot(bot_id)
             err = str(resp.redirect_error or resp.error or "")
             logger.info(

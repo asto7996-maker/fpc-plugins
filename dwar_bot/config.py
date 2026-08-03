@@ -260,6 +260,12 @@ class CombatConfig:
     unblock_before_finisher: bool = True
     # Heal with potion / food after a finished fight (DwarBOT post_battle_refresh)
     post_battle_heal: bool = True
+    # BotMek.ru share macros (Легенда) — burst / down-hit / prebuff patterns
+    botmek_enabled: bool = True
+    # Optional preset name hint (e.g. "верка", "Ракхари"); empty = auto by level
+    botmek_preset: str = ""
+    # Drink BotMek-style combat elixirs (гнев/мощь) before hunt attack
+    botmek_prebuff: bool = True
 
 
 COMBAT: CombatConfig = CombatConfig()
