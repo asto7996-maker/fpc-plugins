@@ -61,10 +61,10 @@ from dwar_bot.modules.progression_brain import (
 )
 from dwar_bot.core.account_manager import AccountManager, ACCOUNTS_DIR
 from dwar_bot.core.bot_state import BotState, get_bot_state, set_bot_state
-from dwar_bot.core.log_watcher import start_log_monitoring
 from dwar_bot.core.cursor_self_healer import ensure_cursor_cli, _augment_path
 from dwar_bot.core.auto_healer import bind_auto_healer, get_auto_healer
 from dwar_bot.core.error_recovery import get_recovery_stats
+from dwar_bot.core.self_healing import AutonomousLogWatcher, MasterController
 from dwar_bot.config import COMBAT, STATE_FILE
 
 logger = logging.getLogger("dwar_bot.main")
@@ -1499,15 +1499,20 @@ async def main() -> None:
 
     asyncio.create_task(_boot_heal_ready(), name="cursor_cli_boot")
 
+    # Industrial 300s self-healing orchestrator (AST + Cursor CLI + Circuit Breaker)
+    master_controller = MasterController(
+        pause_fn=bot.pause_for_heal,
+        resume_fn=bot.resume_after_heal,
+    )
+    autonomous_watcher = AutonomousLogWatcher(
+        log_path=LOG_FILE,
+        interval_seconds=300,
+        controller=master_controller,
+        notify_fn=_notify_plain,
+    )
     log_watcher_task = asyncio.create_task(
-        start_log_monitoring(
-            45,
-            log_path=LOG_FILE,
-            notify_fn=_notify_plain,
-            pause_fn=bot.pause_for_heal,
-            resume_fn=bot.resume_after_heal,
-        ),
-        name="log_watcher",
+        autonomous_watcher.start_monitoring(interval_seconds=300),
+        name="autonomous_log_watcher_300s",
     )
 
     async def _heal_watchdog() -> None:
@@ -1522,7 +1527,7 @@ async def main() -> None:
 
     asyncio.create_task(_heal_watchdog(), name="heal_watchdog")
     logger.info(
-        "AutoHealer + LogWatcher FULL-AUTO (45s) · CURSOR_API_KEY=%s",
+        "Self-Healing: AutonomousLogWatcher(300s) + AutoHealer · CURSOR_API_KEY=%s",
         "set" if os.getenv("CURSOR_API_KEY") else "MISSING",
     )
 

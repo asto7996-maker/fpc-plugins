@@ -18,7 +18,8 @@ from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Optional
 
 from dwar_bot.core.bot_state import BotState, get_bot_state, set_bot_state
-from dwar_bot.core.cursor_self_healer import heal_ready, patch_code_with_cursor
+from dwar_bot.core.cursor_self_healer import heal_ready
+from dwar_bot.core.self_healing.cursor_engine import apply_patch_via_cursor
 from dwar_bot.core.error_recovery import (
     ErrorClass,
     ClassifiedError,
@@ -229,7 +230,7 @@ class AutoHealer:
 
             try:
                 ok = await asyncio.to_thread(
-                    patch_code_with_cursor, req.failed_file, req.traceback_text
+                    apply_patch_via_cursor, req.failed_file, req.traceback_text
                 )
             except Exception as exc:
                 logger.exception("AutoHealer patch crashed: %s", exc)

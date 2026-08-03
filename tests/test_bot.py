@@ -16,12 +16,15 @@ DWAR = REPO / "dwar_bot"
 
 
 def test_core_modules_importable():
-    from dwar_bot.core import bot_state, cursor_self_healer, log_watcher
+    from dwar_bot.core import bot_state, cursor_self_healer, log_watcher, self_healing
     from dwar_bot.core.bot_state import BotState
 
     assert BotState.PAUSED.name == "PAUSED"
     assert callable(cursor_self_healer.patch_code_with_cursor)
     assert callable(log_watcher.start_log_monitoring)
+    assert callable(self_healing.validate_python_code)
+    assert callable(self_healing.apply_patch_via_cursor)
+    assert callable(self_healing.AutonomousLogWatcher)
 
 
 def test_progression_brain_importable():

@@ -1,10 +1,12 @@
 .heal_backups/
+data/backups/*.bak_*
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
 .env
 .env.*
+!.env.example
 cookies/
 logs/
 screenshots/
