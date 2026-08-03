@@ -134,7 +134,53 @@ class AutonomousLogWatcher:
             or "нужны свежие куки" in low
         ):
             return False
-        return any(m in clean for m in ERROR_MARKERS)
+        # Self-heal / Cursor noise must never re-trigger pause (recursive heal)
+        heal_noise = (
+            "ai_healing",
+            "self_healing",
+            "cursor_executor",
+            "cursor_engine",
+            "cursor_self_healer",
+            "gemini_auditor",
+            "healingorchestrator",
+            "autonomouslogwatcher",
+            "cursorexecutor",
+            "cursor cli timed out",
+            "subprocess.timeoutexpired",
+            "timeout after 150s",
+            "agentn.global.api",
+            "local_fixer",
+        )
+        # Drop healing lines then re-check markers on remaining game code only
+        kept = []
+        skip_tb = False
+        for line in clean.splitlines():
+            ll = line.lower()
+            if any(n in ll for n in heal_noise):
+                skip_tb = True
+                continue
+            if " | dwar_bot.core.ai_healing." in ll or " | dwar_bot.core.self_healing." in ll:
+                skip_tb = True
+                continue
+            if skip_tb:
+                st = line.lstrip()
+                if (
+                    ll.startswith("traceback (most recent call last)")
+                    or st.startswith("File ")
+                    or ll.startswith("subprocess.")
+                    or (line.startswith(" ") or line.startswith("\t"))
+                    or ("error:" in ll and not ll[:1].isdigit())
+                ):
+                    continue
+                if len(line) >= 4 and line[0].isdigit():
+                    skip_tb = False
+                else:
+                    continue
+            kept.append(line)
+        filtered = "\n".join(kept)
+        if not filtered.strip():
+            return False
+        return any(m in filtered for m in ERROR_MARKERS)
 
     @staticmethod
     def _extract_traceback(chunk: str) -> str:
@@ -153,12 +199,17 @@ class AutonomousLogWatcher:
         paths = _FILE_RE.findall(traceback_text) or _FILE_RE.findall(_strip_ansi(chunk))
         for p in reversed(paths):
             norm = p.replace("\\", "/")
+            # Never "heal" the healer itself
+            if "ai_healing" in norm or "self_healing" in norm:
+                continue
             if "dwar_bot/" in norm:
                 return norm[norm.find("dwar_bot/"):]
             if "core/self_healing/" in norm:
                 continue
         if paths:
-            return paths[-1]
+            last = paths[-1].replace("\\", "/")
+            if "ai_healing" not in last and "self_healing" not in last:
+                return last
         return "dwar_bot/main.py"
 
     async def _circuit_trip(self, failed_file: str) -> None:
@@ -181,12 +232,22 @@ class AutonomousLogWatcher:
             and "cursor_self_healer" not in line
             and "auto_healer" not in line
             and "log_watcher" not in line
+            and "ai_healing" not in line
+            and "cursor_executor" not in line
+            and "gemini_auditor" not in line
+            and "HealingOrchestrator" not in line
+            and "CursorExecutor" not in line
+            and "TimeoutExpired" not in line
+            and "Cursor CLI timed out" not in line
         )
         if not self._is_actionable(filtered):
             return
 
         tb = self._extract_traceback(filtered)
         failed_file = self._extract_failed_file(tb, filtered)
+        if "ai_healing" in failed_file or "self_healing" in failed_file:
+            logger.debug("Skip heal of healer file: %s", failed_file)
+            return
 
         if failed_file in self._blocked_files:
             logger.debug("Circuit open for %s — skip", failed_file)
@@ -262,7 +323,8 @@ class AutonomousLogWatcher:
             while self._running:
                 try:
                     state = get_bot_state()
-                    if state == BotState.HEALING:
+                    # Skip while any heal path holds the farm (Gemini orch uses PAUSED)
+                    if state in (BotState.HEALING, BotState.PAUSED):
                         await asyncio.sleep(5)
                         continue
 

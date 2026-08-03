@@ -260,6 +260,20 @@ class HealingOrchestrator:
 
         try:
             await self._pause_bot()
+            # Guard: recent fight wins in the same window → do not burn Cursor on "CRASH"
+            raw_low = raw_error.lower()
+            if issue_type in ("CRASH", "STUCK_NO_PROGRESS") and (
+                "бой выигран" in raw_low
+                or "telemetry battle win" in raw_low
+                or "fight: fightover" in raw_low
+            ):
+                logger.info(
+                    "HealingOrchestrator: skip %s — live fight wins in window.",
+                    issue_type,
+                )
+                await self._resume_bot()
+                return False
+
             await self._notify(
                 "⚠️ <b>Gemini Audit Alert:</b> Обнаружена проблема "
                 f"(<code>{issue_type}</code>) в файле <code>{target}</code>. "

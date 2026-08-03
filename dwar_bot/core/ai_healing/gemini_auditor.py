@@ -152,13 +152,71 @@ def _normalize_verdict(data: dict[str, Any]) -> Optional[dict[str, Any]]:
     }
 
 
+def _strip_healing_noise(log_slice: str) -> str:
+    """Drop self-heal / Cursor / Gemini lines so they cannot fake CRASH/STUCK."""
+    skip_sub = (
+        "ai_healing",
+        "self_healing",
+        "cursor_executor",
+        "cursor_engine",
+        "cursor_self_healer",
+        "gemini_auditor",
+        "healingorchestrator",
+        "autonomouslogwatcher",
+        "google_genai",
+        "local_fixer",
+        "cursorexecutor",
+        "cursor cli timed out",
+        "timeout after 150s",
+        "agentn.global.api",
+    )
+    out = []
+    skip_tb = False
+    for line in (log_slice or "").splitlines():
+        low = line.lower()
+        if any(s in low for s in skip_sub):
+            skip_tb = True
+            continue
+        if "subprocess.timeoutexpired" in low or low.startswith("timeoutexpired"):
+            skip_tb = True
+            continue
+        # Swallow Traceback frames that belong to a just-skipped heal ERROR
+        if skip_tb:
+            stripped = line.lstrip()
+            if (
+                low.startswith("traceback (most recent call last)")
+                or stripped.startswith("File ")
+                or low.startswith("subprocess.")
+                or (
+                    stripped
+                    and not stripped[0].isdigit()
+                    and (
+                        stripped.endswith("Error")
+                        or "Error:" in stripped
+                        or stripped.startswith("During handling")
+                    )
+                )
+                or (line.startswith(" ") or line.startswith("\t"))
+            ):
+                continue
+            # Next dated log line → resume normal filtering
+            if len(line) >= 4 and line[0].isdigit():
+                skip_tb = False
+            else:
+                continue
+        out.append(line)
+    return "\n".join(out)
+
+
 def _heuristic_audit(
     log_slice: str,
     telemetry_summary: dict,
     current_state: str,
 ) -> Optional[dict[str, Any]]:
     """Offline / no-key fallback so orchestrator still works."""
-    blob = (log_slice or "").lower()
+    # HEURISTIC_NO_FALSE_PAUSE_V1 — ignore heal Tracebacks; wins ≠ stuck
+    clean_slice = _strip_healing_noise(log_slice)
+    blob = clean_slice.lower()
     tel = telemetry_summary or {}
 
     # Auth / cookie waits are operational, not code crashes
@@ -190,9 +248,17 @@ def _heuristic_audit(
         "dom desync",
         "selector not found",
     )
-    # Full Traceback only if not auth-related
-    has_real_crash = any(m in blob for m in crash_markers) or (
-        "traceback (most recent call last)" in blob
+    # Real game-code crash only — not Cursor/heal TimeoutExpired Tracebacks
+    has_typed_crash = any(m in blob for m in crash_markers)
+    has_traceback = "traceback (most recent call last)" in blob
+    heal_tb = (
+        "timeoutexpired" in blob
+        or "cursor cli" in blob
+        or "agentn.global.api" in blob
+    )
+    has_real_crash = has_typed_crash or (
+        has_traceback
+        and not heal_tb
         and "tokenexpirederror" not in blob
         and "authrequirederror" not in blob
         and "waiting for fresh cookies" not in blob
@@ -201,10 +267,11 @@ def _heuristic_audit(
         "local recover for stagnation",
         "завис",
         "одни и те же",
-        "диалог не сдвинулся",
         "npc 409 — поговорить об излечении",
         "stagnation",
     )
+    # "диалог не сдвинулся" alone is normal during heal_wounded / gated travel
+    soft_stuck = ("диалог не сдвинулся",)
     dom_markers = ("dom_changed", "selector not found", "iframe", "playwright timeout")
 
     if has_real_crash:
@@ -221,7 +288,7 @@ def _heuristic_audit(
             "target_file": target,
             "cursor_prompt": (
                 f"В логах за 120с обнаружен crash/traceback при state={current_state}. "
-                f"Исправь корневую ошибку в {target}. Лог:\n{log_slice[-2500:]}"
+                f"Исправь корневую ошибку в {target}. Лог:\n{clean_slice[-2500:]}"
             ),
         }
 
@@ -235,22 +302,44 @@ def _heuristic_audit(
             "cursor_prompt": (
                 "Похоже на DOM/selector drift. Сверь selectors.py с актуальным "
                 f"UI и поправь хрупкие локаторы. state={current_state}. "
-                f"Лог:\n{log_slice[-2000:]}"
+                f"Лог:\n{clean_slice[-2000:]}"
             ),
         }
 
     exp_delta = float(tel.get("exp_delta") or tel.get("exp_gained") or 0)
     gold_delta = float(tel.get("gold_delta") or 0)
+    battles = int(tel.get("battles") or tel.get("wins") or 0)
+    wins = int(tel.get("wins") or 0)
     same_focus = int(tel.get("same_focus_ticks") or 0)
+    # Live wins / fights mean the bot is progressing — never pause for "stuck"
+    if (
+        battles > 0
+        or wins > 0
+        or "бой выигран" in blob
+        or "fight: fightover" in blob
+        or "telemetry battle win" in blob
+    ):
+        return {
+            "issue_detected": False,
+            "issue_type": "STUCK_NO_PROGRESS",
+            "target_file": "dwar_bot/main.py",
+            "cursor_prompt": "",
+        }
+    hard_stuck = any(m in blob for m in stuck_markers)
+    soft_only = (not hard_stuck) and any(m in blob for m in soft_stuck)
     no_progress = (
         exp_delta <= 0
         and gold_delta <= 0
         and (
-            any(m in blob for m in stuck_markers)
-            or same_focus >= 3
+            hard_stuck
+            or (soft_only and same_focus >= 5)
+            or same_focus >= 5
             or str(tel.get("progress") or "").lower() in ("none", "stuck", "0")
         )
     )
+    # World-objective farm window often has 0 exp/gold deltas — don't false-pause
+    if "heal_wounded" in blob or "world objective" in blob or "мир-цель" in blob:
+        no_progress = hard_stuck and same_focus >= 8
     if no_progress and current_state.upper() not in ("PAUSED", "HEALING"):
         target = "dwar_bot/modules/quest_tracker.py"
         if "hunt" in blob or "combat" in blob or "расселин" in blob:
@@ -262,7 +351,7 @@ def _heuristic_audit(
             "cursor_prompt": (
                 "Бот без прогресса Exp/Gold за окно аудита (STUCK_NO_PROGRESS). "
                 f"state={current_state} telemetry={tel}. "
-                f"Устрани зацикливание действий. Лог:\n{log_slice[-2500:]}"
+                f"Устрани зацикливание действий. Лог:\n{clean_slice[-2500:]}"
             ),
         }
 

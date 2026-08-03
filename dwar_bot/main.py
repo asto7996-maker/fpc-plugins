@@ -1312,6 +1312,23 @@ class DwarBot:
                 npc_id = str(payload.get("npc_id") or "")
                 if not npc_id:
                     return False
+                # While heal_wounded (etc.) is open — do NOT open unrelated NPCs
+                # (seasonal #816 / arena #817 were soft-banned as false heal targets).
+                if self.quests.has_world_objective():
+                    wo_npcs = self.quests.world_objective_npc_ids()
+                    if npc_id not in wo_npcs:
+                        logger.info(
+                            "Skip NPC %s — active world objective '%s' (only %s).",
+                            npc_id,
+                            (self.quests.pending_world_objective or {}).get("kind"),
+                            ",".join(sorted(wo_npcs)) or "—",
+                        )
+                        self.quests.mark_npc_exhausted(
+                            npc_id,
+                            global_npc=int(payload.get("global_npc", 0) or 0),
+                            link_id=str(payload.get("link_id") or "0"),
+                        )
+                        return False
                 if npc_id in self.quests.world_objective_npc_ids():
                     logger.info(
                         "Skip NPC %s — world objective '%s' still pending.",
