@@ -381,6 +381,7 @@ class DwarBot:
             "need_quest_unlock": self.brain.need_quest_unlock,
             "awaiting_quest_turnin": self.brain.awaiting_quest_turnin,
             "pending_hunt_mob": self.brain.pending_hunt_mob or self.quests.pending_hunt_mob,
+            "world_objective": dict(self.quests.pending_world_objective or {}),
             "recovery": {
                 "last_kind": get_recovery_stats().last_kind,
                 "auth_waits": get_recovery_stats().auth_waits,
@@ -616,6 +617,30 @@ class DwarBot:
         self._char = self._profile.char
         self._state = self._profile.state
 
+        # Fight-first: never plan NPC/travel while locked in battle
+        if bool(getattr(self._state, "fight_id", 0)) or bool(
+            getattr(self._state, "flags", 0) & 0x1
+        ):
+            logger.info(
+                "⚔️ Активный бой fight_id=%s — завершаю до планирования.",
+                getattr(self._state, "fight_id", 0) or "?",
+            )
+            result = await self.combat.finish_fight(timeout=180.0)
+            logger.info("Fight-first → %s", result.name)
+            if result == BattleResult.WIN:
+                self.combat.session.battles_joined += 1
+                self.quests.clear_exhausted(local_only=True)
+                self.brain.mark_hunt_kill_done()
+                try:
+                    turned = await self.quests.retry_pending_type2()
+                    if turned:
+                        self.brain.clear_hunt_gate()
+                        self.quests.clear_hunt_gate()
+                except Exception as exc:
+                    logger.debug("fight-first turn-in: %s", exc)
+            await _sleep(1.0, 2.5)
+            return
+
         # Overloaded bag blocks travel and quest objectives — free junk first
         try:
             dropped = await self.combat.free_backpack()
@@ -803,7 +828,12 @@ class DwarBot:
         in_battle = bool(self._state.flags & 0x1) or bool(self._state.fight_id)
 
         # Quest type=2 kill gate → prefer hunt_farm mob (one kill, then turn-in)
-        if self.quests.pending_hunt_mob:
+        if self.quests.has_world_objective():
+            # Outside-dialogue goal: stop NPC/hunt-gate spam
+            self.brain.clear_hunt_gate()
+            self.quests.clear_hunt_gate()
+            self.brain.awaiting_quest_turnin = False
+        elif self.quests.pending_hunt_mob:
             self.brain.pending_hunt_mob = self.quests.pending_hunt_mob
             if not self.brain.awaiting_quest_turnin:
                 self.brain.need_quest_unlock = True
@@ -812,6 +842,17 @@ class DwarBot:
             if self.brain.pending_hunt_mob and self.brain._hunt_streak >= 1:
                 self.brain.pending_hunt_mob = ""
                 self.brain.need_quest_unlock = False
+
+        # Attempt world objective (medicine USE etc.) before planning
+        if self.quests.has_world_objective():
+            try:
+                done = await self.quests.pursue_world_objective()
+                if done:
+                    logger.info("World objective completed this tick.")
+                    await _sleep(1.0, 2.0)
+                    return
+            except Exception as exc:
+                logger.debug("pursue_world_objective: %s", exc)
 
         event_timers = await self.timers.scrape_event_timers(hunt=hunt)
         # Empty bag: light farm nudge, not a 10‑minute hunt lock
@@ -846,15 +887,27 @@ class DwarBot:
         )
 
         # Level-Up Decision Tree → MasterController + optional focus override
+        wo = self.quests.pending_world_objective or {}
         decision = self.leveling.decide(
             profile=self._profile,
             brain_focus=snap.focus,
             brain_options=snap.options,
             area_id=str(self._state.area_id or ""),
-            pending_hunt_mob=self.brain.pending_hunt_mob or self.quests.pending_hunt_mob,
-            awaiting_turnin=self.brain.awaiting_quest_turnin,
-            need_quest_unlock=self.brain.need_quest_unlock,
+            pending_hunt_mob=(
+                "" if self.quests.has_world_objective()
+                else (self.brain.pending_hunt_mob or self.quests.pending_hunt_mob)
+            ),
+            awaiting_turnin=(
+                False if self.quests.has_world_objective()
+                else self.brain.awaiting_quest_turnin
+            ),
+            need_quest_unlock=(
+                False if self.quests.has_world_objective()
+                else self.brain.need_quest_unlock
+            ),
             in_battle=in_battle,
+            world_objective_kind=str(wo.get("kind") or ""),
+            blocked_npc_ids=self.quests.world_objective_npc_ids(),
         )
         await self.leveling.apply(decision)
         if decision.focus_override is not None:
@@ -1018,6 +1071,7 @@ class DwarBot:
             f"auth_blocked={st.get('auth_blocked')} sid=<code>{st.get('sess_sid')}</code>",
             f"area={st.get('area_id')} fight_id={st.get('fight_id')}",
             f"unlock={st.get('need_quest_unlock')} hunt={st.get('pending_hunt_mob') or '—'}",
+            f"world_obj={((st.get('world_objective') or {}).get('kind') or '—')}",
             f"wins={st.get('wins')} losses={st.get('losses')} loot={st.get('loot_claimed')}",
             "",
             "<b>Recovery</b>",
@@ -1247,6 +1301,26 @@ class DwarBot:
                 npc_id = str(payload.get("npc_id") or "")
                 if not npc_id:
                     return False
+                if npc_id in self.quests.world_objective_npc_ids():
+                    logger.info(
+                        "Skip NPC %s — world objective '%s' still pending.",
+                        npc_id,
+                        (self.quests.pending_world_objective or {}).get("kind"),
+                    )
+                    self.quests.mark_npc_exhausted(
+                        npc_id,
+                        global_npc=int(payload.get("global_npc", 0) or 0),
+                        link_id=str(payload.get("link_id") or "0"),
+                    )
+                    # Re-assert long ban
+                    key = (
+                        f"{int(payload.get('global_npc', 0) or 0)}:"
+                        f"{npc_id}:{payload.get('link_id') or '0'}"
+                    )
+                    self.quests._world_objective_keys.add(key)
+                    self.quests._exhausted_dialogues.add(key)
+                    self.quests._soft_ban_until[key] = time.time() + 1800.0
+                    return False
                 self._telemetry_quest_begin(
                     str(focus.title or payload.get("title") or "Квест"),
                     npc_id=npc_id,
@@ -1274,6 +1348,16 @@ class DwarBot:
                 )
                 if steps:
                     logger.info("📜 Квестовых шагов: %d (NPC %s)", steps, npc_id)
+                    if self.quests.has_world_objective():
+                        self.brain.clear_hunt_gate()
+                        self.brain.awaiting_quest_turnin = False
+                        logger.info(
+                            "Мир-цель '%s' — NPC %s забанен, иду выполнять вне диалога.",
+                            self.quests.pending_world_objective.get("kind"),
+                            npc_id,
+                        )
+                        await _sleep(1.0, 2.0)
+                        return True
                     if self.quests.has_pending_type2() or self.quests.pending_hunt_mob:
                         # Type=2 asked for a kill mid-dialogue — hunt once, then turn in
                         mob = self.quests.pending_hunt_mob or "Крэтс"
@@ -1300,6 +1384,11 @@ class DwarBot:
                     "NPC %s: диалог исчерпан / нужен прогресс квеста (бой/лут).",
                     npc_id,
                 )
+                return False
+
+            if action == ActionType.USE_ITEM:
+                if self.quests.has_world_objective():
+                    return await self.quests.pursue_world_objective()
                 return False
 
             if action in (ActionType.COMBAT_AREA, ActionType.AREA_ACTION):
@@ -1427,12 +1516,19 @@ class DwarBot:
                         self.brain.awaiting_quest_turnin = False
                         # Soft nudge — story NPC first, hunt only if type=2 asks
                         self.brain.push_farm(120.0)
-                        cleared = self.quests.clear_exhausted(local_only=True)
-                        logger.info(
-                            "Нужен приказ военачальника — возвращаюсь к сюжету "
-                            "(снято exhausted: %d).",
-                            cleared,
-                        )
+                        if self.quests.has_world_objective():
+                            logger.info(
+                                "Нужен приказ военачальника, но мир-цель '%s' активна "
+                                "— NPC не открываю.",
+                                self.quests.pending_world_objective.get("kind"),
+                            )
+                        else:
+                            cleared = self.quests.clear_exhausted(local_only=True)
+                            logger.info(
+                                "Нужен приказ военачальника — возвращаюсь к сюжету "
+                                "(снято exhausted: %d).",
+                                cleared,
+                            )
                     return False
                 new_state = await self._client.get_state()
                 if new_state.area_id and new_state.area_id != self._state.area_id:

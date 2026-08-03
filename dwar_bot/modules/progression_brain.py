@@ -59,6 +59,7 @@ class ActionType(Enum):
     TRAVEL = "travel"
     AREA_ACTION = "area_action"
     BUFF = "buff"
+    USE_ITEM = "use_item"
     IDLE = "idle"
 
 

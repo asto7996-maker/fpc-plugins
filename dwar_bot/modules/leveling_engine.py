@@ -283,15 +283,25 @@ class LevelingEngine:
         awaiting_turnin: bool = False,
         need_quest_unlock: bool = False,
         in_battle: bool = False,
+        world_objective_kind: str = "",
+        blocked_npc_ids: Optional[set[str]] = None,
     ) -> LevelingDecision:
         char = profile.char
         level = char.level or self.progress.level
         self.progress.level = level
         options = list(brain_options or [])
         notes: list[str] = []
+        blocked = blocked_npc_ids or set()
 
         # Soft XP cap detection
         xp_capped = self._no_level_wins >= self.XP_CAP_IDLE_WINS and level >= 2
+
+        # World objective (heal wounded etc.) — never force story-NPC re-entry
+        if world_objective_kind:
+            notes.append(f"world_obj={world_objective_kind}")
+            awaiting_turnin = False
+            need_quest_unlock = False
+            pending_hunt_mob = ""
 
         # --- Priority 1: urgent / doable quests ---
         quest_opt = self._pick_quest_option(
@@ -300,8 +310,13 @@ class LevelingEngine:
             pending_hunt_mob=pending_hunt_mob,
             awaiting_turnin=awaiting_turnin,
             need_quest_unlock=need_quest_unlock,
+            blocked_npc_ids=blocked,
         )
-        urgent_quest = self._best_kb_quest(level=level, area_id=area_id)
+        if world_objective_kind:
+            quest_opt = None  # hard-skip P1 while world goal is open
+        urgent_quest = None if world_objective_kind else self._best_kb_quest(
+            level=level, area_id=area_id,
+        )
 
         if quest_opt or (urgent_quest and (need_quest_unlock or awaiting_turnin or pending_hunt_mob)):
             title = (
@@ -321,36 +336,42 @@ class LevelingEngine:
                     goal=GoalKind.QUEST,
                 )
             elif not focus and urgent_quest:
-                focus = GameOption(
-                    ActionType.QUEST_NPC,
-                    title=f"Квест: {urgent_quest.title}",
-                    score=920,
-                    detail=f"Exp≈{urgent_quest.exp_reward:.0f}",
-                    payload={"npc_id": urgent_quest.npc_id, "quest_key": urgent_quest.quest_key},
-                    goal=GoalKind.QUEST,
+                # Skip KB quests that point at a blocked world-objective NPC
+                u_npc = str(getattr(urgent_quest, "npc_id", "") or "")
+                if u_npc and u_npc in blocked:
+                    focus = None
+                else:
+                    focus = GameOption(
+                        ActionType.QUEST_NPC,
+                        title=f"Квест: {urgent_quest.title}",
+                        score=920,
+                        detail=f"Exp≈{urgent_quest.exp_reward:.0f}",
+                        payload={"npc_id": urgent_quest.npc_id, "quest_key": urgent_quest.quest_key},
+                        goal=GoalKind.QUEST,
+                    )
+            if focus:
+                directive = StrategicDirective(
+                    state=BotState.EXECUTING_QUEST,
+                    priority=1,
+                    title=title,
+                    reason="P1: срочный квест с опытом/доблестью",
+                    quest_title=title,
+                    npc_id=(urgent_quest.npc_id if urgent_quest else ""),
+                    area_id=area_id,
+                    mob_name=pending_hunt_mob,
+                    exp_per_hour=self.progress.exp_per_hour,
                 )
-            directive = StrategicDirective(
-                state=BotState.EXECUTING_QUEST,
-                priority=1,
-                title=title,
-                reason="P1: срочный квест с опытом/доблестью",
-                quest_title=title,
-                npc_id=(urgent_quest.npc_id if urgent_quest else ""),
-                area_id=area_id,
-                mob_name=pending_hunt_mob,
-                exp_per_hour=self.progress.exp_per_hour,
-            )
-            self.progress.priority_title = f"Квест '{title}'"
-            self.progress.mode = "quest"
-            notes.append("priority=QUEST")
-            decision = LevelingDecision(
-                directive=directive,
-                focus_override=focus,
-                boost_needed=False,
-                progress=self.progress,
-                notes=notes,
-            )
-            return decision
+                self.progress.priority_title = f"Квест '{title}'"
+                self.progress.mode = "quest"
+                notes.append("priority=QUEST")
+                decision = LevelingDecision(
+                    directive=directive,
+                    focus_override=focus,
+                    boost_needed=False,
+                    progress=self.progress,
+                    notes=notes,
+                )
+                return decision
 
         # --- Buff check before farm series ---
         boost_needed = self._needs_exp_boost(profile) and not in_battle
@@ -464,11 +485,16 @@ class LevelingEngine:
         pending_hunt_mob: str,
         awaiting_turnin: bool,
         need_quest_unlock: bool,
+        blocked_npc_ids: Optional[set[str]] = None,
     ) -> Optional[GameOption]:
+        blocked = blocked_npc_ids or set()
         quest_opts = [
             o for o in options
-            if o.action in (ActionType.QUEST_NPC, ActionType.QUEST_TURNIN)
-            or o.goal == GoalKind.QUEST
+            if (
+                o.action in (ActionType.QUEST_NPC, ActionType.QUEST_TURNIN)
+                or o.goal == GoalKind.QUEST
+            )
+            and str((o.payload or {}).get("npc_id") or "") not in blocked
         ]
         if awaiting_turnin or need_quest_unlock:
             if quest_opts:

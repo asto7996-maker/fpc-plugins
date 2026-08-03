@@ -116,11 +116,189 @@ class QuestTracker:
         # After type=2 needs a hunt kill — remembered for brain / retry
         self._pending_type2: dict[str, str] = {}
         self.pending_hunt_mob: str = ""
+        # World objective after dialogue closes to area.php (heal wounded, gather, …)
+        # Survives clear_exhausted so we do not re-spam the same NPC.
+        self.pending_world_objective: dict[str, Any] = {}
+        self._world_objective_keys: set[str] = set()
+        self._world_obj_last_try: float = 0.0
 
     def clear_hunt_gate(self) -> None:
         """Clear quest kill gate after turn-in or travel unlock."""
         self.pending_hunt_mob = ""
         self._pending_type2 = {}
+
+    def clear_world_objective(self, reason: str = "") -> None:
+        if self.pending_world_objective:
+            logger.info(
+                "World objective cleared (%s): %s",
+                reason or "done",
+                self.pending_world_objective.get("kind"),
+            )
+        self.pending_world_objective = {}
+        self._world_objective_keys.clear()
+        self._world_obj_last_try = 0.0
+
+    def has_world_objective(self, kind: str = "") -> bool:
+        if not self.pending_world_objective:
+            return False
+        if kind:
+            return self.pending_world_objective.get("kind") == kind
+        return True
+
+    def world_objective_npc_ids(self) -> set[str]:
+        """NPC ids that must stay soft-banned while a world objective is active."""
+        out: set[str] = set()
+        npc = str((self.pending_world_objective or {}).get("npc_id") or "")
+        if npc:
+            out.add(npc)
+        for key in self._world_objective_keys:
+            parts = str(key).split(":")
+            if len(parts) >= 2 and parts[1]:
+                out.add(parts[1])
+        return out
+
+    @staticmethod
+    def detect_world_objective_kind(*texts: str) -> str:
+        """Infer world-objective kind from NPC dialogue snippets."""
+        blob = " ".join(str(t or "") for t in texts).lower()
+        if any(
+            kw in blob
+            for kw in (
+                "ранен", "излечен", "излечени", "снадоб", "раздал",
+                "ополчен", "поле боя",
+            )
+        ):
+            return "heal_wounded"
+        if any(kw in blob for kw in ("лав", "ведр", "собер", "добыч")):
+            return "gather"
+        return ""
+
+    def set_world_objective(
+        self,
+        *,
+        kind: str,
+        title: str = "",
+        npc_id: str = "",
+        artikul_id: str = "",
+        artifact_title: str = "",
+        quest_id: str = "",
+        area_id: str = "",
+        ban_key: str = "",
+        ban_sec: float = 1800.0,
+    ) -> None:
+        # World goals are outside dialogue — kill-gate / type=2 no longer apply.
+        self.clear_hunt_gate()
+        self.pending_world_objective = {
+            "kind": kind,
+            "title": title,
+            "npc_id": str(npc_id or ""),
+            "artikul_id": str(artikul_id or ""),
+            "artifact_title": artifact_title,
+            "quest_id": str(quest_id or ""),
+            "area_id": str(area_id or ""),
+            "set_at": time.time(),
+        }
+        if ban_key:
+            self._world_objective_keys.add(ban_key)
+            self._exhausted_dialogues.add(ban_key)
+            self._soft_ban_until[ban_key] = time.time() + max(120.0, ban_sec)
+        logger.warning(
+            "World objective SET kind=%s title=%r artikul=%s npc=%s ban=%ss",
+            kind, title, artikul_id or "—", npc_id or "—", int(ban_sec),
+        )
+
+    async def pursue_world_objective(self) -> bool:
+        """Attempt the active world objective once (rate-limited)."""
+        obj = self.pending_world_objective
+        if not obj:
+            return False
+        now = time.time()
+        if now - self._world_obj_last_try < 45.0:
+            return False
+        self._world_obj_last_try = now
+        kind = str(obj.get("kind") or "")
+        if kind == "heal_wounded":
+            return await self._try_heal_wounded(obj)
+        logger.info("World objective '%s' — no automated protocol yet.", kind)
+        return False
+
+    async def _try_heal_wounded(self, obj: dict[str, Any]) -> bool:
+        """Best-effort: use quest medicine on bots / via common USE."""
+        artikul = str(obj.get("artikul_id") or "18209")
+        art_id = ""
+        try:
+            bag = await self._client.get_bag()
+        except Exception as exc:
+            logger.debug("heal_wounded get_bag: %s", exc)
+            return False
+        for a in bag.get("artifact_list") or []:
+            if str(a.get("artikul_id") or "") == artikul:
+                art_id = str(a.get("id") or a.get("artifact_id") or "")
+                if not obj.get("artifact_title"):
+                    obj["artifact_title"] = str(a.get("title") or a.get("name") or "")
+                break
+        if not art_id:
+            logger.warning(
+                "heal_wounded: medicine artikul=%s not in bag — keep farming / wait.",
+                artikul,
+            )
+            return False
+
+        attempts: list[tuple[str, dict[str, Any]]] = [
+            ("USE", {"artifact_id": art_id}),
+            ("DRINK", {"artifact_id": art_id}),
+        ]
+        try:
+            st = await self._client.get_state()
+            bots = await self._client.get_hunt_bots(st.area_id or obj.get("area_id") or "")
+        except Exception:
+            bots = []
+        for bot in bots[:6]:
+            bid = str(bot.get("id") or "")
+            if not bid:
+                continue
+            name = str(bot.get("name") or "")
+            # Prefer non-aggressive / wounded-looking targets if labeled
+            attempts.append((
+                "USE",
+                {
+                    "artifact_id": art_id,
+                    "object_class": "BOT",
+                    "object_id": bid,
+                    "bot_id": bid,
+                },
+            ))
+            logger.debug("heal target candidate bot=%s %s", bid, name[:40])
+
+        for code, extra in attempts:
+            try:
+                resp = await self._client.common_action(code, extra)
+            except Exception as exc:
+                logger.debug("heal_wounded %s failed: %s", code, exc)
+                continue
+            err = str(resp.error or getattr(resp, "redirect_error", "") or "")
+            logger.info(
+                "heal_wounded %s %s → status=%s err=%s",
+                code, {k: extra[k] for k in extra if k != "artifact_id"},
+                resp.status, (err or "—")[:80],
+            )
+            if resp.status == STATUS_OK and not (
+                err and err.lower() not in ("false", "none", "")
+                and "не задано" in err.lower()
+            ):
+                # Ambiguous OK without error — treat as progress signal
+                if not err or err.lower() in ("false", "none", ""):
+                    logger.warning("heal_wounded: USE accepted — clearing objective.")
+                    self.clear_world_objective("medicine_used")
+                    return True
+            await asyncio.sleep(random.uniform(0.3, 0.7))
+
+        logger.info(
+            "heal_wounded: HTTP USE not accepted yet (Flash-only?). "
+            "NPC %s stays banned; farming until turn-in possible.",
+            obj.get("npc_id") or "?",
+        )
+        return False
 
     def has_pending_type2(self) -> bool:
         return bool(self._pending_type2)
@@ -309,16 +487,29 @@ class QuestTracker:
     def _reset_exhausted_if_quests_changed(self, quests: list[Quest]) -> None:
         sig = "|".join(sorted(f"{q.quest_id}:{q.status.name}" for q in quests))
         if sig != self._last_quest_signature:
-            if self._exhausted_dialogues:
-                logger.debug("Quest state changed — re-enabling NPC dialogues.")
-            self._exhausted_dialogues.clear()
+            preserve = set(self._world_objective_keys)
+            if self._exhausted_dialogues - preserve:
+                logger.debug(
+                    "Quest state changed — re-enabling NPC dialogues "
+                    "(kept %d world-objective bans).",
+                    len(preserve),
+                )
+            self._exhausted_dialogues = set(preserve)
             self._visited_npcs.clear()
+            self._soft_ban_until = {
+                k: v for k, v in self._soft_ban_until.items() if k in preserve
+            }
             self._last_quest_signature = sig
 
     def _purge_expired_soft_bans(self) -> None:
         now = time.time()
         expired = [k for k, until in self._soft_ban_until.items() if until <= now]
         for k in expired:
+            # Keep world-objective bans alive while the objective is pending
+            if k in self._world_objective_keys and self.pending_world_objective:
+                self._soft_ban_until[k] = now + 900.0
+                self._exhausted_dialogues.add(k)
+                continue
             self._soft_ban_until.pop(k, None)
             self._exhausted_dialogues.discard(k)
             # Allow retrying the type=2 message after soft ban
@@ -336,6 +527,7 @@ class QuestTracker:
             parts = str(key).split(":")
             if len(parts) >= 2 and parts[1]:
                 out.add(parts[1])
+        out.update(self.world_objective_npc_ids())
         return out
 
     def mark_npc_exhausted(
@@ -351,20 +543,30 @@ class QuestTracker:
         self._soft_ban_until.setdefault(key, time.time() + 180.0)
 
     def clear_exhausted(self, *, local_only: bool = False) -> int:
-        """Re-enable NPC dialogues. Returns how many keys were cleared."""
+        """Re-enable NPC dialogues. Returns how many keys were cleared.
+
+        Keys tied to an active ``pending_world_objective`` are preserved so
+        the bot does not re-enter the same NPC dialogue loop (e.g. heal wounded).
+        """
+        preserve = set(self._world_objective_keys)
         if not local_only:
-            n = len(self._exhausted_dialogues)
-            self._exhausted_dialogues.clear()
+            n = len(self._exhausted_dialogues - preserve)
+            self._exhausted_dialogues = set(preserve)
             self._answered_points.clear()
-            self._soft_ban_until.clear()
+            self._soft_ban_until = {
+                k: v for k, v in self._soft_ban_until.items() if k in preserve
+            }
             return n
-        keep = {k for k in self._exhausted_dialogues if str(k).startswith("1:")}
+        # local_only: drop local (global_npc=0) keys except world-objective bans
+        keep = {
+            k for k in self._exhausted_dialogues
+            if str(k).startswith("1:") or k in preserve
+        }
         n = len(self._exhausted_dialogues) - len(keep)
         self._exhausted_dialogues = keep
         self._soft_ban_until = {
             k: v for k, v in self._soft_ban_until.items() if k in keep
         }
-        # Allow local message answers again
         self._answered_points.clear()
         return n
 
@@ -664,13 +866,40 @@ class QuestTracker:
                     self.clear_hunt_gate()
                     if quest_id:
                         self.session.quests_accepted += 1
-                    # Dialogue closed to area → objective is active (e.g. лава)
+                    # Dialogue closed to area → objective is active (e.g. лава / раненые)
                     if last_redir and "npc.php" not in last_redir.lower():
-                        self._exhausted_dialogues.add(key)
-                        self._soft_ban_until[key] = time.time() + 120.0
+                        kind = self.detect_world_objective_kind(
+                            title, desc, child_title, str(child.get("message") or ""),
+                        )
+                        if kind == "heal_wounded":
+                            self.set_world_objective(
+                                kind=kind,
+                                title=str(title or "Излечение ополченцев"),
+                                npc_id=str(npc_id),
+                                artikul_id="18209",
+                                artifact_title="Деревенское снадобье",
+                                quest_id=str(quest_id or ""),
+                                area_id=str(area_id or ""),
+                                ban_key=key,
+                                ban_sec=1800.0,
+                            )
+                        elif kind:
+                            self.set_world_objective(
+                                kind=kind,
+                                title=str(title or ""),
+                                npc_id=str(npc_id),
+                                quest_id=str(quest_id or ""),
+                                area_id=str(area_id or ""),
+                                ban_key=key,
+                                ban_sec=900.0,
+                            )
+                        else:
+                            self._exhausted_dialogues.add(key)
+                            self._soft_ban_until[key] = time.time() + 180.0
                         logger.info(
-                            "Квест принят / диалог закрыт → %s (выполняю цель в мире).",
+                            "Квест принят / диалог закрыт → %s (цель в мире%s).",
                             last_redir.split("?")[0],
+                            f"={kind}" if kind else "",
                         )
                         return steps
                     # Still on NPC — refresh JSON view and continue
