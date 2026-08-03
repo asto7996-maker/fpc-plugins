@@ -223,6 +223,11 @@ class DwarBot:
         if bt and mob_name and not bt.mob_name:
             bt.mob_name = mob_name
         if bt and notify and self.settings.notify.battles:
+            wo = self.quests.pending_world_objective or {}
+            # Flash-only heal wait: hunting does not progress quest — mute battle spam
+            if wo.get("flash_only"):
+                logger.debug("battle TG muted (flash_only world objective)")
+                return
             await self.rich.notify_battle_finished(bt)
 
     def _telemetry_quest_begin(self, title: str, *, npc_id: str = "") -> None:
@@ -923,6 +928,7 @@ class DwarBot:
             ),
             in_battle=in_battle,
             world_objective_kind=str(wo.get("kind") or ""),
+            world_objective_flash_only=bool(wo.get("flash_only")),
             blocked_npc_ids=self.quests.world_objective_npc_ids(),
         )
         await self.leveling.apply(decision)
@@ -934,6 +940,7 @@ class DwarBot:
                 or ov.score >= (snap.focus.score - 50)
                 or decision.directive.priority <= 1
                 or decision.boost_needed
+                or getattr(decision.progress, "mode", "") == "world_objective"
             ):
                 snap.focus = ov
                 snap.now = f"Level-Up: {ov.title}"
@@ -1086,7 +1093,11 @@ class DwarBot:
                         for c in active_cd[:3]
                     ),
                 )
-            await _sleep(8.0, 18.0)
+            wo = self.quests.pending_world_objective or {}
+            if wo.get("flash_only"):
+                await _sleep(120.0, 240.0)
+            else:
+                await _sleep(8.0, 18.0)
 
     async def admin_diagnose(self) -> str:
         """Full diagnostic dump for Telegram /diagnose."""
@@ -1263,6 +1274,14 @@ class DwarBot:
 
         try:
             if action == ActionType.HUNT_MOB:
+                wo = self.quests.pending_world_objective or {}
+                if wo.get("flash_only"):
+                    logger.info(
+                        "Hunt skipped — flash_only '%s' (снадобье только в клиенте).",
+                        wo.get("kind"),
+                    )
+                    await _sleep(45.0, 90.0)
+                    return True
                 mob_name = str(payload.get("name") or self.brain.pending_hunt_mob or "")
                 self._telemetry_battle_begin(source="hunt", mob_name=mob_name)
                 if self.brain.pending_hunt_mob or self.quests.pending_hunt_mob:
@@ -1618,6 +1637,14 @@ class DwarBot:
                 return True
 
             if action == ActionType.IDLE:
+                wo = self.quests.pending_world_objective or {}
+                if wo.get("flash_only"):
+                    logger.info(
+                        "Idle 3–5 мин — мир-цель '%s' ждёт Flash/клик по раненым.",
+                        wo.get("kind"),
+                    )
+                    await _sleep(180.0, 300.0)
+                    return True
                 return False
 
         except TokenExpiredError:

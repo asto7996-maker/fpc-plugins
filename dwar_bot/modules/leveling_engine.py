@@ -284,6 +284,7 @@ class LevelingEngine:
         need_quest_unlock: bool = False,
         in_battle: bool = False,
         world_objective_kind: str = "",
+        world_objective_flash_only: bool = False,
         blocked_npc_ids: Optional[set[str]] = None,
     ) -> LevelingDecision:
         char = profile.char
@@ -302,7 +303,7 @@ class LevelingEngine:
             awaiting_turnin = False
             need_quest_unlock = False
             pending_hunt_mob = ""
-            # Drop junk global NPC options + demote endless hunt while Flash goal is open
+            # Drop junk global NPC options; Flash-only → NO hunt storm at all
             filtered: list[GameOption] = []
             for o in options:
                 title_l = (o.title or "").lower()
@@ -316,27 +317,52 @@ class LevelingEngine:
                 ):
                     continue
                 if o.action == ActionType.HUNT_MOB:
-                    o.score = min(float(o.score), 180.0)
+                    if world_objective_flash_only:
+                        # Medicine is Flash/canvas — hunting Крэтс does not advance quest
+                        continue
+                    o.score = min(float(o.score), 120.0)
                     o.detail = f"world_obj cap · {o.detail}"
+                if o.action == ActionType.TRAVEL and world_objective_flash_only:
+                    # Village exit gated until war-chief order after heal
+                    o.score = min(float(o.score), 40.0)
+                    o.detail = f"blocked until heal · {o.detail}"
+                if o.action == ActionType.COMBAT_FRONT and world_objective_flash_only:
+                    o.score = min(float(o.score), 30.0)
                 filtered.append(o)
             options = filtered
-            # Prefer area hotspot / idle over farm override
+            # Prefer area hotspot; else long idle (not hunt)
             area_opt = next(
                 (
                     o for o in options
-                    if o.action in (ActionType.COMBAT_AREA, ActionType.AREA_ACTION, ActionType.USE_ITEM)
+                    if o.action in (
+                        ActionType.COMBAT_AREA, ActionType.AREA_ACTION, ActionType.USE_ITEM,
+                    )
+                    and float(o.score) >= 50
                 ),
                 None,
             )
             idle_opt = next((o for o in options if o.action == ActionType.IDLE), None)
-            focus_wo = area_opt or idle_opt or next(
-                (o for o in options if o.action == ActionType.HUNT_MOB), None,
-            )
+            if idle_opt is None:
+                idle_opt = GameOption(
+                    ActionType.IDLE,
+                    title="Ждать (мир-цель Flash)",
+                    score=900.0 if world_objective_flash_only else 50.0,
+                    detail="heal_wounded flash-only — no hunt spam",
+                    goal=GoalKind.IDLE,
+                )
+            elif world_objective_flash_only:
+                idle_opt.score = 900.0
+                idle_opt.title = "Ждать снадобье / Flash"
+                idle_opt.detail = "HTTP USE недоступен — пауза вместо охоты"
+            focus_wo = area_opt or idle_opt
             directive = StrategicDirective(
                 state=BotState.FARMING,
                 priority=2,
                 title=f"Мир-цель: {world_objective_kind}",
-                reason=f"P2-world: {world_objective_kind} (no junk NPC / capped hunt)",
+                reason=(
+                    f"P2-world: {world_objective_kind}"
+                    + (" FLASH-idle" if world_objective_flash_only else " capped")
+                ),
                 area_id=area_id,
                 exp_per_hour=self.progress.exp_per_hour,
             )
@@ -346,7 +372,10 @@ class LevelingEngine:
                 directive=directive,
                 focus_override=focus_wo,
                 progress=self.progress,
-                notes=notes + ["priority=WORLD_OBJECTIVE"],
+                notes=notes + [
+                    "priority=WORLD_OBJECTIVE",
+                    "flash_only" if world_objective_flash_only else "http",
+                ],
             )
 
         # --- Priority 1: urgent / doable quests ---

@@ -17,13 +17,16 @@ def test_junk_npc_blacklist_in_brain():
 def test_leveling_world_objective_early_return():
     src = (ROOT / "modules" / "leveling_engine.py").read_text(encoding="utf-8")
     assert "priority=WORLD_OBJECTIVE" in src
-    assert "world_obj cap" in src
+    assert "FLASH-idle" in src or "flash_only" in src
+    assert "world_objective_flash_only" in src
 
 
-def test_local_recover_respects_world_objective():
-    src = (ROOT / "main.py").read_text(encoding="utf-8")
-    assert "no hunt storm" in src
-    assert "Intentional skip" in src or "Intentional world-objective" in src
+def test_flash_only_mutes_hunt_and_battle_tg():
+    main = (ROOT / "main.py").read_text(encoding="utf-8")
+    assert "battle TG muted (flash_only world objective)" in main
+    assert "Hunt skipped — flash_only" in main
+    assert "Idle 3–5 мин" in main
+    assert "no hunt storm" in main
 
 
 def test_heal_wounded_flash_cooldown():
