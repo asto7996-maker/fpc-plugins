@@ -234,9 +234,10 @@ class ProgressionBrain:
         self.farm_push_until = 0.0
 
     def clear_hunt_gate(self) -> None:
-        """Quest kill gate cleared (dialogue advanced or travel unlocked)."""
+        """Quest kill gate cleared (dialogue advanced, world objective, or travel unlocked)."""
         self.pending_hunt_mob = ""
         self.awaiting_quest_turnin = False
+        self.need_quest_unlock = False
         self._hunt_streak = 0
 
     def empty_streak(self, name: str) -> int:

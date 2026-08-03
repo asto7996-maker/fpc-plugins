@@ -81,6 +81,10 @@ class CombatEngine:
         self._stats = stats
         self.session = BattleStats()
         self._fight = FightClient(client)
+        # Serialize hunt/finish so Local recover / fight-first cannot open
+        # a second WebSocket on the same fight (hangs: no ATTACKNOW / no win).
+        self._fight_lock = asyncio.Lock()
+        self._fight_busy = False
 
     # ------------------------------------------------------------------
     # State detection
@@ -480,6 +484,13 @@ class CombatEngine:
 
     async def finish_fight(self, *, timeout: float = 180.0) -> BattleResult:
         """Complete the current fight over wsproxy. Returns WIN/LOSE/ONGOING/ERROR."""
+        if self._fight_lock.locked() and self._fight_busy:
+            logger.info("finish_fight: бой уже ведётся другим таском — жду lock.")
+        async with self._fight_lock:
+            return await self._finish_fight_unlocked(timeout=timeout)
+
+    async def _finish_fight_unlocked(self, *, timeout: float = 180.0) -> BattleResult:
+        self._fight_busy = True
         try:
             outcome: FightOutcome = await self._fight.complete_current_fight(
                 timeout=timeout,
@@ -504,6 +515,8 @@ class CombatEngine:
         except Exception as exc:
             logger.warning("finish_fight error: %s", exc)
             return BattleResult.ERROR
+        finally:
+            self._fight_busy = False
 
     async def try_hunt_attack(
         self,
@@ -517,9 +530,27 @@ class CombatEngine:
 
         For quest «Проба сил» use name_substr='крэтс'.
         """
+        if self._fight_lock.locked() and self._fight_busy:
+            logger.info(
+                "try_hunt_attack: бой уже идёт — жду завершения вместо второго WS."
+            )
+        async with self._fight_lock:
+            return await self._try_hunt_attack_unlocked(
+                name_substr=name_substr,
+                artikul_id=artikul_id,
+                area_id=area_id,
+            )
+
+    async def _try_hunt_attack_unlocked(
+        self,
+        *,
+        name_substr: str = "",
+        artikul_id: str = "",
+        area_id: str = "",
+    ) -> BattleResult:
         try:
             if await self.is_in_battle():
-                return await self.finish_fight()
+                return await self._finish_fight_unlocked()
 
             bots = await self._client.get_hunt_bots(area_id=area_id, free_only=True)
             if not bots:
@@ -573,17 +604,30 @@ class CombatEngine:
 
             await asyncio.sleep(random.uniform(0.6, 1.4))
             if not await self.is_in_battle():
-                # redirect to fight.php is also a signal
+                # Server may enter fight despite a soft error text
                 redir = str(resp.redirect_url or "")
-                if "fight" not in redir.lower():
-                    if err and "напад" in err.lower():
-                        return BattleResult.ERROR
+                err_l = err.lower()
+                if "fight" in redir.lower() or "бой" in err_l or "сражен" in err_l:
+                    logger.info(
+                        "ATTACK_BOT soft-miss but fight signals present — finish_fight."
+                    )
+                elif err and (
+                    "нельзя" in err_l
+                    or "напад" in err_l
+                    or "занят" in err_l
+                ):
+                    # Already fighting / action blocked — recheck once
+                    await asyncio.sleep(0.8)
+                    if await self.is_in_battle():
+                        return await self._finish_fight_unlocked()
+                    return BattleResult.ERROR
+                else:
                     return BattleResult.NO_BATTLE
 
             self.session.battles_joined += 1
             self.session.consecutive_battles += 1
             self.session.attacks_made += 1
-            result = await self.finish_fight()
+            result = await self._finish_fight_unlocked()
             if result == BattleResult.WIN:
                 return BattleResult.WIN
             if result == BattleResult.LOSE:

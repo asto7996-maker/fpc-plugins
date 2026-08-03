@@ -161,6 +161,7 @@ class FightClient:
         timeout: float = 180.0,
         hit_zone: int = MIDDLE_ATTACK_ID,
     ) -> FightOutcome:
+        # FIGHT_WS_SERIAL_V1 — one reconnect if WS drops mid-fight
         st = await self._client.get_state()
         if not st.fight_id:
             return FightOutcome(error="not in fight")
@@ -168,7 +169,39 @@ class FightClient:
         vars_ = conf.get("swf_fight_vars") or {}
         if not vars_:
             return FightOutcome(error="no fight conf vars")
-        return await self.run_fight(vars_, timeout=timeout, hit_zone=hit_zone)
+
+        last = FightOutcome(error="fight not started")
+        attempts = 2
+        per_try = max(45.0, float(timeout) / attempts)
+        for attempt in range(1, attempts + 1):
+            last = await self.run_fight(
+                vars_, timeout=per_try, hit_zone=hit_zone,
+            )
+            if last.finished:
+                return last
+            # Left the fight somehow (server ended it)
+            try:
+                st2 = await self._client.get_state()
+                if not st2.fight_id:
+                    last.finished = True
+                    last.won = True
+                    last.error = ""
+                    return last
+            except Exception:
+                pass
+            if attempt < attempts:
+                logger.warning(
+                    "Fight WS attempt %d/%d failed (%s) — reconnect…",
+                    attempt, attempts, last.error or "no finish",
+                )
+                await asyncio.sleep(1.0)
+                # Refresh fight vars for new akey / url_finish
+                try:
+                    conf = await self._client.get_fight_conf(st.fight_id)
+                    vars_ = conf.get("swf_fight_vars") or vars_
+                except Exception as exc:
+                    logger.debug("refresh fight conf: %s", exc)
+        return last
 
     async def run_fight(
         self,
@@ -194,6 +227,7 @@ class FightClient:
 
         ws_url = f"wss://{ws_host}"
         outcome = FightOutcome(url_finish=url_finish)
+        our_team_win: Optional[int] = None
         cookie_hdr = "; ".join(
             f"{k}={v}" for k, v in (self._client._session or {}).items() if v
         )
@@ -216,6 +250,9 @@ class FightClient:
             connect_kwargs: dict[str, Any] = {
                 "open_timeout": 15,
                 "max_size": 2**22,
+                "ping_interval": 20,
+                "ping_timeout": 20,
+                "close_timeout": 5,
             }
             try:
                 import inspect
@@ -249,18 +286,21 @@ class FightClient:
                 await self._send_pak(ws, pack_params([(0, PT_INT, FS_SCCL_STATE)]))
 
                 deadline = asyncio.get_event_loop().time() + timeout
-                our_team_win: Optional[int] = None
                 idle_attacks = 0
+                last_progress = asyncio.get_event_loop().time()
+                inited = False
 
                 while asyncio.get_event_loop().time() < deadline:
                     try:
-                        raw = await asyncio.wait_for(ws.recv(), timeout=8.0)
+                        raw = await asyncio.wait_for(ws.recv(), timeout=5.0)
                     except asyncio.TimeoutError:
-                        # Nudge state / opportunistic attack if turn stalled
+                        now = asyncio.get_event_loop().time()
+                        # Stall: INIT OK but no ATTACKNOW for too long → nudge hard
+                        stalled = (now - last_progress) > 25.0
                         await self._send_pak(
                             ws, pack_params([(0, PT_INT, FS_SCCL_STATE)])
                         )
-                        if idle_attacks < 3:
+                        if idle_attacks < (8 if stalled else 4):
                             await self._send_pak(
                                 ws,
                                 pack_params([
@@ -271,6 +311,16 @@ class FightClient:
                             )
                             outcome.attacks += 1
                             idle_attacks += 1
+                            if stalled and idle_attacks % 3 == 0:
+                                # Skip turn to unstick server turn state
+                                await self._send_pak(
+                                    ws,
+                                    pack_params([(0, PT_INT, FS_SCCL_SKIP_TURN)]),
+                                )
+                                logger.warning(
+                                    "Fight stall nudge: attacks=%d idle=%.0fs",
+                                    outcome.attacks, now - last_progress,
+                                )
                         continue
 
                     for frame in self._iter_frames(raw):
@@ -291,6 +341,7 @@ class FightClient:
                                 )
                                 outcome.attacks += 1
                                 idle_attacks = 0
+                                last_progress = asyncio.get_event_loop().time()
                                 logger.info(
                                     "Fight: ATTACKNOW → hit zone=%s (#%d)",
                                     hit_zone, outcome.attacks,
@@ -306,9 +357,12 @@ class FightClient:
                                 break
                             elif ev in (FS_PE_ATTACKWAIT, FS_PE_ATTACK, FS_PE_ATTACKTIMEOUT):
                                 idle_attacks = 0
+                                last_progress = asyncio.get_event_loop().time()
                         elif cmd == FS_SCCL_INIT:
                             # status in vals[1]; 0 == OK
                             status = vals[1] if len(vals) > 1 else None
+                            inited = True
+                            last_progress = asyncio.get_event_loop().time()
                             logger.info("Fight: INIT status=%s", status)
                             if status not in (0, "0", None) and status not in (0,):
                                 # -5 = NO_AUTH etc.
@@ -319,9 +373,17 @@ class FightClient:
                         break
                 else:
                     outcome.error = "fight timeout"
+                    if inited and outcome.attacks == 0:
+                        logger.warning(
+                            "Fight timeout with 0 attacks after INIT — likely hang."
+                        )
         except Exception as exc:
             logger.warning("Fight WS error: %s", exc)
-            return FightOutcome(error=str(exc), url_finish=url_finish)
+            return FightOutcome(
+                error=str(exc),
+                url_finish=url_finish,
+                attacks=outcome.attacks,
+            )
 
         if outcome.finished and url_finish:
             try:
@@ -330,6 +392,14 @@ class FightClient:
                 logger.info("Fight finish URL hit: %s", path[:80])
             except Exception as exc:
                 logger.debug("fight_finish: %s", exc)
+        elif outcome.error and url_finish and outcome.attacks > 0:
+            # Best-effort settle after WS drop mid-fight
+            try:
+                path = url_finish if url_finish.startswith("/") else "/" + url_finish
+                await self._client._get(path)
+                logger.info("Fight finish URL after WS error: %s", path[:80])
+            except Exception:
+                pass
 
         # Confirm we left the fight
         try:
@@ -337,6 +407,7 @@ class FightClient:
             if not st.fight_id:
                 outcome.finished = True
                 outcome.won = True if our_team_win in (None, 1) else bool(outcome.won)
+                outcome.error = ""
             elif outcome.finished:
                 outcome.won = our_team_win == 1
         except Exception:

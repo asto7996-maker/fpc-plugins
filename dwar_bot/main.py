@@ -1134,6 +1134,12 @@ class DwarBot:
     async def _local_recover_stagnation(self, focus_key: str) -> bool:
         """Break stuck loops → hunt kill / farm. Prefer quest mob over fronts."""
         logger.warning("Local recover for stagnation: %s → hunt/farm", focus_key)
+        # Never open a parallel fight WS while the main tick is mid-combat
+        if getattr(self.combat, "_fight_busy", False):
+            logger.info(
+                "Local recover: бой уже идёт (_fight_busy) — не стартую второй WS."
+            )
+            return False
         self.brain.push_farm(600.0)
         if "расселин" in focus_key.lower() or "combat_area" in focus_key.lower():
             self.brain.mark_cooldown("Расселина", 180)
@@ -1145,11 +1151,15 @@ class DwarBot:
                 return True
         # Newbie unlock: kill Крэтс on hunt_farm
         if self.settings.farm.farm_area and self.settings.farm.auto_combat:
-            mob = (
-                self.brain.pending_hunt_mob
-                or self.quests.pending_hunt_mob
-                or ("Крэтс" if self.brain.need_quest_unlock else "")
-            )
+            # World objective / no live type=2 gate → light farm only, not forced Крэтс
+            if self.quests.has_world_objective():
+                mob = ""
+            else:
+                mob = (
+                    self.brain.pending_hunt_mob
+                    or self.quests.pending_hunt_mob
+                    or ("Крэтс" if self.brain.need_quest_unlock else "")
+                )
             result = await self.combat.try_hunt_attack(name_substr=mob)
             if result in (
                 BattleResult.WIN, BattleResult.JOINED,
