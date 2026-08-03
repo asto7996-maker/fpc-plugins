@@ -269,8 +269,11 @@ class AutoCoder:
     def _lock_flash_objective_state(self) -> bool:
         """Patch persisted world_objective so the running bot stops USE probes."""
         candidates = [
+            self.repo_root / "dwar_bot" / "state.json",
             self.repo_root / "dwar_bot" / "data" / "state.json",
+            PKG_ROOT / "state.json",
             PKG_ROOT / "data" / "state.json",
+            Path("/root/dwar_bot/state.json"),
             Path("/root/dwar_bot/data/state.json"),
         ]
         try:

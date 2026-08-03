@@ -220,6 +220,11 @@ class QuestTracker:
         wo = dict(self.pending_world_objective or {})
         if not wo or str(wo.get("kind") or "") != "heal_wounded":
             return False
+        now = time.time()
+        already = bool(wo.get("flash_only") and wo.get("http_impossible"))
+        prev_until = float(wo.get("protocol_fail_until") or 0)
+        if already and prev_until > now + 3600.0:
+            return False  # locked solid — no log spam
         changed = False
         if not wo.get("flash_only"):
             wo["flash_only"] = True
@@ -227,8 +232,7 @@ class QuestTracker:
         if not wo.get("http_impossible"):
             wo["http_impossible"] = True
             changed = True
-        until = time.time() + max(3600.0, float(cooldown_sec))
-        prev_until = float(wo.get("protocol_fail_until") or 0)
+        until = now + max(3600.0, float(cooldown_sec))
         if until > prev_until:
             wo["protocol_fail_until"] = until
             changed = True
