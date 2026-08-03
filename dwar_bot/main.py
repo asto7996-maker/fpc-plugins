@@ -1124,8 +1124,23 @@ class DwarBot:
             brain = snap.focus
             # Under world_objective farm_open: keep brain GEAR/QUEST if they beat farm override
             keep_brain = False
+            flash_locked = bool(
+                wo.get("kind") == "heal_wounded"
+                and (wo.get("flash_only") or wo.get("http_impossible"))
+            )
+            brain_npc = ""
+            if brain is not None and brain.action == ActionType.QUEST_NPC:
+                brain_npc = str((brain.payload or {}).get("npc_id") or "")
+            skip_keep_quest = bool(
+                flash_locked
+                and brain is not None
+                and brain.action == ActionType.QUEST_NPC
+                and brain_npc
+                and brain_npc in self.quests.world_objective_npc_ids()
+            )
             if (
                 brain is not None
+                and not skip_keep_quest
                 and getattr(decision.progress, "mode", "") == "world_objective"
                 and brain.action in (
                     ActionType.EQUIP,
