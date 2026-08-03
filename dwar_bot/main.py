@@ -1074,6 +1074,14 @@ class DwarBot:
                     await self.notify(f"⚔️ Бой через <b>{name}</b>!", "battles")
                     await _sleep(3.0, 6.0)
                     return True
+                if loot_n > 0:
+                    # Quest gather (e.g. ведро лавы) — return to story NPC ASAP
+                    self.quests.clear_exhausted(local_only=True)
+                    self.brain.pending_hunt_mob = ""
+                    self.brain.mark_hunt_kill_done()  # reuse turn-in priority
+                    logger.info("📦 Добыча с точки — сдаём сюжетному NPC.")
+                    await _sleep(1.0, 2.0)
+                    return True
                 # Empty / flavor-only → escalate CD (stop Расселина spam)
                 if loot_n <= 0:
                     streak = self.brain.empty_streak(name) + 1  # note_result runs after

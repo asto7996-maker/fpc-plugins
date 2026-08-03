@@ -167,7 +167,10 @@ class ApiResponse:
         lines: list[str] = []
         for b in self.bonus_text or []:
             if isinstance(b, str) and b.strip():
-                lines.append(b.strip())
+                # Strip simple HTML tags for logs/Telegram
+                clean = re.sub(r"<[^>]+>", "", b).strip()
+                if clean:
+                    lines.append(clean)
             elif isinstance(b, dict):
                 t = b.get("text") or b.get("title") or b.get("bonus_text") or ""
                 if t:
@@ -176,10 +179,26 @@ class ApiResponse:
             if not isinstance(m, dict):
                 continue
             kind = str(m.get("type") or m.get("name") or m.get("macro") or "").upper()
-            title = m.get("title") or m.get("artikul_title") or m.get("text") or ""
-            artikul = m.get("artikul") or m.get("art_id") or m.get("id") or ""
+            data = m.get("data") if isinstance(m.get("data"), dict) else {}
+            title = (
+                m.get("title")
+                or m.get("artikul_title")
+                or m.get("text")
+                or data.get("title")
+                or ""
+            )
+            artikul = (
+                m.get("artikul")
+                or m.get("art_id")
+                or m.get("id")
+                or data.get("artikul_id")
+                or ""
+            )
+            num = data.get("num") or m.get("num") or ""
             if "ARTIFACT" in kind or title:
                 label = str(title or artikul or kind).strip()
+                if num:
+                    label = f"{label} ×{num}"
                 if label:
                     lines.append(f"ARTIFACT: {label}")
         return lines
@@ -720,12 +739,27 @@ class DwarGameClient:
         bonus = inner.get("bonus_text", []) or []
         if not bonus and isinstance(data, dict):
             bonus = data.get("bonus_text", []) or []
-        macros = inner.get("macros", []) or inner.get("macro_list", []) or []
-        if not macros and isinstance(data, dict):
-            macros = data.get("macros", []) or data.get("macro_list", []) or []
-        # Some actions nest macros under redirect / awards
-        if not macros and isinstance(inner.get("awards"), list):
-            macros = inner.get("awards") or []
+        macros: list = []
+        for src in (inner, data if isinstance(data, dict) else {}):
+            if not isinstance(src, dict):
+                continue
+            for key_m in ("macros", "macro_list", "macros_list", "awards"):
+                raw_m = src.get(key_m)
+                if isinstance(raw_m, list) and raw_m:
+                    macros = list(raw_m)
+                    break
+                if isinstance(raw_m, dict) and raw_m:
+                    # HTML/Flash often returns {MCR…: {name, data}}
+                    macros = []
+                    for mid, meta in raw_m.items():
+                        if isinstance(meta, dict):
+                            row = dict(meta)
+                            row.setdefault("id", mid)
+                            macros.append(row)
+                    if macros:
+                        break
+            if macros:
+                break
 
         return ApiResponse(
             status=int(inner.get("status", 0) or 0),
