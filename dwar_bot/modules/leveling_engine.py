@@ -331,13 +331,19 @@ class LevelingEngine:
                     ActionType.COMBAT_AREA,
                     ActionType.AREA_ACTION,
                 ):
-                    continue
+                    if flash_open:
+                        # Loot points OK at Lv3+ — capped so they don't spam over story/gear
+                        o.score = min(max(float(o.score), 380.0), 560.0)
+                        o.detail = f"lv{level} loot · {o.detail}"
+                    else:
+                        continue
                 if o.action == ActionType.HUNT_MOB:
                     if world_objective_flash_only and not flash_open:
                         o.score = min(max(float(o.score), 200.0), 350.0)
                         o.detail = f"flash wait · hunt ok · {o.detail}"
                     elif flash_open:
-                        o.score = min(max(float(o.score), 420.0), 700.0)
+                        # Cap hunt so EQUIP/QUEST/loot can win the tick
+                        o.score = min(max(float(o.score), 300.0), 480.0)
                         o.detail = f"lv{level} farm · {o.detail}"
                     else:
                         o.score = min(float(o.score), 120.0)
@@ -358,6 +364,16 @@ class LevelingEngine:
                         o.score = max(float(o.score), 300.0)
                     else:
                         o.score = min(float(o.score), 30.0)
+                if flash_open and o.action == ActionType.EQUIP:
+                    o.score = max(float(o.score), 940.0)
+                    o.detail = f"lv{level} gear · {o.detail}"
+                if flash_open and o.action == ActionType.REPAIR:
+                    o.score = max(float(o.score), 920.0)
+                    o.detail = f"lv{level} gear · {o.detail}"
+                if flash_open and o.action == ActionType.QUEST_NPC:
+                    # Local story (Вождь / Военачальник) — keep competitive vs hunt
+                    o.score = min(max(float(o.score), 700.0), 980.0)
+                    o.detail = f"lv{level} story · {o.detail}"
                 filtered.append(o)
             options = filtered
             idle_opt = next((o for o in options if o.action == ActionType.IDLE), None)
@@ -383,22 +399,28 @@ class LevelingEngine:
                 if flash_open:
                     idle_opt.score = min(float(idle_opt.score), 80.0)
                     idle_opt.title = "Пауза (Flash side-quest)"
-                    idle_opt.detail = "lv3+ — охота/выход важнее idle"
+                    idle_opt.detail = "lv3+ — сюжет/экип/охота важнее idle"
                 else:
                     idle_opt.score = max(float(idle_opt.score), 150.0)
                     idle_opt.title = "Ждать снадобье / Flash"
                     idle_opt.detail = "HTTP USE недоступен — охота или пауза"
-            hunt_opt = None
-            hunt_candidates = [o for o in options if o.action == ActionType.HUNT_MOB]
-            if hunt_candidates:
-                hunt_opt = max(hunt_candidates, key=lambda o: float(o.score))
-            travel_opt = None
-            travel_candidates = [o for o in options if o.action == ActionType.TRAVEL]
-            if travel_candidates:
-                travel_opt = max(travel_candidates, key=lambda o: float(o.score))
+
+            def _best(*acts: ActionType) -> Optional[GameOption]:
+                cands = [o for o in options if o.action in acts]
+                return max(cands, key=lambda o: float(o.score)) if cands else None
+
+            hunt_opt = _best(ActionType.HUNT_MOB)
+            travel_opt = _best(ActionType.TRAVEL)
+            gear_opt = _best(ActionType.EQUIP, ActionType.REPAIR)
+            quest_opt_wo = _best(ActionType.QUEST_NPC)
+            loot_opt = _best(ActionType.COMBAT_AREA, ActionType.AREA_ACTION)
 
             if world_objective_flash_only and flash_open:
-                candidates = [c for c in (travel_opt, hunt_opt, idle_opt) if c]
+                candidates = [
+                    c for c in (
+                        gear_opt, quest_opt_wo, loot_opt, travel_opt, hunt_opt, idle_opt,
+                    ) if c
+                ]
                 focus_wo = max(candidates, key=lambda o: float(o.score))
             elif world_objective_flash_only:
                 focus_wo = hunt_opt or idle_opt
@@ -415,10 +437,18 @@ class LevelingEngine:
                     ),
                     None,
                 )
-                focus_wo = area_opt or idle_opt
+                focus_wo = gear_opt or quest_opt_wo or area_opt or idle_opt
             reason_tag = " capped"
             if world_objective_flash_only and flash_open:
-                if focus_wo and focus_wo.action == ActionType.TRAVEL:
+                if focus_wo and focus_wo.action in (ActionType.EQUIP, ActionType.REPAIR):
+                    reason_tag = " FLASH-gear"
+                elif focus_wo and focus_wo.action == ActionType.QUEST_NPC:
+                    reason_tag = " FLASH-quest"
+                elif focus_wo and focus_wo.action in (
+                    ActionType.COMBAT_AREA, ActionType.AREA_ACTION,
+                ):
+                    reason_tag = " FLASH-loot"
+                elif focus_wo and focus_wo.action == ActionType.TRAVEL:
                     reason_tag = " FLASH-exit"
                 elif focus_wo and focus_wo.action == ActionType.HUNT_MOB:
                     reason_tag = " FLASH-farm-lv3"

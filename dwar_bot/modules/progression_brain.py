@@ -348,7 +348,7 @@ class ProgressionBrain:
             options.append(GameOption(
                 ActionType.REPAIR,
                 f"Ремонт ×{len(profile.broken_items)}",
-                score=850,
+                score=900,
                 detail=", ".join(i.title for i in profile.broken_items[:3]),
                 goal=GoalKind.GEAR,
             ))
@@ -360,7 +360,7 @@ class ProgressionBrain:
             options.append(GameOption(
                 ActionType.EQUIP,
                 f"Надеть снаряжение ×{len(unequipped)}",
-                score=820,
+                score=920,
                 detail=unequipped[0].title,
                 goal=GoalKind.GEAR,
             ))
@@ -695,6 +695,9 @@ class ProgressionBrain:
                     ) in ("1",):
                         o.score += 100.0
                     # Do not demote local story NPCs during farm-push
+                elif o.action in (ActionType.EQUIP, ActionType.REPAIR):
+                    # Gear always beats casual farm under farm-push
+                    o.score = max(float(o.score), 930.0 if o.action == ActionType.EQUIP else 910.0)
         elif self.awaiting_quest_turnin:
             for o in options:
                 if o.action == ActionType.QUEST_NPC and not str(
@@ -814,10 +817,11 @@ class ProgressionBrain:
         if focus and focus.goal == GoalKind.SURVIVE:
             steps.append(PlanStep(GoalKind.SURVIVE, "Восстановить HP", "иначе смерть / простой"))
         if farm_mode or self.farm_push_active():
-            steps.append(PlanStep(GoalKind.COMBAT, "Фарм: точки / фронты / переходы", "сюжет застрял — качаемся"))
-            steps.append(PlanStep(GoalKind.TRAVEL, "Сменить локацию для фарма", "пустая Расселина / закрытый квест"))
+            # Balanced loop: gear → story check → farm → travel (not endless hunt)
             steps.append(PlanStep(GoalKind.GEAR, "Надеть и чинить добычу", "сила растёт от экипа"))
-            steps.append(PlanStep(GoalKind.QUEST, "Вернуться к сюжету позже", "когда появится прогресс"))
+            steps.append(PlanStep(GoalKind.QUEST, "Проверить сюжет / Вождя", "приказ / сдача / новые цели"))
+            steps.append(PlanStep(GoalKind.COMBAT, "Фарм между квестами", "XP и лут, не вместо сюжета"))
+            steps.append(PlanStep(GoalKind.TRAVEL, "Сменить локацию", "когда военачальник разрешит"))
         else:
             steps.append(PlanStep(GoalKind.QUEST, "Сюжет / диалоги Вождя", "открывает переходы и новые цели"))
             if self.awaiting_quest_turnin:

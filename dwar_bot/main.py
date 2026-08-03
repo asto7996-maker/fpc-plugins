@@ -1011,9 +1011,29 @@ class DwarBot:
         )
         await self.leveling.apply(decision)
         if decision.focus_override is not None:
-            # Prefer strategic override when it clearly beats idle / weak focus
             ov = decision.focus_override
+            brain = snap.focus
+            # Under world_objective farm_open: keep brain GEAR/QUEST if they beat farm override
+            keep_brain = False
             if (
+                brain is not None
+                and getattr(decision.progress, "mode", "") == "world_objective"
+                and brain.action in (
+                    ActionType.EQUIP,
+                    ActionType.REPAIR,
+                    ActionType.QUEST_NPC,
+                    ActionType.USE_ITEM,
+                )
+                and float(brain.score) + 20.0 >= float(ov.score)
+            ):
+                keep_brain = True
+                logger.info(
+                    "Keep brain '%s' (%.0f) over world override '%s' (%.0f)",
+                    brain.title, brain.score, ov.title, ov.score,
+                )
+            if keep_brain:
+                pass
+            elif (
                 snap.focus is None
                 or ov.score >= (snap.focus.score - 50)
                 or decision.directive.priority <= 1
@@ -1436,6 +1456,25 @@ class DwarBot:
                     await self._telemetry_battle_end(result, mob_name=mob_name)
                     self.brain.mark_hunt_kill_done()
                     self.quests.clear_exhausted(local_only=True)
+                    # Wear/repair loot before next pull — gear first, then story
+                    try:
+                        self._profile = await self.stats.read_full_profile()
+                        self._char = self._profile.char
+                        self._state = self._profile.state
+                    except Exception:
+                        pass
+                    if farm.auto_repair:
+                        try:
+                            await self.combat.repair_broken_gear(self._profile)
+                        except Exception as exc:
+                            logger.debug("post-hunt repair: %s", exc)
+                    if farm.auto_equip:
+                        try:
+                            equipped = await self.combat.auto_equip(self._profile)
+                            if equipped and self.settings.notify.gear:
+                                await self.notify(f"👕 Надето после боя: {equipped}", "gear")
+                        except Exception as exc:
+                            logger.debug("post-hunt equip: %s", exc)
                     # Immediately try type=2 turn-in — do not farm more Крэтс
                     turned = 0
                     try:
@@ -1458,6 +1497,16 @@ class DwarBot:
                         return True
                     if self.quests.pending_hunt_mob:
                         self.brain.pending_hunt_mob = self.quests.pending_hunt_mob
+                    # Soft story nudge: pause farm-push so Вождь can win next tick
+                    wo = self.quests.pending_world_objective or {}
+                    if wo.get("farm_open") or int(getattr(self._char, "level", 1) or 1) >= 3:
+                        self.brain.farm_push_until = min(
+                            self.brain.farm_push_until,
+                            time.time() + 45.0,
+                        )
+                        logger.info(
+                            "Post-hunt: cleared local NPCs + gear pass — check сюжет next."
+                        )
                     return True
                 if result in (BattleResult.JOINED, BattleResult.ONGOING, BattleResult.LOSE):
                     if result == BattleResult.LOSE:
@@ -1510,36 +1559,27 @@ class DwarBot:
                 npc_id = str(payload.get("npc_id") or "")
                 if not npc_id:
                     return False
-                # While heal_wounded (etc.) is open — do NOT open unrelated NPCs
-                # (seasonal #816 / arena #817 were soft-banned as false heal targets).
-                if self.quests.has_world_objective():
-                    wo_npcs = self.quests.world_objective_npc_ids()
-                    if npc_id not in wo_npcs:
-                        logger.info(
-                            "Skip NPC %s — active world objective '%s' (only %s).",
-                            npc_id,
-                            (self.quests.pending_world_objective or {}).get("kind"),
-                            ",".join(sorted(wo_npcs)) or "—",
-                        )
-                        self.quests.mark_npc_exhausted(
-                            npc_id,
-                            global_npc=int(payload.get("global_npc", 0) or 0),
-                            link_id=str(payload.get("link_id") or "0"),
-                        )
-                        # Intentional skip — do NOT count as stagnation
-                        return True
-                if npc_id in self.quests.world_objective_npc_ids():
+                # heal_wounded NPC stays blocked; under farm_open other local story NPCs OK
+                wo = self.quests.pending_world_objective or {}
+                farm_open = bool(
+                    wo.get("farm_open")
+                    or (
+                        wo.get("flash_only")
+                        and int(getattr(self._char, "level", 1) or 1) >= 3
+                    )
+                )
+                wo_npcs = self.quests.world_objective_npc_ids()
+                if npc_id in wo_npcs:
                     logger.info(
                         "Skip NPC %s — world objective '%s' still pending.",
                         npc_id,
-                        (self.quests.pending_world_objective or {}).get("kind"),
+                        wo.get("kind"),
                     )
                     self.quests.mark_npc_exhausted(
                         npc_id,
                         global_npc=int(payload.get("global_npc", 0) or 0),
                         link_id=str(payload.get("link_id") or "0"),
                     )
-                    # Re-assert long ban
                     key = (
                         f"{int(payload.get('global_npc', 0) or 0)}:"
                         f"{npc_id}:{payload.get('link_id') or '0'}"
@@ -1548,6 +1588,26 @@ class DwarBot:
                     self.quests._exhausted_dialogues.add(key)
                     self.quests._soft_ban_until[key] = time.time() + 1800.0
                     return False
+                if self.quests.has_world_objective() and not farm_open:
+                    logger.info(
+                        "Skip NPC %s — active world objective '%s' (only %s).",
+                        npc_id,
+                        wo.get("kind"),
+                        ",".join(sorted(wo_npcs)) or "—",
+                    )
+                    self.quests.mark_npc_exhausted(
+                        npc_id,
+                        global_npc=int(payload.get("global_npc", 0) or 0),
+                        link_id=str(payload.get("link_id") or "0"),
+                    )
+                    # Intentional skip — do NOT count as stagnation
+                    return True
+                if farm_open and self.quests.has_world_objective():
+                    logger.info(
+                        "Story NPC %s while farm_open '%s' — сюжет/приказ поверх фарма.",
+                        npc_id,
+                        wo.get("kind"),
+                    )
                 self._telemetry_quest_begin(
                     str(focus.title or payload.get("title") or "Квест"),
                     npc_id=npc_id,
@@ -1620,7 +1680,14 @@ class DwarBot:
 
             if action in (ActionType.COMBAT_AREA, ActionType.AREA_ACTION):
                 wo = self.quests.pending_world_objective or {}
-                if wo.get("flash_only"):
+                farm_open = bool(
+                    wo.get("farm_open")
+                    or (
+                        wo.get("flash_only")
+                        and int(getattr(self._char, "level", 1) or 1) >= 3
+                    )
+                )
+                if wo.get("flash_only") and not farm_open:
                     logger.info(
                         "Точка '%s' пропущена — flash_only '%s' (нужен клик по раненым).",
                         payload.get("name") or "?",
@@ -1629,6 +1696,11 @@ class DwarBot:
                     self.brain.mark_cooldown(str(payload.get("name") or "точка"), 300)
                     await _sleep(20.0, 40.0)
                     return True
+                if farm_open and wo.get("flash_only"):
+                    logger.info(
+                        "Лут-точка '%s' при farm_open — экип/добыча поверх Flash side-quest.",
+                        payload.get("name") or "?",
+                    )
                 name = str(payload.get("name") or "точка")
                 obj_id = str(payload.get("object_id") or self._state.area_id or "0")
                 act_id = str(payload.get("action_id") or "")

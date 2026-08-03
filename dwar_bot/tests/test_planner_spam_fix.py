@@ -112,10 +112,87 @@ def test_flash_only_lv3_prefers_travel_or_hunt():
         blocked_npc_ids={"409"},
     )
     assert decision.focus_override is not None
-    assert decision.focus_override.action in (ActionType.TRAVEL, ActionType.HUNT_MOB)
-    assert decision.focus_override.action != ActionType.COMBAT_AREA
-    assert "FLASH-exit" in decision.directive.reason or "FLASH-farm-lv3" in decision.directive.reason
+    assert decision.focus_override.action in (
+        ActionType.TRAVEL, ActionType.HUNT_MOB, ActionType.COMBAT_AREA,
+    )
+    assert decision.focus_override.action != ActionType.IDLE
+    assert any(
+        tag in decision.directive.reason
+        for tag in ("FLASH-exit", "FLASH-farm-lv3", "FLASH-loot")
+    )
     assert "flash_farm_open" in decision.notes
+
+
+def test_flash_only_lv3_prefers_gear_over_hunt():
+    eng = LevelingEngine()
+    profile = FullProfile(char=CharStats(level=3, hp=147, hp_max=147))
+    options = [
+        GameOption(
+            ActionType.EQUIP,
+            title="Надеть снаряжение ×2",
+            score=820,
+            goal=GoalKind.GEAR,
+        ),
+        GameOption(
+            ActionType.HUNT_MOB,
+            title="Зигред-воин",
+            score=460,
+            payload={"name": "Зигред-воин"},
+            goal=GoalKind.COMBAT,
+        ),
+        GameOption(
+            ActionType.TRAVEL,
+            title="Дымные сопки",
+            score=200,
+            payload={"area_id": "192"},
+            goal=GoalKind.TRAVEL,
+        ),
+    ]
+    decision = eng.decide(
+        profile=profile,
+        brain_focus=None,
+        brain_options=options,
+        area_id="932",
+        world_objective_kind="heal_wounded",
+        world_objective_flash_only=True,
+        blocked_npc_ids={"409"},
+    )
+    assert decision.focus_override is not None
+    assert decision.focus_override.action == ActionType.EQUIP
+    assert "FLASH-gear" in decision.directive.reason
+
+
+def test_flash_only_lv3_prefers_story_quest():
+    eng = LevelingEngine()
+    profile = FullProfile(char=CharStats(level=3, hp=147, hp_max=147))
+    options = [
+        GameOption(
+            ActionType.QUEST_NPC,
+            title="NPC: Военачальник",
+            score=950,
+            payload={"npc_id": "2"},
+            goal=GoalKind.QUEST,
+        ),
+        GameOption(
+            ActionType.HUNT_MOB,
+            title="Зигред-воин",
+            score=460,
+            payload={"name": "Зигред-воин"},
+            goal=GoalKind.COMBAT,
+        ),
+    ]
+    decision = eng.decide(
+        profile=profile,
+        brain_focus=None,
+        brain_options=options,
+        area_id="932",
+        world_objective_kind="heal_wounded",
+        world_objective_flash_only=True,
+        blocked_npc_ids={"409"},
+    )
+    assert decision.focus_override is not None
+    assert decision.focus_override.action == ActionType.QUEST_NPC
+    assert "FLASH-quest" in decision.directive.reason
 
 
 def test_infer_hunt_mob_level3_aliases():
@@ -124,6 +201,14 @@ def test_infer_hunt_mob_level3_aliases():
     assert qt._infer_hunt_mob_name("Убей Крэтс-вожака") == "Крэтс-вожак"
     assert qt._infer_hunt_mob_name("Повергни Крэтса") == "Крэтс"
     assert qt._infer_hunt_mob_name("Примите меня в отряд") == ""
+
+
+def test_main_allows_story_and_loot_under_farm_open():
+    src = (ROOT / "main.py").read_text(encoding="utf-8")
+    assert "Story NPC %s while farm_open" in src
+    assert "Лут-точка '%s' при farm_open" in src
+    assert "post-hunt equip" in src or "Надето после боя" in src
+    assert "Keep brain" in src
 
 
 def test_flash_only_does_not_prefer_rasselina():
