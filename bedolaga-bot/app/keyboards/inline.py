@@ -984,33 +984,33 @@ def get_info_menu_keyboard(
             ]
         )
 
+    legal_row: list = []
     if show_privacy_policy:
-        buttons.append(
-            [
-                premium_button(
-                    texts.t('MENU_PRIVACY_POLICY', 'Политика конфиденциальности'),
-                    icon='privacy',
-                    callback_data='menu_privacy_policy',
-                )
-            ]
+        legal_row.append(
+            premium_button(
+                texts.t('MENU_PRIVACY_POLICY', 'Приватность'),
+                icon='privacy',
+                callback_data='menu_privacy_policy',
+            )
         )
-
     if show_public_offer:
-        buttons.append(
-            [
-                premium_button(
-                    texts.t('MENU_PUBLIC_OFFER', 'Публичная оферта'),
-                    icon='offer',
-                    callback_data='menu_public_offer',
-                )
-            ]
+        legal_row.append(
+            premium_button(
+                texts.t('MENU_PUBLIC_OFFER', 'Соглашение'),
+                icon='offer',
+                callback_data='menu_public_offer',
+            )
         )
+    if legal_row:
+        # One compact row on phones; split only if somehow >2 legal CTAs.
+        for i in range(0, len(legal_row), 2):
+            buttons.append(legal_row[i : i + 2])
 
     if show_rules:
         buttons.append(
             [
                 premium_button(
-                    texts.t('MENU_RULES', 'Правила сервиса'),
+                    texts.t('MENU_RULES', 'Правила'),
                     icon='rules',
                     callback_data='menu_rules',
                 )

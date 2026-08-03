@@ -266,7 +266,7 @@ async def handle_profile_unavailable(callback: types.CallbackQuery) -> None:
     await callback.answer(
         texts.t(
             'MENU_PROFILE_UNAVAILABLE',
-            '❗️ Личный кабинет пока недоступен. Попробуйте позже.',
+            '❗️ Кабинет пока недоступен. Попробуйте позже.',
         ),
         show_alert=True,
     )
@@ -377,9 +377,9 @@ async def show_info_menu(
     prompt = texts.t(
         'MENU_INFO_PROMPT',
         'Выберите раздел:\n\n'
-        '🔎 FAQ — ответы на частые вопросы\n'
-        '🔒 Политика конфиденциальности\n'
-        '📖 Правила сервиса',
+        '🔎 FAQ\n'
+        '🔒 Приватность\n'
+        '📖 Правила',
     )
     caption = inject_premium_emojis(f'{header}\n\n{prompt}' if prompt else header)
 

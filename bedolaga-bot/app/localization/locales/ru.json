@@ -1153,7 +1153,7 @@
   "MENU_FAQ": "FAQ",
   "MENU_INFO": "Инфо",
   "MENU_INFO_HEADER": "ℹ️ <b>Инфо</b>",
-  "MENU_INFO_PROMPT": "Выберите раздел:\n\n🔎 FAQ — ответы на частые вопросы\n🔒 Политика конфиденциальности\n📖 Правила сервиса",
+  "MENU_INFO_PROMPT": "Выберите раздел:\n\n🔎 FAQ\n🔒 Приватность\n📖 Правила",
   "MENU_LANGUAGE": "Язык",
   "MENU_PRIVACY_POLICY": "Приватность",
   "MENU_PROFILE": "Кабинет",
