@@ -240,20 +240,29 @@ class CursorExecutor:
 
     def _pytest_ok(self, env: dict) -> bool:
         env = dict(env)
-        pp = env.get("PYTHONPATH", "")
-        # Ensure both repo root and dwar_bot parent are importable
-        roots = [str(self.repo_root)]
+        # VPS: workspace=/root/dwar_bot but imports need parent on PYTHONPATH
+        # and tests reference paths like dwar_bot/core/...
         if self.repo_root.name == "dwar_bot":
-            roots.append(str(self.repo_root.parent))
-        for r in roots:
+            cwd = self.repo_root.parent
+            test_target = "dwar_bot/tests/test_bot.py"
+            if not (cwd / test_target).exists():
+                test_target = "dwar_bot/tests/test_ai_healing.py"
+            py_roots = [str(cwd), str(self.repo_root)]
+        else:
+            cwd = self.repo_root
+            test_target = resolve_test_target(self.repo_root)
+            py_roots = [str(self.repo_root)]
+
+        pp = env.get("PYTHONPATH", "")
+        for r in py_roots:
             if r not in pp.split(os.pathsep):
                 pp = r + (os.pathsep + pp if pp else "")
         env["PYTHONPATH"] = pp
 
-        test_target = resolve_test_target(self.repo_root)
         for venv_py in (
             Path("/opt/dwar_venv/bin/python"),
             self.repo_root / ".venv" / "bin" / "python",
+            cwd / ".venv" / "bin" / "python",
         ):
             if venv_py.exists():
                 cmd = [str(venv_py), "-m", "pytest", test_target, "-q", "--tb=short"]
@@ -265,12 +274,12 @@ class CursorExecutor:
             else:
                 cmd = ["python3", "-m", "pytest", test_target, "-q", "--tb=short"]
 
-        logger.info("CursorExecutor: %s (cwd=%s)", " ".join(cmd), self.repo_root)
+        logger.info("CursorExecutor: %s (cwd=%s)", " ".join(cmd), cwd)
         try:
             proc = subprocess.run(
                 cmd,
                 env=env,
-                cwd=str(self.repo_root),
+                cwd=str(cwd),
                 capture_output=True,
                 text=True,
                 timeout=120,
