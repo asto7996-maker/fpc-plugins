@@ -998,6 +998,14 @@ class DwarBot:
         # Attempt world objective (medicine USE etc.) before planning
         if self.quests.has_world_objective():
             wo = self.quests.pending_world_objective or {}
+            # Self-heal: known Flash heal never probes HTTP USE again
+            if wo.get("kind") == "heal_wounded" and (
+                wo.get("flash_only") or "не задано" in str(wo.get("last_error") or "").lower()
+            ):
+                try:
+                    self.quests.lock_flash_world_objective(cooldown_sec=86400.0)
+                except Exception:
+                    pass
             # Every few ticks under farm_open: unban local story NPCs for dialogue
             if (
                 (wo.get("farm_open") or int(getattr(self._char, "level", 1) or 1) >= 3)
@@ -1012,10 +1020,17 @@ class DwarBot:
                     except Exception:
                         pass
                 cleared = self.quests.clear_exhausted(local_only=True)
-                cleared += self.quests.clear_world_objective_npc_ban()
+                # Do NOT clear WO giver ban every tick when flash-locked —
+                # that re-opens «излечение ополченцев» and SET-spams Telegram.
+                wo_now = self.quests.pending_world_objective or {}
+                if not (
+                    wo_now.get("kind") == "heal_wounded"
+                    and (wo_now.get("flash_only") or wo_now.get("http_impossible"))
+                ):
+                    cleared += self.quests.clear_world_objective_npc_ban()
                 if cleared:
                     logger.info(
-                        "farm_open story refresh: cleared %d NPC ban(s) incl. world-obj giver.",
+                        "farm_open story refresh: cleared %d NPC ban(s).",
                         cleared,
                     )
             try:
@@ -1394,7 +1409,19 @@ class DwarBot:
 
         wo = self.quests.pending_world_objective or {}
         # Flash-only heal_wounded: intentional wait — try light hunt, never escalate TG spam
-        if wo.get("flash_only"):
+        if (
+            wo.get("kind") == "heal_wounded"
+            and (
+                wo.get("flash_only")
+                or wo.get("http_impossible")
+                or "не задано" in focus_key.lower()
+                or "heal_wounded" in focus_key.lower()
+            )
+        ):
+            try:
+                self.quests.lock_flash_world_objective(cooldown_sec=86400.0)
+            except Exception:
+                pass
             kind = wo.get("kind") or "world"
             logger.info(
                 "Local recover: flash_only '%s' — quiet hunt/idle (no AutoHealer spam).",

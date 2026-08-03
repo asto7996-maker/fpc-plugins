@@ -19,9 +19,26 @@ from dwar_bot.core.auto_coder import (
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_auto_coder_module_syntax():
-    src = (ROOT / "core" / "auto_coder.py").read_text(encoding="utf-8")
-    ast.parse(src)
+def test_auto_coder_suppresses_flash_noise(tmp_path):
+    log = tmp_path / "bot.log"
+    log.write_text(
+        "heal_wounded: HTTP USE rejected (Не задано действие!) — cooldown 1800s.\n"
+        "Post-hunt open-farm: gear done, continue pulls.\n"
+        "telemetry battle WIN «Зигред-воин»\n",
+        encoding="utf-8",
+    )
+    state = tmp_path / "state.json"
+    state.write_text(
+        '{"world_objective": {"kind": "heal_wounded", "flash_only": true}}',
+        encoding="utf-8",
+    )
+    coder = AutoCoder(dry_run=True, log_path=log, repo_root=tmp_path)
+    with patch("dwar_bot.config.STATE_FILE", state):
+        issue = coder.check_health()
+    assert issue is None
+    data = __import__("json").loads(state.read_text(encoding="utf-8"))
+    assert data["world_objective"].get("http_impossible") is True
+
 
 
 def test_build_prompt_contains_required_fields():

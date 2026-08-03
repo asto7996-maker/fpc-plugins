@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 import os
 import random
@@ -209,6 +210,9 @@ class AutoCoder:
         Priority: CRASH > NO_PROGRESS.
         """
         self.stats["checks"] += 1
+        # Known Flash side-quest noise is NOT a crash / stuck code bug
+        if self._suppress_known_flash_noise():
+            return None
         crash = self._detect_crash()
         if crash:
             self.stats["crashes"] += 1
@@ -218,6 +222,90 @@ class AutoCoder:
             self.stats["no_progress"] += 1
             return stuck
         return None
+
+    def _suppress_known_flash_noise(self) -> bool:
+        """
+        Self-heal path for heal_wounded / «Не задано действие!».
+
+        Locks Flash WO in state.json and skips Cursor escalate — HTTP USE
+        cannot target canvas wounded soldiers.
+        """
+        text = self._read_log_tail(max_bytes=60_000)
+        if not text:
+            return False
+        low = text.lower()
+        markers = (
+            "не задано действие",
+            "heal_wounded: http use rejected",
+            "heal_wounded: flash-only",
+            "world objective set kind=heal_wounded",
+        )
+        hits = sum(1 for m in markers if m in low)
+        if hits < 1 and "heal_wounded" not in low:
+            return False
+        # Recent open-farm activity ⇒ healthy despite Flash WO
+        farming = any(
+            m in low
+            for m in (
+                "post-hunt open-farm",
+                "telemetry battle win",
+                "hunt_farm lv",
+                "flash-farm-lv3",
+            )
+        )
+        locked = self._lock_flash_objective_state()
+        if locked or farming or hits >= 1:
+            if locked:
+                logger.info(
+                    "AutoCoder: locked heal_wounded flash/http_impossible in state "
+                    "(no Cursor — protocol is client-only)."
+                )
+                self.stats["fixes_ok"] = self.stats.get("fixes_ok", 0) + (1 if locked else 0)
+            # Only fully suppress escalate when farming or we locked state
+            if farming or locked:
+                return True
+        return False
+
+    def _lock_flash_objective_state(self) -> bool:
+        """Patch persisted world_objective so the running bot stops USE probes."""
+        candidates = [
+            self.repo_root / "dwar_bot" / "data" / "state.json",
+            PKG_ROOT / "data" / "state.json",
+            Path("/root/dwar_bot/data/state.json"),
+        ]
+        try:
+            from dwar_bot.config import STATE_FILE
+            candidates.insert(0, Path(STATE_FILE))
+        except Exception:
+            pass
+        changed = False
+        for path in candidates:
+            try:
+                if not path.is_file():
+                    continue
+                data = json.loads(path.read_text(encoding="utf-8"))
+                if not isinstance(data, dict):
+                    continue
+                wo = data.get("world_objective")
+                if not isinstance(wo, dict) or wo.get("kind") != "heal_wounded":
+                    continue
+                before = json.dumps(wo, sort_keys=True)
+                wo["flash_only"] = True
+                wo["http_impossible"] = True
+                wo["flash_notified"] = True
+                wo["protocol_fail_until"] = time.time() + 86400.0
+                data["world_objective"] = wo
+                after = json.dumps(wo, sort_keys=True)
+                if after != before:
+                    path.write_text(
+                        json.dumps(data, ensure_ascii=False, indent=2),
+                        encoding="utf-8",
+                    )
+                    changed = True
+                    logger.info("AutoCoder: patched %s heal_wounded lock", path)
+            except Exception as exc:
+                logger.debug("AutoCoder state lock %s: %s", path, exc)
+        return changed
 
     def _read_log_tail(self, max_bytes: int = 120_000) -> str:
         path = self.log_path

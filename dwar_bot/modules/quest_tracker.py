@@ -199,16 +199,50 @@ class QuestTracker:
                     float(self._soft_ban_until.get(ban_key) or 0),
                     now + 1800.0,
                 )
-            logger.warning(
-                "World objective RESTORED kind=%s flash_only=%s npc=%s",
+            logger.info(
+                "World objective RESTORED kind=%s flash_only=%s http_impossible=%s npc=%s",
                 wo.get("kind"),
                 bool(wo.get("flash_only")),
+                bool(wo.get("http_impossible")),
                 npc or "—",
             )
             return True
         except Exception as exc:
             logger.debug("load world objective: %s", exc)
             return False
+
+    def lock_flash_world_objective(self, *, cooldown_sec: float = 86400.0) -> bool:
+        """
+        Runtime self-heal: mark heal_wounded as Flash-only / HTTP-impossible.
+
+        Stops USE probes and SET spam without requiring a code patch restart.
+        """
+        wo = dict(self.pending_world_objective or {})
+        if not wo or str(wo.get("kind") or "") != "heal_wounded":
+            return False
+        changed = False
+        if not wo.get("flash_only"):
+            wo["flash_only"] = True
+            changed = True
+        if not wo.get("http_impossible"):
+            wo["http_impossible"] = True
+            changed = True
+        until = time.time() + max(3600.0, float(cooldown_sec))
+        prev_until = float(wo.get("protocol_fail_until") or 0)
+        if until > prev_until:
+            wo["protocol_fail_until"] = until
+            changed = True
+        if not wo.get("flash_notified"):
+            wo["flash_notified"] = True
+            changed = True
+        self.pending_world_objective = wo
+        if changed:
+            self._persist_world_objective()
+            logger.info(
+                "Self-heal: heal_wounded locked flash_only/http_impossible until +%.0fs",
+                cooldown_sec,
+            )
+        return True
 
     def has_world_objective(self, kind: str = "") -> bool:
         if not self.pending_world_objective:
@@ -261,6 +295,37 @@ class QuestTracker:
         # World goals are outside dialogue — kill-gate / type=2 no longer apply.
         self.clear_hunt_gate()
         prev = dict(self.pending_world_objective or {})
+        same_kind = bool(prev.get("kind") == kind and kind)
+
+        # Idempotent: already tracking flash heal_wounded — no TG WARNING spam
+        if (
+            same_kind
+            and kind == "heal_wounded"
+            and (prev.get("flash_only") or prev.get("http_impossible"))
+        ):
+            if ban_key:
+                self._world_objective_keys.add(ban_key)
+                self._exhausted_dialogues.add(ban_key)
+                self._soft_ban_until[ban_key] = time.time() + max(120.0, ban_sec)
+            # Preserve lock flags; refresh title/npc if empty
+            wo = dict(prev)
+            if title and not wo.get("title"):
+                wo["title"] = title
+            if npc_id and not wo.get("npc_id"):
+                wo["npc_id"] = str(npc_id)
+            if artikul_id and not wo.get("artikul_id"):
+                wo["artikul_id"] = str(artikul_id)
+            wo["flash_only"] = True
+            if prev.get("http_impossible"):
+                wo["http_impossible"] = True
+            self.pending_world_objective = wo
+            self._persist_world_objective()
+            logger.debug(
+                "World objective KEEP kind=%s (flash_only, no re-SET)",
+                kind,
+            )
+            return
+
         self.pending_world_objective = {
             "kind": kind,
             "title": title or prev.get("title") or "",
@@ -278,19 +343,23 @@ class QuestTracker:
         if kind == "heal_wounded":
             # Known: wounded targets are not in HTML area / hunt_farm (Flash/canvas).
             self.pending_world_objective["flash_only"] = True
-            if prev.get("kind") == kind:
+            if same_kind:
                 for k in (
                     "flash_notified",
                     "tg_flash_sent",
                     "protocol_fail_until",
                     "artifact_title",
+                    "http_impossible",
+                    "farm_open",
                 ):
                     if k in prev:
                         self.pending_world_objective[k] = prev[k]
             else:
                 self.pending_world_objective["flash_notified"] = False
         self._persist_world_objective()
-        logger.warning(
+        # First SET only → WARNING (TG); repeats of non-flash kinds stay INFO
+        log_fn = logger.info if same_kind else logger.warning
+        log_fn(
             "World objective SET kind=%s title=%r artikul=%s npc=%s ban=%ss",
             kind, title, artikul_id or "—", npc_id or "—", int(ban_sec),
         )
@@ -313,8 +382,21 @@ class QuestTracker:
     async def _try_heal_wounded(self, obj: dict[str, Any]) -> bool:
         """Best-effort medicine use — fail fast, never storm the API.
 
-        HEAL_WOUNDED_SAFE_GUARD_V2
+        HEAL_WOUNDED_SAFE_GUARD_V3
         """
+        # Once Flash-only / HTTP-impossible — never probe USE again
+        if obj.get("http_impossible") or obj.get("flash_only"):
+            fail_until = float(obj.get("protocol_fail_until") or 0)
+            if not fail_until or time.time() >= fail_until:
+                # Soft renew lock silently; still no HTTP
+                obj = dict(obj)
+                obj["flash_only"] = True
+                obj["http_impossible"] = True
+                obj["protocol_fail_until"] = time.time() + 3600.0
+                self.pending_world_objective = obj
+                self._persist_world_objective()
+            return False
+
         # Circuit: after a failed protocol, wait before retrying
         fail_until = float(obj.get("protocol_fail_until") or 0)
         if fail_until and time.time() < fail_until:
@@ -334,7 +416,7 @@ class QuestTracker:
                     obj["artifact_title"] = str(a.get("title") or a.get("name") or "")
                 break
         if not art_id:
-            logger.warning(
+            logger.info(
                 "heal_wounded: medicine artikul=%s not in bag — farm / wait.",
                 artikul,
             )
@@ -346,8 +428,12 @@ class QuestTracker:
             resp = await self._client.common_action("USE", {"artifact_id": art_id})
         except Exception as exc:
             logger.info("heal_wounded USE exception: %s", exc)
+            obj = dict(obj)
             obj["protocol_fail_until"] = time.time() + 600.0
-            self.pending_world_objective = dict(obj)
+            obj["flash_only"] = True
+            obj["http_impossible"] = True
+            self.pending_world_objective = obj
+            self._persist_world_objective()
             return False
 
         err = str(resp.error or getattr(resp, "redirect_error", "") or "")
@@ -357,30 +443,31 @@ class QuestTracker:
         )
         err_l = err.lower()
         if resp.status == STATUS_OK and err_l in ("", "false", "none"):
-            logger.warning("heal_wounded: USE accepted — clearing objective.")
+            logger.info("heal_wounded: USE accepted — clearing objective.")
             self.clear_world_objective("medicine_used")
             return True
 
-        # Protocol unknown / Flash-only — long cool-down, keep NPC banned, light farm
-        # (wounded soldiers are not in HTML area.php / hunt_farm — canvas/Flash target).
-        cooldown = 1800.0
+        # Protocol unknown / Flash-only — permanent HTTP lock + long cool-down
+        cooldown = 86400.0  # 24h; Flash target will not become HTTP overnight
+        obj = dict(obj)
         obj["protocol_fail_until"] = time.time() + cooldown
         obj["flash_only"] = True
-        self.pending_world_objective = dict(obj)
-        if not obj.get("flash_notified"):
-            obj["flash_notified"] = True
-            self.pending_world_objective = dict(obj)
+        obj["http_impossible"] = True
+        first = not bool(obj.get("flash_notified"))
+        obj["flash_notified"] = True
+        self.pending_world_objective = obj
+        self._persist_world_objective()
+        if first:
             logger.warning(
-                "heal_wounded: FLASH-ONLY target (HTTP '%s') — cooldown %ds. "
-                "Нужен клик по раненым в клиенте; бот не спамит USE/NPC.",
-                (err or "empty")[:60], int(cooldown),
+                "heal_wounded: FLASH-ONLY (HTTP '%s') — locked, no more USE. "
+                "Клик по раненым в клиенте; бот фармит сюжет/Exp.",
+                (err or "empty")[:60],
             )
         else:
-            logger.warning(
-                "heal_wounded: HTTP USE rejected (%s) — cooldown %ds.",
-                (err or "empty")[:80], int(cooldown),
+            logger.info(
+                "heal_wounded: HTTP still impossible (%s) — lock renewed, no USE.",
+                (err or "empty")[:80],
             )
-        self._persist_world_objective()
         return False
 
     def has_pending_type2(self) -> bool:
@@ -919,6 +1006,20 @@ class QuestTracker:
         self.session.npcs_visited += 1
         npc_href = href or ""
 
+        # Already tracking Flash heal_wounded — don't re-open the same accept loop
+        if self.has_world_objective("heal_wounded"):
+            wo = self.pending_world_objective or {}
+            if wo.get("flash_only") or wo.get("http_impossible"):
+                wo_npc = str(wo.get("npc_id") or "")
+                if not wo_npc or wo_npc == str(npc_id):
+                    logger.info(
+                        "NPC %s: heal_wounded already flash-locked — skip re-accept.",
+                        npc_id,
+                    )
+                    self._exhausted_dialogues.add(key)
+                    self._soft_ban_until[key] = time.time() + 900.0
+                    return 0
+
         for _ in range(max_steps):
             pt = raw.get("npc|point") or {}
             point = pt.get("point") or {}
@@ -1011,6 +1112,26 @@ class QuestTracker:
                         kind = self.detect_world_objective_kind(
                             title, desc, child_title, str(child.get("message") or ""),
                         )
+                        if kind and self.has_world_objective(kind):
+                            logger.info(
+                                "Квест принят / диалог закрыт → %s (цель уже=%s).",
+                                last_redir.split("?")[0],
+                                kind,
+                            )
+                            # Soft refresh ban without SET WARNING
+                            if kind == "heal_wounded":
+                                self.set_world_objective(
+                                    kind=kind,
+                                    title=str(title or "Излечение ополченцев"),
+                                    npc_id=str(npc_id),
+                                    artikul_id="18209",
+                                    artifact_title="Деревенское снадобье",
+                                    quest_id=str(quest_id or ""),
+                                    area_id=str(area_id or ""),
+                                    ban_key=key,
+                                    ban_sec=1800.0,
+                                )
+                            return steps
                         if kind == "heal_wounded":
                             self.set_world_objective(
                                 kind=kind,

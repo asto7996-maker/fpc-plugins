@@ -255,10 +255,60 @@ def test_autohealer_ignores_flash_idle():
 
 def test_heal_wounded_flash_cooldown():
     src = (ROOT / "modules" / "quest_tracker.py").read_text(encoding="utf-8")
-    assert "FLASH-ONLY" in src
-    assert "1800.0" in src
+    assert "FLASH-ONLY" in src or "flash_only" in src
+    assert "http_impossible" in src
+    assert "HEAL_WOUNDED_SAFE_GUARD_V3" in src
+    assert "lock_flash_world_objective" in src
     assert "load_world_objective" in src
     assert "_persist_world_objective" in src
+
+
+def test_set_world_objective_idempotent_no_spam(tmp_path):
+    qt = QuestTracker(client=None)  # type: ignore[arg-type]
+    state = tmp_path / "state.json"
+    state.write_text("{}", encoding="utf-8")
+    qt._world_objective_state_path = lambda: state  # type: ignore[method-assign]
+    qt.set_world_objective(
+        kind="heal_wounded",
+        title="first",
+        npc_id="409",
+        artikul_id="18209",
+        ban_key="global:409",
+    )
+    assert qt.pending_world_objective.get("flash_only") is True
+    qt.pending_world_objective["http_impossible"] = True
+    qt.pending_world_objective["flash_notified"] = True
+    qt.set_world_objective(
+        kind="heal_wounded",
+        title="Поговорить об излечении ополченцев",
+        npc_id="409",
+        artikul_id="18209",
+        ban_key="0:409:0",
+    )
+    # Same kind + flash → KEEP, preserve lock
+    assert qt.pending_world_objective.get("http_impossible") is True
+    assert qt.pending_world_objective.get("flash_only") is True
+
+
+def test_try_heal_wounded_skips_when_flash_locked():
+    import asyncio
+    from unittest.mock import MagicMock
+
+    qt = QuestTracker(client=MagicMock())  # type: ignore[arg-type]
+    qt.pending_world_objective = {
+        "kind": "heal_wounded",
+        "flash_only": True,
+        "http_impossible": True,
+        "artikul_id": "18209",
+    }
+    qt._persist_world_objective = lambda: None  # type: ignore[method-assign]
+
+    async def _run():
+        ok = await qt._try_heal_wounded(dict(qt.pending_world_objective))
+        assert ok is False
+        qt._client.common_action.assert_not_called()
+
+    asyncio.run(_run())
 
 
 def test_world_objective_persist_roundtrip(tmp_path, monkeypatch):

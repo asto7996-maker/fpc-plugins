@@ -50,26 +50,34 @@ def _quest_tracker_path() -> Path:
 
 def _patch_heal_wounded_guard() -> Optional[str]:
     """
-    Harden _try_heal_wounded: stop after first 'Не задано действие!',
-    never spam BOT USE that triggers empty-JSON retry storms.
+    Harden _try_heal_wounded: never USE when flash_only / http_impossible.
     """
     path = _quest_tracker_path()
     if not path.exists():
         return None
     src = path.read_text(encoding="utf-8")
-    marker = "HEAL_WOUNDED_SAFE_GUARD_V2"
+    marker = "HEAL_WOUNDED_SAFE_GUARD_V3"
     if marker in src:
-        logger.info("local_fixer: heal_wounded guard already present")
+        logger.info("local_fixer: heal_wounded V3 guard already present")
         return None
 
-    # Replace the whole _try_heal_wounded method body via a unique anchor
     new_method = '''
     async def _try_heal_wounded(self, obj: dict[str, Any]) -> bool:
         """Best-effort medicine use — fail fast, never storm the API.
 
         ''' + marker + '''
         """
-        # Circuit: after a failed protocol, wait before retrying
+        if obj.get("http_impossible") or obj.get("flash_only"):
+            fail_until = float(obj.get("protocol_fail_until") or 0)
+            if not fail_until or time.time() >= fail_until:
+                obj = dict(obj)
+                obj["flash_only"] = True
+                obj["http_impossible"] = True
+                obj["protocol_fail_until"] = time.time() + 3600.0
+                self.pending_world_objective = obj
+                self._persist_world_objective()
+            return False
+
         fail_until = float(obj.get("protocol_fail_until") or 0)
         if fail_until and time.time() < fail_until:
             return False
@@ -88,20 +96,22 @@ def _patch_heal_wounded_guard() -> Optional[str]:
                     obj["artifact_title"] = str(a.get("title") or a.get("name") or "")
                 break
         if not art_id:
-            logger.warning(
+            logger.info(
                 "heal_wounded: medicine artikul=%s not in bag — farm / wait.",
                 artikul,
             )
             return False
 
-        # Only one safe probe: USE artifact alone. Do NOT target random hunt bots
-        # (that yields empty JSON + 4× exponential retries and freezes the tick).
         try:
             resp = await self._client.common_action("USE", {"artifact_id": art_id})
         except Exception as exc:
             logger.info("heal_wounded USE exception: %s", exc)
+            obj = dict(obj)
             obj["protocol_fail_until"] = time.time() + 600.0
-            self.pending_world_objective = dict(obj)
+            obj["flash_only"] = True
+            obj["http_impossible"] = True
+            self.pending_world_objective = obj
+            self._persist_world_objective()
             return False
 
         err = str(resp.error or getattr(resp, "redirect_error", "") or "")
@@ -111,16 +121,21 @@ def _patch_heal_wounded_guard() -> Optional[str]:
         )
         err_l = err.lower()
         if resp.status == STATUS_OK and err_l in ("", "false", "none"):
-            logger.warning("heal_wounded: USE accepted — clearing objective.")
+            logger.info("heal_wounded: USE accepted — clearing objective.")
             self.clear_world_objective("medicine_used")
             return True
 
-        # Protocol unknown / Flash-only — cool down 10 min, keep NPC banned, farm
-        obj["protocol_fail_until"] = time.time() + 600.0
-        self.pending_world_objective = dict(obj)
+        cooldown = 86400.0
+        obj = dict(obj)
+        obj["protocol_fail_until"] = time.time() + cooldown
+        obj["flash_only"] = True
+        obj["http_impossible"] = True
+        obj["flash_notified"] = True
+        self.pending_world_objective = obj
+        self._persist_world_objective()
         logger.warning(
-            "heal_wounded: HTTP USE rejected (%s) — cooldown 600s, farm without NPC spam.",
-            (err or "empty")[:80],
+            "heal_wounded: FLASH-ONLY (HTTP '%s') — locked, no more USE.",
+            (err or "empty")[:60],
         )
         return False
 '''
@@ -136,7 +151,6 @@ def _patch_heal_wounded_guard() -> Optional[str]:
     updated = pattern.sub(new_method.rstrip() + "\n\n", src, count=1)
     if updated == src:
         return None
-    # Syntax check
     import ast
 
     try:
@@ -145,5 +159,5 @@ def _patch_heal_wounded_guard() -> Optional[str]:
         logger.error("local_fixer: syntax error after patch: %s", exc)
         return None
     path.write_text(updated, encoding="utf-8")
-    logger.warning("local_fixer: applied heal_wounded fail-fast guard → %s", path)
+    logger.warning("local_fixer: applied heal_wounded V3 guard → %s", path)
     return str(path)

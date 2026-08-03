@@ -147,6 +147,8 @@ class AutoHealer:
         if (
             "снадоб" in key_l
             or "flash" in key_l
+            or "heal_wounded" in key_l
+            or "излечен" in key_l
             or key_l.startswith("idle:ждать")
         ):
             self._stagnation_count = 0

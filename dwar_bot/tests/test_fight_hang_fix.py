@@ -53,6 +53,8 @@ def test_voenachalnik_block_farms_at_lv3():
     assert "_quest_kill_gated" in src
     assert "quest_gate=gated" in src or "mark_hunt_kill_done(quest_gate=" in src
     assert "via farm_push" in src  # level-up adapt must not pin pending_hunt_mob
+    assert "lock_flash_world_objective" in src
+    assert "http_impossible" in src or "flash-locked" in src
 
 
 def test_fight_client_reconnect_marker():

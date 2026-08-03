@@ -15,6 +15,7 @@ import asyncio
 import logging
 import logging.handlers
 import os
+import re
 import time
 import traceback
 from pathlib import Path
@@ -84,6 +85,33 @@ class _TelegramHandler(logging.Handler):
         self._queue: asyncio.Queue[str] = asyncio.Queue(maxsize=500)
         self._task: Optional[asyncio.Task] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._dedupe_until: dict[str, float] = {}
+        self._dedupe_sec = 900.0
+
+    def _should_drop_duplicate(self, text: str) -> bool:
+        """Suppress repeated operational WARNINGs (Flash WO / USE reject) to TG."""
+        low = text.lower()
+        fingerprints = (
+            "world objective set kind=heal_wounded",
+            "world objective restored kind=heal_wounded",
+            "heal_wounded: http use rejected",
+            "heal_wounded: flash-only",
+            "не задано действие",
+        )
+        if not any(fp in low for fp in fingerprints):
+            return False
+        # Normalize noisy variable parts
+        key = re.sub(r"\d+", "#", low)[:160]
+        now = time.time()
+        # prune
+        self._dedupe_until = {
+            k: v for k, v in self._dedupe_until.items() if v > now
+        }
+        until = self._dedupe_until.get(key, 0.0)
+        if until > now:
+            return True
+        self._dedupe_until[key] = now + self._dedupe_sec
+        return False
 
     def _get_loop(self) -> Optional[asyncio.AbstractEventLoop]:
         try:
@@ -97,6 +125,8 @@ class _TelegramHandler(logging.Handler):
             # Truncate to Telegram message limit
             if len(text) > 4096:
                 text = text[:4090] + "…"
+            if self._should_drop_duplicate(text):
+                return
             loop = self._get_loop()
             if loop is not None:
                 if self._task is None or self._task.done():
