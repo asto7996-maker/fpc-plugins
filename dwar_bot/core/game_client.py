@@ -1187,6 +1187,128 @@ class DwarGameClient:
         })
         return resp.raw
 
+    @staticmethod
+    def build_npc_href(
+        npc_id: str | int,
+        *,
+        global_npc: int = 0,
+        link_id: str | int = 0,
+        f_id: str | int = 0,
+        href: str = "",
+    ) -> str:
+        """Build /npc.php URL. Prefer a hashed href from area/hunt when given."""
+        raw = (href or "").strip()
+        if raw:
+            if raw.startswith("http://") or raw.startswith("https://"):
+                from urllib.parse import urlparse
+                parsed = urlparse(raw)
+                return parsed.path + (("?" + parsed.query) if parsed.query else "")
+            return raw if raw.startswith("/") else "/" + raw.lstrip("/")
+        if int(global_npc or 0):
+            return f"/npc.php?global_npc=1&npc_id={npc_id}"
+        return (
+            f"/npc.php?f_id={f_id or 0}&npc_id={npc_id}"
+            f"&global_npc=0&link_id={link_id or 0}"
+        )
+
+    async def open_npc_page(
+        self,
+        npc_id: str | int,
+        *,
+        global_npc: int = 0,
+        link_id: str | int = 0,
+        f_id: str | int = 0,
+        href: str = "",
+    ) -> str:
+        """Fetch the HTML NPC dialogue page (contains answer URLs with CSRF hash)."""
+        path = self.build_npc_href(
+            npc_id,
+            global_npc=global_npc,
+            link_id=link_id,
+            f_id=f_id,
+            href=href,
+        )
+        resp = await self._get(path)
+        return resp.text or ""
+
+    async def npc_html_answer(
+        self,
+        npc_id: str | int,
+        ref: str | int,
+        *,
+        global_npc: int = 0,
+        link_id: str | int = 0,
+        f_id: str | int = 0,
+        href: str = "",
+    ) -> tuple[bool, str]:
+        """
+        Answer a type=2 dialogue *message* via HTML npc.php.
+
+        Flash/HTML clients use ``action=answer&ref=<message_id>&<hash>``.
+        JSON ``npc|answer`` with ``subpoint_id=<message_id>`` returns status=2
+        and never advances these phrases (e.g. award claim / enlistment).
+        """
+        import re
+        from urllib.parse import urlparse
+
+        ref_s = str(ref)
+        page = await self.open_npc_page(
+            npc_id,
+            global_npc=global_npc,
+            link_id=link_id,
+            f_id=f_id,
+            href=href,
+        )
+        if not page or len(page) < 200:
+            return False, "npc page empty/redirect"
+
+        answer_urls: list[str] = []
+        for m in re.finditer(
+            r'(?:data-url|href)=["\']([^"\']*npc\.php[^"\']*action=answer[^"\']*)["\']',
+            page,
+            re.I,
+        ):
+            answer_urls.append(m.group(1))
+        for m in re.finditer(
+            r"location\.href\s*=\s*['\"](npc\.php[^'\"]*action=answer[^'\"]*)['\"]",
+            page,
+            re.I,
+        ):
+            answer_urls.append(m.group(1))
+
+        chosen = ""
+        for u in answer_urls:
+            if re.search(rf"[?&]ref={re.escape(ref_s)}(?:&|$)", u):
+                chosen = u
+                break
+        if not chosen and answer_urls:
+            # Single visible answer — take it
+            if len(answer_urls) == 1:
+                chosen = answer_urls[0]
+        if not chosen:
+            return False, f"no HTML answer url for ref={ref_s}"
+
+        path = chosen if chosen.startswith("/") else "/" + chosen.lstrip("/")
+        resp = await self._get(path)
+        # Answer applies on the 302; follow to the next dialogue page.
+        loc = resp.headers.get("location") or ""
+        if resp.status_code in (301, 302, 303, 307, 308) and loc:
+            if loc.startswith("http://") or loc.startswith("https://"):
+                parsed = urlparse(loc)
+                follow = parsed.path + (("?" + parsed.query) if parsed.query else "")
+            else:
+                follow = loc if loc.startswith("/") else "/" + loc.lstrip("/")
+            resp2 = await self._get(follow)
+            body = resp2.text or ""
+            return True, body
+        body = resp.text or ""
+        # 200 with new dialogue, or tiny redirect script
+        if resp.status_code == 200 and len(body) > 500:
+            return True, body
+        if "npc.php" in body.lower() or "quest-description" in body.lower():
+            return True, body
+        return False, f"unexpected answer response status={resp.status_code} len={len(body)}"
+
     # ------------------------------------------------------------------
     # Specific game actions
     # ------------------------------------------------------------------

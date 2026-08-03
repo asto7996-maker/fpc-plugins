@@ -370,11 +370,11 @@ class ProgressionBrain:
                 raw_g = story_npc.get("global_npc", 1)
                 is_global = int(0 if raw_g in (0, "0", False) else (raw_g or 1)) == 1
                 # Global seasonal NPCs must not outrank village story
-                score = 520 if is_global else 820
+                score = 520 if is_global else 980
                 if self.awaiting_quest_turnin and not is_global:
                     score = 1250  # turn in kill BEFORE next hunt
                 elif self.need_quest_unlock and not is_global:
-                    score = 900
+                    score = 1050
                 options.append(GameOption(
                     ActionType.QUEST_NPC,
                     f"Сюжетный NPC #{sid}",
@@ -389,6 +389,7 @@ class ProgressionBrain:
                         "link_id": str(story_npc.get("link_id") or "0"),
                         "f_id": str(story_npc.get("f_id") or "0"),
                         "area_id": str(story_npc.get("area_id") or area.area_id or "0"),
+                        "href": str(story_npc.get("url") or ""),
                     },
                     goal=GoalKind.EVENT if is_global else GoalKind.QUEST,
                 ))
@@ -398,11 +399,12 @@ class ProgressionBrain:
                 break
             if str(npc.npc_id) in exhausted:
                 continue
-            qscore = 800 if not npc.is_global else 520
+            # Level-up / village story NPCs always beat casual hunt/arena
+            qscore = 950 if not npc.is_global else 520
             if self.awaiting_quest_turnin and not npc.is_global:
-                qscore = 1200
+                qscore = 1250
             elif self.need_quest_unlock and not npc.is_global:
-                qscore = 880
+                qscore = 1000
             options.append(GameOption(
                 ActionType.QUEST_NPC,
                 f"NPC: {npc.title}",
@@ -414,6 +416,7 @@ class ProgressionBrain:
                     "link_id": str(npc.link_id or "0"),
                     "f_id": str(npc.f_id or "0"),
                     "area_id": str(npc.area_id or area.area_id or "0"),
+                    "href": str(npc.url or ""),
                 },
                 goal=GoalKind.QUEST if not npc.is_global else GoalKind.EVENT,
             ))
@@ -426,8 +429,8 @@ class ProgressionBrain:
             if itype == "npc" and item.npc_id and farm.auto_quests:
                 if str(item.npc_id) in exhausted:
                     continue
-                nscore = 850 if self.awaiting_quest_turnin else (
-                    800 if self.need_quest_unlock else 770
+                nscore = 1250 if self.awaiting_quest_turnin else (
+                    1000 if self.need_quest_unlock else 960
                 )
                 options.append(GameOption(
                     ActionType.QUEST_NPC,
@@ -440,6 +443,7 @@ class ProgressionBrain:
                         "link_id": str(item.link_id or "0"),
                         "f_id": str(item.f_id or "0"),
                         "area_id": str(area.area_id or "0"),
+                        "href": str(item.href or ""),
                     },
                     goal=GoalKind.QUEST,
                 ))

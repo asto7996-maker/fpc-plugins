@@ -156,7 +156,28 @@ class QuestTracker:
         global_npc = int(pending.get("global_npc") or 0)
         link_id = str(pending.get("link_id") or "0")
         f_id = str(pending.get("f_id") or "0")
+        href = str(pending.get("href") or "")
         try:
+            # Prefer HTML ref= answer — same path as live dialogue for type=2 messages
+            html_ok = False
+            if child_id:
+                try:
+                    html_ok, _ = await self._client.npc_html_answer(
+                        npc_id,
+                        child_id,
+                        global_npc=global_npc,
+                        link_id=link_id,
+                        f_id=f_id,
+                        href=href,
+                    )
+                except Exception as exc:
+                    logger.debug("retry_pending_type2 html: %s", exc)
+            if html_ok:
+                self.session.dialogues_handled += 1
+                self.clear_hunt_gate()
+                logger.info("type=2 принят (HTML) — охота больше не нужна для этого этапа.")
+                return 1
+
             raw_ans = await self._client.npc_answer(
                 npc_id,
                 quest_id=quest_id,
@@ -472,10 +493,20 @@ class QuestTracker:
             score -= 5
         return score
 
+    @staticmethod
+    def _as_child_list(children: Any) -> list[dict]:
+        """npc|point.child_list may be a list or a dict keyed by ord."""
+        if isinstance(children, dict):
+            return [v for v in children.values() if isinstance(v, dict)]
+        if isinstance(children, list):
+            return [c for c in children if isinstance(c, dict)]
+        return []
+
     def _pick_child(self, children: list[dict]) -> Optional[dict]:
-        if not children:
+        kids = self._as_child_list(children)
+        if not kids:
             return None
-        ranked = sorted(children, key=self._score_child, reverse=True)
+        ranked = sorted(kids, key=self._score_child, reverse=True)
         for ch in ranked:
             if self._score_child(ch) < 0:
                 continue
@@ -498,6 +529,7 @@ class QuestTracker:
         link_id: str = "0",
         f_id: str = "0",
         area_id: str = "0",
+        href: str = "",
         max_steps: int = 10,
     ) -> int:
         """
@@ -541,11 +573,12 @@ class QuestTracker:
             return 0
 
         self.session.npcs_visited += 1
+        npc_href = href or ""
 
         for _ in range(max_steps):
             pt = raw.get("npc|point") or {}
             point = pt.get("point") or {}
-            children = pt.get("child_list") or []
+            children = self._as_child_list(pt.get("child_list"))
             title = point.get("title") or quests_block.get("quest_id") or ""
             desc = re.sub(r"<[^>]+>", " ", str(point.get("description") or ""))
             desc = re.sub(r"\s+", " ", desc).strip()
@@ -598,9 +631,102 @@ class QuestTracker:
             # 2) Sub-point:        {id, quest_id, parent_id, title, …}
             to_point = str(child.get("to_point_id") or "")
             from_point = str(child.get("from_point_id") or pt.get("point_id") or "")
+            old_pid = str(pt.get("point_id") or "")
+            ans: dict = {}
+            ans_ok = False
+            moved = False
 
             if to_point:
-                # Message transition (type=2): try opening destination + answer variants
+                # Message phrases (type=2): JSON npc|answer(ref as subpoint) fails
+                # with status=2. HTML npc.php?action=answer&ref=<id>&hash works.
+                html_ok = False
+                try:
+                    html_ok, html_body = await self._client.npc_html_answer(
+                        npc_id,
+                        child_id,
+                        global_npc=global_npc,
+                        link_id=link_id,
+                        f_id=f_id,
+                        href=npc_href,
+                    )
+                except Exception as exc:
+                    logger.debug("npc_html_answer(%s ref=%s): %s", npc_id, child_id, exc)
+                    html_ok, html_body = False, str(exc)
+
+                if html_ok:
+                    logger.info(
+                        "HTML-ответ ref=%s принят (msg → %s).",
+                        child_id, to_point,
+                    )
+                    raw = await self._client.npc_quests(
+                        npc_id,
+                        global_npc=global_npc,
+                        link_id=link_id,
+                        f_id=f_id,
+                        area_id=area_id,
+                    )
+                    quests_block = raw.get("npc|quests") or {}
+                    point_list = quests_block.get("point_list") or []
+                    new_pt = raw.get("npc|point") or {}
+                    new_pid = str(new_pt.get("point_id") or "")
+                    moved = bool(new_pid) and new_pid != old_pid
+                    ans_ok = True
+                    ans = {"status": STATUS_OK}
+                    # Capture hashed href from redirect page if present
+                    if html_body and "npc.php" in html_body:
+                        m_href = re.search(
+                            r'location\.href=[\'"]([^\'"]*npc\.php[^\'"]+)[\'"]',
+                            html_body,
+                            re.I,
+                        )
+                        if m_href:
+                            npc_href = m_href.group(1)
+                    if not moved and new_pid == old_pid:
+                        # Same point id but different children still counts
+                        new_kids = {
+                            str(x.get("id"))
+                            for x in self._as_child_list(new_pt.get("child_list"))
+                        }
+                        old_kids = {str(x.get("id")) for x in children}
+                        if new_kids != old_kids:
+                            moved = True
+                    if ans_ok or moved:
+                        self._answered_points.add(child_id)
+                        self.session.dialogues_handled += 1
+                        steps += 1
+                        self.clear_hunt_gate()
+                        if quest_id:
+                            self.session.quests_accepted += 1
+                        awards = new_pt.get("award_list") or []
+                        for a in awards[:5]:
+                            logger.info("  Награда: %s", a)
+                        # macros in award_message
+                        macros = new_pt.get("macros_list") or {}
+                        if isinstance(macros, dict):
+                            for mid, meta in list(macros.items())[:4]:
+                                if isinstance(meta, dict):
+                                    logger.info(
+                                        "  Макрос: %s %s",
+                                        meta.get("name"),
+                                        (meta.get("data") or {}).get("title"),
+                                    )
+                        await asyncio.sleep(random.uniform(0.8, 2.0))
+                        if not moved and str(new_pt.get("point_id") or "") == old_pid:
+                            same = {
+                                str(x.get("id"))
+                                for x in self._as_child_list(new_pt.get("child_list"))
+                            }
+                            if child_id in same:
+                                logger.info(
+                                    "NPC %s: HTML-ответ не сдвинул диалог — "
+                                    "возможно, нужна цель квеста.",
+                                    npc_id,
+                                )
+                                self._exhausted_dialogues.add(key)
+                                break
+                        continue
+
+                # Fallback: JSON answer variants (works for some points)
                 raw = await self._client.npc_point(
                     npc_id,
                     quest_id=quest_id,
@@ -610,7 +736,6 @@ class QuestTracker:
                     f_id=f_id,
                     subpoint_id=to_point,
                 )
-                nxt_pt = raw.get("npc|point") or {}
                 raw_ans = await self._client.npc_answer(
                     npc_id,
                     quest_id=quest_id,
@@ -630,33 +755,30 @@ class QuestTracker:
                         f_id=f_id,
                         subpoint_id=child_id,
                     )
-                ans_ok = int(
-                    (raw_ans.get("npc|answer") or {}).get("status", 0) or 0
-                ) == STATUS_OK
-                # Prefer answer payload only when the server accepted it
+                ans = raw_ans.get("npc|answer") or {}
+                ans_ok = int(ans.get("status", 0) or 0) == STATUS_OK
                 if ans_ok and (raw_ans.get("npc|point") or {}).get("point"):
                     raw = raw_ans
                 elif ans_ok:
                     raw = raw_ans
                 else:
-                    # Opening to_point often returns empty done=true — not real progress.
-                    # type=2 kill lines like «Крэтс повержен» need a LIVE hunt_farm kill.
-                    # Do NOT treat enlistment replies as hunt gates.
+                    # JSON failed too — maybe a real kill gate
                     point_obj = pt.get("point") if isinstance(pt.get("point"), dict) else {}
                     mob_name = self._infer_hunt_mob_name(
                         child_title,
                         str(child.get("message") or ""),
                         str(point_obj.get("target_name") or ""),
+                        str(point_obj.get("title") or ""),
+                        str(point_obj.get("description") or ""),
                     )
                     if not mob_name:
                         logger.info(
-                            "type=2 отклонён (msg %s → %s) — это не убийство моба "
-                            "('%s'); пробую другой ответ.",
+                            "type=2 msg %s → %s не принят (HTML+JSON) — "
+                            "'%s'; пробую другой ответ.",
                             child_id, to_point, child_title[:60],
                         )
                         self._answered_points.add(child_id)
                         self.clear_hunt_gate()
-                        # Soft-skip only this child — keep walking other replies
                         await asyncio.sleep(random.uniform(0.3, 0.8))
                         continue
                     logger.info(
@@ -665,7 +787,6 @@ class QuestTracker:
                     )
                     started = await self._attack_hunt_for_quest(mob_name)
                     if started:
-                        # Keep dialogue retryable after the fight
                         self._pending_type2 = {
                             "npc_id": str(npc_id),
                             "quest_id": str(quest_id),
@@ -675,11 +796,11 @@ class QuestTracker:
                             "global_npc": int(global_npc or 0),
                             "link_id": str(link_id or "0"),
                             "f_id": str(f_id or "0"),
+                            "href": npc_href,
                             "mob_name": mob_name,
                         }
                         await asyncio.sleep(random.uniform(0.5, 1.2))
                         return max(1, steps)
-                    # Short soft-ban only — do NOT mark child answered forever
                     self._exhausted_dialogues.add(key)
                     self._soft_ban_until[key] = time.time() + 45.0
                     break
@@ -718,7 +839,6 @@ class QuestTracker:
 
             new_pt = raw.get("npc|point") or {}
             new_pid = str(new_pt.get("point_id") or "")
-            old_pid = str(pt.get("point_id") or "")
             moved = bool(new_pid) and new_pid != old_pid and not new_pt.get("done")
             ans_ok = int(ans.get("status", 0) or 0) == STATUS_OK
 
@@ -761,9 +881,12 @@ class QuestTracker:
                 again = raw.get("npc|point") or {}
                 if str(again.get("point_id") or "") == old_pid:
                     same_children = {
-                        str(x.get("id")) for x in (again.get("child_list") or [])
+                        str(x.get("id"))
+                        for x in self._as_child_list(again.get("child_list"))
                     }
-                    if child_id in same_children or not (again.get("child_list") or []):
+                    if child_id in same_children or not self._as_child_list(
+                        again.get("child_list")
+                    ):
                         logger.info(
                             "NPC %s: диалог не сдвинулся (возможно, нужно выполнить цель квеста).",
                             npc_id,
@@ -859,13 +982,14 @@ class QuestTracker:
                     story["npc_id"], story.get("global_npc", 1),
                 )
                 steps = await self.walk_npc_api(
-                    story["npc_id"],
-                    global_npc=int(story.get("global_npc", 1) or 1),
-                    link_id=str(story.get("link_id") or "0"),
-                    f_id=str(story.get("f_id") or "0"),
-                    area_id=str(story.get("area_id") or "0"),
-                )
-                actions += steps
+                story["npc_id"],
+                global_npc=int(story.get("global_npc", 1) or 1),
+                link_id=str(story.get("link_id") or "0"),
+                f_id=str(story.get("f_id") or "0"),
+                area_id=str(story.get("area_id") or "0"),
+                href=str(story.get("url") or ""),
+            )
+            actions += steps
 
         # 2. Local area NPCs first (quest givers like Вождь Торгор), then events
         for npc in await self.list_available_npcs():
@@ -887,6 +1011,7 @@ class QuestTracker:
                 link_id=npc.link_id or "0",
                 f_id=npc.f_id or "0",
                 area_id=npc.area_id or "0",
+                href=npc.url or "",
             )
             actions += steps
             if steps:

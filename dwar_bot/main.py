@@ -1012,6 +1012,7 @@ class DwarBot:
                     link_id=str(payload.get("link_id") or "0"),
                     f_id=str(payload.get("f_id") or "0"),
                     area_id=str(payload.get("area_id") or "0"),
+                    href=str(payload.get("href") or payload.get("url") or ""),
                 )
                 if steps:
                     logger.info("📜 Квестовых шагов: %d (NPC %s)", steps, npc_id)

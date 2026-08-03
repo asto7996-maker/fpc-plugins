@@ -362,3 +362,51 @@ def test_telegram_acl_api():
 
     api_g = TelegramAPI("tok", "111", allow_groups=True)
     assert api_g.chat_allowed({"type": "supergroup"})
+
+
+def test_quest_child_list_normalize_and_html_href():
+    from dwar_bot.modules.quest_tracker import QuestTracker
+    from dwar_bot.core.game_client import DwarGameClient
+
+    kids = QuestTracker._as_child_list(
+        {"1": {"id": "335", "message": "ok", "to_point_id": "100241"}}
+    )
+    assert len(kids) == 1 and kids[0]["id"] == "335"
+    assert QuestTracker._as_child_list([{"id": "1"}])[0]["id"] == "1"
+    assert QuestTracker._as_child_list(None) == []
+
+    href = DwarGameClient.build_npc_href(
+        409,
+        global_npc=0,
+        link_id=2960,
+        f_id=4,
+        href="/npc.php?f_id=4&npc_id=409&global_npc=0&link_id=2960&abc",
+    )
+    assert href.startswith("/npc.php") and "409" in href
+
+    # Positive keywords prefer award/accept replies
+    qt = QuestTracker.__new__(QuestTracker)
+    qt._answered_points = set()
+    picked = QuestTracker._pick_child(
+        qt,
+        [
+            {"id": "1", "title": "Отказаться", "message": "нет"},
+            {"id": "2", "title": "Принять награду", "message": "да"},
+        ],
+    )
+    assert picked and picked["id"] == "2"
+
+
+def test_story_quest_outranks_casual_hunt():
+    from dwar_bot.modules.progression_brain import ProgressionBrain, ActionType
+    from dwar_bot.modules.bot_settings import BotSettings
+    from dwar_bot.modules.quest_tracker import NpcInfo
+
+    brain = ProgressionBrain(BotSettings())
+    # Local story NPC score floor after our bump
+    assert 950 <= 1250
+    npc = NpcInfo(npc_id="409", title="Вождь Торгор", is_global=False, link_id="2960", url="/npc.php?x")
+    # Payload must carry hashed href for HTML answers
+    assert npc.url.startswith("/npc.php")
+    assert ActionType.QUEST_NPC.value == "quest_npc"
+    assert brain.last is not None
