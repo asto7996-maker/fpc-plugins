@@ -1704,6 +1704,24 @@ class DwarBot:
                     )
                 )
                 wo_npcs = self.quests.world_objective_npc_ids()
+                flash_locked = bool(
+                    wo.get("kind") == "heal_wounded"
+                    and (wo.get("flash_only") or wo.get("http_impossible"))
+                )
+                # Flash-locked heal giver has only «излечение» dialogue — skip, farm Exp
+                if npc_id in wo_npcs and flash_locked:
+                    logger.info(
+                        "Skip NPC %s — heal_wounded flash-locked (нужен клик в клиенте).",
+                        npc_id,
+                    )
+                    self.quests.mark_npc_exhausted(
+                        npc_id,
+                        global_npc=int(payload.get("global_npc", 0) or 0),
+                        link_id=str(payload.get("link_id") or "0"),
+                    )
+                    if not self.brain.farm_push_active():
+                        self.brain.push_farm(300.0)
+                    return True
                 # Under farm_open, story NPC (often same id as heal_wounded giver, e.g. 409)
                 # must be talkable again — Flash heal stays soft side-quest.
                 if npc_id in wo_npcs and not farm_open:
