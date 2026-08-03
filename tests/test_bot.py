@@ -16,7 +16,7 @@ DWAR = REPO / "dwar_bot" if (REPO / "dwar_bot" / "core").is_dir() else REPO
 
 
 def test_core_modules_importable():
-    from dwar_bot.core import bot_state, cursor_self_healer, log_watcher, self_healing
+    from dwar_bot.core import bot_state, cursor_self_healer, log_watcher, self_healing, auto_coder
     from dwar_bot.core.bot_state import BotState
 
     assert BotState.PAUSED.name == "PAUSED"
@@ -25,6 +25,8 @@ def test_core_modules_importable():
     assert callable(self_healing.validate_python_code)
     assert callable(self_healing.apply_patch_via_cursor)
     assert callable(self_healing.AutonomousLogWatcher)
+    assert callable(auto_coder.bind_auto_coder)
+    assert callable(auto_coder.AutoCoder)
 
 
 def test_progression_brain_importable():

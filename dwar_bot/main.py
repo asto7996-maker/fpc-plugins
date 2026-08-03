@@ -66,6 +66,7 @@ from dwar_bot.core.auto_healer import bind_auto_healer, get_auto_healer
 from dwar_bot.core.error_recovery import get_recovery_stats
 from dwar_bot.core.self_healing import AutonomousLogWatcher
 from dwar_bot.core.ai_healing import HealingOrchestrator
+from dwar_bot.core.auto_coder import bind_auto_coder
 from dwar_bot.core.master_controller import (
     StrategicDirective,
     bind_master_controller,
@@ -2148,6 +2149,18 @@ async def main() -> None:
     # Equivalent one-liner form:
     # asyncio.create_task(start_healing_orchestrator(120, notify_fn=_notify_plain, ...))
 
+    # Autonomous AutoCoder: stuck / crash → Cursor CLI patch (120–300s)
+    auto_coder = bind_auto_coder(
+        log_path=LOG_FILE,
+        notify_fn=_notify_plain,
+        interval_min=120,
+        interval_max=300,
+    )
+    auto_coder_task = asyncio.create_task(
+        auto_coder.run_forever(),
+        name="auto_coder_120_300s",
+    )
+
     async def _heal_watchdog() -> None:
         while not _shutdown_event.is_set():
             await asyncio.sleep(900)
@@ -2160,7 +2173,7 @@ async def main() -> None:
 
     asyncio.create_task(_heal_watchdog(), name="heal_watchdog")
     logger.info(
-        "Self-Healing(300s) + GeminiAudit(120s) + LevelingEngine · "
+        "Self-Healing(300s) + GeminiAudit(120s) + AutoCoder(120-300s) + LevelingEngine · "
         "CURSOR_API_KEY=%s GEMINI_API_KEY=%s",
         "set" if os.getenv("CURSOR_API_KEY") else "MISSING",
         "set" if os.getenv("GEMINI_API_KEY") else "MISSING",
@@ -2206,6 +2219,13 @@ async def main() -> None:
             healing_orch_task.cancel()
             try:
                 await healing_orch_task
+            except asyncio.CancelledError:
+                pass
+        if not auto_coder_task.done():
+            auto_coder.stop()
+            auto_coder_task.cancel()
+            try:
+                await auto_coder_task
             except asyncio.CancelledError:
                 pass
         if tg_task:
