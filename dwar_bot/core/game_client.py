@@ -1008,6 +1008,18 @@ class DwarGameClient:
             extra["link_id"] = str(link_id)
         return await self.entry_point("common", "action", extra)
 
+    async def get_bag(self) -> dict:
+        """Return ``user|bag`` payload (artifact_list + capacity)."""
+        resp = await self.entry_point("user", "bag", {})
+        return (resp.raw or {}).get("user|bag") or resp.data or {}
+
+    async def drop_artifact(self, artifact_id: str | int, count: int = 1) -> ApiResponse:
+        """Destroy/drop an inventory item (frees backpack weight)."""
+        return await self.common_action(
+            "DROP",
+            {"artifact_id": str(artifact_id), "count": int(count or 1)},
+        )
+
     # ------------------------------------------------------------------
     # Hunt / arena (hunt_conf.php)
     # ------------------------------------------------------------------

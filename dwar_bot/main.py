@@ -505,6 +505,16 @@ class DwarBot:
         self._char = self._profile.char
         self._state = self._profile.state
 
+        # Overloaded bag blocks travel and quest objectives — free junk first
+        try:
+            dropped = await self.combat.free_backpack()
+            if dropped:
+                self._profile = await self.stats.read_full_profile()
+                self._char = self._profile.char
+                self._state = self._profile.state
+        except Exception as exc:
+            logger.debug("free_backpack: %s", exc)
+
         if not self._char.nick:
             # In-fight lock: user.php returns a fight.php redirect stub without
             # ``var par`` — soft recheck still passes because state.fight_id is set.
@@ -1152,6 +1162,10 @@ class DwarBot:
                     logger.info("Переход закрыт: %s", err[:160])
                     # Don't spam the same gated exit
                     self.brain.mark_cooldown(f"Переход: {name}", 300)
+                    if "перегруз" in err.lower() or "рюкзак" in err.lower():
+                        dropped = await self.combat.free_backpack(target_free=8)
+                        if dropped:
+                            return True
                     if "военачальник" in err.lower() or "покинуть селение" in err.lower():
                         self.brain.need_quest_unlock = True
                         self.brain.awaiting_quest_turnin = False

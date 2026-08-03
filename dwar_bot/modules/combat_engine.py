@@ -298,6 +298,89 @@ class CombatEngine:
                 await asyncio.sleep(random.uniform(0.4, 1.0))
         return equipped
 
+    # Starter duplicate junk — safe to DROP when backpack is overloaded
+    _JUNK_ARTIKULS = {
+        "3908", "3909", "3910", "3911",  # starter leather / club / shield
+        "18012",  # apple
+    }
+    _KEEP_ARTIKULS = {
+        "18209", "18208",  # quest medicine / lava
+        "18013", "18014",  # starter elixirs
+    }
+
+    async def free_backpack(self, *, target_free: int = 5, max_drops: int = 25) -> int:
+        """
+        Drop duplicate junk when bag weight exceeds capacity.
+
+        Returns number of items dropped. Quest / useful artikuls are kept.
+        """
+        try:
+            bag = await self._client.get_bag()
+        except Exception as exc:
+            logger.debug("get_bag: %s", exc)
+            return 0
+        cap = bag.get("capacity") or {}
+        try:
+            used = int(cap.get("used") or 0)
+            total = int(cap.get("total") or 0)
+        except (TypeError, ValueError):
+            return 0
+        if total <= 0 or used <= total:
+            return 0
+        need = max(0, used - total + int(target_free))
+        arts = bag.get("artifact_list") or []
+        # Prefer dropping junk artikuls; keep one of each if possible
+        seen_junk: set[str] = set()
+        drop_ids: list[str] = []
+        for a in arts:
+            if not isinstance(a, dict):
+                continue
+            aid = str(a.get("artikul_id") or "")
+            iid = str(a.get("id") or "")
+            if not iid or aid in self._KEEP_ARTIKULS:
+                continue
+            if aid in self._JUNK_ARTIKULS:
+                if aid in seen_junk:
+                    drop_ids.append(iid)
+                else:
+                    seen_junk.add(aid)  # keep one copy
+            if len(drop_ids) >= need:
+                break
+        # Still overweight? drop remaining junk including first copies
+        if len(drop_ids) < need:
+            for a in arts:
+                if not isinstance(a, dict):
+                    continue
+                aid = str(a.get("artikul_id") or "")
+                iid = str(a.get("id") or "")
+                if not iid or aid in self._KEEP_ARTIKULS or iid in drop_ids:
+                    continue
+                if aid in self._JUNK_ARTIKULS:
+                    drop_ids.append(iid)
+                if len(drop_ids) >= need:
+                    break
+
+        dropped = 0
+        for iid in drop_ids[:max_drops]:
+            try:
+                resp = await self._client.drop_artifact(iid, count=1)
+                err = str(resp.redirect_error or resp.error or "")
+                if resp.status == STATUS_OK and (
+                    not err or err.lower() in ("false", "none")
+                ):
+                    dropped += 1
+                else:
+                    logger.debug("DROP %s → %s", iid, err[:80])
+            except Exception as exc:
+                logger.debug("DROP %s failed: %s", iid, exc)
+            await asyncio.sleep(random.uniform(0.2, 0.5))
+        if dropped:
+            logger.info(
+                "🗑 Освободил рюкзак: выбросил %d хлама (было %s/%s).",
+                dropped, used, total,
+            )
+        return dropped
+
     # ------------------------------------------------------------------
     # Combat log
     # ------------------------------------------------------------------
