@@ -144,7 +144,7 @@ def test_master_controller_apply_directive():
 
 def test_main_wires_leveling_engine():
     src = (Path(__file__).resolve().parents[1] / "dwar_bot" / "main.py").read_text(encoding="utf-8")
+    assert "format_level_up_rich" in src or "build_level_up_update" in src
     assert "LevelingEngine" in src
-    assert "GameKnowledgeBase" in src or "get_knowledge_base" in src
-    assert "build_level_up_update" in src
+    assert "get_knowledge_base" in src
     assert "StrategicDirective" in src

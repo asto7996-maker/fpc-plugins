@@ -71,7 +71,10 @@ from dwar_bot.core.master_controller import (
     get_master_controller,
 )
 from dwar_bot.core.game_knowledge_base import get_knowledge_base
+from dwar_bot.core.telemetry_engine import TelemetryEngine, LootItem
+from dwar_bot.core.rich_notifications import RichNotifications
 from dwar_bot.modules.leveling_engine import LevelingEngine
+from dwar_bot.modules.analytics_reporter import AnalyticsReporter
 from dwar_bot.config import COMBAT, STATE_FILE
 
 logger = logging.getLogger("dwar_bot.main")
@@ -124,6 +127,13 @@ class DwarBot:
             controller=self.controller,
             account_id=self.account_id,
         )
+        self.telemetry = TelemetryEngine(
+            account_id=self.account_id,
+            price_lookup=self.knowledge,
+        )
+        self.rich = RichNotifications(self.telemetry)
+        self.analytics = AnalyticsReporter(self)
+        self._wire_telemetry_hooks()
 
         self._iteration = 0
         self._errors_in_row = 0
@@ -148,6 +158,114 @@ class DwarBot:
 
     def bind_telegram(self, tg: TelegramBotHandler) -> None:
         self._tg = tg
+        # Rich notifications go through the same owner-scoped notify path
+        self.rich.bind_notify(self._rich_notify)
+
+    async def _rich_notify(self, text: str, category: str = "") -> None:
+        await self.notify(text, category)
+
+    def _wire_telemetry_hooks(self) -> None:
+        """Instrument combat potion use with exact consumable telemetry."""
+        engine = self.combat
+        orig = engine.use_potion
+
+        async def _tracked_use_potion(artifact):
+            ok = await orig(artifact)
+            if ok:
+                title = getattr(artifact, "title", "") or "зелье"
+                kind = "scroll" if "свиток" in title.lower() else "potion"
+                self.telemetry.note_consumable(
+                    title,
+                    kind=kind,
+                    context=f"combat.use_potion art_id={getattr(artifact, 'art_id', '')}",
+                )
+            return ok
+
+        engine.use_potion = _tracked_use_potion  # type: ignore[method-assign]
+
+    def _telemetry_battle_begin(
+        self,
+        *,
+        source: str,
+        mob_name: str = "",
+        mob_id: str = "",
+    ) -> None:
+        self.telemetry.start_battle(
+            source=source,
+            mob_id=mob_id,
+            mob_name=mob_name,
+            area_id=str(self._state.area_id or ""),
+            potions_baseline=self.combat.session.potions_used,
+            attacks_baseline=self.combat.session.attacks_made,
+        )
+
+    async def _telemetry_battle_end(
+        self,
+        result: BattleResult,
+        *,
+        mob_name: str = "",
+        notify: bool = True,
+    ) -> None:
+        if result not in (
+            BattleResult.WIN, BattleResult.LOSE, BattleResult.FLED, BattleResult.ERROR,
+        ):
+            return
+        bt = self.telemetry.end_battle(
+            result=result.name,
+            potions_total=self.combat.session.potions_used,
+            attacks_total=self.combat.session.attacks_made,
+        )
+        if bt and mob_name and not bt.mob_name:
+            bt.mob_name = mob_name
+        if bt and notify and self.settings.notify.battles:
+            await self.rich.notify_battle_finished(bt)
+
+    def _telemetry_quest_begin(self, title: str, *, npc_id: str = "") -> None:
+        self.telemetry.ensure_quest(
+            title or "Квест",
+            npc_id=npc_id,
+            area_id=str(self._state.area_id or ""),
+            profile=self._profile,
+            gold=float(self._state.money or 0),
+        )
+
+    async def _telemetry_quest_complete(
+        self,
+        *,
+        title: str = "",
+        notify: bool = True,
+    ) -> None:
+        # Prefer KB quest rewards when known
+        exp = 0.0
+        valor = 0.0
+        exp_pct = 0.0
+        qtitle = title
+        if self.telemetry.active_quest:
+            qtitle = qtitle or self.telemetry.active_quest.title
+        for q in self.knowledge.list_quests(max_level=self._char.level or 99)[:20]:
+            if qtitle and qtitle.lower() in q.title.lower():
+                exp = q.exp_reward
+                valor = q.valor_reward
+                break
+        if exp <= 0:
+            # LevelingEngine proxy from recent note
+            exp = max(50.0, self.leveling.progress.exp_per_hour / 12.0)
+        if self._char.level:
+            # rough % of level bucket
+            bucket = 800.0 * max(1, self._char.level)
+            exp_pct = (exp / bucket) * 100.0 if bucket else 0.0
+        qt = self.telemetry.complete_quest(
+            profile=self._profile,
+            gold=float(self._state.money or 0),
+            exp_gained=exp,
+            exp_pct_of_level=exp_pct,
+            valor_gained=valor,
+            title=qtitle or None,
+        )
+        if qt:
+            self.leveling.note_quest_progress(title=qt.title, exp_reward=qt.exp_gained)
+            if notify and self.settings.notify.quests:
+                await self.rich.notify_quest_completed(qt)
 
     def _apply_combat_thresholds(self) -> None:
         f = self.settings.farm
@@ -235,6 +353,26 @@ class DwarBot:
                 "priority": self.leveling.progress.priority_title,
                 "directive": self.controller.directive_summary(),
             },
+            "telemetry": {
+                "rates": self.telemetry.rates(window_sec=3600.0),
+                "battles": self.telemetry.battle_stats_summary(),
+                "active_quest": (
+                    {
+                        "title": self.telemetry.active_quest.title,
+                        "started_at": self.telemetry.active_quest.started_at,
+                        "consumables": len(self.telemetry.active_quest.consumables),
+                    }
+                    if self.telemetry.active_quest else None
+                ),
+                "active_battle": (
+                    {
+                        "mob": self.telemetry.active_battle.mob_name,
+                        "source": self.telemetry.active_battle.source,
+                        "started_at": self.telemetry.active_battle.started_at,
+                    }
+                    if self.telemetry.active_battle else None
+                ),
+            },
             "loot_claimed": self._loot_claimed,
             "settings": self.settings.to_dict(),
             "bot_state": get_bot_state().name,
@@ -255,54 +393,8 @@ class DwarBot:
         }
 
     async def build_report(self) -> str:
-        """Full progression-aware report for Telegram / heartbeat."""
-        st = self.get_status()
-        r = self.settings.report
-        parts = [
-            f"<b>📈 Отчёт DwarBot</b> · {time.strftime('%H:%M:%S')}",
-            f"🧙 <b>{st.get('nick','?')}</b> Lv{st.get('level','?')} · "
-            f"❤️ {st.get('hp','?')}/{st.get('hp_max','?')} · "
-            f"💰 {st.get('money','?')}",
-            f"📍 {st.get('area_title') or st.get('area_id','?')} · "
-            f"⏱ {st.get('uptime','?')} · тик {st.get('iteration',0)}",
-        ]
-        if r.include_plan:
-            parts.append("")
-            parts.append(self.brain.last.report_html())
-        if r.include_combat:
-            parts.append(
-                f"\n⚔️ Бои: {st.get('battles',0)} · "
-                f"🏆{st.get('wins',0)} / 💀{st.get('losses',0)} · "
-                f"WR {st.get('win_rate',0):.0f}%"
-            )
-        if r.include_quests:
-            parts.append(
-                f"📜 Квесты: ✅{st.get('quests_completed',0)} · "
-                f"📝{st.get('quests_accepted',0)} · "
-                f"💬{st.get('dialogues',0)}"
-            )
-        if r.include_inventory:
-            parts.append(
-                f"🎒 Предметов: {len(st.get('inventory') or [])} · "
-                f"🧪 {st.get('potions_count',0)} · "
-                f"🎁 лут-тиков: {self._loot_claimed}"
-            )
-        if r.include_timers:
-            timers = st.get("timers") or []
-            if timers:
-                tlines = ", ".join(
-                    f"{t.get('description','?')}: {t.get('remaining','?')}"
-                    for t in timers[:4]
-                )
-                parts.append(f"⏱ {tlines}")
-        f = self.settings.farm
-        parts.append(
-            f"🤖 Макс-фарм {self.settings.on_off(f.max_farm)} · "
-            f"Квесты {self.settings.on_off(f.auto_quests)} · "
-            f"Бои {self.settings.on_off(f.auto_combat)} · "
-            f"Лут {self.settings.on_off(f.auto_loot)}"
-        )
-        return "\n".join(parts)
+        """Full analytics report — telemetry + knowledge + state machine."""
+        return self.analytics.build_full_report()
 
     async def pause(self, *, quiet: bool = False) -> None:
         self._paused = True
@@ -462,17 +554,8 @@ class DwarBot:
                     await asyncio.sleep(s)
 
     async def _maybe_send_report(self) -> None:
-        r = self.settings.report
-        if not r.enabled:
-            return
-        interval = max(5, int(r.interval_min)) * 60
-        if time.time() - self.settings.last_report_at < interval:
-            return
         try:
-            text = await self.build_report()
-            await self.notify(text, "heartbeat")
-            self.settings.last_report_at = time.time()
-            self.settings.save()
+            await self.analytics.maybe_send_heartbeat()
         except Exception as exc:
             logger.debug("auto report failed: %s", exc)
 
@@ -656,6 +739,18 @@ class DwarBot:
 
         await self.timers.update_regen(self._char.hp, self._char.mp)
         await self._emit_state_notifications()
+
+        # Economy snapshot every tick (feeds Gold/hr Exp/hr)
+        self.telemetry.note_economy(
+            gold=float(self._state.money or 0),
+            exp_proxy=self.leveling.progress.exp_per_hour * max(
+                0.01, (time.time() - self.leveling._session_started) / 3600.0
+            ),
+            battles=self.combat.session.battles_joined,
+            wins=self.combat.session.wins,
+            potions_used=self.combat.session.potions_used,
+            quests_completed=self.quests.session.quests_completed,
+        )
 
         for note in self._profile.notifications[:3]:
             logger.info("📢 %s", note.text[:150])
@@ -875,10 +970,18 @@ class DwarBot:
             except Exception as exc:
                 logger.debug("idle multitasking: %s", exc)
 
-        # Periodic Telegram Level-Up Update
+        # Periodic Telegram Level-Up Update (rich + telemetry rates)
         if self.leveling.should_report() and self.settings.notify.level_up:
             try:
-                await self.notify(self.leveling.build_level_up_update(), "level_up")
+                text = self.rich.format_level_up_rich(
+                    level=self.leveling.progress.level,
+                    exp_pct=self.leveling.progress.exp_pct,
+                    exp_per_hour=self.leveling.progress.exp_per_hour,
+                    eta_seconds=self.leveling.progress.eta_seconds,
+                    priority=self.leveling.progress.priority_title,
+                    directive_state=self.controller.directive_summary().get("state", ""),
+                )
+                await self.notify(text, "level_up")
                 self.leveling.mark_reported()
             except Exception as exc:
                 logger.debug("level-up update: %s", exc)
@@ -1053,6 +1156,12 @@ class DwarBot:
 
         try:
             if action == ActionType.HUNT_MOB:
+                mob_name = str(payload.get("name") or self.brain.pending_hunt_mob or "")
+                self._telemetry_battle_begin(source="hunt", mob_name=mob_name)
+                if self.brain.pending_hunt_mob or self.quests.pending_hunt_mob:
+                    self._telemetry_quest_begin(
+                        f"Охота: {self.brain.pending_hunt_mob or self.quests.pending_hunt_mob}",
+                    )
                 if payload.get("finish_only") or await self.combat.is_in_battle():
                     result = await self.combat.finish_fight()
                 else:
@@ -1061,7 +1170,7 @@ class DwarBot:
                         area_id=str(payload.get("area_id") or ""),
                     )
                 if result == BattleResult.WIN:
-                    await self.notify("⚔️ Охота: победа!", "battles")
+                    await self._telemetry_battle_end(result, mob_name=mob_name)
                     self.brain.mark_hunt_kill_done()
                     self.quests.clear_exhausted(local_only=True)
                     # Immediately try type=2 turn-in — do not farm more Крэтс
@@ -1073,14 +1182,26 @@ class DwarBot:
                     if turned:
                         self.brain.clear_hunt_gate()
                         self.quests.clear_hunt_gate()
-                        await self.notify("📜 Квест: убийство сдано Вождю", "quests")
+                        # Refresh profile for accurate quest reward diffs
+                        try:
+                            self._profile = await self.stats.read_full_profile()
+                            self._char = self._profile.char
+                            self._state = self._profile.state
+                        except Exception:
+                            pass
+                        await self._telemetry_quest_complete(
+                            title=f"Охота на {mob_name}" if mob_name else "Охота",
+                        )
                         return True
                     if self.quests.pending_hunt_mob:
                         self.brain.pending_hunt_mob = self.quests.pending_hunt_mob
                     return True
                 if result in (BattleResult.JOINED, BattleResult.ONGOING, BattleResult.LOSE):
+                    if result == BattleResult.LOSE:
+                        await self._telemetry_battle_end(result, mob_name=mob_name)
                     return True
                 self.brain.mark_cooldown(focus.title, 60)
+                await self._telemetry_battle_end(BattleResult.ERROR, mob_name=mob_name, notify=False)
                 return False
 
             # Legacy: "already in fight" combat_area without action_id
@@ -1126,12 +1247,22 @@ class DwarBot:
                 npc_id = str(payload.get("npc_id") or "")
                 if not npc_id:
                     return False
+                self._telemetry_quest_begin(
+                    str(focus.title or payload.get("title") or "Квест"),
+                    npc_id=npc_id,
+                )
                 # Prefer finishing pending type=2 turn-in first
                 if self.quests.has_pending_type2() and self.brain.awaiting_quest_turnin:
                     turned = await self.quests.retry_pending_type2()
                     if turned:
                         self.brain.clear_hunt_gate()
-                        await self.notify("📜 Квест: убийство сдано", "quests")
+                        try:
+                            self._profile = await self.stats.read_full_profile()
+                            self._char = self._profile.char
+                            self._state = self._profile.state
+                        except Exception:
+                            pass
+                        await self._telemetry_quest_complete(title=str(focus.title or ""))
                         return True
                 steps = await self.quests.walk_npc_api(
                     npc_id,
@@ -1150,10 +1281,14 @@ class DwarBot:
                         logger.info("Сюжет ждёт убийства '%s' — одна охота, потом сдача.", mob)
                     else:
                         self.brain.clear_hunt_gate()
-                    await self.notify(
-                        f"📜 Диалог с NPC {npc_id}: <b>{steps}</b> шаг(ов)",
-                        "quests",
-                    )
+                        # Dialogue-only progress without kill gate — still a milestone
+                        if self.settings.notify.quests:
+                            await self.notify(
+                                f"📜 Диалог с NPC {npc_id}: <b>{steps}</b> шаг(ов)\n"
+                                f"⏱ квест «{focus.title}» в трекинге с "
+                                f"{time.strftime('%H:%M:%S', time.localtime(self.telemetry.active_quest.started_at)) if self.telemetry.active_quest else '—'}",
+                                "quests",
+                            )
                     await _sleep(2.0, 5.0)
                     return True
                 self.quests.mark_npc_exhausted(
@@ -1198,7 +1333,9 @@ class DwarBot:
                     self.combat.session.battles_joined += 1
                     self.combat.session.consecutive_battles += 1
                     logger.info("⚔️ Бой начат через '%s'!", name)
-                    await self.notify(f"⚔️ Бой через <b>{name}</b>!", "battles")
+                    self._telemetry_battle_begin(source="area", mob_name=name)
+                    if self.settings.notify.battles:
+                        await self.notify(f"⚔️ Бой через <b>{name}</b>!", "battles")
                     await _sleep(3.0, 6.0)
                     return True
                 if loot_n > 0:
@@ -1245,7 +1382,9 @@ class DwarBot:
                     return False
                 result = await self.combat.try_arena()
                 if result == BattleResult.JOINED:
-                    await self.notify("⚔️ Арена: вступил в бой!", "battles")
+                    self._telemetry_battle_begin(source="arena", mob_name="Арена")
+                    if self.settings.notify.battles:
+                        await self.notify("⚔️ Арена: вступил в бой!", "battles")
                     return True
                 if result == BattleResult.ONGOING:
                     return True
