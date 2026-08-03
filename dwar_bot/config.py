@@ -291,7 +291,7 @@ TELEGRAM_MIN_LEVEL: str = os.getenv("TELEGRAM_MIN_LEVEL", "WARNING")
 # ---------------------------------------------------------------------------
 CURSOR_API_KEY: str = os.getenv("CURSOR_API_KEY", "")
 GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
-GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-flash-latest")
 HEALING_AUDIT_INTERVAL_SEC: int = int(os.getenv("HEALING_AUDIT_INTERVAL_SEC", "120"))
 # Maximum messages per minute to avoid Telegram rate-limits
 TELEGRAM_RATE_LIMIT: int = 20

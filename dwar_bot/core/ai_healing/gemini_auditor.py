@@ -20,7 +20,17 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 
 _ISSUE_TYPES = frozenset({"CRASH", "STUCK_NO_PROGRESS", "DOM_CHANGED"})
 
-_DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+_DEFAULT_MODEL = "gemini-flash-latest"
+_MODEL_FALLBACKS = (
+    "gemini-flash-latest",
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
+)
+
+
+def _preferred_model(explicit: str = "") -> str:
+    _load_dotenv()
+    return (explicit or os.environ.get("GEMINI_MODEL") or _DEFAULT_MODEL).strip()
 
 
 def _load_dotenv() -> None:
@@ -256,7 +266,7 @@ class GeminiAuditor:
         allow_heuristic_fallback: bool = True,
     ) -> None:
         self.api_key = (api_key or _gemini_api_key()).strip()
-        self.model = (model or _DEFAULT_MODEL).strip()
+        self.model = _preferred_model(model)
         self.allow_heuristic_fallback = allow_heuristic_fallback
         self._client = None
 
@@ -296,18 +306,44 @@ class GeminiAuditor:
         if self.api_key:
             try:
                 client = self._ensure_client()
-                response = client.models.generate_content(
-                    model=self.model,
-                    contents=prompt,
-                )
-                text = getattr(response, "text", None) or ""
-                if not text and getattr(response, "candidates", None):
-                    # Best-effort extract from candidates
+                models_try = [self.model] + [
+                    m for m in _MODEL_FALLBACKS if m != self.model
+                ]
+                text = ""
+                last_exc: Optional[Exception] = None
+                for model_name in models_try:
                     try:
-                        parts = response.candidates[0].content.parts
-                        text = "".join(getattr(p, "text", "") or "" for p in parts)
-                    except Exception:
-                        text = str(response)
+                        response = client.models.generate_content(
+                            model=model_name,
+                            contents=prompt,
+                        )
+                        text = getattr(response, "text", None) or ""
+                        if not text and getattr(response, "candidates", None):
+                            try:
+                                parts = response.candidates[0].content.parts
+                                text = "".join(
+                                    getattr(p, "text", "") or "" for p in parts
+                                )
+                            except Exception:
+                                text = str(response)
+                        if text:
+                            if model_name != self.model:
+                                logger.info(
+                                    "GeminiAuditor: using fallback model %s",
+                                    model_name,
+                                )
+                            break
+                    except Exception as exc:
+                        last_exc = exc
+                        logger.warning(
+                            "GeminiAuditor model %s failed: %s",
+                            model_name, str(exc)[:180],
+                        )
+                        continue
+                else:
+                    if last_exc:
+                        raise last_exc
+
                 parsed = _extract_json(text)
                 if parsed is not None:
                     verdict = _normalize_verdict(parsed)
