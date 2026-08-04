@@ -74,17 +74,21 @@ class PureFarmEngine:
         level: int,
         auto_quests: bool = True,
         force: bool = False,
+        story_stalled: bool = False,
     ) -> bool:
         """
         Hunt-only mode.
 
         When ``auto_quests`` is True (default), return False so the main
-        planner can talk to story NPCs and advance quests. Pass
-        ``force=True`` (env PURE_FARM_ONLY) to ignore that gate.
+        planner can talk to story NPCs. Pass ``force=True`` (env
+        PURE_FARM_ONLY) or ``story_stalled=True`` (Flash heal blocked) to
+        hunt anyway.
         """
-        if auto_quests and not force:
+        if force or story_stalled:
+            return True
+        if auto_quests:
             return False
-        if force or max_farm:
+        if max_farm:
             return True
         if str(area_id or "") in VILLAGE_AREAS and int(level or 1) >= 2:
             return True

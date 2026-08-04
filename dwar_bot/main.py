@@ -118,11 +118,27 @@ class DwarBot:
         self.quests = QuestTracker(client)
         try:
             if self.quests.load_world_objective():
+                wo = self.quests.pending_world_objective or {}
                 logger.info(
                     "Restored world objective '%s' (flash_only=%s)",
-                    (self.quests.pending_world_objective or {}).get("kind"),
-                    bool((self.quests.pending_world_objective or {}).get("flash_only")),
+                    wo.get("kind"),
+                    bool(wo.get("flash_only")),
                 )
+                # Flash heal with no HTTP path: stall immediately so we hunt
+                # instead of spinning empty story-checks on boot.
+                if (
+                    wo.get("kind") == "heal_wounded"
+                    and (wo.get("flash_only") or wo.get("http_impossible"))
+                    and float(wo.get("stalled_until") or 0) < time.time()
+                ):
+                    wo = dict(wo)
+                    wo["stalled_until"] = time.time() + 900.0
+                    wo["farm_open"] = True
+                    self.quests.pending_world_objective = wo
+                    self.quests._persist_world_objective()
+                    logger.warning(
+                        "Boot: heal_wounded Flash-stalled 15min — PureFarm hunt."
+                    )
         except Exception as exc:
             logger.debug("load_world_objective: %s", exc)
         self.timers = TimersManager(client)
@@ -928,32 +944,75 @@ class DwarBot:
         await self._emit_state_notifications()
 
         # ------------------------------------------------------------------
-        # PURE FARM filler: hunt-only ONLY when auto_quests is off (or
-        # PURE_FARM_ONLY=1). With quests on — story/NPC planner owns the tick.
+        # PURE FARM: hunt-only when quests off, PURE_FARM_ONLY=1, or story
+        # stalled on Flash heal_wounded (no HTTP progress possible).
         # ------------------------------------------------------------------
         pure_farm_force = os.getenv("PURE_FARM_ONLY", "0").strip().lower() in (
             "1", "true", "yes", "on",
         )
+        wo_early = {}
+        try:
+            wo_early = dict(self.quests.pending_world_objective or {})
+        except Exception:
+            wo_early = {}
+        story_stalled = (
+            str(wo_early.get("kind") or "") == "heal_wounded"
+            and bool(wo_early.get("flash_only") or wo_early.get("http_impossible"))
+            and float(wo_early.get("stalled_until") or 0) > time.time()
+        )
+        # Expired stall → one story-check this tick, then re-stall if needed
+        if (
+            str(wo_early.get("kind") or "") == "heal_wounded"
+            and float(wo_early.get("stalled_until") or 0)
+            and float(wo_early.get("stalled_until") or 0) <= time.time()
+        ):
+            try:
+                wo_clr = dict(wo_early)
+                wo_clr.pop("stalled_until", None)
+                self.quests.pending_world_objective = wo_clr
+                self.quests._persist_world_objective()
+                self.quests.clear_exhausted(local_only=True)
+                self.quests.clear_world_objective_npc_ban(
+                    str(wo_clr.get("npc_id") or "409")
+                )
+                logger.info(
+                    "heal_wounded stall expired — story-check Вождя this tick."
+                )
+            except Exception as exc:
+                logger.debug("clear stall: %s", exc)
+            story_stalled = False
+
         if self.pure_farm.should_run(
             max_farm=bool(farm.max_farm),
             area_id=str(self._state.area_id or ""),
             level=int(self._char.level or 1),
             auto_quests=bool(farm.auto_quests),
             force=pure_farm_force,
+            story_stalled=story_stalled,
         ):
+            reason = (
+                "Flash heal stalled — hunt for real wins"
+                if story_stalled
+                else ("hunt-only force" if pure_farm_force else "hunt-only filler")
+            )
             try:
                 await self.controller.apply_directive(
                     StrategicDirective(
                         state=BotState.FARMING,
                         priority=1,
                         title="Pure Farm",
-                        reason="hunt-only filler (quests off)",
+                        reason=reason,
                         area_id=str(self._state.area_id or ""),
                         exp_per_hour=0.0,
                     )
                 )
             except Exception:
                 pass
+            if story_stalled and self._iteration <= 2:
+                logger.info(
+                    "Story stalled on Flash heal_wounded — PureFarm hunt ON "
+                    "(click wounded in client to unlock Военачальник)."
+                )
             handled = await self.pure_farm.run_tick(self)
             if handled:
                 self.telemetry.note_economy(
@@ -972,29 +1031,20 @@ class DwarBot:
                 "(set PURE_FARM_ONLY=1 to force hunt-only)."
             )
 
-        # Village story: periodically re-open local NPC dialogues so Вождь /
-        # Военачальник stay reachable between farm beats.
+        # Village: equip bag gear once per session (not every 3 ticks)
         if (
             farm.auto_quests
             and str(self._state.area_id or "") in {"930", "931", "932"}
-            and self._iteration % 3 == 1
+            and not getattr(self, "_bag_equipped_once", False)
         ):
             try:
-                cleared = self.quests.clear_exhausted(local_only=True)
-                if cleared:
-                    logger.info(
-                        "Story refresh: cleared %d local NPC ban(s).",
-                        cleared,
-                    )
-            except Exception as exc:
-                logger.debug("story refresh: %s", exc)
-            # Put on bag gear (user.php often shows 0 items in village)
-            try:
                 n_eq = await self.combat.equip_from_bag()
+                self._bag_equipped_once = True
                 if n_eq and self.settings.notify.gear:
                     await self.notify(f"👕 Из сумки надето: {n_eq}", "gear")
             except Exception as exc:
                 logger.debug("village equip_from_bag: %s", exc)
+                self._bag_equipped_once = True
 
         # Economy snapshot every tick (feeds Gold/hr Exp/hr)
         self.telemetry.note_economy(

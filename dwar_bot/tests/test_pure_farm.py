@@ -32,6 +32,17 @@ def test_should_run_respects_auto_quests():
     assert eng.should_run(
         max_farm=False, area_id="192", level=5, auto_quests=True, force=True,
     ) is True
+    # Flash heal stalled → hunt for real wins
+    assert eng.should_run(
+        max_farm=True, area_id="932", level=3, auto_quests=True, story_stalled=True,
+    ) is True
+
+
+def test_main_wires_story_stall_farm():
+    src = (ROOT / "main.py").read_text(encoding="utf-8")
+    assert "story_stalled" in src
+    assert "stalled_until" in src
+    assert "Flash heal stalled" in src or "heal_wounded stall" in src
 
 
 def test_telegram_stats_show_wins():

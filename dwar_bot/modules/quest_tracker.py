@@ -999,6 +999,23 @@ class QuestTracker:
                 "NPC %s: story check — только Flash «излечение», жду клик/приказ.",
                 npc_id,
             )
+            # Stall planner: stop burning ticks on empty story-checks.
+            # PureFarm/hunt resumes until stalled_until; re-check later.
+            try:
+                wo = dict(self.pending_world_objective or {})
+                if wo.get("kind") == "heal_wounded":
+                    wo["stalled_until"] = time.time() + 900.0  # 15 min
+                    wo["farm_open"] = True
+                    wo["flash_only"] = True
+                    wo["http_impossible"] = True
+                    self.pending_world_objective = wo
+                    self._persist_world_objective()
+                    logger.warning(
+                        "heal_wounded STALLED 15min — hunt/PureFarm until "
+                        "client click on wounded or next story-check."
+                    )
+            except Exception as exc:
+                logger.debug("mark stalled: %s", exc)
             return 0
 
         logger.info(
