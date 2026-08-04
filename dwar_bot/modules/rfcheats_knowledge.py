@@ -40,13 +40,13 @@ RFCHEATS_TITLE = "АвтоБан за самописного бота в Два�
 @dataclass
 class RfCheatsDefaults:
     """Soft limits inspired by the ban post + community advice."""
-    # OP ran 1–12h/day → stay well under marathon by default
-    max_continuous_minutes: int = 180   # 3h unbroken activity
-    max_daily_minutes: int = 480        # 8h active / calendar day
+    # OP ran 1–12h/day → stay under marathon, but 8h hard-stop was killing farm
+    max_continuous_minutes: int = 240   # 4h unbroken then short break
+    max_daily_minutes: int = 720        # 12h active / calendar day
     # Burst farm then mandatory break (community: don't grind flat 24h)
-    burst_minutes: int = 45
-    break_min_minutes: float = 8.0
-    break_max_minutes: float = 20.0
+    burst_minutes: int = 60
+    break_min_minutes: float = 5.0
+    break_max_minutes: float = 12.0
     # Their failed anti-detect delay floor (ms) → seconds for API pacing
     action_delay_min: float = 0.3
     action_delay_max: float = 0.9
@@ -54,8 +54,8 @@ class RfCheatsDefaults:
     think_pause_chance: float = 0.12
     think_pause_min: float = 2.0
     think_pause_max: float = 8.0
-    # After hitting daily budget — cool down this many minutes
-    daily_exhausted_break_minutes: float = 45.0
+    # After hitting daily budget — cool down until next calendar day (not 45m loops)
+    daily_exhausted_break_minutes: float = 30.0
 
 
 RFCHEATS_DEFAULTS = RfCheatsDefaults()
@@ -155,17 +155,42 @@ class HygieneTracker:
         if self.last_activity and (now - self.last_activity) > 600:
             self.continuous_started = now
             self.burst_started = now
-        self.daily_active_sec += max(0.0, float(seconds))
+        # Cap per-call so fight stubs can't inflate daily budget
+        self.daily_active_sec += min(90.0, max(0.0, float(seconds)))
         self.last_activity = now
         self._save()
 
     def note_break(self, sleep_sec: float = 0.0) -> None:
         now = time.time()
+        # Never extend an already-active break (prevents spin re-arm)
+        if self.break_until and now < self.break_until:
+            return
         self.break_until = now + max(0.0, float(sleep_sec))
         self.continuous_started = 0.0
         self.burst_started = 0.0
         self.last_activity = now
         self._save()
+
+    def remaining_break_sec(self) -> float:
+        self._rollover_day()
+        now = time.time()
+        if self.break_until and now < self.break_until:
+            return max(0.0, self.break_until - now)
+        return 0.0
+
+    def clear_break(self) -> None:
+        """Operator / self-heal: resume farm immediately."""
+        self.break_until = 0.0
+        self._save()
+
+    @staticmethod
+    def _seconds_until_local_midnight() -> float:
+        from datetime import datetime, timedelta
+        now = datetime.now()
+        nxt = (now + timedelta(days=1)).replace(
+            hour=0, minute=0, second=5, microsecond=0,
+        )
+        return max(60.0, (nxt - now).total_seconds())
 
     def check(self) -> HygieneDecision:
         """Return whether the bot should pause before more farm work."""
@@ -180,10 +205,12 @@ class HygieneTracker:
 
         daily_limit = float(self.d.max_daily_minutes) * 60.0
         if daily_limit > 0 and self.daily_active_sec >= daily_limit:
-            pause = float(self.d.daily_exhausted_break_minutes) * 60.0
+            # Pause until next calendar day (rollover clears counter).
+            # Old 45-min re-arm loop zeroed farm for hours with empty hunt ticks.
+            pause = self._seconds_until_local_midnight()
             return HygieneDecision(
                 True,
-                f"daily budget {self.d.max_daily_minutes}min",
+                f"daily budget {self.d.max_daily_minutes}min → until midnight",
                 pause,
             )
 

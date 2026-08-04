@@ -144,6 +144,19 @@ class CombatEngine:
                     ),
                 )
                 self._hygiene = HygieneTracker(defaults=d)
+                # Self-heal stuck empty-hunt loops: long orphan break after 8h budget
+                try:
+                    rem = float(self._hygiene.remaining_break_sec() or 0)
+                    used = float(self._hygiene.daily_active_sec or 0) / 60.0
+                    if rem > 120.0:
+                        self.hygiene_clear_break()
+                        logger.warning(
+                            "RF-Cheats hygiene: cleared orphan break "
+                            "(%.0fs left, daily=%.0fmin / %d) — resume farm",
+                            rem, used, d.max_daily_minutes,
+                        )
+                except Exception as exc:
+                    logger.debug("hygiene auto-clear: %s", exc)
                 logger.info(
                     "RF-Cheats hygiene: continuous≤%dmin daily≤%dmin burst≤%dmin",
                     d.max_continuous_minutes,
@@ -725,6 +738,34 @@ class CombatEngine:
         self._suis_session_kills = 0
         self._suis_error_ops = 0
         self._suis_failed_ops = 0
+
+    def hygiene_remaining_sec(self) -> float:
+        hy = self._hygiene
+        if hy is None or not getattr(COMBAT, "rfcheats_hygiene_enabled", True):
+            return 0.0
+        try:
+            return float(hy.remaining_break_sec())
+        except Exception:
+            return 0.0
+
+    def hygiene_clear_break(self) -> None:
+        hy = self._hygiene
+        if hy is None:
+            return
+        try:
+            hy.clear_break()
+            # Soft-reset inflated daily counter so farm can resume today
+            if float(getattr(hy, "daily_active_sec", 0) or 0) > 0:
+                limit = float(hy.d.max_daily_minutes) * 60.0
+                if hy.daily_active_sec >= limit:
+                    hy.daily_active_sec = max(0.0, limit * 0.35)
+                    hy._save()
+                    logger.info(
+                        "RF-Cheats hygiene: cleared break + soft daily reset → %.0fmin used",
+                        hy.daily_active_sec / 60.0,
+                    )
+        except Exception as exc:
+            logger.debug("hygiene_clear_break: %s", exc)
 
     async def _rfcheats_before_hunt(self) -> bool:
         """

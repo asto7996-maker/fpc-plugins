@@ -53,6 +53,25 @@ def test_hygiene_daily_budget(tmp_path: Path):
     dec = hy.check()
     assert dec.should_pause
     assert "daily" in dec.reason
+    assert "midnight" in dec.reason
+    assert dec.sleep_sec >= 60.0
+
+
+def test_note_break_idempotent(tmp_path: Path):
+    hy = HygieneTracker(defaults=RFCHEATS_DEFAULTS, state_path=tmp_path / "nb.json")
+    hy.note_break(120.0)
+    first = hy.break_until
+    hy.note_break(9999.0)  # must not extend
+    assert hy.break_until == first
+    assert hy.remaining_break_sec() > 0
+
+
+def test_clear_break_resumes(tmp_path: Path):
+    hy = HygieneTracker(defaults=RFCHEATS_DEFAULTS, state_path=tmp_path / "cb.json")
+    hy.note_break(600.0)
+    hy.clear_break()
+    assert hy.remaining_break_sec() == 0.0
+    assert hy.check().should_pause is False
 
 
 def test_action_delay_in_op_range():
@@ -65,7 +84,8 @@ def test_action_delay_in_op_range():
 def test_persist_daily(tmp_path: Path):
     path = tmp_path / "state.json"
     hy = HygieneTracker(state_path=path)
-    hy.note_activity(120.0)
+    hy.note_activity(80.0)
+    hy.note_activity(50.0)  # per-call cap 90s — two calls accumulate
     hy2 = HygieneTracker(state_path=path)
     assert hy2.daily_active_sec >= 120.0
 

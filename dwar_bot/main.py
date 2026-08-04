@@ -1694,12 +1694,28 @@ class DwarBot:
                         self.telemetry.cancel_battle()
                     except Exception:
                         pass
+                    rem = 0.0
+                    try:
+                        rem = float(self.combat.hygiene_remaining_sec() or 0.0)
+                    except Exception:
+                        rem = 0.0
+                    if rem > 1.0:
+                        # Real wait — do NOT spin hunt every 10s with empty ticks
+                        wait = min(rem, 90.0)
+                        self.brain.mark_cooldown(focus.title, max(60.0, wait))
+                        logger.info(
+                            "Hunt hygiene break — sleeping %.0fs (%.0fs left total)",
+                            wait, rem,
+                        )
+                        await _sleep(wait * 0.85, wait)
+                        return False
                     self.brain.mark_cooldown(focus.title, 45)
                     logger.info(
                         "Hunt soft-skip (NO_BATTLE) «%s» — limit/hygiene/empty.",
                         mob_name or "?",
                     )
-                    return True
+                    await _sleep(8.0, 15.0)
+                    return False
                 self.brain.mark_cooldown(focus.title, 60)
                 await self._telemetry_battle_end(BattleResult.ERROR, mob_name=mob_name, notify=False)
                 return False

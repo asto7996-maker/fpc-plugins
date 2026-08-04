@@ -287,9 +287,9 @@ class CombatConfig:
     gamebots_occupied_retry: int = 2
     # RF-Cheats t=403608 — session hygiene after autoban discussion
     rfcheats_hygiene_enabled: bool = True
-    rfcheats_max_continuous_minutes: int = 180
-    rfcheats_max_daily_minutes: int = 480
-    rfcheats_burst_minutes: int = 45
+    rfcheats_max_continuous_minutes: int = 240
+    rfcheats_max_daily_minutes: int = 720
+    rfcheats_burst_minutes: int = 60
 
 
 COMBAT: CombatConfig = CombatConfig()
