@@ -1008,10 +1008,11 @@ class DwarBot:
                 )
             except Exception:
                 pass
-            if story_stalled and self._iteration <= 2:
+            if story_stalled and not getattr(self, "_flash_stall_logged", False):
+                self._flash_stall_logged = True
                 logger.info(
-                    "Story stalled on Flash heal_wounded — PureFarm hunt ON "
-                    "(click wounded in client to unlock Военачальник)."
+                    "Story stalled on Flash heal_wounded — PureFarm idle "
+                    "(0-exp Cretas skipped; click wounded in client to unlock exit)."
                 )
             handled = await self.pure_farm.run_tick(self)
             if handled:
