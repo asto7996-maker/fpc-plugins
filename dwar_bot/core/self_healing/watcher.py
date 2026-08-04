@@ -30,10 +30,13 @@ _TRACEBACK_RE = re.compile(
 )
 
 ERROR_MARKERS = (
-    "ERROR",
-    "CRITICAL",
-    "Traceback",
-    "DOM-Desync",
+    "Traceback (most recent call last)",
+)
+
+# Log-level tokens (must be the logging level column, not message text like
+# ``telemetry battle ERROR`` which is an INFO soft-fail).
+_LOG_LEVEL_RE = re.compile(
+    r"\|\s*(?:\x1b\[[0-9;]*m)?(ERROR|CRITICAL)(?:\x1b\[[0-9;]*m)?\s*\|",
 )
 
 MAX_PATCH_ATTEMPTS = 3
@@ -134,7 +137,7 @@ class AutonomousLogWatcher:
             or "нужны свежие куки" in low
         ):
             return False
-        # Self-heal / Cursor noise must never re-trigger pause (recursive heal)
+        # Self-heal / Cursor / Gemini / AutoCoder noise must never re-trigger
         heal_noise = (
             "ai_healing",
             "self_healing",
@@ -144,12 +147,29 @@ class AutonomousLogWatcher:
             "gemini_auditor",
             "healingorchestrator",
             "autonomouslogwatcher",
+            "auto_coder",
+            "autocoder",
             "cursorexecutor",
             "cursor cli timed out",
             "subprocess.timeoutexpired",
             "timeout after 150s",
             "agentn.global.api",
             "local_fixer",
+            "critical fail:",
+            "circuit-breaker",
+            "self-healing fail",
+            "self-healing success",
+            "pytest failed",
+            "google_genai",
+            "generativelanguage.googleapis",
+            "unauthenticated",
+            # Soft gameplay telemetry — NOT a crash
+            "telemetry battle error",
+            "telemetry battle skip",
+            "suis: лимит убийств",
+            "rf-cheats hygiene",
+            "heal_wounded",
+            "не задано действие",
         )
         # Drop healing lines then re-check markers on remaining game code only
         kept = []
@@ -160,6 +180,9 @@ class AutonomousLogWatcher:
                 skip_tb = True
                 continue
             if " | dwar_bot.core.ai_healing." in ll or " | dwar_bot.core.self_healing." in ll:
+                skip_tb = True
+                continue
+            if " | dwar_bot.core.auto_coder" in ll or " | dwar_bot.core.auto_healer" in ll:
                 skip_tb = True
                 continue
             if skip_tb:
@@ -180,7 +203,14 @@ class AutonomousLogWatcher:
         filtered = "\n".join(kept)
         if not filtered.strip():
             return False
-        return any(m in filtered for m in ERROR_MARKERS)
+        # Real crash: Traceback OR log-level ERROR/CRITICAL column
+        if "Traceback (most recent call last)" in filtered:
+            return True
+        if _LOG_LEVEL_RE.search(filtered):
+            return True
+        if "DOM-Desync" in filtered:
+            return True
+        return False
 
     @staticmethod
     def _extract_traceback(chunk: str) -> str:
@@ -188,10 +218,12 @@ class AutonomousLogWatcher:
         m = _TRACEBACK_RE.search(clean)
         if m:
             return m.group(1).strip()
-        for marker in ERROR_MARKERS:
-            idx = clean.find(marker)
-            if idx >= 0:
-                return clean[idx: idx + 4000].strip()
+        # Prefer real ERROR/CRITICAL log lines over soft message text
+        for line in clean.splitlines():
+            if _LOG_LEVEL_RE.search(line) or "Traceback" in line:
+                idx = clean.find(line)
+                if idx >= 0:
+                    return clean[idx: idx + 4000].strip()
         return clean[-4000:].strip()
 
     @staticmethod
@@ -200,7 +232,7 @@ class AutonomousLogWatcher:
         for p in reversed(paths):
             norm = p.replace("\\", "/")
             # Never "heal" the healer itself
-            if "ai_healing" in norm or "self_healing" in norm:
+            if "ai_healing" in norm or "self_healing" in norm or "auto_coder" in norm:
                 continue
             if "dwar_bot/" in norm:
                 return norm[norm.find("dwar_bot/"):]
@@ -208,16 +240,27 @@ class AutonomousLogWatcher:
                 continue
         if paths:
             last = paths[-1].replace("\\", "/")
-            if "ai_healing" not in last and "self_healing" not in last:
+            if (
+                "ai_healing" not in last
+                and "self_healing" not in last
+                and "auto_coder" not in last
+            ):
                 return last
-        return "dwar_bot/main.py"
+        # No stack frame → do NOT default to main.py (causes false circuit trips)
+        return ""
 
     async def _circuit_trip(self, failed_file: str) -> None:
         self._blocked_files.add(failed_file)
-        await self.controller.pause(reason=f"circuit-breaker:{failed_file}")
+        # Blacklist further auto-heals for this file, but KEEP farming.
+        # Permanent PAUSE was a false-positive footgun (telemetry ERROR / Cursor timeout).
+        try:
+            await self.controller.resume(reason=f"circuit-breaker-farm:{failed_file}")
+        except Exception:
+            set_bot_state(BotState.RUNNING)
         alarm = (
-            f"🚨 **CRITICAL FAIL:** Файл `{failed_file}` не удалось починить "
-            f"за {MAX_PATCH_ATTEMPTS} попытки. Требуется вмешательство разработчика!"
+            f"🚨 **CRITICAL FAIL:** Авто-патч `{failed_file}` не прошёл "
+            f"за {MAX_PATCH_ATTEMPTS} попытки. Фарм продолжается; авто-heal "
+            f"для файла отключён до рестарта. Нужен разбор логов."
         )
         logger.critical(alarm)
         await self._notify_tg(alarm)
@@ -231,6 +274,7 @@ class AutonomousLogWatcher:
             and "cursor_engine" not in line
             and "cursor_self_healer" not in line
             and "auto_healer" not in line
+            and "auto_coder" not in line
             and "log_watcher" not in line
             and "ai_healing" not in line
             and "cursor_executor" not in line
@@ -239,18 +283,23 @@ class AutonomousLogWatcher:
             and "CursorExecutor" not in line
             and "TimeoutExpired" not in line
             and "Cursor CLI timed out" not in line
+            and "telemetry battle ERROR" not in line
+            and "telemetry battle SKIP" not in line
         )
         if not self._is_actionable(filtered):
             return
 
         tb = self._extract_traceback(filtered)
         failed_file = self._extract_failed_file(tb, filtered)
+        if not failed_file:
+            logger.debug("Actionable log without file frame — skip auto-heal")
+            return
         if "ai_healing" in failed_file or "self_healing" in failed_file:
             logger.debug("Skip heal of healer file: %s", failed_file)
             return
 
         if failed_file in self._blocked_files:
-            logger.debug("Circuit open for %s — skip", failed_file)
+            logger.debug("Circuit open for %s — skip heal, farm continues", failed_file)
             return
 
         attempts = self.patch_attempts[failed_file]

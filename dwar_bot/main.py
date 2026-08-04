@@ -1662,6 +1662,19 @@ class DwarBot:
                     if result == BattleResult.LOSE:
                         await self._telemetry_battle_end(result, mob_name=mob_name)
                     return True
+                # NO_BATTLE = soft skip (SUIS kill-limit / RF hygiene / no free mobs)
+                # Must NOT log telemetry battle ERROR — that false-trips AutonomousLogWatcher.
+                if result == BattleResult.NO_BATTLE:
+                    try:
+                        self.telemetry.cancel_battle()
+                    except Exception:
+                        pass
+                    self.brain.mark_cooldown(focus.title, 45)
+                    logger.info(
+                        "Hunt soft-skip (NO_BATTLE) «%s» — limit/hygiene/empty.",
+                        mob_name or "?",
+                    )
+                    return True
                 self.brain.mark_cooldown(focus.title, 60)
                 await self._telemetry_battle_end(BattleResult.ERROR, mob_name=mob_name, notify=False)
                 return False

@@ -58,8 +58,37 @@ def test_watcher_ignores_cursor_executor_errors():
     assert AutonomousLogWatcher._is_actionable(chunk) is False
 
 
+def test_watcher_ignores_telemetry_battle_error():
+    """SUIS kill-limit / hygiene → INFO 'telemetry battle ERROR' must NOT pause farm."""
+    chunk = (
+        "2026-08-04 01:45:05 | INFO | dwar_bot.modules.combat_engine | "
+        "SUIS: лимит убийств 50 достигнут.\n"
+        "2026-08-04 01:45:32 | INFO | dwar_bot.core.telemetry_engine | "
+        "telemetry battle ERROR «Зигред-воин» hunt dur=27 сек dps=0.0 eff=30 pots=0\n"
+        "2026-08-04 01:45:38 | INFO | dwar_bot.main | [60] xylophaze Lv3 | area=932\n"
+    )
+    assert AutonomousLogWatcher._is_actionable(chunk) is False
+    assert AutonomousLogWatcher._extract_failed_file(chunk, chunk) == ""
+
+
+def test_watcher_actionable_on_real_traceback():
+    chunk = (
+        "2026-08-04 03:00:00 | ERROR | dwar_bot.main | boom\n"
+        "Traceback (most recent call last):\n"
+        '  File "/root/dwar_bot/modules/combat_engine.py", line 10, in run\n'
+        "    raise RuntimeError('x')\n"
+        "RuntimeError: x\n"
+    )
+    assert AutonomousLogWatcher._is_actionable(chunk) is True
+    assert "combat_engine.py" in AutonomousLogWatcher._extract_failed_file(
+        AutonomousLogWatcher._extract_traceback(chunk), chunk
+    )
+
+
 def test_markers_present_in_sources():
     g = (ROOT / "core" / "ai_healing" / "gemini_auditor.py").read_text(encoding="utf-8")
     assert "HEURISTIC_NO_FALSE_PAUSE_V1" in g
     w = (ROOT / "core" / "self_healing" / "watcher.py").read_text(encoding="utf-8")
     assert "Cursor CLI timed out" in w
+    assert "telemetry battle error" in w
+    assert "circuit-breaker-farm" in w

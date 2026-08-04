@@ -95,12 +95,15 @@ def test_circuit_breaker_trips_after_three_fails(tmp_path: Path):
 
         assert watcher.patch_attempts["dwar_bot/modules/hunt_farm.py"] >= MAX_PATCH_ATTEMPTS
         assert "dwar_bot/modules/hunt_farm.py" in watcher._blocked_files
-        assert get_bot_state() == BotState.PAUSED
+        # Circuit blacklists heal but keeps farming (no permanent PAUSE)
+        assert get_bot_state() == BotState.RUNNING
         critical = [
             c for c in notify.await_args_list
             if c.args and "CRITICAL FAIL" in c.args[0]
         ]
         assert critical, "expected CRITICAL FAIL Telegram alarm"
+        assert "фарм продолжается" in critical[0].args[0].lower() or "Фарм продолжается" in critical[0].args[0]
+
 
         before = calls["n"]
         await watcher._handle_error(chunk)

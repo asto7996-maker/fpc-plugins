@@ -682,8 +682,8 @@ class TelemetryEngine:
         attacks_baseline: int = 0,
     ) -> BattleTelemetry:
         if self.active_battle and not self.active_battle.finished_at:
-            # close as ERROR if overlapping
-            self.end_battle(result="ERROR", potions_total=potions_baseline, attacks_total=attacks_baseline)
+            # Overlapping start — drop quietly (not a crash)
+            self.cancel_battle()
 
         bt = BattleTelemetry(
             event_id=uuid.uuid4().hex[:16],
@@ -698,6 +698,10 @@ class TelemetryEngine:
         bt._attacks_baseline = attacks_baseline  # type: ignore[attr-defined]
         self.active_battle = bt
         return bt
+
+    def cancel_battle(self) -> None:
+        """Drop active battle without ERROR log (NO_BATTLE / hygiene / soft skip)."""
+        self.active_battle = None
 
     def note_battle_hit(
         self,

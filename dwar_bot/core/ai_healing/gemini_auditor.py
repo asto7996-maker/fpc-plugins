@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import re
+import time
 from pathlib import Path
 from typing import Any, Optional
 
@@ -377,6 +378,7 @@ class GeminiAuditor:
         self.model = _preferred_model(model)
         self.allow_heuristic_fallback = allow_heuristic_fallback
         self._client = None
+        self._auth_fail_until: float = 0.0
         if self.api_key:
             logger.info(
                 "GeminiAuditor ready key_kind=%s model=%s",
@@ -454,6 +456,11 @@ class GeminiAuditor:
         # Refresh key each call (AQ. keys may be rotated in .env without restart)
         if not self.api_key:
             self.api_key = _gemini_api_key()
+        # Auth dead — don't spam 401 every 120s
+        if self.api_key and time.time() < float(self._auth_fail_until or 0):
+            if self.allow_heuristic_fallback:
+                return _heuristic_audit(log_slice, telemetry_summary, current_state)
+            return None
         prompt = _PROMPT_TEMPLATE.format(
             current_state=current_state or "UNKNOWN",
             log_slice=(log_slice or "")[-8000:] or "(empty)",
@@ -482,14 +489,29 @@ class GeminiAuditor:
                             break
                     except Exception as exc:
                         last_exc = exc
+                        msg = str(exc)
+                        if "401" in msg or "UNAUTHENTICATED" in msg:
+                            self._auth_fail_until = time.time() + 3600.0
+                            logger.warning(
+                                "GeminiAuditor auth dead (401) — backoff 1h, heuristic only"
+                            )
+                            break
                         logger.warning(
                             "GeminiAuditor model %s failed: %s",
-                            model_name, str(exc)[:180],
+                            model_name, msg[:180],
                         )
                         continue
                 else:
                     if last_exc:
                         raise last_exc
+                if time.time() < float(self._auth_fail_until or 0):
+                    if self.allow_heuristic_fallback:
+                        return _heuristic_audit(
+                            log_slice, telemetry_summary, current_state
+                        )
+                    return None
+                if not text and last_exc:
+                    raise last_exc
 
                 parsed = _extract_json(text)
                 if parsed is not None:
@@ -506,7 +528,10 @@ class GeminiAuditor:
                     (text or "")[:300],
                 )
             except Exception as exc:
-                logger.warning("GeminiAuditor API failed: %s", exc)
+                msg = str(exc)
+                if "401" in msg or "UNAUTHENTICATED" in msg:
+                    self._auth_fail_until = time.time() + 3600.0
+                logger.warning("GeminiAuditor API failed: %s", msg[:200])
 
         if not self.allow_heuristic_fallback:
             return None
