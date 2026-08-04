@@ -463,14 +463,143 @@ class CombatEngine:
             logger.info("equip_from_bag: надето %d предмет(ов) из сумки.", equipped)
         return equipped
 
+    # Bag actions that unlock gear / finish hunt loot (use nested meta.id!)
+    _BAG_OPEN_KEYWORDS = (
+        "вскрыть",
+        "открыть",
+        "развернуть",
+        "добить",
+        "прикоснуться",
+        "использовать",
+        "съесть",
+    )
+    _BAG_OPEN_ITEM_KEYWORDS = (
+        "набор",
+        "сундук",
+        "шкатул",
+        "горшок",
+        "поручен",
+        "пленен",
+        "крэтс",
+        "душ",
+        "яблок",
+    )
+    _BAG_SKIP_CODES = frozenset({"PUT_ON", "PUT_OFF", "NPC"})
+
+    async def open_bag_actions(self, *, max_actions: int = 6) -> int:
+        """
+        Open kits/chests and finish captives via ``action_run.php``.
+
+        Uses ``artifact_actions[].id`` (not the dict key). Wrong id yields
+        «Не задано действие!» and was why village loot never progressed.
+        Returns number of successful actions.
+        """
+        if await self.is_in_battle():
+            return 0
+        try:
+            bag = await self._client.get_bag()
+        except Exception as exc:
+            logger.debug("open_bag_actions get_bag: %s", exc)
+            return 0
+
+        plans: list[tuple[int, str, str, str, dict]] = []
+        for a in bag.get("artifact_list") or []:
+            if not isinstance(a, dict):
+                continue
+            art_id = str(a.get("id") or "")
+            art_title = str(a.get("title") or "")
+            acts = a.get("artifact_actions") or {}
+            if not art_id or not isinstance(acts, dict):
+                continue
+            for _key, meta in acts.items():
+                if not isinstance(meta, dict):
+                    continue
+                code = str(meta.get("code") or "")
+                if code in self._BAG_SKIP_CODES:
+                    continue
+                real_id = self._client.bag_action_real_id(meta)
+                if not real_id:
+                    continue
+                atitle = str(meta.get("title") or "")
+                blob = f"{art_title} {atitle}".lower()
+                if not any(k in blob for k in self._BAG_OPEN_ITEM_KEYWORDS):
+                    continue
+                if str(meta.get("visible") or "1") == "0":
+                    continue
+                score = 0
+                if any(k in blob for k in ("набор", "сундук", "шкатул", "душ")):
+                    score += 50
+                if "пленен" in blob or "добить" in blob:
+                    score += 80  # hunt loot turn-in
+                if "горшок" in blob:
+                    score += 40
+                if any(k in atitle.lower() for k in self._BAG_OPEN_KEYWORDS):
+                    score += 10
+                plans.append((score, art_id, real_id, f"{art_title}/{atitle}", meta))
+
+        plans.sort(key=lambda x: -x[0])
+        opened = 0
+        for _score, art_id, real_id, label, meta in plans[: max(1, int(max_actions))]:
+            if await self.is_in_battle():
+                break
+            try:
+                resp = await self._client.run_artifact_action(art_id, real_id)
+                ok = bool((resp.raw or {}).get("action_run", {}).get("ok")) or (
+                    resp.status == 0 and not resp.error
+                )
+                err = str(resp.error or resp.redirect_error or "")
+                if (not ok) and meta.get("description"):
+                    resp = await self._client.run_artifact_action(
+                        art_id, real_id, confirmed=True
+                    )
+                    ok = bool((resp.raw or {}).get("action_run", {}).get("ok")) or (
+                        resp.status == 0 and not resp.error
+                    )
+                    err = str(resp.error or resp.redirect_error or "")
+                if ok:
+                    opened += 1
+                    logger.info("Bag action OK: %s (id=%s)", label, real_id)
+                    # Captive finish / some kits may start a fight
+                    if await self.is_in_battle():
+                        await self.finish_fight(timeout=180.0)
+                else:
+                    low = err.lower()
+                    # Soft skips — expected gates, not protocol bugs
+                    if any(
+                        x in low
+                        for x in (
+                            "не задано",
+                            "ключом",
+                            "звания",
+                            "уровн",
+                            "символов",
+                            "чаще",
+                            "бою",
+                        )
+                    ):
+                        logger.debug("Bag action skip %s: %s", label, err[:120])
+                    else:
+                        logger.info("Bag action fail %s: %s", label, err[:120])
+            except Exception as exc:
+                logger.debug("open_bag_actions %s: %s", label, exc)
+            await asyncio.sleep(random.uniform(0.25, 0.6))
+
+        if opened:
+            logger.info("open_bag_actions: выполнено %d действи(й) из сумки.", opened)
+        return opened
+
     # Starter duplicate junk — safe to DROP when backpack is overloaded
     _JUNK_ARTIKULS = {
         "3908", "3909", "3910", "3911",  # starter leather / club / shield
         "18012",  # apple
+        "12913", "12914", "12915", "12916", "12917", "12918",  # essays
+        "1012",  # empty summon amulets
     }
     _KEEP_ARTIKULS = {
         "18209", "18208",  # quest medicine / lava
         "18013", "18014",  # starter elixirs
+        "2497",  # captive Cretas (hunt turn-in)
+        "33370", "17978", "17979", "17980", "24421", "47706",  # kits/chests
     }
 
     async def free_backpack(self, *, target_free: int = 5, max_drops: int = 25) -> int:
@@ -521,6 +650,20 @@ class CombatEngine:
                 if not iid or aid in self._KEEP_ARTIKULS or iid in drop_ids:
                     continue
                 if aid in self._JUNK_ARTIKULS:
+                    drop_ids.append(iid)
+                if len(drop_ids) >= need:
+                    break
+        # Still overweight? drop essays / empty summons by title
+        if len(drop_ids) < need:
+            for a in arts:
+                if not isinstance(a, dict):
+                    continue
+                aid = str(a.get("artikul_id") or "")
+                iid = str(a.get("id") or "")
+                title = str(a.get("title") or "").lower()
+                if not iid or aid in self._KEEP_ARTIKULS or iid in drop_ids:
+                    continue
+                if any(k in title for k in ("очерк", "амулет вызова")):
                     drop_ids.append(iid)
                 if len(drop_ids) >= need:
                     break

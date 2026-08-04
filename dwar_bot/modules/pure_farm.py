@@ -39,7 +39,7 @@ class PureFarmStats:
         elapsed = max(1.0, time.time() - self.started_at)
         wph = self.wins / elapsed * 3600.0
         gold_delta = self.money_now - self.money_at_start
-        return "\n".join([
+        lines = [
             "⚔️ <b>Pure Farm</b>",
             f"• Побед: <b>{self.wins}</b> · поражений: {self.losses} · skip: {self.skips}",
             f"• Скорость: <b>{wph:.0f}</b> побед/час",
@@ -47,7 +47,13 @@ class PureFarmStats:
             f"• Уровень: {self.level_at_start} → <b>{self.level_now}</b>",
             f"• Золото: {self.money_at_start:.2f} → <b>{self.money_now:.2f}</b> "
             f"({gold_delta:+.2f})",
-        ])
+        ]
+        if self.wins >= 10 and abs(gold_delta) < 0.01 and self.level_now <= self.level_at_start:
+            lines.append(
+                "• ⚠️ Победы без золота/уровня — деревенские Крэтс дают 0 exp; "
+                "открываем наборы/пленённых, нужен клик по раненым для выхода."
+            )
+        return "\n".join(lines)
 
 
 class PureFarmEngine:
@@ -195,6 +201,37 @@ class PureFarmEngine:
             result = await bot.combat.finish_fight(timeout=180.0)
             await self._note_result(bot, result, mob="(active)")
             return True
+
+        # Real progress: open kits/chests/captives BEFORE empty Cretas grind.
+        # Wrong action_id used to make this a no-op («Не задано действие!»).
+        try:
+            n_bag = await bot.combat.open_bag_actions(max_actions=5)
+            if n_bag:
+                logger.info("PureFarm: bag actions opened=%d", n_bag)
+                try:
+                    await bot.combat.free_backpack(target_free=3, max_drops=20)
+                except Exception:
+                    pass
+                try:
+                    await bot.combat.equip_from_bag(max_items=6)
+                except Exception:
+                    pass
+                # Re-check money/level after loot
+                try:
+                    bot._state = await bot._client.get_state()
+                    self.stats.money_now = float(bot._state.money or self.stats.money_now)
+                    self.stats.level_now = int(bot._state.level or self.stats.level_now)
+                except Exception:
+                    pass
+                return True
+        except Exception as exc:
+            logger.debug("PureFarm bag actions: %s", exc)
+
+        # Overweight bag blocks travel / some actions
+        try:
+            await bot.combat.free_backpack(target_free=2, max_drops=15)
+        except Exception:
+            pass
 
         # Village: always Крэтс; elsewhere empty needle → SUIS priority / any free
         mob = ""

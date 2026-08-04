@@ -1038,13 +1038,35 @@ class DwarBot:
             and not getattr(self, "_bag_equipped_once", False)
         ):
             try:
+                # Open kits/captives first (meta.id protocol) — real loot progress
+                n_open = await self.combat.open_bag_actions(max_actions=6)
+                if n_open:
+                    logger.info("Village bag actions: %d", n_open)
+                    await self.combat.free_backpack(target_free=3, max_drops=25)
                 n_eq = await self.combat.equip_from_bag()
                 self._bag_equipped_once = True
                 if n_eq and self.settings.notify.gear:
                     await self.notify(f"👕 Из сумки надето: {n_eq}", "gear")
+                if n_open and self.settings.notify.loot:
+                    await self.notify(f"🎁 Сумка: открыто действий {n_open}", "loot")
             except Exception as exc:
                 logger.debug("village equip_from_bag: %s", exc)
                 self._bag_equipped_once = True
+
+        # Periodically open bag loot even after first equip (kits stack up)
+        if (
+            farm.auto_quests
+            and str(self._state.area_id or "") in {"930", "931", "932"}
+            and self._iteration > 0
+            and self._iteration % 8 == 0
+            and not await self.combat.is_in_battle()
+        ):
+            try:
+                n_open = await self.combat.open_bag_actions(max_actions=3)
+                if n_open:
+                    await self.combat.free_backpack(target_free=2, max_drops=15)
+            except Exception as exc:
+                logger.debug("periodic bag actions: %s", exc)
 
         # Economy snapshot every tick (feeds Gold/hr Exp/hr)
         self.telemetry.note_economy(

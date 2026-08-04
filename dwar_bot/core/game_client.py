@@ -1008,6 +1008,84 @@ class DwarGameClient:
             extra["link_id"] = str(link_id)
         return await self.entry_point("common", "action", extra)
 
+    async def run_artifact_action(
+        self,
+        artifact_id: str | int,
+        action_id: str | int,
+        *,
+        confirmed: bool = False,
+        url_close: str = "user.php?mode=personage&group=2&update_swf=1",
+    ) -> ApiResponse:
+        """
+        Run a bag artifact action via ``action_run.php`` (Dwarium / Flash form).
+
+        Important: ``action_id`` must be the nested meta ``id`` from
+        ``artifact_actions`` (e.g. ``22711`` for apples), NOT the dict key /
+        ``meta.action_id`` (e.g. ``8442``). Wrong id → «Не задано действие!».
+        """
+        from urllib.parse import quote, unquote
+
+        art_id = str(artifact_id)
+        act_id = str(action_id)
+        default = f"ARTIFACT_{art_id}_{act_id}"
+        body = {
+            "object_class": "ARTIFACT",
+            "object_id": art_id,
+            "action_id": act_id,
+            "url_success": f"action_form.php?success=1&default={default}",
+            "url_error": f"action_form.php?failed=1&default={default}",
+            "artifact_id": art_id,
+            "in[object_class]": "ARTIFACT",
+            "in[object_id]": art_id,
+            "in[action_id]": act_id,
+            "in[url_success]": "action_form.php?success=1",
+            "in[url_error]": "action_form.php?failed=1",
+            "in[param_success][url_close]": url_close,
+        }
+        if confirmed:
+            body["confirmed"] = "1"
+            body["in[confirmed]"] = "1"
+
+        old_ref = self._headers.get("Referer")
+        self._headers["Referer"] = (
+            f"{self._world_url}/action_form.php?0.1&artifact_id={art_id}"
+            f"&in[param_success][url_close]={quote(url_close)}"
+        )
+        try:
+            resp = await self._post("/action_run.php", body)
+        finally:
+            if old_ref is not None:
+                self._headers["Referer"] = old_ref
+
+        loc = resp.headers.get("Location", "") or ""
+        text = resp.text or ""
+        # JS redirect fallback
+        if not loc and "action_form.php" in text:
+            m = re.search(r'location="(action_form\.php[^"]+)"', text)
+            if m:
+                loc = m.group(1)
+        err = ""
+        m_err = re.search(r"error=([^&]+)", loc)
+        if m_err:
+            err = unquote(m_err.group(1).replace("+", " "))
+        ok = "success=1" in loc and "failed=" not in loc
+        return ApiResponse(
+            status=0 if ok else 100,
+            error=err,
+            data={"location": loc, "ok": ok},
+            redirect_url=loc or None,
+            redirect_error=err or None,
+            raw={"action_run": {"ok": ok, "location": loc, "error": err}},
+        )
+
+    @staticmethod
+    def bag_action_real_id(meta: dict) -> str:
+        """Resolve the action_run.php id from an ``artifact_actions`` entry."""
+        if not isinstance(meta, dict):
+            return ""
+        # Live protocol uses nested ``id`` (food conf action_id), not key/action_id.
+        return str(meta.get("id") or "").strip()
+
     async def get_bag(self) -> dict:
         """Return ``user|bag`` payload (artifact_list + capacity)."""
         resp = await self.entry_point("user", "bag", {})
