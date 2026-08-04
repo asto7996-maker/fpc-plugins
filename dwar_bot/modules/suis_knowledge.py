@@ -328,6 +328,20 @@ def default_hunt_mob(level: int = 1) -> str:
     return names[0] if names else "Крэтс"
 
 
+def village_hunt_mob(level: int = 1) -> str:
+    """
+    Newbie village (area 932) hunt pin.
+
+    Map only spawns early mobs (Крэтс / псы). Pinning Зигред-воин causes
+    endless fallback spam and false AutoHealer stagnation.
+    """
+    lvl = max(1, int(level or 1))
+    if lvl <= 2:
+        return "Крэтс"
+    # Lv3+ still stuck in village until Военачальник unlocks exit
+    return "Крэтс"
+
+
 def default_hunt_list() -> list[str]:
     return [m.name for m in SUIS_MOBS if m.hunt_default] or ["Крэтс"]
 

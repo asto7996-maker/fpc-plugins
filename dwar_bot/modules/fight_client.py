@@ -628,6 +628,9 @@ class FightClient:
 
         def _won_from_team() -> bool:
             # Canvas: win if winTeam == persTeam. Fallback: team 1 (common PvE).
+            # win_team=None + 0 attacks is NOT a real win (phantom settle).
+            if outcome.attacks <= 0:
+                return False
             if win_team is None:
                 return True
             if brain.pers_team is not None:

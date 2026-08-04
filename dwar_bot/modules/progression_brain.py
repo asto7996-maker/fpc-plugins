@@ -631,10 +631,17 @@ class ProgressionBrain:
             lvl = int(getattr(char, "level", 1) or 1)
             default_mob = ""
             try:
-                from dwar_bot.modules.suis_knowledge import default_hunt_mob
-                default_mob = default_hunt_mob(lvl)
+                from dwar_bot.modules.suis_knowledge import (
+                    default_hunt_mob,
+                    village_hunt_mob,
+                )
+                area = str(getattr(state, "area_id", "") or "")
+                if area in {"930", "931", "932"}:
+                    default_mob = village_hunt_mob(lvl)
+                else:
+                    default_mob = default_hunt_mob(lvl)
             except Exception:
-                default_mob = "Крэтс" if lvl <= 2 else "Зигред-воин"
+                default_mob = "Крэтс"
             mob = self.pending_hunt_mob or (
                 default_mob if self.need_quest_unlock else ""
             )

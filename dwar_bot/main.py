@@ -579,12 +579,19 @@ class DwarBot:
                     await asyncio.sleep(s)
 
     def _level_hunt_mob(self, fallback: str = "") -> str:
-        """SUIS-aware default hunt pin for current character level."""
+        """SUIS-aware default hunt pin for current character level / area."""
         try:
-            from dwar_bot.modules.suis_knowledge import default_hunt_mob
+            from dwar_bot.modules.suis_knowledge import default_hunt_mob, village_hunt_mob
             lvl = int(getattr(self._char, "level", 1) or 1)
+            area = str(getattr(self._state, "area_id", "") or "")
+            # Newbie village 932 has Крэтс only — Зигред-воин is not on the map
+            if area in {"930", "931", "932"}:
+                return village_hunt_mob(lvl)
             return default_hunt_mob(lvl)
         except Exception:
+            area = str(getattr(self._state, "area_id", "") or "")
+            if area in {"930", "931", "932"}:
+                return fallback or "Крэтс"
             return fallback or "Крэтс"
 
     def _wo_farm_open(self, wo: Optional[dict] = None) -> bool:
@@ -1482,9 +1489,13 @@ class DwarBot:
                 ):
                     logger.info("Local recover flash hunt → %s", result.name)
                     return True
-            # Consumed — caller must NOT treat this as a loud "fixed stagnation"
-            return False
-
+            # Intentional open-farm under flash_only — consume stagnation,
+            # do NOT escalate AutoHealer→Cursor (that was the FAIL spam).
+            farm_open = self._wo_farm_open(wo)
+            if farm_open or int(getattr(self._char, "level", 1) or 1) >= 3:
+                self.brain.push_farm(300.0)
+                return True
+            return True
         # World objective (non-flash): pursue once, no hunt storm
         if self.quests.has_world_objective():
             kind = wo.get("kind")

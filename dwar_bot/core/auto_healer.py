@@ -153,6 +153,35 @@ class AutoHealer:
         ):
             self._stagnation_count = 0
             return
+        # Open-farm hunt loop is expected (same mob, same area) — wins are progress.
+        # Cursor "stagnation" patches here only burn API and restart the bot.
+        if key_l.startswith("hunt_mob:") and not progressed:
+            # Soft: need more ticks before even local recover
+            self._stagnation_count += 1
+            if self._stagnation_count < STAGNATION_TICKS * 3:
+                return
+            now = time.time()
+            if now - self._last_stagnation_heal < STAGNATION_HEAL_COOLDOWN:
+                return
+            self._last_stagnation_heal = now
+            self._stagnation_count = 0
+            if self.on_local_recover:
+                try:
+                    fixed = await self.on_local_recover(focus_key)
+                    if fixed:
+                        logger.info(
+                            "AutoHealer: hunt_mob local recover OK (no Cursor) %s",
+                            focus_key,
+                        )
+                        return
+                except Exception as exc:
+                    logger.debug("local recover hunt: %s", exc)
+            # Still no Cursor escalate for hunt farm — log only
+            logger.info(
+                "AutoHealer: hunt_mob soft-stagnation ignored (open farm) %s",
+                focus_key,
+            )
+            return
         if progressed:
             self._stagnation_count = 0
             return

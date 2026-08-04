@@ -95,6 +95,7 @@ class CombatEngine:
         self._suis_session_kills: int = 0
         self._suis_error_ops: int = 0
         self._suis_failed_ops: int = 0
+        self._last_map_hunt_name: str = ""
         self._hygiene = None
         if getattr(COMBAT, "suis_enabled", True):
             try:
@@ -1002,6 +1003,20 @@ class CombatEngine:
                 return BattleResult.NO_BATTLE
 
             needle = (name_substr or "").lower()
+            # Prefer last successful map mob over ghost pins (Зигред in village)
+            last_map = str(getattr(self, "_last_map_hunt_name", "") or "").strip()
+            if last_map and needle and needle not in last_map.lower():
+                # Check if pin exists; if not, switch to last_map early
+                pin_present = any(
+                    needle in str(b.get("name") or "").lower() for b in bots
+                )
+                if not pin_present:
+                    logger.info(
+                        "Hunt pin '%s' absent — using last map hit '%s'",
+                        name_substr, last_map,
+                    )
+                    needle = last_map.lower()
+                    name_substr = last_map
             # SUIS hunt priority when caller didn't pin a specific mob
             if (
                 not needle
@@ -1054,17 +1069,25 @@ class CombatEngine:
                             )
                             candidates = alt
                             needle = pref_l
+                            # Remember map-real mob so next ticks don't re-pin ghost
+                            try:
+                                self._last_map_hunt_name = prefer
+                            except Exception:
+                                pass
                             break
                 except Exception as exc:
                     logger.debug("suis hunt fallback: %s", exc)
             if not candidates and not art:
                 candidates = list(bots)
                 if needle and candidates:
+                    hit_name = str(candidates[0].get("name") or "")
                     logger.info(
-                        "SUIS hunt fallback → any free bot (no match for %r)",
-                        name_substr,
+                        "SUIS hunt fallback → any free bot (no match for %r) → '%s'",
+                        name_substr, hit_name,
                     )
                     needle = ""
+                    if hit_name:
+                        self._last_map_hunt_name = hit_name
             if not candidates and not needle and not art:
                 candidates = list(bots)
             if not candidates:

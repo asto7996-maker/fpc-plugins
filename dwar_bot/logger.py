@@ -100,6 +100,10 @@ class _TelegramHandler(logging.Handler):
             "hp at 0%",
             "wait regen / finish fight",
             "no potion spam",
+            "autohealer: stagnation",
+            "autohealer start reason=stagnation",
+            "autohealer fail",
+            "local recover for stagnation",
         )
         if not any(fp in low for fp in fingerprints):
             return False
