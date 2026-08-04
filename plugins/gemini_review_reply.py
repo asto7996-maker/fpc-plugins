@@ -28,6 +28,218 @@ from telebot.types import CallbackQuery, InlineKeyboardButton as IKB, InlineKeyb
 import telebot
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Premium Telegram custom emoji (tgmacicons / KotikFree3 / Random_emfx / ScroogeProjects)
+# Text: <tg-emoji emoji-id="...">fallback</tg-emoji>  |  Buttons: icon_custom_emoji_id
+# FunPay buyer chats stay unicode — only Telegram HTML messages are injected.
+# ─────────────────────────────────────────────────────────────────────────────
+
+PREMIUM_EMOJI = {
+    'ℹ': '5258503720928288433',  # tgmacicons via ℹ
+    'ℹ️': '5258503720928288433',  # tgmacicons via ℹ️
+    '⌛': '5258258882022612173',  # tgmacicons via ⏲
+    '⌛️': '5258258882022612173',  # tgmacicons via ⏲
+    '⏭': '5260450573768990626',  # tgmacicons via ➡️
+    '⏱': '5258258882022612173',  # tgmacicons via ⏲
+    '⏲': '5258258882022612173',  # tgmacicons via ⏲
+    '⏳': '5258258882022612173',  # tgmacicons via ⏲
+    '⏸': '5258258882022612173',  # tgmacicons via ⏲
+    '★': '5258185631355378853',  # tgmacicons via ⭐️
+    '☕': '5359712636688670045',  # ScroogeProjects via ⭐️
+    '♻️': '5258420634785947640',  # tgmacicons via 🔄
+    '⚙': '5258096772776991776',  # tgmacicons via ⚙
+    '⚙️': '5258096772776991776',  # tgmacicons via ⚙️
+    '⚠': '5258474669769497337',  # tgmacicons via ❗️
+    '⚠️': '5258474669769497337',  # tgmacicons via ❗️
+    '⚡': '5258152182150077732',  # tgmacicons via ⚡
+    '⚡️': '5258152182150077732',  # tgmacicons via ⚡️
+    '⚪️': '5442736201356298637',  # ScroogeProjects via ◽️
+    '⛔': '5275969776668134187',  # tgmacicons via ⛔
+    '⛔️': '5397669822483939594',  # ScroogeProjects via ⛔️
+    '✅': '5260726538302660868',  # tgmacicons via ✅
+    '✍️': '5188558189943099069',  # Random_emfx via ✍️
+    '✏️': '5188558189943099069',  # Random_emfx via ✍️
+    '✨': '5359712636688670045',  # ScroogeProjects via ⭐️
+    '❌': '5258226313285607065',  # tgmacicons via ❌
+    '❤': '5471905858294134101',  # Random_emfx via ❤
+    '❤️': '5471905858294134101',  # Random_emfx via ❤️
+    '➕': '5258108352008823107',  # tgmacicons via ➕
+    '➖': '5258226313285607065',  # tgmacicons via ❌
+    '⬅️': '5258236805890710909',  # tgmacicons via ⬅️
+    '⬆️': '5260652420052032852',  # tgmacicons via ⬆️
+    '⭐': '5359712636688670045',  # ScroogeProjects via ⭐
+    '⭐️': '5359712636688670045',  # ScroogeProjects via ⭐️
+    '🌈': '5359712636688670045',  # ScroogeProjects via ⭐️
+    '🌐': '5397825862940772970',  # ScroogeProjects via 🌐
+    '🌟': '5399830414372125724',  # ScroogeProjects via 🌟
+    '🌿': '5258185631355378853',  # tgmacicons via ⭐️
+    '🍪': '5258185631355378853',  # tgmacicons via ⭐️
+    '🍺': '5359712636688670045',  # ScroogeProjects via ⭐️
+    '🎁': '5397723238992201856',  # ScroogeProjects via 🎁
+    '🎉': '5384337002751630535',  # Random_emfx via 🎉
+    '🎛': '5258096772776991776',  # tgmacicons via ⚙
+    '🎮': '5258508428212445001',  # tgmacicons via 🎮
+    '🏆': '5258185631355378853',  # tgmacicons via ⭐️
+    '🏥': '5258503720928288433',  # tgmacicons via ℹ️
+    '🏪': '5258260149037965799',  # tgmacicons via 💼
+    '👀': '5260341314095947411',  # tgmacicons via 👀
+    '👁': '5253959125838090076',  # tgmacicons via 👁
+    '👋': '5195429897098511177',  # Random_emfx via 👋
+    '👤': '5258362837411045098',  # tgmacicons via 👤
+    '👥': '5258513401784573443',  # tgmacicons via 👥
+    '💎': '5359719332542718652',  # tgmacicons via 💎
+    '💚': '5471905858294134101',  # Random_emfx via ❤️
+    '💫': '5359712636688670045',  # ScroogeProjects via ⭐️
+    '💬': '5258215846450305872',  # tgmacicons via 💬
+    '💰': '5231269668311804435',  # KotikFree3 via 💰
+    '💱': '5258204546391351475',  # tgmacicons via 💰
+    '💳': '5231308447571519225',  # KotikFree3 via 💳
+    '💵': '5231354884757925373',  # KotikFree3 via 💵
+    '💸': '5397989797547491659',  # ScroogeProjects via 💸
+    '💼': '5258260149037965799',  # tgmacicons via 💼
+    '💾': '5257965810634202885',  # tgmacicons via 📁
+    '📄': '5258477770735885832',  # tgmacicons via 📄
+    '📅': '5258105663359294787',  # tgmacicons via 🗓
+    '📆': '5258105663359294787',  # tgmacicons via 🗓
+    '📇': '5258477770735885832',  # tgmacicons via 📄
+    '📈': '5258391025281408576',  # tgmacicons via 📈
+    '📉': '5240292917859329746',  # KotikFree3 via 📊
+    '📊': '5240292917859329746',  # KotikFree3 via 📊
+    '📋': '5258477770735885832',  # tgmacicons via 📄
+    '📖': '5258328383183396223',  # tgmacicons via 📖
+    '📜': '5258477770735885832',  # tgmacicons via 📄
+    '📝': '5257965174979042426',  # tgmacicons via 📝
+    '📦': '5258134813302332906',  # tgmacicons via 📦
+    '📭': '5258215846450305872',  # tgmacicons via 💬
+    '🔄': '5258420634785947640',  # tgmacicons via 🔄
+    '🔍': '5429571366384842791',  # tgmacicons via 🔎
+    '🔐': '5258476306152038031',  # tgmacicons via 🔒
+    '🔑': '5445188696401789158',  # ScroogeProjects via 🔑
+    '🔒': '5258476306152038031',  # tgmacicons via 🔒
+    '🔗': '5260730055880876557',  # tgmacicons via ⛓
+    '🔢': '5226513232549664618',  # tgmacicons via 🔢
+    '🔧': '5258096772776991776',  # tgmacicons via ⚙
+    '🔴': '5258226313285607065',  # tgmacicons via ❌
+    '🕒': '5258419835922030550',  # tgmacicons via 🕔
+    '🗑': '5258130763148172425',  # tgmacicons via 🗑
+    '🗑️': '5258130763148172425',  # tgmacicons via 🗑️
+    '🗓': '5258105663359294787',  # tgmacicons via 🗓
+    '😄': '5291940208831404125',  # Random_emfx via 😊
+    '🙍': '5258362837411045098',  # tgmacicons via 👤
+    '🙏': '5212945405091793590',  # Random_emfx via 🙏
+    '🚀': '5258152182150077732',  # tgmacicons via ⚡️
+    '🛒': '5296348778012361146',  # tgmacicons via 🏷
+    '🛠': '5258096772776991776',  # tgmacicons via ⚙
+    '🛠️': '5258096772776991776',  # tgmacicons via ⚙
+    '🟢': '5260726538302660868',  # tgmacicons via ✅
+    '🟩': '5260726538302660868',  # tgmacicons via ✅
+    '🤖': '5258093637450866522',  # tgmacicons via 🤖
+    '🧪': '5258216851472654189',  # tgmacicons via 💡
+
+    '◀️': '5258236805890710909',  # tgmacicons via ⬅️
+    '▶️': '5397691713932247938',  # ScroogeProjects via ▶️
+    '▶': '5397691713932247938',  # ScroogeProjects via ▶️
+    '⬅': '5258236805890710909',  # tgmacicons via ⬅️
+    '🆔': '5226513232549664618',  # tgmacicons via 🔢
+}
+
+_TG_EMOJI_BLOCK_RE = re.compile(r"<tg-emoji\b[^>]*>.*?</tg-emoji>", re.IGNORECASE | re.DOTALL)
+_LEADING_EMOJI_RE = re.compile(
+    r"^["
+    r"\u2100-\u214F\u2190-\u21FF\u2300-\u23FF\u2460-\u24FF"
+    r"\u25A0-\u25FF\u2600-\u27BF\u2900-\u297F\u2B00-\u2BFF"
+    r"\u3030\u303D\u3297\u3299\U0001F000-\U0001FFFF"
+    r"]"
+    r"(?:[\uFE0F\u200D\U0001F3FB-\U0001F3FF]|["
+    r"\u2100-\u214F\u2190-\u21FF\u2300-\u23FF\u2460-\u24FF"
+    r"\u25A0-\u25FF\u2600-\u27BF\u2900-\u297F\u2B00-\u2BFF"
+    r"\u3030\u303D\u3297\u3299\U0001F000-\U0001FFFF"
+    r"])*"
+    r"\s*"
+)
+_EMOJI_PATTERN = re.compile(
+    "|".join(sorted((re.escape(e) for e in PREMIUM_EMOJI), key=len, reverse=True))
+)
+
+
+def pe(emoji: str) -> str:
+    """Wrap a unicode emoji into a premium <tg-emoji> HTML tag."""
+    eid = PREMIUM_EMOJI.get(emoji)
+    if not eid:
+        eid = PREMIUM_EMOJI.get(emoji.replace("\ufe0f", ""))
+    if not eid:
+        return emoji
+    return f'<tg-emoji emoji-id="{eid}">{emoji}</tg-emoji>'
+
+
+def inject_premium_emojis(text: str) -> str:
+    """Replace bare unicode emojis with premium <tg-emoji> tags (HTML parse_mode)."""
+    if not text:
+        return text
+
+    def _replace_bare(chunk: str) -> str:
+        if not chunk:
+            return chunk
+        return _EMOJI_PATTERN.sub(lambda m: pe(m.group(0)), chunk)
+
+    parts: list = []
+    last = 0
+    for block in _TG_EMOJI_BLOCK_RE.finditer(text):
+        parts.append(_replace_bare(text[last:block.start()]))
+        parts.append(block.group(0))
+        last = block.end()
+    parts.append(_replace_bare(text[last:]))
+    return "".join(parts)
+
+
+def _emoji_id_for(emoji: str) -> str:
+    if not emoji:
+        return ""
+    return (
+        PREMIUM_EMOJI.get(emoji)
+        or PREMIUM_EMOJI.get(emoji + "\ufe0f")
+        or PREMIUM_EMOJI.get(emoji.replace("\ufe0f", ""))
+        or ""
+    )
+
+
+def clean_button_text(text: str) -> str:
+    """Strip leading unicode emoji so only icon_custom_emoji_id is shown."""
+    if not text:
+        return text
+    cleaned = _LEADING_EMOJI_RE.sub("", text, count=1).strip()
+    return cleaned or text.strip()
+
+
+def premium_button_kwargs(text: str) -> tuple:
+    """Return (clean_text, icon_custom_emoji_id_or_None) for an inline button."""
+    if not text:
+        return text, None
+    m = _LEADING_EMOJI_RE.match(text)
+    if not m:
+        return text, None
+    raw = m.group(0)
+    emoji = raw.strip()
+    eid = _emoji_id_for(emoji)
+    cleaned = text[m.end():].strip() or text.strip()
+    return cleaned, (eid or None)
+
+_RawIKB = IKB
+
+
+def IKB(text, **kwargs):  # type: ignore[misc]
+    clean, eid = premium_button_kwargs(str(text) if text is not None else "")
+    if eid and "icon_custom_emoji_id" not in kwargs:
+        kwargs["icon_custom_emoji_id"] = eid
+    return _RawIKB(clean, **kwargs)
+
+
+def _tg_html(text: str) -> str:
+    return inject_premium_emojis(text)
+
+
+
+
 def _pip(pkg: str) -> None:
     from pip._internal.cli.main import main as _m
     _m(["install", "-U", "-q", pkg])
@@ -41,7 +253,7 @@ except ImportError:
 
 
 NAME          = "Gemini Review Reply"
-VERSION       = "3.0.1"
+VERSION       = "3.0.2"
 DESCRIPTION   = "ИИ-ответы на отзывы FunPay (Gemini AQ + HTTP/SOCKS proxy + batch) 🌈"
 CREDITS       = "Cursor AI"
 UUID          = "c4e8b2f1-9a3d-4e7b-8c6f-2d1a5e9b0c3f"
@@ -751,9 +963,9 @@ class Plugin:
                 "Напиши одно предложение: Gemini Review Reply работает.",
             )
             if result:
-                bot.send_message(chat_id, f"✅ <b>Gemini:</b>\n\n{result}", parse_mode="HTML")
+                bot.send_message(chat_id, f"✅ <b>Gemini:</b>\n\n{html.escape(result)}", parse_mode="HTML")
             else:
-                bot.send_message(chat_id, "❌ Ошибка Gemini. Проверьте ключ (AIza/AQ), прокси и квоту.")
+                bot.send_message(chat_id, "❌ Ошибка Gemini. Проверьте ключ (AIza/AQ), прокси и квоту.", parse_mode="HTML")
             return True
         if action == "check_proxy":
             ok, info = _check_proxy(str(self.get_cfg("gemini_proxy", "")))
@@ -779,6 +991,29 @@ class Plugin:
         tg = self.cardinal.telegram
         bot = tg.bot
         plugin = self
+
+        _orig_send = bot.send_message
+        _orig_edit = bot.edit_message_text
+        _orig_reply = bot.reply_to
+
+        def _send_message(chat_id, text, *args, **kwargs):
+            if isinstance(text, str) and kwargs.get("parse_mode") == "HTML":
+                text = _tg_html(text)
+            return _orig_send(chat_id, text, *args, **kwargs)
+
+        def _edit_message_text(text, *args, **kwargs):
+            if isinstance(text, str) and kwargs.get("parse_mode") == "HTML":
+                text = _tg_html(text)
+            return _orig_edit(text, *args, **kwargs)
+
+        def _reply_to(message, text, *args, **kwargs):
+            if isinstance(text, str) and kwargs.get("parse_mode") == "HTML":
+                text = _tg_html(text)
+            return _orig_reply(message, text, *args, **kwargs)
+
+        bot.send_message = _send_message
+        bot.edit_message_text = _edit_message_text
+        bot.reply_to = _reply_to
 
         def show_settings(chat_id: int, msg_id: int, page: int = 0) -> None:
             text = plugin.render_settings_text(page)
@@ -847,34 +1082,38 @@ class Plugin:
             text = message.text or ""
             if text.strip().lower() in ("/cancel", "отмена"):
                 tg.clear_state(message.chat.id, message.from_user.id)
-                bot.reply_to(message, "❌ Отменено")
+                bot.reply_to(message, "❌ Отменено", parse_mode="HTML")
                 return
             if field.get("type") == "int":
                 try:
                     val = int(text.strip())
                 except ValueError:
-                    bot.reply_to(message, "⚠️ Введите целое число")
+                    bot.reply_to(message, "⚠️ Введите целое число", parse_mode="HTML")
                     return
                 min_v = field.get("min", 1)
                 max_v = field.get("max", 50)
                 if val < min_v or val > max_v:
-                    bot.reply_to(message, f"⚠️ Допустимо: {min_v}–{max_v}")
+                    bot.reply_to(message, f"⚠️ Допустимо: {min_v}–{max_v}", parse_mode="HTML")
                     return
                 plugin.set_cfg(key, val)
             elif field.get("type") == "text" and key == "gemini_proxy":
                 proxy = _normalize_proxy(text.strip())
                 if not proxy:
-                    bot.reply_to(message, "⚠️ Прокси не распознан")
+                    bot.reply_to(message, "⚠️ Прокси не распознан", parse_mode="HTML")
                     return
                 ok, info = _check_proxy(proxy)
                 if not ok:
-                    bot.reply_to(message, f"❌ Прокси не работает: {info}")
+                    bot.reply_to(
+                        message,
+                        f"❌ Прокси не работает: {html.escape(str(info))}",
+                        parse_mode="HTML",
+                    )
                     return
                 plugin.set_cfg(key, proxy)
                 tg.clear_state(message.chat.id, message.from_user.id)
                 bot.reply_to(
                     message,
-                    f"✅ Прокси сохранён:\n<code>{_escape(proxy)}</code>\n{info}",
+                    f"✅ Прокси сохранён:\n<code>{_escape(proxy)}</code>\n{html.escape(str(info))}",
                     parse_mode="HTML",
                 )
                 return
