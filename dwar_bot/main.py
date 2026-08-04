@@ -77,6 +77,7 @@ from dwar_bot.core.telemetry_engine import TelemetryEngine
 from dwar_bot.core.rich_notifications import RichNotifications
 from dwar_bot.modules.leveling_engine import LevelingEngine
 from dwar_bot.modules.analytics_reporter import AnalyticsReporter
+from dwar_bot.modules.pure_farm import PureFarmEngine
 from dwar_bot.config import COMBAT, STATE_FILE
 
 logger = logging.getLogger("dwar_bot.main")
@@ -144,6 +145,7 @@ class DwarBot:
         )
         self.rich = RichNotifications(self.telemetry)
         self.analytics = AnalyticsReporter(self)
+        self.pure_farm = PureFarmEngine()
         self._wire_telemetry_hooks()
 
         self._iteration = 0
@@ -924,6 +926,42 @@ class DwarBot:
 
         await self.timers.update_regen(self._char.hp, self._char.mp)
         await self._emit_state_notifications()
+
+        # ------------------------------------------------------------------
+        # PURE FARM (rewritten core): hunt-only, ignore flash heal_wounded /
+        # Level-Up planner. max_farm=True (default) or village 930–932.
+        # ------------------------------------------------------------------
+        if self.pure_farm.should_run(
+            max_farm=bool(farm.max_farm),
+            area_id=str(self._state.area_id or ""),
+            level=int(self._char.level or 1),
+        ):
+            try:
+                await self.controller.apply_directive(
+                    StrategicDirective(
+                        state=BotState.FARMING,
+                        priority=1,
+                        title="Pure Farm",
+                        reason="hunt-only rewrite",
+                        area_id=str(self._state.area_id or ""),
+                        exp_per_hour=0.0,
+                    )
+                )
+            except Exception:
+                pass
+            handled = await self.pure_farm.run_tick(self)
+            if handled:
+                # Feed economy so AutoCoder sees battle progress
+                self.telemetry.note_economy(
+                    gold=float(self._state.money or 0),
+                    exp_proxy=float(self.pure_farm.stats.wins) * 50.0,
+                    battles=self.combat.session.battles_joined,
+                    wins=max(self.combat.session.wins, self.pure_farm.stats.wins),
+                    potions_used=self.combat.session.potions_used,
+                    quests_completed=self.quests.session.quests_completed,
+                )
+                await _sleep(1.0, 2.5)
+                return
 
         # Economy snapshot every tick (feeds Gold/hr Exp/hr)
         self.telemetry.note_economy(
@@ -2465,38 +2503,56 @@ async def main() -> None:
         name="autonomous_log_watcher_300s",
     )
 
-    # Level-1 Gemini auditor (120s) → Level-2 Cursor executor
-    async def _orch_pause() -> None:
-        await bot.pause(quiet=True)
+    # Gemini + AutoCoder OFF by default — they false-pause village farm.
+    # Enable with ENABLE_SELF_HEAL=1 if you want Cursor auto-patches.
+    enable_self_heal = os.getenv("ENABLE_SELF_HEAL", "0").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+    healing_orchestrator = None
+    healing_orch_task = None
+    auto_coder = None
+    auto_coder_task = None
+    if enable_self_heal:
+        async def _orch_pause() -> None:
+            for rt in accounts.all_runtimes():
+                try:
+                    await rt.bot.pause(quiet=True)
+                except Exception:
+                    pass
 
-    async def _orch_resume() -> None:
-        await bot.resume_game(quiet=True)
+        async def _orch_resume() -> None:
+            for rt in accounts.all_runtimes():
+                try:
+                    await rt.bot.resume_game(quiet=True)
+                except Exception:
+                    pass
 
-    healing_orchestrator = HealingOrchestrator(
-        log_path=LOG_FILE,
-        interval_seconds=120,
-        notify_fn=_notify_plain,
-        pause_fn=_orch_pause,
-        resume_fn=_orch_resume,
-    )
-    healing_orch_task = asyncio.create_task(
-        healing_orchestrator.run_forever(),
-        name="gemini_healing_orchestrator_120s",
-    )
-    # Equivalent one-liner form:
-    # asyncio.create_task(start_healing_orchestrator(120, notify_fn=_notify_plain, ...))
-
-    # Autonomous AutoCoder: stuck / crash → Cursor CLI patch (120–300s)
-    auto_coder = bind_auto_coder(
-        log_path=LOG_FILE,
-        notify_fn=_notify_plain,
-        interval_min=120,
-        interval_max=300,
-    )
-    auto_coder_task = asyncio.create_task(
-        auto_coder.run_forever(),
-        name="auto_coder_120_300s",
-    )
+        healing_orchestrator = HealingOrchestrator(
+            log_path=LOG_FILE,
+            interval_seconds=120,
+            notify_fn=_notify_plain,
+            pause_fn=_orch_pause,
+            resume_fn=_orch_resume,
+        )
+        healing_orch_task = asyncio.create_task(
+            healing_orchestrator.run_forever(),
+            name="gemini_healing_orchestrator_120s",
+        )
+        auto_coder = bind_auto_coder(
+            log_path=LOG_FILE,
+            notify_fn=_notify_plain,
+            interval_min=120,
+            interval_max=300,
+        )
+        auto_coder_task = asyncio.create_task(
+            auto_coder.run_forever(),
+            name="auto_coder_120_300s",
+        )
+        logger.info("Self-heal ON (Gemini+AutoCoder) ENABLE_SELF_HEAL=1")
+    else:
+        logger.info(
+            "PureFarm rewrite: Gemini/AutoCoder OFF — hunt-only core, no false restarts."
+        )
 
     async def _heal_watchdog() -> None:
         while not _shutdown_event.is_set():
@@ -2510,8 +2566,8 @@ async def main() -> None:
 
     asyncio.create_task(_heal_watchdog(), name="heal_watchdog")
     logger.info(
-        "Self-Healing(300s) + GeminiAudit(120s) + AutoCoder(120-300s) + LevelingEngine · "
-        "CURSOR_API_KEY=%s GEMINI_API_KEY=%s",
+        "PureFarm rewrite active · LogWatcher(300s) · self_heal=%s · CURSOR=%s GEMINI=%s",
+        "ON" if enable_self_heal else "OFF",
         "set" if os.getenv("CURSOR_API_KEY") else "MISSING",
         "set" if os.getenv("GEMINI_API_KEY") else "MISSING",
     )
@@ -2551,15 +2607,17 @@ async def main() -> None:
                 await log_watcher_task
             except asyncio.CancelledError:
                 pass
-        if not healing_orch_task.done():
-            healing_orchestrator.stop()
+        if healing_orch_task is not None and not healing_orch_task.done():
+            if healing_orchestrator is not None:
+                healing_orchestrator.stop()
             healing_orch_task.cancel()
             try:
                 await healing_orch_task
             except asyncio.CancelledError:
                 pass
-        if not auto_coder_task.done():
-            auto_coder.stop()
+        if auto_coder_task is not None and not auto_coder_task.done():
+            if auto_coder is not None:
+                auto_coder.stop()
             auto_coder_task.cancel()
             try:
                 await auto_coder_task
