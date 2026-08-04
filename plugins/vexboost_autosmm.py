@@ -2,7 +2,7 @@ from __future__ import annotations
 
 # === ОБЯЗАТЕЛЬНЫЕ ПОЛЯ FunPay Cardinal (НЕ УДАЛЯТЬ) ===
 NAME = "VexBoost AutoSMM"
-VERSION = "2.4.9"
+VERSION = "2.4.10"
 DESCRIPTION = "Автонакрутка SMM-услуг для FunPay Cardinal"
 CREDITS = "@xei1y"
 UUID = "a3f8c2e1-7b4d-4a9f-9e2c-1d5b8f6a0c3e"
@@ -28,6 +28,216 @@ from telebot.types import InlineKeyboardButton, InlineKeyboardMarkup
 from tg_bot import CBT
 from FunPayAPI.types import MessageTypes
 from FunPayAPI.updater.events import LastChatMessageChangedEvent, NewMessageEvent, NewOrderEvent
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Premium Telegram custom emoji (tgmacicons / KotikFree3 / Random_emfx / ScroogeProjects)
+# Text: <tg-emoji emoji-id="...">fallback</tg-emoji>  |  Buttons: icon_custom_emoji_id
+# FunPay buyer chats stay unicode — only Telegram HTML messages are injected.
+# ─────────────────────────────────────────────────────────────────────────────
+
+PREMIUM_EMOJI = {
+    'ℹ': '5258503720928288433',  # tgmacicons via ℹ
+    'ℹ️': '5258503720928288433',  # tgmacicons via ℹ️
+    '⌛': '5258258882022612173',  # tgmacicons via ⏲
+    '⌛️': '5258258882022612173',  # tgmacicons via ⏲
+    '⏭': '5260450573768990626',  # tgmacicons via ➡️
+    '⏱': '5258258882022612173',  # tgmacicons via ⏲
+    '⏲': '5258258882022612173',  # tgmacicons via ⏲
+    '⏳': '5258258882022612173',  # tgmacicons via ⏲
+    '⏸': '5258258882022612173',  # tgmacicons via ⏲
+    '★': '5258185631355378853',  # tgmacicons via ⭐️
+    '☕': '5359712636688670045',  # ScroogeProjects via ⭐️
+    '♻️': '5258420634785947640',  # tgmacicons via 🔄
+    '⚙': '5258096772776991776',  # tgmacicons via ⚙
+    '⚙️': '5258096772776991776',  # tgmacicons via ⚙️
+    '⚠': '5258474669769497337',  # tgmacicons via ❗️
+    '⚠️': '5258474669769497337',  # tgmacicons via ❗️
+    '⚡': '5258152182150077732',  # tgmacicons via ⚡
+    '⚡️': '5258152182150077732',  # tgmacicons via ⚡️
+    '⚪️': '5442736201356298637',  # ScroogeProjects via ◽️
+    '⛔': '5275969776668134187',  # tgmacicons via ⛔
+    '⛔️': '5397669822483939594',  # ScroogeProjects via ⛔️
+    '✅': '5260726538302660868',  # tgmacicons via ✅
+    '✍️': '5188558189943099069',  # Random_emfx via ✍️
+    '✏️': '5188558189943099069',  # Random_emfx via ✍️
+    '✨': '5359712636688670045',  # ScroogeProjects via ⭐️
+    '❌': '5258226313285607065',  # tgmacicons via ❌
+    '❤': '5471905858294134101',  # Random_emfx via ❤
+    '❤️': '5471905858294134101',  # Random_emfx via ❤️
+    '➕': '5258108352008823107',  # tgmacicons via ➕
+    '➖': '5258226313285607065',  # tgmacicons via ❌
+    '⬅️': '5258236805890710909',  # tgmacicons via ⬅️
+    '⬆️': '5260652420052032852',  # tgmacicons via ⬆️
+    '⭐': '5359712636688670045',  # ScroogeProjects via ⭐
+    '⭐️': '5359712636688670045',  # ScroogeProjects via ⭐️
+    '🌈': '5359712636688670045',  # ScroogeProjects via ⭐️
+    '🌐': '5397825862940772970',  # ScroogeProjects via 🌐
+    '🌟': '5399830414372125724',  # ScroogeProjects via 🌟
+    '🌿': '5258185631355378853',  # tgmacicons via ⭐️
+    '🍪': '5258185631355378853',  # tgmacicons via ⭐️
+    '🍺': '5359712636688670045',  # ScroogeProjects via ⭐️
+    '🎁': '5397723238992201856',  # ScroogeProjects via 🎁
+    '🎉': '5384337002751630535',  # Random_emfx via 🎉
+    '🎛': '5258096772776991776',  # tgmacicons via ⚙
+    '🎮': '5258508428212445001',  # tgmacicons via 🎮
+    '🏆': '5258185631355378853',  # tgmacicons via ⭐️
+    '🏥': '5258503720928288433',  # tgmacicons via ℹ️
+    '🏪': '5258260149037965799',  # tgmacicons via 💼
+    '👀': '5260341314095947411',  # tgmacicons via 👀
+    '👁': '5253959125838090076',  # tgmacicons via 👁
+    '👋': '5195429897098511177',  # Random_emfx via 👋
+    '👤': '5258362837411045098',  # tgmacicons via 👤
+    '👥': '5258513401784573443',  # tgmacicons via 👥
+    '💎': '5359719332542718652',  # tgmacicons via 💎
+    '💚': '5471905858294134101',  # Random_emfx via ❤️
+    '💫': '5359712636688670045',  # ScroogeProjects via ⭐️
+    '💬': '5258215846450305872',  # tgmacicons via 💬
+    '💰': '5231269668311804435',  # KotikFree3 via 💰
+    '💱': '5258204546391351475',  # tgmacicons via 💰
+    '💳': '5231308447571519225',  # KotikFree3 via 💳
+    '💵': '5231354884757925373',  # KotikFree3 via 💵
+    '💸': '5397989797547491659',  # ScroogeProjects via 💸
+    '💼': '5258260149037965799',  # tgmacicons via 💼
+    '💾': '5257965810634202885',  # tgmacicons via 📁
+    '📄': '5258477770735885832',  # tgmacicons via 📄
+    '📅': '5258105663359294787',  # tgmacicons via 🗓
+    '📆': '5258105663359294787',  # tgmacicons via 🗓
+    '📇': '5258477770735885832',  # tgmacicons via 📄
+    '📈': '5258391025281408576',  # tgmacicons via 📈
+    '📉': '5240292917859329746',  # KotikFree3 via 📊
+    '📊': '5240292917859329746',  # KotikFree3 via 📊
+    '📋': '5258477770735885832',  # tgmacicons via 📄
+    '📖': '5258328383183396223',  # tgmacicons via 📖
+    '📜': '5258477770735885832',  # tgmacicons via 📄
+    '📝': '5257965174979042426',  # tgmacicons via 📝
+    '📦': '5258134813302332906',  # tgmacicons via 📦
+    '📭': '5258215846450305872',  # tgmacicons via 💬
+    '🔄': '5258420634785947640',  # tgmacicons via 🔄
+    '🔍': '5429571366384842791',  # tgmacicons via 🔎
+    '🔐': '5258476306152038031',  # tgmacicons via 🔒
+    '🔑': '5445188696401789158',  # ScroogeProjects via 🔑
+    '🔒': '5258476306152038031',  # tgmacicons via 🔒
+    '🔗': '5260730055880876557',  # tgmacicons via ⛓
+    '🔢': '5226513232549664618',  # tgmacicons via 🔢
+    '🔧': '5258096772776991776',  # tgmacicons via ⚙
+    '🔴': '5258226313285607065',  # tgmacicons via ❌
+    '🕒': '5258419835922030550',  # tgmacicons via 🕔
+    '🗑': '5258130763148172425',  # tgmacicons via 🗑
+    '🗑️': '5258130763148172425',  # tgmacicons via 🗑️
+    '🗓': '5258105663359294787',  # tgmacicons via 🗓
+    '😄': '5291940208831404125',  # Random_emfx via 😊
+    '🙍': '5258362837411045098',  # tgmacicons via 👤
+    '🙏': '5212945405091793590',  # Random_emfx via 🙏
+    '🚀': '5258152182150077732',  # tgmacicons via ⚡️
+    '🛒': '5296348778012361146',  # tgmacicons via 🏷
+    '🛠': '5258096772776991776',  # tgmacicons via ⚙
+    '🛠️': '5258096772776991776',  # tgmacicons via ⚙
+    '🟢': '5260726538302660868',  # tgmacicons via ✅
+    '🟩': '5260726538302660868',  # tgmacicons via ✅
+    '🤖': '5258093637450866522',  # tgmacicons via 🤖
+    '🧪': '5258216851472654189',  # tgmacicons via 💡
+
+    '◀️': '5258236805890710909',  # tgmacicons via ⬅️
+    '▶️': '5397691713932247938',  # ScroogeProjects via ▶️
+    '▶': '5397691713932247938',  # ScroogeProjects via ▶️
+    '⬅': '5258236805890710909',  # tgmacicons via ⬅️
+    '🆔': '5226513232549664618',  # tgmacicons via 🔢
+}
+
+_TG_EMOJI_BLOCK_RE = re.compile(r"<tg-emoji\b[^>]*>.*?</tg-emoji>", re.IGNORECASE | re.DOTALL)
+_LEADING_EMOJI_RE = re.compile(
+    r"^["
+    r"\u2100-\u214F\u2190-\u21FF\u2300-\u23FF\u2460-\u24FF"
+    r"\u25A0-\u25FF\u2600-\u27BF\u2900-\u297F\u2B00-\u2BFF"
+    r"\u3030\u303D\u3297\u3299\U0001F000-\U0001FFFF"
+    r"]"
+    r"(?:[\uFE0F\u200D\U0001F3FB-\U0001F3FF]|["
+    r"\u2100-\u214F\u2190-\u21FF\u2300-\u23FF\u2460-\u24FF"
+    r"\u25A0-\u25FF\u2600-\u27BF\u2900-\u297F\u2B00-\u2BFF"
+    r"\u3030\u303D\u3297\u3299\U0001F000-\U0001FFFF"
+    r"])*"
+    r"\s*"
+)
+_EMOJI_PATTERN = re.compile(
+    "|".join(sorted((re.escape(e) for e in PREMIUM_EMOJI), key=len, reverse=True))
+)
+
+
+def pe(emoji: str) -> str:
+    """Wrap a unicode emoji into a premium <tg-emoji> HTML tag."""
+    eid = PREMIUM_EMOJI.get(emoji)
+    if not eid:
+        eid = PREMIUM_EMOJI.get(emoji.replace("\ufe0f", ""))
+    if not eid:
+        return emoji
+    return f'<tg-emoji emoji-id="{eid}">{emoji}</tg-emoji>'
+
+
+def inject_premium_emojis(text: str) -> str:
+    """Replace bare unicode emojis with premium <tg-emoji> tags (HTML parse_mode)."""
+    if not text:
+        return text
+
+    def _replace_bare(chunk: str) -> str:
+        if not chunk:
+            return chunk
+        return _EMOJI_PATTERN.sub(lambda m: pe(m.group(0)), chunk)
+
+    parts: list = []
+    last = 0
+    for block in _TG_EMOJI_BLOCK_RE.finditer(text):
+        parts.append(_replace_bare(text[last:block.start()]))
+        parts.append(block.group(0))
+        last = block.end()
+    parts.append(_replace_bare(text[last:]))
+    return "".join(parts)
+
+
+def _emoji_id_for(emoji: str) -> str:
+    if not emoji:
+        return ""
+    return (
+        PREMIUM_EMOJI.get(emoji)
+        or PREMIUM_EMOJI.get(emoji + "\ufe0f")
+        or PREMIUM_EMOJI.get(emoji.replace("\ufe0f", ""))
+        or ""
+    )
+
+
+def clean_button_text(text: str) -> str:
+    """Strip leading unicode emoji so only icon_custom_emoji_id is shown."""
+    if not text:
+        return text
+    cleaned = _LEADING_EMOJI_RE.sub("", text, count=1).strip()
+    return cleaned or text.strip()
+
+
+def premium_button_kwargs(text: str) -> tuple:
+    """Return (clean_text, icon_custom_emoji_id_or_None) for an inline button."""
+    if not text:
+        return text, None
+    m = _LEADING_EMOJI_RE.match(text)
+    if not m:
+        return text, None
+    raw = m.group(0)
+    emoji = raw.strip()
+    eid = _emoji_id_for(emoji)
+    cleaned = text[m.end():].strip() or text.strip()
+    return cleaned, (eid or None)
+
+def _Btn(text: str, **kwargs):
+    """InlineKeyboardButton with premium icon_custom_emoji_id when leading emoji is mapped."""
+    clean, eid = premium_button_kwargs(text)
+    if eid and "icon_custom_emoji_id" not in kwargs:
+        kwargs["icon_custom_emoji_id"] = eid
+    return InlineKeyboardButton(clean, **kwargs)
+
+
+def _tg_html(text: str) -> str:
+    return inject_premium_emojis(text)
+
+
 
 if TYPE_CHECKING:
     from cardinal import Cardinal
@@ -212,15 +422,15 @@ def _template_edit_prompt(template_key: str) -> str:
 def _templates_keyboard() -> InlineKeyboardMarkup:
     kb = InlineKeyboardMarkup(row_width=1)
     for key, (label, _) in MESSAGE_TEMPLATE_LABELS.items():
-        kb.add(InlineKeyboardButton(label, callback_data=f"vb_tpl_edit_{key}"))
-    kb.add(InlineKeyboardButton("⬅️ Назад", callback_data="vb_back_main"))
+        kb.add(_Btn(label, callback_data=f"vb_tpl_edit_{key}"))
+    kb.add(_Btn("⬅️ Назад", callback_data="vb_back_main"))
     return kb
 
 
 def _template_edit_keyboard(template_key: str) -> InlineKeyboardMarkup:
     kb = InlineKeyboardMarkup(row_width=1)
-    kb.add(InlineKeyboardButton("🔄 Сбросить по умолчанию", callback_data=f"vb_tpl_reset_{template_key}"))
-    kb.add(InlineKeyboardButton("⬅️ К списку шаблонов", callback_data="vb_templates_menu"))
+    kb.add(_Btn("🔄 Сбросить по умолчанию", callback_data=f"vb_tpl_reset_{template_key}"))
+    kb.add(_Btn("⬅️ К списку шаблонов", callback_data="vb_templates_menu"))
     return kb
 
 
@@ -1502,7 +1712,7 @@ def _send_tg_to_admins(c: "Cardinal", text: str, keyboard: Optional[InlineKeyboa
     for user_id in users:
         try:
             c.telegram.bot.send_message(
-                user_id, text, parse_mode="HTML",
+                user_id, _tg_html(text), parse_mode="HTML",
                 reply_markup=keyboard, disable_web_page_preview=True,
             )
         except Exception as exc:
@@ -1529,7 +1739,7 @@ def send_order_created_notification(
     except Exception:
         fp_bal_text = "н/д"
 
-    btn = InlineKeyboardButton(
+    btn = _Btn(
         "🌐 Открыть заказ FunPay",
         url=get_funpay_order_url(order["OrderID"]),
     )
@@ -1558,7 +1768,7 @@ def send_order_error_notification(c: "Cardinal", error: str, order: Dict[str, An
     settings = load_settings()
     if not settings.get("set_alert_errororder"):
         return
-    btn = InlineKeyboardButton("🌐 Заказ FunPay", url=get_funpay_order_url(order["OrderID"]))
+    btn = _Btn("🌐 Заказ FunPay", url=get_funpay_order_url(order["OrderID"]))
     kb = InlineKeyboardMarkup().add(btn)
     text = (
         f"❌ <b>Ошибка {NAME}</b>\n\n"
@@ -1580,7 +1790,7 @@ def send_order_complete_notification(
     settings = load_settings()
     if not settings.get("set_alert_complete"):
         return
-    btn = InlineKeyboardButton("🌐 Заказ FunPay", url=get_funpay_order_url(order.get("order_id", "")))
+    btn = _Btn("🌐 Заказ FunPay", url=get_funpay_order_url(order.get("order_id", "")))
     kb = InlineKeyboardMarkup().add(btn)
     text = (
         f"🎉 <b>Заказ выполнен {NAME}</b>\n\n"
@@ -1598,7 +1808,7 @@ def send_partial_order_notification(
     if not settings.get("set_alert_partial"):
         return
     funpay_id = info.get("order_id", "")
-    btn = InlineKeyboardButton("🌐 Заказ FunPay", url=get_funpay_order_url(funpay_id))
+    btn = _Btn("🌐 Заказ FunPay", url=get_funpay_order_url(funpay_id))
     kb = InlineKeyboardMarkup().add(btn)
     text = (
         f"⏸ <b>Partial {NAME}</b>\n\n"
@@ -1640,7 +1850,7 @@ def send_start_notification(c: "Cardinal") -> None:
         f"<i>Если команда не отвечает, нажмите кнопку ниже</i>"
     )
     kb = InlineKeyboardMarkup()
-    kb.add(InlineKeyboardButton("⚙️ Открыть панель VexBoost", callback_data="vb_open_panel"))
+    kb.add(_Btn("⚙️ Открыть панель VexBoost", callback_data="vb_open_panel"))
     _send_tg_to_admins(c, text, kb)
 
 
@@ -2415,21 +2625,21 @@ def _guide_menu_keyboard() -> InlineKeyboardMarkup:
         ("🔧 Проблемы", "fix"),
     )
     for i in range(0, len(labels), 2):
-        left = InlineKeyboardButton(labels[i][0], callback_data=f"vb_guide_{labels[i][1]}")
+        left = _Btn(labels[i][0], callback_data=f"vb_guide_{labels[i][1]}")
         if i + 1 < len(labels):
-            right = InlineKeyboardButton(
+            right = _Btn(
                 labels[i + 1][0], callback_data=f"vb_guide_{labels[i + 1][1]}",
             )
             kb.row(left, right)
         else:
             kb.row(left)
-    kb.row(InlineKeyboardButton("⬅️ В меню", callback_data="vb_back_main"))
+    kb.row(_Btn("⬅️ В меню", callback_data="vb_back_main"))
     return kb
 
 
 def _guide_section_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(row_width=1).add(
-        InlineKeyboardButton("⬅️ К разделам гайда", callback_data="vb_guide"),
+        _Btn("⬅️ К разделам гайда", callback_data="vb_guide"),
     )
 
 
@@ -2442,56 +2652,56 @@ def _main_keyboard() -> InlineKeyboardMarkup:
     mode = get_auth_mode()
     if mode == "login":
         kb.row(
-            InlineKeyboardButton("🔗 URL", callback_data="vb_set_panel_url"),
-            InlineKeyboardButton("👤 Логин", callback_data="vb_set_login"),
+            _Btn("🔗 URL", callback_data="vb_set_panel_url"),
+            _Btn("👤 Логин", callback_data="vb_set_login"),
         )
         kb.row(
-            InlineKeyboardButton("🔒 Пароль", callback_data="vb_set_password"),
-            InlineKeyboardButton("✅ Режим: Логин", callback_data="vb_auth_mode_menu"),
+            _Btn("🔒 Пароль", callback_data="vb_set_password"),
+            _Btn("✅ Режим: Логин", callback_data="vb_auth_mode_menu"),
         )
     elif mode == "token":
         kb.row(
-            InlineKeyboardButton("🔗 URL", callback_data="vb_set_panel_url"),
-            InlineKeyboardButton("🔑 AuthToken", callback_data="vb_set_token"),
+            _Btn("🔗 URL", callback_data="vb_set_panel_url"),
+            _Btn("🔑 AuthToken", callback_data="vb_set_token"),
         )
         kb.row(
-            InlineKeyboardButton("🍪 Режим: AuthToken", callback_data="vb_auth_mode_menu"),
+            _Btn("🍪 Режим: AuthToken", callback_data="vb_auth_mode_menu"),
         )
     else:
         kb.row(
-            InlineKeyboardButton("🔗 API URL", callback_data="vb_set_url"),
-            InlineKeyboardButton("🔐 API KEY", callback_data="vb_set_key"),
+            _Btn("🔗 API URL", callback_data="vb_set_url"),
+            _Btn("🔐 API KEY", callback_data="vb_set_key"),
         )
         kb.row(
-            InlineKeyboardButton("🔑 Режим: API KEY", callback_data="vb_auth_mode_menu"),
+            _Btn("🔑 Режим: API KEY", callback_data="vb_auth_mode_menu"),
         )
     kb.row(
-        InlineKeyboardButton("📊 Статистика", callback_data="vb_stats_menu"),
-        InlineKeyboardButton("💰 Баланс", callback_data="vb_balance_btn"),
+        _Btn("📊 Статистика", callback_data="vb_stats_menu"),
+        _Btn("💰 Баланс", callback_data="vb_balance_btn"),
     )
     kb.row(
-        InlineKeyboardButton("📝 Ожидают ссылку", callback_data="vb_pay_orders"),
-        InlineKeyboardButton("📋 Активные", callback_data="vb_active_orders"),
+        _Btn("📝 Ожидают ссылку", callback_data="vb_pay_orders"),
+        _Btn("📋 Активные", callback_data="vb_active_orders"),
     )
     kb.row(
-        InlineKeyboardButton("📜 История", callback_data="vb_history"),
-        InlineKeyboardButton("🏆 Топ услуг", callback_data="vb_top_services"),
+        _Btn("📜 История", callback_data="vb_history"),
+        _Btn("🏆 Топ услуг", callback_data="vb_top_services"),
     )
     kb.row(
-        InlineKeyboardButton("💎 Прибыль", callback_data="vb_profit"),
-        InlineKeyboardButton("📈 График", callback_data="vb_chart"),
+        _Btn("💎 Прибыль", callback_data="vb_profit"),
+        _Btn("📈 График", callback_data="vb_chart"),
     )
     kb.row(
-        InlineKeyboardButton("🏥 Диагностика", callback_data="vb_health"),
-        InlineKeyboardButton("📊 Детально", callback_data="vb_extended_stats"),
+        _Btn("🏥 Диагностика", callback_data="vb_health"),
+        _Btn("📊 Детально", callback_data="vb_extended_stats"),
     )
     kb.row(
-        InlineKeyboardButton("📝 Шаблоны", callback_data="vb_templates_menu"),
-        InlineKeyboardButton("🛠 Настройки", callback_data="vb_settings_menu"),
+        _Btn("📝 Шаблоны", callback_data="vb_templates_menu"),
+        _Btn("🛠 Настройки", callback_data="vb_settings_menu"),
     )
     kb.row(
-        InlineKeyboardButton("📖 Гайд", callback_data="vb_guide"),
-        InlineKeyboardButton("ℹ️ Помощь", callback_data="vb_help"),
+        _Btn("📖 Гайд", callback_data="vb_guide"),
+        _Btn("ℹ️ Помощь", callback_data="vb_help"),
     )
     return kb
 
@@ -2499,21 +2709,21 @@ def _main_keyboard() -> InlineKeyboardMarkup:
 def _stats_keyboard() -> InlineKeyboardMarkup:
     kb = InlineKeyboardMarkup(row_width=2)
     kb.row(
-        InlineKeyboardButton("📅 Сегодня", callback_data="vb_stats_1"),
-        InlineKeyboardButton("📆 7 дней", callback_data="vb_stats_7"),
+        _Btn("📅 Сегодня", callback_data="vb_stats_1"),
+        _Btn("📆 7 дней", callback_data="vb_stats_7"),
     )
     kb.row(
-        InlineKeyboardButton("🗓 30 дней", callback_data="vb_stats_30"),
-        InlineKeyboardButton("📊 Всё время", callback_data="vb_stats_0"),
+        _Btn("🗓 30 дней", callback_data="vb_stats_30"),
+        _Btn("📊 Всё время", callback_data="vb_stats_0"),
     )
-    kb.add(InlineKeyboardButton("⬅️ Назад", callback_data="vb_back_main"))
+    kb.add(_Btn("⬅️ Назад", callback_data="vb_back_main"))
     return kb
 
 
 def _settings_keyboard(settings: Dict[str, Any]) -> InlineKeyboardMarkup:
     def toggle_btn(key: str, label_on: str, label_off: str) -> InlineKeyboardButton:
         on = settings.get(key, False)
-        return InlineKeyboardButton(
+        return _Btn(
             f"{'🟢' if on else '🔴'} {label_on if on else label_off}",
             callback_data=f"vb_toggle_{key}",
         )
@@ -2531,7 +2741,7 @@ def _settings_keyboard(settings: Dict[str, Any]) -> InlineKeyboardMarkup:
     kb.add(toggle_btn("set_notify_buyer_partial", "Partial → покупателю", "Partial → покупателю"))
     kb.add(toggle_btn("set_alert_partial", "Увед. Partial (TG)", "Увед. Partial (TG)"))
     kb.add(toggle_btn("set_tg_private", "Закрытые TG каналы", "Закрытые TG каналы"))
-    kb.add(InlineKeyboardButton("⬅️ Назад", callback_data="vb_back_main"))
+    kb.add(_Btn("⬅️ Назад", callback_data="vb_back_main"))
     return kb
 
 
@@ -2625,6 +2835,7 @@ def _send_vb_panel(bot, chat_id: int, *, reply_to: Any = None) -> None:
     settings = load_settings()
     text = _settings_summary(settings)
     markup = _main_keyboard()
+    text = _tg_html(text)
     if reply_to is not None:
         bot.reply_to(
             reply_to, text, reply_markup=markup, parse_mode="HTML",
@@ -2655,6 +2866,29 @@ def init_commands(cardinal: "Cardinal", *args) -> None:
     tg = cardinal.telegram
     bot = tg.bot
     bot_instance_id = id(bot)
+
+    _orig_reply_to = bot.reply_to
+    _orig_send_message = bot.send_message
+    _orig_edit_message_text = bot.edit_message_text
+
+    def reply_to(message, text, **kwargs):
+        if kwargs.get("parse_mode") == "HTML" and isinstance(text, str):
+            text = _tg_html(text)
+        return _orig_reply_to(message, text, **kwargs)
+
+    def send_message(chat_id, text, **kwargs):
+        if kwargs.get("parse_mode") == "HTML" and isinstance(text, str):
+            text = _tg_html(text)
+        return _orig_send_message(chat_id, text, **kwargs)
+
+    def edit_message_text(text, chat_id, message_id, **kwargs):
+        if kwargs.get("parse_mode") == "HTML" and isinstance(text, str):
+            text = _tg_html(text)
+        return _orig_edit_message_text(text, chat_id, message_id, **kwargs)
+
+    bot.reply_to = reply_to
+    bot.send_message = send_message
+    bot.edit_message_text = edit_message_text
     if _tg_bot_instance_id == bot_instance_id:
         logger.debug("%s: Telegram-обработчики уже зарегистрированы для этого бота", LOGGER_PREFIX)
         return
@@ -2666,7 +2900,7 @@ def init_commands(cardinal: "Cardinal", *args) -> None:
         except Exception as exc:
             logger.error("%s: ошибка /vexboost: %s", LOGGER_PREFIX, exc)
             logger.debug(traceback.format_exc())
-            bot.reply_to(message, f"⚠️ Ошибка панели: {exc}")
+            bot.reply_to(message, f"⚠️ Ошибка панели: {html.escape(str(exc))}", parse_mode="HTML")
 
     def send_stats_cmd(message):
         try:
@@ -2675,7 +2909,7 @@ def init_commands(cardinal: "Cardinal", *args) -> None:
             bot.reply_to(message, text, parse_mode="HTML", reply_markup=_stats_keyboard())
         except Exception as exc:
             logger.error("%s: ошибка /vb_stats: %s", LOGGER_PREFIX, exc)
-            bot.reply_to(message, f"⚠️ Ошибка статистики: {exc}")
+            bot.reply_to(message, f"⚠️ Ошибка статистики: {html.escape(str(exc))}", parse_mode="HTML")
 
     def send_balance_cmd(message):
         try:
@@ -2694,7 +2928,7 @@ def init_commands(cardinal: "Cardinal", *args) -> None:
             bot.reply_to(message, text, parse_mode="HTML")
         except Exception as exc:
             logger.error("%s: ошибка /vb_balance: %s", LOGGER_PREFIX, exc)
-            bot.reply_to(message, f"⚠️ Ошибка баланса: {exc}")
+            bot.reply_to(message, f"⚠️ Ошибка баланса: {html.escape(str(exc))}", parse_mode="HTML")
 
     def open_plugin_settings(call):
         try:
@@ -2751,10 +2985,10 @@ def init_commands(cardinal: "Cardinal", *args) -> None:
             elif call.data == "vb_auth_mode_menu":
                 mode_kb = InlineKeyboardMarkup(row_width=1)
                 mode_kb.add(
-                    InlineKeyboardButton("👤 Логин + пароль", callback_data="vb_auth_mode_login"),
-                    InlineKeyboardButton("🍪 AuthToken (cookie)", callback_data="vb_auth_mode_token"),
-                    InlineKeyboardButton("🔑 API KEY", callback_data="vb_auth_mode_key"),
-                    InlineKeyboardButton("⬅️ Назад", callback_data="vb_back_main"),
+                    _Btn("👤 Логин + пароль", callback_data="vb_auth_mode_login"),
+                    _Btn("🍪 AuthToken (cookie)", callback_data="vb_auth_mode_token"),
+                    _Btn("🔑 API KEY", callback_data="vb_auth_mode_key"),
+                    _Btn("⬅️ Назад", callback_data="vb_back_main"),
                 )
                 bot.edit_message_text(
                     "Выберите способ авторизации VexBoost:",
@@ -2848,7 +3082,7 @@ def init_commands(cardinal: "Cardinal", *args) -> None:
                 bot.edit_message_text(
                     StatisticsManager.get_top_services(), chat_id, msg_id,
                     reply_markup=InlineKeyboardMarkup().add(
-                        InlineKeyboardButton("⬅️ Назад", callback_data="vb_back_main"),
+                        _Btn("⬅️ Назад", callback_data="vb_back_main"),
                     ),
                     parse_mode="HTML",
                 )
@@ -2870,7 +3104,7 @@ def init_commands(cardinal: "Cardinal", *args) -> None:
                 bot.edit_message_text(
                     text, chat_id, msg_id,
                     reply_markup=InlineKeyboardMarkup().add(
-                        InlineKeyboardButton("⬅️ Назад", callback_data="vb_back_main"),
+                        _Btn("⬅️ Назад", callback_data="vb_back_main"),
                     ),
                     parse_mode="HTML",
                 )
@@ -2890,7 +3124,7 @@ def init_commands(cardinal: "Cardinal", *args) -> None:
                 bot.edit_message_text(
                     text, chat_id, msg_id,
                     reply_markup=InlineKeyboardMarkup().add(
-                        InlineKeyboardButton("⬅️ Назад", callback_data="vb_back_main"),
+                        _Btn("⬅️ Назад", callback_data="vb_back_main"),
                     ),
                     parse_mode="HTML",
                 )
@@ -2899,7 +3133,7 @@ def init_commands(cardinal: "Cardinal", *args) -> None:
                 bot.edit_message_text(
                     OrderHistory.format_recent_text(15), chat_id, msg_id,
                     reply_markup=InlineKeyboardMarkup().add(
-                        InlineKeyboardButton("⬅️ Назад", callback_data="vb_back_main"),
+                        _Btn("⬅️ Назад", callback_data="vb_back_main"),
                     ),
                     parse_mode="HTML",
                 )
@@ -2973,8 +3207,8 @@ def init_commands(cardinal: "Cardinal", *args) -> None:
                 bot.edit_message_text(
                     _help_text(), chat_id, msg_id,
                     reply_markup=InlineKeyboardMarkup().add(
-                        InlineKeyboardButton("📖 Полный гайд", callback_data="vb_guide"),
-                        InlineKeyboardButton("⬅️ Назад", callback_data="vb_back_main"),
+                        _Btn("📖 Полный гайд", callback_data="vb_guide"),
+                        _Btn("⬅️ Назад", callback_data="vb_back_main"),
                     ),
                     parse_mode="HTML",
                 )
@@ -3018,7 +3252,7 @@ def init_commands(cardinal: "Cardinal", *args) -> None:
             settings["auth_mode"] = "login"
             _invalidate_vexboost_session()
             save_settings(settings)
-            bot.reply_to(message, "✅ Логин сохранён.")
+            bot.reply_to(message, "✅ Логин сохранён.", parse_mode="HTML")
         elif state == "vb_panel_password":
             settings["vexboost_password"] = message.text
             settings["auth_mode"] = "login"
@@ -3028,13 +3262,13 @@ def init_commands(cardinal: "Cardinal", *args) -> None:
                 bot.delete_message(message.chat.id, message.message_id)
             except Exception:
                 pass
-            bot.reply_to(message, "✅ Пароль сохранён. Проверьте: /vb_balance")
+            bot.reply_to(message, "✅ Пароль сохранён. Проверьте: /vb_balance", parse_mode="HTML")
         elif state == "vb_auth_token":
             settings["auth_token"] = _normalize_auth_token(message.text)
             settings["auth_mode"] = "token"
             _invalidate_vexboost_session()
             save_settings(settings)
-            bot.reply_to(message, "✅ AuthToken сохранён. Проверьте: /vb_balance")
+            bot.reply_to(message, "✅ AuthToken сохранён. Проверьте: /vb_balance", parse_mode="HTML")
         elif state == "vb_api_url":
             settings["api_url"] = message.text.strip().rstrip("/")
             save_settings(settings)
@@ -3044,14 +3278,14 @@ def init_commands(cardinal: "Cardinal", *args) -> None:
             settings["auth_mode"] = "api_key"
             _invalidate_vexboost_session()
             save_settings(settings)
-            bot.reply_to(message, "✅ API KEY сохранён.")
+            bot.reply_to(message, "✅ API KEY сохранён.", parse_mode="HTML")
         elif state.startswith("vb_tpl_"):
             template_key = state.replace("vb_tpl_", "")
             if template_key in MESSAGE_TEMPLATE_LABELS:
                 label = MESSAGE_TEMPLATE_LABELS[template_key][0]
                 if message.text.strip() == "/default":
                     settings[template_key] = DEFAULT_SETTINGS[template_key]
-                    bot.reply_to(message, f"✅ Шаблон «{label}» сброшен по умолчанию.")
+                    bot.reply_to(message, f"✅ Шаблон «{label}» сброшен по умолчанию.", parse_mode="HTML")
                 else:
                     settings[template_key] = message.text
                     bot.reply_to(
@@ -3221,28 +3455,28 @@ VB_EXTRA_CALLBACKS = {
     "vb_health": lambda c, bot, chat_id, msg_id: bot.edit_message_text(
         PluginHealthCheck.run_all(), chat_id, msg_id,
         reply_markup=InlineKeyboardMarkup().add(
-            InlineKeyboardButton("⬅️ Назад", callback_data="vb_back_main"),
+            _Btn("⬅️ Назад", callback_data="vb_back_main"),
         ),
         parse_mode="HTML",
     ),
     "vb_profit": lambda c, bot, chat_id, msg_id: bot.edit_message_text(
         _profit_summary_text(), chat_id, msg_id,
         reply_markup=InlineKeyboardMarkup().add(
-            InlineKeyboardButton("⬅️ Назад", callback_data="vb_back_main"),
+            _Btn("⬅️ Назад", callback_data="vb_back_main"),
         ),
         parse_mode="HTML",
     ),
     "vb_chart": lambda c, bot, chat_id, msg_id: bot.edit_message_text(
         _daily_chart_text(7), chat_id, msg_id,
         reply_markup=InlineKeyboardMarkup().add(
-            InlineKeyboardButton("⬅️ Назад", callback_data="vb_back_main"),
+            _Btn("⬅️ Назад", callback_data="vb_back_main"),
         ),
         parse_mode="HTML",
     ),
     "vb_extended_stats": lambda c, bot, chat_id, msg_id: bot.edit_message_text(
         _extended_stats_text(), chat_id, msg_id,
         reply_markup=InlineKeyboardMarkup().add(
-            InlineKeyboardButton("⬅️ Назад", callback_data="vb_stats_menu"),
+            _Btn("⬅️ Назад", callback_data="vb_stats_menu"),
         ),
         parse_mode="HTML",
     ),

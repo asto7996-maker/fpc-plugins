@@ -26,6 +26,219 @@ _ensure_deps()
 import requests
 import telebot
 from telebot.types import InlineKeyboardMarkup as K, InlineKeyboardButton as B
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Premium Telegram custom emoji (tgmacicons / KotikFree3 / Random_emfx / ScroogeProjects)
+# Text: <tg-emoji emoji-id="...">fallback</tg-emoji>  |  Buttons: icon_custom_emoji_id
+# FunPay buyer chats stay unicode — only Telegram HTML messages are injected.
+# ─────────────────────────────────────────────────────────────────────────────
+
+PREMIUM_EMOJI = {
+    'ℹ': '5258503720928288433',  # tgmacicons via ℹ
+    'ℹ️': '5258503720928288433',  # tgmacicons via ℹ️
+    '⌛': '5258258882022612173',  # tgmacicons via ⏲
+    '⌛️': '5258258882022612173',  # tgmacicons via ⏲
+    '⏭': '5260450573768990626',  # tgmacicons via ➡️
+    '⏱': '5258258882022612173',  # tgmacicons via ⏲
+    '⏲': '5258258882022612173',  # tgmacicons via ⏲
+    '⏳': '5258258882022612173',  # tgmacicons via ⏲
+    '⏸': '5258258882022612173',  # tgmacicons via ⏲
+    '★': '5258185631355378853',  # tgmacicons via ⭐️
+    '☕': '5359712636688670045',  # ScroogeProjects via ⭐️
+    '♻️': '5258420634785947640',  # tgmacicons via 🔄
+    '⚙': '5258096772776991776',  # tgmacicons via ⚙
+    '⚙️': '5258096772776991776',  # tgmacicons via ⚙️
+    '⚠': '5258474669769497337',  # tgmacicons via ❗️
+    '⚠️': '5258474669769497337',  # tgmacicons via ❗️
+    '⚡': '5258152182150077732',  # tgmacicons via ⚡
+    '⚡️': '5258152182150077732',  # tgmacicons via ⚡️
+    '⚪️': '5442736201356298637',  # ScroogeProjects via ◽️
+    '⛔': '5275969776668134187',  # tgmacicons via ⛔
+    '⛔️': '5397669822483939594',  # ScroogeProjects via ⛔️
+    '✅': '5260726538302660868',  # tgmacicons via ✅
+    '✍️': '5188558189943099069',  # Random_emfx via ✍️
+    '✏️': '5188558189943099069',  # Random_emfx via ✍️
+    '✨': '5359712636688670045',  # ScroogeProjects via ⭐️
+    '❌': '5258226313285607065',  # tgmacicons via ❌
+    '❤': '5471905858294134101',  # Random_emfx via ❤
+    '❤️': '5471905858294134101',  # Random_emfx via ❤️
+    '➕': '5258108352008823107',  # tgmacicons via ➕
+    '➖': '5258226313285607065',  # tgmacicons via ❌
+    '⬅️': '5258236805890710909',  # tgmacicons via ⬅️
+    '⬆️': '5260652420052032852',  # tgmacicons via ⬆️
+    '⭐': '5359712636688670045',  # ScroogeProjects via ⭐
+    '⭐️': '5359712636688670045',  # ScroogeProjects via ⭐️
+    '🌈': '5359712636688670045',  # ScroogeProjects via ⭐️
+    '🌐': '5397825862940772970',  # ScroogeProjects via 🌐
+    '🌟': '5399830414372125724',  # ScroogeProjects via 🌟
+    '🌿': '5258185631355378853',  # tgmacicons via ⭐️
+    '🍪': '5258185631355378853',  # tgmacicons via ⭐️
+    '🍺': '5359712636688670045',  # ScroogeProjects via ⭐️
+    '🎁': '5397723238992201856',  # ScroogeProjects via 🎁
+    '🎉': '5384337002751630535',  # Random_emfx via 🎉
+    '🎛': '5258096772776991776',  # tgmacicons via ⚙
+    '🎮': '5258508428212445001',  # tgmacicons via 🎮
+    '🏆': '5258185631355378853',  # tgmacicons via ⭐️
+    '🏥': '5258503720928288433',  # tgmacicons via ℹ️
+    '🏪': '5258260149037965799',  # tgmacicons via 💼
+    '👀': '5260341314095947411',  # tgmacicons via 👀
+    '👁': '5253959125838090076',  # tgmacicons via 👁
+    '👋': '5195429897098511177',  # Random_emfx via 👋
+    '👤': '5258362837411045098',  # tgmacicons via 👤
+    '👥': '5258513401784573443',  # tgmacicons via 👥
+    '💎': '5359719332542718652',  # tgmacicons via 💎
+    '💚': '5471905858294134101',  # Random_emfx via ❤️
+    '💫': '5359712636688670045',  # ScroogeProjects via ⭐️
+    '💬': '5258215846450305872',  # tgmacicons via 💬
+    '💰': '5231269668311804435',  # KotikFree3 via 💰
+    '💱': '5258204546391351475',  # tgmacicons via 💰
+    '💳': '5231308447571519225',  # KotikFree3 via 💳
+    '💵': '5231354884757925373',  # KotikFree3 via 💵
+    '💸': '5397989797547491659',  # ScroogeProjects via 💸
+    '💼': '5258260149037965799',  # tgmacicons via 💼
+    '💾': '5257965810634202885',  # tgmacicons via 📁
+    '📄': '5258477770735885832',  # tgmacicons via 📄
+    '📅': '5258105663359294787',  # tgmacicons via 🗓
+    '📆': '5258105663359294787',  # tgmacicons via 🗓
+    '📇': '5258477770735885832',  # tgmacicons via 📄
+    '📈': '5258391025281408576',  # tgmacicons via 📈
+    '📉': '5240292917859329746',  # KotikFree3 via 📊
+    '📊': '5240292917859329746',  # KotikFree3 via 📊
+    '📋': '5258477770735885832',  # tgmacicons via 📄
+    '📖': '5258328383183396223',  # tgmacicons via 📖
+    '📜': '5258477770735885832',  # tgmacicons via 📄
+    '📝': '5257965174979042426',  # tgmacicons via 📝
+    '📦': '5258134813302332906',  # tgmacicons via 📦
+    '📭': '5258215846450305872',  # tgmacicons via 💬
+    '🔄': '5258420634785947640',  # tgmacicons via 🔄
+    '🔍': '5429571366384842791',  # tgmacicons via 🔎
+    '🔐': '5258476306152038031',  # tgmacicons via 🔒
+    '🔑': '5445188696401789158',  # ScroogeProjects via 🔑
+    '🔒': '5258476306152038031',  # tgmacicons via 🔒
+    '🔗': '5260730055880876557',  # tgmacicons via ⛓
+    '🔢': '5226513232549664618',  # tgmacicons via 🔢
+    '🔧': '5258096772776991776',  # tgmacicons via ⚙
+    '🔴': '5258226313285607065',  # tgmacicons via ❌
+    '🕒': '5258419835922030550',  # tgmacicons via 🕔
+    '🗑': '5258130763148172425',  # tgmacicons via 🗑
+    '🗑️': '5258130763148172425',  # tgmacicons via 🗑️
+    '🗓': '5258105663359294787',  # tgmacicons via 🗓
+    '😄': '5291940208831404125',  # Random_emfx via 😊
+    '🙍': '5258362837411045098',  # tgmacicons via 👤
+    '🙏': '5212945405091793590',  # Random_emfx via 🙏
+    '🚀': '5258152182150077732',  # tgmacicons via ⚡️
+    '🛒': '5296348778012361146',  # tgmacicons via 🏷
+    '🛠': '5258096772776991776',  # tgmacicons via ⚙
+    '🛠️': '5258096772776991776',  # tgmacicons via ⚙
+    '🟢': '5260726538302660868',  # tgmacicons via ✅
+    '🟩': '5260726538302660868',  # tgmacicons via ✅
+    '🤖': '5258093637450866522',  # tgmacicons via 🤖
+    '🧪': '5258216851472654189',  # tgmacicons via 💡
+
+    '◀️': '5258236805890710909',  # tgmacicons via ⬅️
+    '▶️': '5397691713932247938',  # ScroogeProjects via ▶️
+    '▶': '5397691713932247938',  # ScroogeProjects via ▶️
+    '⬅': '5258236805890710909',  # tgmacicons via ⬅️
+    '🆔': '5226513232549664618',  # tgmacicons via 🔢
+}
+
+_TG_EMOJI_BLOCK_RE = re.compile(r"<tg-emoji\b[^>]*>.*?</tg-emoji>", re.IGNORECASE | re.DOTALL)
+_LEADING_EMOJI_RE = re.compile(
+    r"^["
+    r"\u2100-\u214F\u2190-\u21FF\u2300-\u23FF\u2460-\u24FF"
+    r"\u25A0-\u25FF\u2600-\u27BF\u2900-\u297F\u2B00-\u2BFF"
+    r"\u3030\u303D\u3297\u3299\U0001F000-\U0001FFFF"
+    r"]"
+    r"(?:[\uFE0F\u200D\U0001F3FB-\U0001F3FF]|["
+    r"\u2100-\u214F\u2190-\u21FF\u2300-\u23FF\u2460-\u24FF"
+    r"\u25A0-\u25FF\u2600-\u27BF\u2900-\u297F\u2B00-\u2BFF"
+    r"\u3030\u303D\u3297\u3299\U0001F000-\U0001FFFF"
+    r"])*"
+    r"\s*"
+)
+_EMOJI_PATTERN = re.compile(
+    "|".join(sorted((re.escape(e) for e in PREMIUM_EMOJI), key=len, reverse=True))
+)
+
+
+def pe(emoji: str) -> str:
+    """Wrap a unicode emoji into a premium <tg-emoji> HTML tag."""
+    eid = PREMIUM_EMOJI.get(emoji)
+    if not eid:
+        eid = PREMIUM_EMOJI.get(emoji.replace("\ufe0f", ""))
+    if not eid:
+        return emoji
+    return f'<tg-emoji emoji-id="{eid}">{emoji}</tg-emoji>'
+
+
+def inject_premium_emojis(text: str) -> str:
+    """Replace bare unicode emojis with premium <tg-emoji> tags (HTML parse_mode)."""
+    if not text:
+        return text
+
+    def _replace_bare(chunk: str) -> str:
+        if not chunk:
+            return chunk
+        return _EMOJI_PATTERN.sub(lambda m: pe(m.group(0)), chunk)
+
+    parts: list = []
+    last = 0
+    for block in _TG_EMOJI_BLOCK_RE.finditer(text):
+        parts.append(_replace_bare(text[last:block.start()]))
+        parts.append(block.group(0))
+        last = block.end()
+    parts.append(_replace_bare(text[last:]))
+    return "".join(parts)
+
+
+def _emoji_id_for(emoji: str) -> str:
+    if not emoji:
+        return ""
+    return (
+        PREMIUM_EMOJI.get(emoji)
+        or PREMIUM_EMOJI.get(emoji + "\ufe0f")
+        or PREMIUM_EMOJI.get(emoji.replace("\ufe0f", ""))
+        or ""
+    )
+
+
+def clean_button_text(text: str) -> str:
+    """Strip leading unicode emoji so only icon_custom_emoji_id is shown."""
+    if not text:
+        return text
+    cleaned = _LEADING_EMOJI_RE.sub("", text, count=1).strip()
+    return cleaned or text.strip()
+
+
+def premium_button_kwargs(text: str) -> tuple:
+    """Return (clean_text, icon_custom_emoji_id_or_None) for an inline button."""
+    if not text:
+        return text, None
+    m = _LEADING_EMOJI_RE.match(text)
+    if not m:
+        return text, None
+    raw = m.group(0)
+    emoji = raw.strip()
+    eid = _emoji_id_for(emoji)
+    cleaned = text[m.end():].strip() or text.strip()
+    return cleaned, (eid or None)
+
+_RawBtn = B
+
+
+def B(text, **kwargs):  # type: ignore[misc]
+    """Inline button with premium icon when the label starts with a mapped emoji."""
+    clean, eid = premium_button_kwargs(str(text) if text is not None else "")
+    if eid and "icon_custom_emoji_id" not in kwargs:
+        kwargs["icon_custom_emoji_id"] = eid
+    return _RawBtn(clean, **kwargs)
+
+
+def _tg_html(text: str) -> str:
+    return inject_premium_emojis(text)
+
+
 from tg_bot import CBT
 from FunPayAPI.updater.events import NewOrderEvent, NewMessageEvent
 from FunPayAPI.common.enums import MessageTypes, SubCategoryTypes
@@ -35,7 +248,7 @@ if TYPE_CHECKING:
     from cardinal import Cardinal
 
 NAME = "KOSell Rent"
-VERSION = "1.1.29b"
+VERSION = "1.1.29c"
 DESCRIPTION = "Официальный плагин KOSell.store"
 CREDITS = "@KOSell1"
 UUID = "0d8a4c2f-6e71-4b3a-9c4d-2f1e8a7b6c50"
@@ -543,7 +756,7 @@ def notify_admins(reason: str, order=None, raw: str = "", extra: str = "", dedup
         return
     for admin_id in _admins():
         try:
-            bot.send_message(admin_id, text, parse_mode="HTML", reply_markup=kb)
+            bot.send_message(admin_id, _tg_html(text), parse_mode="HTML", reply_markup=kb)
         except Exception:
             pass
 
@@ -553,7 +766,7 @@ def notify_admins_info(text: str):
         return
     for admin_id in _admins():
         try:
-            bot.send_message(admin_id, f"{LP} {text}", parse_mode="HTML")
+            bot.send_message(admin_id, _tg_html(f"{LP} {text}"), parse_mode="HTML")
         except Exception:
             pass
 
@@ -1304,7 +1517,7 @@ def _finalize_update_after_restart():
         done_txt += f"\n\n<b>Что нового:</b>\n{_html.escape(notes)}"
     for admin_id, mid in data.get("refs", []):
         try:
-            bot.edit_message_text(done_txt, admin_id, mid, parse_mode="HTML", reply_markup=kb)
+            bot.edit_message_text(_tg_html(done_txt), admin_id, mid, parse_mode="HTML", reply_markup=kb)
         except Exception:
             pass
 
@@ -2344,7 +2557,7 @@ def _ac_progress_edit(chat_id, mid, done, total, created, skipped, failed,
            f"✅ {verb}: {created}{skip_part}   ❌ Ошибок: {failed}{eta_line}\n"
            f"<i>Можно свернуть — процесс идёт в фоне.</i>")
     try:
-        bot.edit_message_text(txt, chat_id, mid, parse_mode="HTML")
+        bot.edit_message_text(_tg_html(txt), chat_id, mid, parse_mode="HTML")
     except Exception:
         pass
 
@@ -2452,7 +2665,7 @@ def _autocreate_run(user_id: int, chat_id=None, mid=None):
         try:
             kb = K()
             kb.row(B("◀️ В меню создания", callback_data=f"{P}_ac"))
-            bot.edit_message_text(done_txt, chat_id, mid, parse_mode="HTML", reply_markup=kb)
+            bot.edit_message_text(_tg_html(done_txt), chat_id, mid, parse_mode="HTML", reply_markup=kb)
         except Exception:
             pass
     else:
@@ -2540,7 +2753,7 @@ def _reprice_run(user_id: int, chat_id=None, mid=None):
         try:
             kb = K()
             kb.row(B("◀️ В меню создания", callback_data=f"{P}_ac"))
-            bot.edit_message_text(done, chat_id, mid, parse_mode="HTML", reply_markup=kb)
+            bot.edit_message_text(_tg_html(done), chat_id, mid, parse_mode="HTML", reply_markup=kb)
         except Exception:
             pass
     else:
@@ -2595,7 +2808,7 @@ def _delete_plugin_run(user_id: int, chat_id=None, mid=None):
         try:
             kb = K()
             kb.row(B("◀️ В меню создания", callback_data=f"{P}_ac"))
-            bot.edit_message_text(done, chat_id, mid, parse_mode="HTML", reply_markup=kb)
+            bot.edit_message_text(_tg_html(done), chat_id, mid, parse_mode="HTML", reply_markup=kb)
         except Exception:
             pass
     else:
@@ -2652,7 +2865,7 @@ def tg_restart(call):
     except Exception:
         pass
     try:
-        bot.edit_message_text(f"<b>{LP}</b>\n♻️ Перезапускаю FPC, применяю обновление…",
+        bot.edit_message_text(_tg_html(f"<b>{LP}</b>\n♻️ Перезапускаю FPC, применяю обновление…"),
                               call.message.chat.id, call.message.id, parse_mode="HTML")
     except Exception:
         pass
@@ -2758,12 +2971,12 @@ def _chk(key) -> str:
 
 def _edit(call, text, kb):
     try:
-        bot.edit_message_text(text, call.message.chat.id, call.message.id, reply_markup=kb, parse_mode="HTML")
+        bot.edit_message_text(_tg_html(text), call.message.chat.id, call.message.id, reply_markup=kb, parse_mode="HTML")
     except Exception as e:
         msg = str(e).lower()
         if "not modified" not in msg:
             try:
-                bot.send_message(call.message.chat.id, text, reply_markup=kb, parse_mode="HTML")
+                bot.send_message(call.message.chat.id, _tg_html(text), reply_markup=kb, parse_mode="HTML")
             except Exception:
                 pass
     try:
@@ -2777,7 +2990,7 @@ def _wiz_msg(chat_id, uid, text, kb):
     mid = w.get("message_id")
     if mid:
         try:
-            bot.edit_message_text(text, chat_id, mid, reply_markup=kb, parse_mode="HTML")
+            bot.edit_message_text(_tg_html(text), chat_id, mid, reply_markup=kb, parse_mode="HTML")
             return mid
         except Exception:
             pass
@@ -3212,7 +3425,7 @@ def tg_msg_dispatch(message):
         back_kb = done_kb(f"{CBT.PLUGIN_SETTINGS}:{UUID}")
         if not key:
             try:
-                bot.send_message(chat_id, "❌ Пустой ключ. Отправьте API-ключ ещё раз.", reply_markup=back_kb)
+                bot.send_message(chat_id, "❌ Пустой ключ. Отправьте API-ключ ещё раз.", reply_markup=back_kb, parse_mode="HTML")
             except Exception:
                 pass
             return
@@ -3236,7 +3449,7 @@ def tg_msg_dispatch(message):
                      "Это может быть временный сбой сети/KOSell — проверьте позже. "
                      "Если повторяется — проверьте правильность ключа.")
         try:
-            bot.send_message(chat_id, f"✅ API ключ сохранён (длина {len(key)}).{extra}", reply_markup=back_kb)
+            bot.send_message(chat_id, f"✅ API ключ сохранён (длина {len(key)}).{extra}", reply_markup=back_kb, parse_mode="HTML")
         except Exception as e:
             logger.error(f"{LP} apikey send_message error: {e}")
 
@@ -3246,16 +3459,16 @@ def tg_msg_dispatch(message):
         if text.isdigit() and idx < len(MAPPINGS):
             MAPPINGS[idx]["hours"] = max(KOSELL_MIN_HOURS, min(720, int(text)))
             save_mappings()
-            bot.send_message(chat_id, f"✅ Часы: {MAPPINGS[idx]['hours']}", reply_markup=done_kb(f"{P}_map:{idx}"))
+            bot.send_message(chat_id, f"✅ Часы: {MAPPINGS[idx]['hours']}", reply_markup=done_kb(f"{P}_map:{idx}"), parse_mode="HTML")
         else:
-            bot.send_message(chat_id, "❌ Нужно число 3-720.", reply_markup=done_kb(f"{P}_map:{idx}"))
+            bot.send_message(chat_id, "❌ Нужно число 3-720.", reply_markup=done_kb(f"{P}_map:{idx}"), parse_mode="HTML")
 
     elif state == f"{P}_manual_lot":
         tg.clear_state(chat_id, user_id, True)
         m = re.search(r"id=(\d+)", text) or re.search(r"(\d{4,})", text)
         if not m:
             bot.send_message(chat_id, "❌ Не нашёл ID. Отправьте число или ссылку вида .../offer?id=12345.",
-                             reply_markup=done_kb(f"{P}_maps:{_page_of('maps')}"))
+                             reply_markup=done_kb(f"{P}_maps:{_page_of('maps')}"), parse_mode="HTML")
             return
         lot_id = m.group(1)
         _addmap_tmp[user_id] = {"lot_id": lot_id, "subcategory_id": None, "title_keyword": ""}
@@ -3276,7 +3489,7 @@ def tg_msg_dispatch(message):
         info = _addmap_tmp.setdefault(user_id, {})
         m = re.search(r"\d+", text)
         if not m:
-            bot.send_message(chat_id, "❌ Нужен числовой ID товара.", reply_markup=done_kb(f"{P}_maps:{_page_of('maps')}"))
+            bot.send_message(chat_id, "❌ Нужен числовой ID товара.", reply_markup=done_kb(f"{P}_maps:{_page_of('maps')}"), parse_mode="HTML")
             return
         pid = m.group()
         info["product_id"] = int(pid)
@@ -3292,7 +3505,7 @@ def tg_msg_dispatch(message):
         tg.clear_state(chat_id, user_id, True)
         info = _addmap_tmp.get(user_id, {})
         if not text.isdigit() or "product_id" not in info:
-            bot.send_message(chat_id, "❌ Нужно число 3-720.", reply_markup=done_kb(f"{P}_maps:{_page_of('maps')}"))
+            bot.send_message(chat_id, "❌ Нужно число 3-720.", reply_markup=done_kb(f"{P}_maps:{_page_of('maps')}"), parse_mode="HTML")
             return
         for k in ("_all", "_filtered"):
             info.pop(k, None)
@@ -3311,7 +3524,7 @@ def tg_msg_dispatch(message):
         _addmap_tmp.pop(user_id, None)
         bot.send_message(chat_id, f"✅ Привязка создана: {MAPPINGS[-1]['product_name']} · "
                                   f"{MAPPINGS[-1]['hours']}ч · лот {MAPPINGS[-1]['lot_id']}",
-                         reply_markup=done_kb(f"{P}_maps:{_page_of('maps')}"))
+                         reply_markup=done_kb(f"{P}_maps:{_page_of('maps')}"), parse_mode="HTML")
 
     elif state.startswith(f"{P}_pset:"):
         key = state.split(":")[1]
@@ -3355,18 +3568,18 @@ def tg_msg_dispatch(message):
                              reply_markup=done_kb(f"{P}_params"), parse_mode="HTML")
         except ValueError as ve:
             if str(ve) == "only_int":
-                bot.send_message(chat_id, "❌ Здесь нужно целое число.", reply_markup=done_kb(f"{P}_params"))
+                bot.send_message(chat_id, "❌ Здесь нужно целое число.", reply_markup=done_kb(f"{P}_params"), parse_mode="HTML")
             else:
-                bot.send_message(chat_id, "❌ Нужно число.", reply_markup=done_kb(f"{P}_params"))
+                bot.send_message(chat_id, "❌ Нужно число.", reply_markup=done_kb(f"{P}_params"), parse_mode="HTML")
         except Exception:
-            bot.send_message(chat_id, "❌ Нужно число.", reply_markup=done_kb(f"{P}_params"))
+            bot.send_message(chat_id, "❌ Нужно число.", reply_markup=done_kb(f"{P}_params"), parse_mode="HTML")
 
     elif state.startswith(f"{P}_settext:"):
         key = state.split(":", 1)[1]
         tg.clear_state(chat_id, user_id, True)
         SETTINGS["texts"][key] = text
         save_settings()
-        bot.send_message(chat_id, f"✅ Текст «{key}» обновлён.", reply_markup=done_kb(f"{P}_texts:{_page_of('texts')}"))
+        bot.send_message(chat_id, f"✅ Текст «{key}» обновлён.", reply_markup=done_kb(f"{P}_texts:{_page_of('texts')}"), parse_mode="HTML")
 
     elif state == f"{P}_ac_w_dcustom":
         tg.clear_state(chat_id, user_id, True)
@@ -3753,7 +3966,7 @@ def _ac_finish(chat_id, uid):
            f"<i>Если игр 0 — проверьте API-ключ KOSell в настройках плагина.</i>")
     if mid:
         try:
-            bot.edit_message_text(txt, chat_id, mid, reply_markup=kb, parse_mode="HTML")
+            bot.edit_message_text(_tg_html(txt), chat_id, mid, reply_markup=kb, parse_mode="HTML")
             return
         except Exception:
             pass
@@ -4121,6 +4334,22 @@ def init(cardinal: "Cardinal"):
     _start_poller()
 
     if tg and bot:
+        _orig_send = bot.send_message
+        _orig_edit = bot.edit_message_text
+
+        def _send_message(chat_id, text, *args, **kwargs):
+            if isinstance(text, str) and kwargs.get("parse_mode") == "HTML":
+                text = _tg_html(text)
+            return _orig_send(chat_id, text, *args, **kwargs)
+
+        def _edit_message_text(text, *args, **kwargs):
+            if isinstance(text, str) and kwargs.get("parse_mode") == "HTML":
+                text = _tg_html(text)
+            return _orig_edit(text, *args, **kwargs)
+
+        bot.send_message = _send_message
+        bot.edit_message_text = _edit_message_text
+
         handlers = [
             (tg_main, lambda c: f"{CBT.PLUGIN_SETTINGS}:{UUID}" in c.data),
             (tg_main, lambda c: c.data == f"{P}_main"),
