@@ -97,6 +97,9 @@ class _TelegramHandler(logging.Handler):
             "heal_wounded: http use rejected",
             "heal_wounded: flash-only",
             "не задано действие",
+            "hp at 0%",
+            "wait regen / finish fight",
+            "no potion spam",
         )
         if not any(fp in low for fp in fingerprints):
             return False

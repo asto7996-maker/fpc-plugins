@@ -72,14 +72,15 @@ def test_flash_only_prefers_hunt_not_rasselina():
 
 
 def test_flash_only_lv3_prefers_travel_or_hunt():
+    """Village exits (сопки) stay gated — hunt must win over Сопки bounce."""
     eng = LevelingEngine()
     profile = FullProfile(char=CharStats(level=3, hp=147, hp_max=147))
     options = [
         GameOption(
             ActionType.TRAVEL,
-            title="Дымные сопки",
+            title="Переход: В Дымные сопки",
             score=200,
-            payload={"area_id": "100"},
+            payload={"area_id": "192"},
             goal=GoalKind.TRAVEL,
         ),
         GameOption(
@@ -113,15 +114,19 @@ def test_flash_only_lv3_prefers_travel_or_hunt():
         blocked_npc_ids={"409"},
     )
     assert decision.focus_override is not None
-    assert decision.focus_override.action in (
-        ActionType.TRAVEL, ActionType.HUNT_MOB, ActionType.COMBAT_AREA,
-    )
-    assert decision.focus_override.action != ActionType.IDLE
-    assert any(
-        tag in decision.directive.reason
-        for tag in ("FLASH-exit", "FLASH-farm-lv3", "FLASH-loot")
-    )
+    assert decision.focus_override.action == ActionType.HUNT_MOB
+    assert "FLASH-farm-lv3" in decision.directive.reason
     assert "flash_farm_open" in decision.notes
+
+
+def test_village_exit_blocked_skips_sopki():
+    from dwar_bot.modules.bot_settings import BotSettings
+    from dwar_bot.modules.progression_brain import ProgressionBrain
+
+    brain = ProgressionBrain(BotSettings())
+    brain.mark_village_exit_blocked(7200)
+    assert brain.village_exit_blocked()
+    assert brain._cooldowns.get("Переход: В Дымные сопки", 0) > 0
 
 
 def test_flash_only_lv3_prefers_gear_over_hunt():

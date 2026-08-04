@@ -1204,7 +1204,7 @@ class DwarBot:
                     " → ".join(s.title for s in snap.plan[:4]),
                 )
 
-        # Notify on plan change (not every tick) — suppress hunt spam
+        # Notify on plan change (not every tick) — suppress hunt spam + village-exit bounce
         if focus_key != self._last_focus_key and focus and focus.action != ActionType.IDLE:
             prev = self._last_focus_key
             self._last_focus_key = focus_key
@@ -1212,7 +1212,15 @@ class DwarBot:
                 focus.action == ActionType.HUNT_MOB
                 and prev.startswith("hunt_mob:")
             )
-            if self.settings.notify.plan and not same_hunt:
+            village_bounce = (
+                focus.action == ActionType.TRAVEL
+                and any(
+                    kw in (focus.title or "").lower()
+                    for kw in ("сопк", "дымн")
+                )
+                and self.brain.village_exit_blocked()
+            )
+            if self.settings.notify.plan and not same_hunt and not village_bounce:
                 await self.notify(
                     f"🧠 <b>{focus.title}</b>\n"
                     f"<i>{snap.now}</i>\n"
@@ -2022,46 +2030,47 @@ class DwarBot:
                 err = str(resp.redirect_error or resp.error or "")
                 if err and err.lower() not in ("false", "none", ""):
                     logger.info("Переход закрыт: %s", err[:160])
-                    # Don't spam the same gated exit
-                    self.brain.mark_cooldown(f"Переход: {name}", 300)
-                    if "перегруз" in err.lower() or "рюкзак" in err.lower():
-                        dropped = await self.combat.free_backpack(target_free=8)
-                        if dropped:
-                            return True
                     if "военачальник" in err.lower() or "покинуть селение" in err.lower():
                         wo = self.quests.pending_world_objective or {}
                         farm_open = bool(
                             wo.get("farm_open")
+                            or (
+                                wo.get("flash_only")
+                                and int(getattr(self._char, "level", 1) or 1) >= 3
+                            )
                             or int(getattr(self._char, "level", 1) or 1) >= 3
                         )
-                        cleared = self.quests.clear_exhausted(local_only=True)
-                        cleared += self.quests.clear_world_objective_npc_ban()
-                        self.brain.mark_cooldown(f"Переход: {name}", 600)
-                        if farm_open or self.quests.has_world_objective():
-                            # Exit gated by story — prioritize NPC dialogue over hunt
+                        # Long ban — 5–10 min CD caused Hunt ↔ Sopki TG spam
+                        self.brain.mark_village_exit_blocked(7200.0)
+                        self.brain.mark_cooldown(f"Переход: {name}", 7200)
+                        if farm_open:
+                            # Stay farming in village; story NPC is Flash-locked
+                            self.brain.need_quest_unlock = False
+                            self.brain.push_farm(600.0)
+                            logger.info(
+                                "Выход закрыт военачальником — фарм в селении "
+                                "(village exit banned 2h, Lv%d).",
+                                int(getattr(self._char, "level", 1) or 1),
+                            )
+                        else:
+                            cleared = self.quests.clear_exhausted(local_only=True)
+                            cleared += self.quests.clear_world_objective_npc_ban()
                             self.brain.need_quest_unlock = True
                             self.brain.awaiting_quest_turnin = False
-                            self.brain.farm_push_until = min(
-                                self.brain.farm_push_until,
-                                time.time() + 90.0,
-                            )
-                            if not self.brain.pending_hunt_mob:
-                                self.brain.pending_hunt_mob = ""
+                            self.brain.push_farm(120.0)
                             logger.info(
                                 "Выход закрыт военачальником — сюжетный диалог "
                                 "(cleared=%d, need_quest_unlock=ON, Lv%d).",
                                 cleared,
                                 int(getattr(self._char, "level", 1) or 1),
                             )
-                        else:
-                            self.brain.need_quest_unlock = True
-                            self.brain.awaiting_quest_turnin = False
-                            self.brain.push_farm(120.0)
-                            logger.info(
-                                "Нужен приказ военачальника — возвращаюсь к сюжету "
-                                "(снято exhausted: %d).",
-                                cleared,
-                            )
+                        return False
+                    if "перегруз" in err.lower() or "рюкзак" in err.lower():
+                        dropped = await self.combat.free_backpack(target_free=8)
+                        if dropped:
+                            return True
+                    # Don't spam the same gated exit
+                    self.brain.mark_cooldown(f"Переход: {name}", 300)
                     return False
                 new_state = await self._client.get_state()
                 if new_state.area_id and new_state.area_id != self._state.area_id:
@@ -2070,6 +2079,8 @@ class DwarBot:
                     self.brain.need_quest_unlock = False
                     self.brain.clear_hunt_gate()
                     self.quests.clear_hunt_gate()
+                    if hasattr(self.brain, "village_exit_blocked_until"):
+                        self.brain.village_exit_blocked_until = 0.0
                     return True
                 return False
 
@@ -2167,6 +2178,12 @@ class DwarBot:
 
                 # Travel
                 if item.code == "COME_IN" and item.area_id:
+                    low = (item.name or "").lower()
+                    if self.brain.village_exit_blocked() and (
+                        str(item.area_id) in {"192", "100"}
+                        or any(kw in low for kw in ("сопк", "дымн"))
+                    ):
+                        continue
                     self._area_moves_tried.add(key)
                     logger.info("Пробую переход: %s → area %s", item.name, item.area_id)
                     resp = await self._client.go_area(item.area_id, code=item.code)
@@ -2174,6 +2191,8 @@ class DwarBot:
                     err = str(resp.redirect_error or resp.error or "")
                     if err and err.lower() not in ("false", "none", ""):
                         logger.info("Переход закрыт: %s", err[:160])
+                        if "военачальник" in err.lower() or "покинуть селение" in err.lower():
+                            self.brain.mark_village_exit_blocked(7200.0)
                         continue
                     new_state = await self._client.get_state()
                     if new_state.area_id and new_state.area_id != area.area_id:
@@ -2182,6 +2201,7 @@ class DwarBot:
                             new_state.area_id, item.name,
                         )
                         self._area_moves_tried.clear()
+                        self.brain.village_exit_blocked_until = 0.0
                         return True
 
                 # Hotspot actions (non-npc) — only count real loot / fight

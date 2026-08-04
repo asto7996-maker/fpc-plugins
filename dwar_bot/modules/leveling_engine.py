@@ -387,11 +387,20 @@ class LevelingEngine:
                         o.detail = f"blocked until heal · {o.detail}"
                     elif flash_open:
                         low = title_l
-                        boost = 520.0 if any(
-                            kw in low for kw in ("сопк", "дымн", "охот", "лес", "поле")
-                        ) else 380.0
-                        o.score = max(float(o.score), boost)
-                        o.detail = f"lv{level} exit ok · {o.detail}"
+                        # Village exits (сопки) stay gated by Военачальник —
+                        # never boost above hunt or Hunt↔Sopki TG spam returns.
+                        village_exit = any(
+                            kw in low for kw in ("сопк", "дымн")
+                        ) or "192" in str((o.payload or {}).get("area_id") or "")
+                        if village_exit:
+                            o.score = min(float(o.score), 200.0)
+                            o.detail = f"lv{level} village-gated · {o.detail}"
+                        else:
+                            boost = 520.0 if any(
+                                kw in low for kw in ("охот", "лес", "поле")
+                            ) else 380.0
+                            o.score = max(float(o.score), boost)
+                            o.detail = f"lv{level} exit ok · {o.detail}"
                 if o.action == ActionType.COMBAT_FRONT and world_objective_flash_only:
                     if flash_open:
                         o.score = max(float(o.score), 300.0)

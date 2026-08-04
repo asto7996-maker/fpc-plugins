@@ -193,6 +193,8 @@ class ProgressionBrain:
         self.farm_push_until: float = 0.0
         # Travel blocked by war chief → must advance local quest NPC
         self.need_quest_unlock: bool = False
+        # Village exit gated by Военачальник (unix ts) — don't retry every 5–10 min
+        self.village_exit_blocked_until: float = 0.0
         # Quest type=2 kill target (e.g. Крэтс) — prefer hunt_farm attack
         self.pending_hunt_mob: str = ""
         # After a quest-required kill: talk to NPC before hunting again
@@ -208,8 +210,33 @@ class ProgressionBrain:
         self._cooldowns[name] = max(prev, until)
         logger.info("Brain CD: '%s' for %.0fs", name, seconds)
 
+    def mark_village_exit_blocked(self, seconds: float = 7200.0) -> None:
+        """
+        War-chief gate: leave village is impossible until story advances.
+        Long ban so planner stops bouncing Hunt ↔ Дымные сопки.
+        """
+        until = time.time() + max(60.0, float(seconds))
+        self.village_exit_blocked_until = max(self.village_exit_blocked_until, until)
+        for title in list(self._cooldowns.keys()):
+            if "переход" in title.lower() and any(
+                kw in title.lower() for kw in ("сопк", "дымн", "охот")
+            ):
+                self._cooldowns[title] = max(self._cooldowns[title], until)
+        # Also seed common titles even if not yet seen
+        for name in ("Переход: В Дымные сопки", "Переход: Дымные сопки"):
+            prev = self._cooldowns.get(name, 0)
+            self._cooldowns[name] = max(prev, until)
+        logger.info(
+            "Brain: village exit blocked for %.0fs (farm in village)",
+            seconds,
+        )
+
+    def village_exit_blocked(self) -> bool:
+        return time.time() < float(self.village_exit_blocked_until or 0.0)
+
     def clear_cooldowns(self) -> None:
         self._cooldowns.clear()
+        self.village_exit_blocked_until = 0.0
 
     def push_farm(self, seconds: float = 600.0) -> None:
         """Temporarily prefer travel/fronts/hotspots over stuck quests."""
@@ -473,6 +500,21 @@ class ProgressionBrain:
 
             if item.code == "COME_IN" and item.area_id and farm.auto_travel:
                 travel_title = f"Переход: {name}"
+                low = name.lower()
+                village_exit = (
+                    str(item.area_id) in {"192", "100"}
+                    or any(kw in low for kw in ("сопк", "дымн"))
+                )
+                if village_exit and self.village_exit_blocked():
+                    left = max(0, int(self.village_exit_blocked_until - time.time()))
+                    options.append(GameOption(
+                        ActionType.IDLE,
+                        f"КД: {travel_title}",
+                        score=5,
+                        detail=f"военачальник · через {left}с",
+                        goal=GoalKind.IDLE,
+                    ))
+                    continue
                 cd_until = self._cooldowns.get(travel_title, 0)
                 if cd_until and time.time() < cd_until:
                     left = max(0, int(cd_until - time.time()))
@@ -488,10 +530,11 @@ class ProgressionBrain:
                 score = 450 if max_farm else 400
                 if self.farm_push_active() or empty_bag:
                     score = 680 if max_farm else 620
-                # Prefer named farm exits (Дымные сопки и т.п.)
-                low = name.lower()
+                # Prefer named farm exits (Дымные сопки и т.п.) — but not when gated
                 if any(kw in low for kw in ("сопк", "дымн", "охот", "лес", "поле", "дорог")):
                     score += 40
+                if village_exit and self.village_exit_blocked():
+                    score = 5
                 options.append(GameOption(
                     ActionType.TRAVEL,
                     travel_title,

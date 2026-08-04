@@ -815,6 +815,23 @@ class CombatEngine:
         except Exception as exc:
             logger.debug("post_battle profile: %s", exc)
             return
+        # Fight-lock stub often reports HP 0/0 — don't WARNING→TG spam
+        try:
+            fight_id = int(getattr(getattr(profile, "state", None), "fight_id", 0) or 0)
+        except Exception:
+            fight_id = 0
+        if fight_id or not getattr(profile.char, "hp_max", 0):
+            logger.debug(
+                "post_battle skip heal — fight stub fight_id=%s hp=%s/%s",
+                fight_id, profile.char.hp, profile.char.hp_max,
+            )
+            return
+        if float(profile.char.hp_percent or 0) <= 0.5:
+            logger.debug(
+                "post_battle skip heal — HP %.0f%% right after fight (regen next tick)",
+                profile.char.hp_percent,
+            )
+            return
         try:
             healed = await self.heal_if_needed(profile)
             if healed:
