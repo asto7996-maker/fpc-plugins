@@ -928,13 +928,18 @@ class DwarBot:
         await self._emit_state_notifications()
 
         # ------------------------------------------------------------------
-        # PURE FARM (rewritten core): hunt-only, ignore flash heal_wounded /
-        # Level-Up planner. max_farm=True (default) or village 930–932.
+        # PURE FARM filler: hunt-only ONLY when auto_quests is off (or
+        # PURE_FARM_ONLY=1). With quests on — story/NPC planner owns the tick.
         # ------------------------------------------------------------------
+        pure_farm_force = os.getenv("PURE_FARM_ONLY", "0").strip().lower() in (
+            "1", "true", "yes", "on",
+        )
         if self.pure_farm.should_run(
             max_farm=bool(farm.max_farm),
             area_id=str(self._state.area_id or ""),
             level=int(self._char.level or 1),
+            auto_quests=bool(farm.auto_quests),
+            force=pure_farm_force,
         ):
             try:
                 await self.controller.apply_directive(
@@ -942,7 +947,7 @@ class DwarBot:
                         state=BotState.FARMING,
                         priority=1,
                         title="Pure Farm",
-                        reason="hunt-only rewrite",
+                        reason="hunt-only filler (quests off)",
                         area_id=str(self._state.area_id or ""),
                         exp_per_hour=0.0,
                     )
@@ -951,7 +956,6 @@ class DwarBot:
                 pass
             handled = await self.pure_farm.run_tick(self)
             if handled:
-                # Feed economy so AutoCoder sees battle progress
                 self.telemetry.note_economy(
                     gold=float(self._state.money or 0),
                     exp_proxy=float(self.pure_farm.stats.wins) * 50.0,
@@ -962,6 +966,28 @@ class DwarBot:
                 )
                 await _sleep(1.0, 2.5)
                 return
+        elif farm.auto_quests and self._iteration <= 2:
+            logger.info(
+                "Story/quests mode ON — PureFarm filler skipped "
+                "(set PURE_FARM_ONLY=1 to force hunt-only)."
+            )
+
+        # Village story: periodically re-open local NPC dialogues so Вождь /
+        # Военачальник stay reachable between farm beats.
+        if (
+            farm.auto_quests
+            and str(self._state.area_id or "") in {"930", "931", "932"}
+            and self._iteration % 3 == 1
+        ):
+            try:
+                cleared = self.quests.clear_exhausted(local_only=True)
+                if cleared:
+                    logger.info(
+                        "Story refresh: cleared %d local NPC ban(s).",
+                        cleared,
+                    )
+            except Exception as exc:
+                logger.debug("story refresh: %s", exc)
 
         # Economy snapshot every tick (feeds Gold/hr Exp/hr)
         self.telemetry.note_economy(
@@ -2508,6 +2534,9 @@ async def main() -> None:
     enable_self_heal = os.getenv("ENABLE_SELF_HEAL", "0").strip().lower() in (
         "1", "true", "yes", "on",
     )
+    pure_farm_only = os.getenv("PURE_FARM_ONLY", "0").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
     healing_orchestrator = None
     healing_orch_task = None
     auto_coder = None
@@ -2551,7 +2580,9 @@ async def main() -> None:
         logger.info("Self-heal ON (Gemini+AutoCoder) ENABLE_SELF_HEAL=1")
     else:
         logger.info(
-            "PureFarm rewrite: Gemini/AutoCoder OFF — hunt-only core, no false restarts."
+            "Gemini/AutoCoder OFF — story/quests first "
+            "(PURE_FARM_ONLY=%s).",
+            "1" if pure_farm_only else "0",
         )
 
     async def _heal_watchdog() -> None:
@@ -2566,7 +2597,9 @@ async def main() -> None:
 
     asyncio.create_task(_heal_watchdog(), name="heal_watchdog")
     logger.info(
-        "PureFarm rewrite active · LogWatcher(300s) · self_heal=%s · CURSOR=%s GEMINI=%s",
+        "Story/quests mode · PureFarm filler=%s · LogWatcher(300s) · "
+        "self_heal=%s · CURSOR=%s GEMINI=%s",
+        "ON" if pure_farm_only else "OFF(auto_quests)",
         "ON" if enable_self_heal else "OFF",
         "set" if os.getenv("CURSOR_API_KEY") else "MISSING",
         "set" if os.getenv("GEMINI_API_KEY") else "MISSING",

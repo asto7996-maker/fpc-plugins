@@ -1,12 +1,12 @@
 """
-PureFarmEngine — rewritten farm-first core.
+PureFarmEngine — hunt-only filler loop.
 
-Ignores Flash side-quests (heal_wounded), Level-Up planner spam, and
-story gates that cannot progress over HTTP. One job: hunt free map bots,
-finish fights over WS, report real wins.
+Ignores Flash side-quests (heal_wounded) and Level-Up planner spam.
+One job: hunt free map bots, finish fights over WS, report real wins.
 
-Activated when FarmSettings.max_farm is True (default) or area is the
-newbie village (930–932).
+Story/quests own the tick when ``auto_quests`` is on. PureFarm runs only
+as a filler when quests are disabled (or ``PURE_FARM_ONLY=1``), and/or
+when ``should_run`` says the area is a farm-only village grind.
 """
 
 from __future__ import annotations
@@ -66,8 +66,25 @@ class PureFarmEngine:
         self._cleared_wo = False
         self._last_report_at = 0.0
 
-    def should_run(self, *, max_farm: bool, area_id: str, level: int) -> bool:
-        if max_farm:
+    def should_run(
+        self,
+        *,
+        max_farm: bool,
+        area_id: str,
+        level: int,
+        auto_quests: bool = True,
+        force: bool = False,
+    ) -> bool:
+        """
+        Hunt-only mode.
+
+        When ``auto_quests`` is True (default), return False so the main
+        planner can talk to story NPCs and advance quests. Pass
+        ``force=True`` (env PURE_FARM_ONLY) to ignore that gate.
+        """
+        if auto_quests and not force:
+            return False
+        if force or max_farm:
             return True
         if str(area_id or "") in VILLAGE_AREAS and int(level or 1) >= 2:
             return True
@@ -133,12 +150,10 @@ class PureFarmEngine:
         self.arm(level=level, money=money)
         self.clear_flash_quest(bot.quests)
 
-        # Drop story pins that stall open farm
+        # Keep open-farm push, but do not wipe quest/story pins — those are
+        # owned by the planner when auto_quests is on.
         try:
-            bot.brain.clear_hunt_gate()
-            bot.brain.need_quest_unlock = False
-            bot.brain.awaiting_quest_turnin = False
-            bot.brain.push_farm(600.0)
+            bot.brain.push_farm(300.0)
         except Exception:
             pass
 

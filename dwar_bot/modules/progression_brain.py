@@ -447,10 +447,14 @@ class ProgressionBrain:
                 continue
             # Level-up / village story NPCs always beat casual hunt/arena
             qscore = 950 if not npc.is_global else 520
+            # Newbie village: story dialogue (Вождь / Военачальник) > Крэтс farm
+            area_now = str(getattr(state, "area_id", "") or "")
+            if not npc.is_global and area_now in {"930", "931", "932"}:
+                qscore = max(qscore, 1100)
             if self.awaiting_quest_turnin and not npc.is_global:
                 qscore = 1250
             elif self.need_quest_unlock and not npc.is_global:
-                qscore = 1000
+                qscore = 1180
             # Long arena CD — do not offer as quest
             if npc.is_global and int(getattr(npc, "time_left", 0) or 0) > 120:
                 continue
@@ -478,9 +482,12 @@ class ProgressionBrain:
             if itype == "npc" and item.npc_id and farm.auto_quests:
                 if str(item.npc_id) in exhausted:
                     continue
+                area_now = str(getattr(state, "area_id", "") or area.area_id or "")
                 nscore = 1250 if self.awaiting_quest_turnin else (
-                    1000 if self.need_quest_unlock else 960
+                    1180 if self.need_quest_unlock else 960
                 )
+                if area_now in {"930", "931", "932"}:
+                    nscore = max(nscore, 1100)
                 options.append(GameOption(
                     ActionType.QUEST_NPC,
                     f"NPC: {name}",
