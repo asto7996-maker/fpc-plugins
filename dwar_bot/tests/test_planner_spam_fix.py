@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 from dwar_bot.core.bot_state import BotState
@@ -365,3 +366,77 @@ def test_flash_locked_keeps_giver_exhausted():
     }
     qt._world_objective_keys.add("global:409")
     assert "409" in qt.exhausted_npc_ids()
+
+
+def test_lv3_empty_rasselina_loses_to_hunt():
+    """Demoted empty hotspot (score≤120) must not beat hunt under farm_open."""
+    eng = LevelingEngine()
+    profile = FullProfile(char=CharStats(level=3, hp=100, hp_max=100))
+    options = [
+        GameOption(
+            ActionType.COMBAT_AREA,
+            title="Точка: Расселина",
+            score=80,
+            payload={"action_id": "4696"},
+            goal=GoalKind.COMBAT,
+        ),
+        GameOption(
+            ActionType.HUNT_MOB,
+            title="Зигред-воин",
+            score=180,
+            payload={"name": "Зигред-воин"},
+            goal=GoalKind.COMBAT,
+        ),
+    ]
+    decision = eng.decide(
+        profile=profile,
+        brain_focus=None,
+        brain_options=options,
+        area_id="932",
+        world_objective_kind="heal_wounded",
+        world_objective_flash_only=True,
+    )
+    assert decision.focus_override is not None
+    assert decision.focus_override.action == ActionType.HUNT_MOB
+    assert "Автофарм" in decision.directive.title
+    assert "heal_wounded" not in decision.directive.title
+
+
+def test_proxy_exp_no_fake_5sec_eta():
+    eng = LevelingEngine()
+    eng.progress.level = 3
+    eng.progress.exp_pct = 99.5  # legacy ceiling
+    eng._no_level_wins = 12
+    eng._proxy_exp = 5000.0
+    eng._exp_samples = [(time.time() - 600, 1000.0), (time.time(), 5000.0)]
+    eng.observe_world(profile=FullProfile(char=CharStats(level=3, hp=100, hp_max=100)))
+    assert eng.progress.exp_pct <= 95.0
+    assert eng.progress.eta_seconds <= 0.0
+    html = eng.progress.telegram_html()
+    assert "5 сек" not in html
+    assert "н/д" in html or "оценка" in html
+
+
+def test_rich_level_up_hides_fake_eta(tmp_path):
+    from dwar_bot.core.rich_notifications import RichNotifications
+    from dwar_bot.core.telemetry_engine import TelemetryEngine
+
+    rich = RichNotifications(TelemetryEngine(tmp_path / "tel.db"))
+    text = rich.format_level_up_rich(
+        level=3,
+        exp_pct=99.5,
+        exp_per_hour=9000.0,
+        eta_seconds=5.0,
+        priority="Автофарм Lv3+",
+        directive_state="FARMING",
+    )
+    assert "5 сек" not in text
+    assert "н/д" in text
+    assert "оценка" in text
+
+
+def test_rfcheats_hunt_no_long_sleep():
+    src = (ROOT / "modules" / "combat_engine.py").read_text(encoding="utf-8")
+    assert "no in-hunt sleep" in src
+    assert "asyncio.sleep(min(float(decision.sleep_sec), 120.0))" not in src
+    assert "soft reset, skip this hunt tick" in src

@@ -138,7 +138,7 @@ def test_catalog_roundtrip(tmp_path: Path):
     data = load_catalog(path)
     assert data["source"].startswith("https://dwar.browsergamebots.com")
     assert len(data["mobs"]) >= 14
-    assert data["combat_defaults"]["session_kill_limit"] == 50
+    assert data["combat_defaults"]["session_kill_limit"] == 12
     assert "gather_defaults" in data
     assert "operator_defaults" in data
 

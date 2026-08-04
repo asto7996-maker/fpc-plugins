@@ -59,9 +59,13 @@ class LevelProgress:
 
     def telegram_html(self) -> str:
         eta = self._fmt_eta(self.eta_seconds)
+        pct_note = f"{self.exp_pct:.1f}%"
+        if self.exp_pct >= 90.0 and self.eta_seconds <= 0:
+            pct_note = f"{self.exp_pct:.0f}%·оценка"
+            eta = "н/д (сервер не отдаёт Exp%)"
         return (
             "📈 <b>Level-Up Update:</b>\n"
-            f"- Уровень: {self.level} ({self.exp_pct:.1f}%)\n"
+            f"- Уровень: {self.level} ({pct_note})\n"
             f"- Скорость кача: +{self.exp_per_hour:,.0f} Exp/час\n"
             f"- До следующего уровня: ~{eta}\n"
             f"- Текущий приоритет: {self.priority_title or '—'}"
@@ -175,6 +179,9 @@ class LevelingEngine:
             self.progress.exp_pct = 5.0
         self._last_level = char.level or self._last_level
         self.progress.level = char.level
+        # Clamp legacy 99.5% ceiling from older builds (fake "~5 сек" ETA)
+        if self.progress.exp_pct > 95.0:
+            self.progress.exp_pct = 95.0
         self._note_exp_sample()
 
         # Parse event timers into KB if they look like Exp windows
@@ -224,7 +231,15 @@ class LevelingEngine:
         self._proxy_exp += exp_guess
         self._no_level_wins += 1
         self.progress.wins = self._wins
-        self.progress.exp_pct = min(99.5, self.progress.exp_pct + max(0.4, exp_guess / 80.0))
+        # Proxy % must NOT claim "seconds to level" — game doesn't expose real Exp.
+        # Soft asymptote ≤95%; above that freeze until real level-up from observe_world.
+        if self.progress.exp_pct < 90.0:
+            self.progress.exp_pct = min(
+                90.0, self.progress.exp_pct + max(0.3, exp_guess / 100.0)
+            )
+        elif self.progress.exp_pct < 95.0:
+            self.progress.exp_pct = min(95.0, self.progress.exp_pct + 0.15)
+        # else: stay ≤95 until CharStats.level increases
         self._note_exp_sample()
 
     def note_quest_progress(self, *, title: str = "", exp_reward: float = 0.0) -> None:
@@ -232,9 +247,12 @@ class LevelingEngine:
         self.progress.quests_done = self._quest_turns
         if exp_reward > 0:
             self._proxy_exp += exp_reward
-            self.progress.exp_pct = min(99.5, self.progress.exp_pct + exp_reward / 50.0)
-        elif title:
-            self.progress.exp_pct = min(99.5, self.progress.exp_pct + 2.0)
+            if self.progress.exp_pct < 95.0:
+                self.progress.exp_pct = min(
+                    95.0, self.progress.exp_pct + exp_reward / 50.0
+                )
+        elif title and self.progress.exp_pct < 95.0:
+            self.progress.exp_pct = min(95.0, self.progress.exp_pct + 1.5)
         self._no_level_wins = 0
         self._note_exp_sample()
 
@@ -247,8 +265,10 @@ class LevelingEngine:
         eph = self._calc_exp_per_hour()
         self.progress.exp_per_hour = eph
         remaining = max(0.0, 100.0 - self.progress.exp_pct)
-        if eph > 1:
-            # Map % → rough exp units: assume 100% ≈ 800 * level
+        # Fake 99%→5sec ETA was lying for hours — hide ETA when proxy is stale
+        if self.progress.exp_pct >= 90.0 and self._no_level_wins >= 8:
+            self.progress.eta_seconds = 0.0
+        elif eph > 1:
             level_bucket = 800.0 * max(1, self.progress.level)
             need = remaining / 100.0 * level_bucket
             self.progress.eta_seconds = need / eph * 3600.0
@@ -342,8 +362,11 @@ class LevelingEngine:
                     ActionType.AREA_ACTION,
                 ):
                     if flash_open:
-                        # Loot points OK at Lv3+ — beat capped hunt (~480)
-                        o.score = min(max(float(o.score), 500.0), 620.0)
+                        # Empty/demoted hotspots (score≤100) must not beat hunt
+                        if float(o.score) <= 120.0:
+                            continue
+                        # Loot below hunt (~480) so empty Расселина doesn't loop
+                        o.score = min(max(float(o.score), 300.0), 420.0)
                         o.detail = f"lv{level} loot · {o.detail}"
                     else:
                         continue
@@ -352,8 +375,8 @@ class LevelingEngine:
                         o.score = min(max(float(o.score), 200.0), 350.0)
                         o.detail = f"flash wait · hunt ok · {o.detail}"
                     elif flash_open:
-                        # Cap hunt so EQUIP/QUEST/loot can win the tick
-                        o.score = min(max(float(o.score), 300.0), 480.0)
+                        # Prefer hunt over empty loot / blocked travel
+                        o.score = min(max(float(o.score), 450.0), 520.0)
                         o.detail = f"lv{level} farm · {o.detail}"
                     else:
                         o.score = min(float(o.score), 120.0)
@@ -472,7 +495,11 @@ class LevelingEngine:
             directive = StrategicDirective(
                 state=BotState.FARMING,
                 priority=2,
-                title=f"Мир-цель: {world_objective_kind}",
+                title=(
+                    f"Автофарм Lv{level}+"
+                    if (world_objective_flash_only and flash_open)
+                    else f"Мир-цель: {world_objective_kind}"
+                ),
                 reason=f"P2-world: {world_objective_kind}{reason_tag}",
                 area_id=area_id,
                 exp_per_hour=self.progress.exp_per_hour,

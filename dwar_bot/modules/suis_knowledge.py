@@ -118,9 +118,9 @@ class SuisCombatDefaults:
     post_battle_hp_wait: float = 100.0
     # Don't eat if already above this
     food_skip_above_hp: float = 75.0
-    # Session limits
+    # Session limits (50 kills → stale SUIS / NO_BATTLE churn; keep short)
     session_minutes: int = 60
-    session_kill_limit: int = 50
+    session_kill_limit: int = 12
     # Error budget (Системные → Разное)
     max_error_ops: int = 25
     max_failed_ops: int = 100

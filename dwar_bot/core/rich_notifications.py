@@ -214,13 +214,22 @@ class RichNotifications:
         directive_state: str = "",
     ) -> str:
         rates = self.telemetry.rates()
+        # Proxy Exp% is not from the server — never claim "~5 сек" near the ceiling.
+        pct_note = f"{exp_pct:.1f}%"
+        if exp_pct >= 90.0 and (eta_seconds <= 0 or eta_seconds < 60.0):
+            pct_note = f"{exp_pct:.0f}%·оценка"
+            eta_note = "н/д (сервер не отдаёт Exp%)"
+        elif eta_seconds <= 0:
+            eta_note = "н/д"
+        else:
+            eta_note = _fmt_duration(eta_seconds)
         return "\n".join([
             "📈 <b>Level-Up Update</b>",
-            f"• Уровень: <b>{level}</b> ({exp_pct:.1f}%)",
+            f"• Уровень: <b>{level}</b> ({pct_note})",
             f"• Скорость кача: <b>+{_fmt_num(exp_per_hour)}</b> Exp/час",
             f"• Телеметрия Exp/час: <b>{_fmt_num(rates['exp_per_hour'])}</b>",
             f"• Gold/час: <b>{_fmt_num(rates['gold_per_hour'], 2)}</b> зл.",
-            f"• До следующего уровня: ~{_esc(_fmt_duration(eta_seconds))}",
+            f"• До следующего уровня: ~{_esc(eta_note)}",
             f"• Текущий приоритет: {_esc(priority or '—')}",
             f"• State Machine: <code>{_esc(directive_state or '—')}</code>",
         ])

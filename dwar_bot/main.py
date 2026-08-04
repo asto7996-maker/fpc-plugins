@@ -898,6 +898,23 @@ class DwarBot:
             (self._client._session.get("sess_sid") or "")[:8],
         )
 
+        # HP≈0: finish any fight stub, then regen — don't farm/Расселина loop
+        if self._char.hp_max and self._char.hp_percent <= 0.5:
+            if await self.combat.is_in_battle():
+                result = await self.combat.finish_fight(timeout=180.0)
+                logger.info("HP≈0 fight finish → %s", result.name)
+                await _sleep(1.0, 2.0)
+                return
+            logger.info("HP≈0 — wait regen (skip farm tick).")
+            if farm.auto_heal:
+                try:
+                    await self.timers.wait_for_hp(target_percent=40.0, max_wait=180)
+                except Exception:
+                    await _sleep(20.0, 40.0)
+            else:
+                await _sleep(20.0, 40.0)
+            return
+
         await self.timers.update_regen(self._char.hp, self._char.mp)
         await self._emit_state_notifications()
 

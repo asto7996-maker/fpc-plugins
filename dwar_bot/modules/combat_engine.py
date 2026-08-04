@@ -16,6 +16,7 @@ import asyncio
 import logging
 import random
 import re
+import time
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Optional
@@ -296,9 +297,25 @@ class CombatEngine:
         if hp_pct >= COMBAT.hp_elixir_threshold:
             return False
 
+        # HP≈0: often fight-lock stub / death — potion spam doesn't help.
+        if hp_pct <= 0.5:
+            now = time.time()
+            last = float(getattr(self, "_hp0_warn_at", 0.0) or 0.0)
+            if now - last >= 120.0:
+                self._hp0_warn_at = now
+                logger.warning(
+                    "HP at %.0f%% — wait regen / finish fight (no potion spam).",
+                    hp_pct,
+                )
+            return False
+
         potion = await self._stats.find_hp_potion()
         if potion is None:
-            logger.warning("HP at %.0f%% but no healing potion in backpack!", hp_pct)
+            now = time.time()
+            last = float(getattr(self, "_no_potion_warn_at", 0.0) or 0.0)
+            if now - last >= 90.0:
+                self._no_potion_warn_at = now
+                logger.warning("HP at %.0f%% but no healing potion in backpack!", hp_pct)
             return False
 
         logger.info("HP %.0f%% below threshold — drinking '%s'.", hp_pct, potion.title)
@@ -712,7 +729,8 @@ class CombatEngine:
     async def _rfcheats_before_hunt(self) -> bool:
         """
         RF-Cheats hygiene gate. Returns True if hunt may proceed.
-        On required break: sleeps and returns False (caller → NO_BATTLE).
+        On required break: arm cooldown via note_break and return False —
+        never sleep minutes inside hunt (that froze Level-Up on empty ticks).
         """
         if not getattr(COMBAT, "rfcheats_hygiene_enabled", True):
             return True
@@ -722,20 +740,20 @@ class CombatEngine:
         try:
             decision = hy.check()
             if decision.should_pause and decision.sleep_sec > 0:
+                left = float(decision.sleep_sec)
                 logger.info(
-                    "RF-Cheats hygiene pause (%s) — %.0fs",
-                    decision.reason, decision.sleep_sec,
+                    "RF-Cheats hygiene cooldown (%s) — skip hunt %.0fs (no in-hunt sleep)",
+                    decision.reason, left,
                 )
-                hy.note_break(decision.sleep_sec)
-                # Cap single sleep so the main loop can still heartbeat
-                await asyncio.sleep(min(float(decision.sleep_sec), 120.0))
+                # Idempotent if already in break_until from prior check()
+                if not (hy.break_until and time.time() < hy.break_until):
+                    hy.note_break(left)
                 return False
             think = hy.maybe_think_pause_sec()
             if think > 0:
-                logger.debug("RF-Cheats think pause %.1fs", think)
-                await asyncio.sleep(think)
+                await asyncio.sleep(min(float(think), 3.0))
             delay = hy.action_delay_sec()
-            await asyncio.sleep(delay)
+            await asyncio.sleep(min(float(delay), 2.5))
         except Exception as exc:
             logger.debug("rfcheats before hunt: %s", exc)
         return True
@@ -881,8 +899,9 @@ class CombatEngine:
                 return await self._finish_fight_unlocked()
 
             if self.suis_session_exhausted():
+                # Soft reset — do NOT sleep 20–40s here (freezes Level-Up ticks).
+                logger.info("SUIS session exhausted — soft reset, skip this hunt tick")
                 self.reset_suis_session()
-                await asyncio.sleep(random.uniform(20, 40))
                 return BattleResult.NO_BATTLE
 
             if not await self._rfcheats_before_hunt():
