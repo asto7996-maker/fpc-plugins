@@ -731,19 +731,18 @@ class QuestTracker:
             wo.get("kind") == "heal_wounded"
             and (wo.get("flash_only") or wo.get("http_impossible"))
         )
-        # Flash-locked heal giver: keep exhausted (dialogue only re-accepts Flash goal)
-        if flash_locked:
-            out.update(self.world_objective_npc_ids())
-            return out
-        # Under farm_open, do not treat the world-objective giver (e.g. Торгор 409)
-        # as permanently exhausted — story must continue.
-        # Only persisted farm_open lifts the story-NPC ban (set at Lv3+ adapt)
-        if not wo.get("farm_open"):
-            out.update(self.world_objective_npc_ids())
-        else:
+        # Under farm_open (Lv3+ soft Flash), keep giver talkable for story-check
+        if wo.get("farm_open"):
             wo_npc = str(wo.get("npc_id") or "")
             if wo_npc:
                 out.discard(wo_npc)
+            return out
+        # Hard Flash wait (no farm_open yet): keep heal giver exhausted
+        if flash_locked:
+            out.update(self.world_objective_npc_ids())
+            return out
+        # Non-flash world objective: ban giver until objective clears
+        out.update(self.world_objective_npc_ids())
         return out
 
     def clear_world_objective_npc_ban(self, npc_id: str = "") -> int:

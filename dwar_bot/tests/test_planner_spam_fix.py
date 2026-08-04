@@ -360,7 +360,8 @@ def test_farm_open_unbans_story_npc():
     assert "global:409" not in qt._world_objective_keys
 
 
-def test_flash_locked_keeps_giver_exhausted():
+def test_flash_locked_farm_open_keeps_giver_talkable():
+    """Lv3+ farm_open: Торгор stays available for story-check."""
     qt = QuestTracker(client=None)  # type: ignore[arg-type]
     qt.pending_world_objective = {
         "kind": "heal_wounded",
@@ -368,6 +369,20 @@ def test_flash_locked_keeps_giver_exhausted():
         "flash_only": True,
         "http_impossible": True,
         "farm_open": True,
+    }
+    qt._world_objective_keys.add("global:409")
+    qt._exhausted_dialogues.add("0:409:0")
+    assert "409" not in qt.exhausted_npc_ids()
+
+
+def test_flash_locked_hard_keeps_giver_exhausted():
+    """Without farm_open, Flash heal giver stays exhausted."""
+    qt = QuestTracker(client=None)  # type: ignore[arg-type]
+    qt.pending_world_objective = {
+        "kind": "heal_wounded",
+        "npc_id": "409",
+        "flash_only": True,
+        "http_impossible": True,
     }
     qt._world_objective_keys.add("global:409")
     assert "409" in qt.exhausted_npc_ids()
