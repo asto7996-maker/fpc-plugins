@@ -398,6 +398,69 @@ class CombatEngine:
                 if await self.equip_item(item):
                     equipped += 1
                 await asyncio.sleep(random.uniform(0.4, 1.0))
+        if equipped:
+            return equipped
+        # user.php inventory often empty in village — try bag API gear
+        return await self.equip_from_bag()
+
+    async def equip_from_bag(self, *, max_items: int = 8) -> int:
+        """
+        Equip wearable gear discovered via ``get_bag`` (not user.php art_alt).
+
+        Newbie village often shows 0 inventory items while bag has leather /
+        sword / rings — put them on so story fights are less empty-handed.
+        """
+        try:
+            bag = await self._client.get_bag()
+        except Exception as exc:
+            logger.debug("equip_from_bag get_bag: %s", exc)
+            return 0
+        arts = bag.get("artifact_list") or []
+        # Prefer known starter gear artikuls, then anything with PUT_ON-ish title
+        prefer = {
+            "10378", "10379", "17972", "46176", "46177", "46314",  # leather / sword / rings
+            "3908", "3909", "3910", "3911",
+        }
+        wear_kw = (
+            "меч", "понож", "куртк", "кольц", "амулет", "щит", "шлем",
+            "доспех", "перчат", "сапог", "пояс", "наруч",
+        )
+        ranked: list[tuple[int, dict]] = []
+        for a in arts:
+            if not isinstance(a, dict):
+                continue
+            aid = str(a.get("artikul_id") or "")
+            title = str(a.get("title") or a.get("name") or "")
+            iid = str(a.get("id") or "")
+            if not iid:
+                continue
+            # Skip quest medicine / consumables / chests
+            if aid in self._KEEP_ARTIKULS:
+                continue
+            tl = title.lower()
+            if any(k in tl for k in ("снадоб", "эликсир", "яблок", "сундук", "набор", "свиток", "очерк", "сфера", "знамя", "оберег")):
+                continue
+            score = 0
+            if aid in prefer:
+                score += 100
+            if any(k in tl for k in wear_kw):
+                score += 50
+            if score <= 0:
+                continue
+            ranked.append((score, a))
+        ranked.sort(key=lambda x: -x[0])
+        equipped = 0
+        for _, a in ranked[:max_items]:
+            art = Artifact(
+                art_id=str(a.get("id") or ""),
+                title=str(a.get("title") or a.get("name") or ""),
+                kind=str(a.get("kind") or "gear"),
+            )
+            if await self.equip_item(art):
+                equipped += 1
+            await asyncio.sleep(random.uniform(0.3, 0.8))
+        if equipped:
+            logger.info("equip_from_bag: надето %d предмет(ов) из сумки.", equipped)
         return equipped
 
     # Starter duplicate junk — safe to DROP when backpack is overloaded

@@ -988,6 +988,13 @@ class DwarBot:
                     )
             except Exception as exc:
                 logger.debug("story refresh: %s", exc)
+            # Put on bag gear (user.php often shows 0 items in village)
+            try:
+                n_eq = await self.combat.equip_from_bag()
+                if n_eq and self.settings.notify.gear:
+                    await self.notify(f"👕 Из сумки надето: {n_eq}", "gear")
+            except Exception as exc:
+                logger.debug("village equip_from_bag: %s", exc)
 
         # Economy snapshot every tick (feeds Gold/hr Exp/hr)
         self.telemetry.note_economy(
@@ -1852,20 +1859,28 @@ class DwarBot:
                     wo.get("kind") == "heal_wounded"
                     and (wo.get("flash_only") or wo.get("http_impossible"))
                 )
-                # Flash-locked heal giver has only «излечение» dialogue — skip, farm Exp
+                # Flash-locked heal giver: periodic story-check (new points / turn-in)
+                # instead of permanent skip — click on wounded still needed in client.
                 if npc_id in wo_npcs and flash_locked:
+                    if self._iteration % 4 != 1:
+                        logger.info(
+                            "Skip NPC %s — heal_wounded flash-locked "
+                            "(story-check next ticks).",
+                            npc_id,
+                        )
+                        self.quests.mark_npc_exhausted(
+                            npc_id,
+                            global_npc=int(payload.get("global_npc", 0) or 0),
+                            link_id=str(payload.get("link_id") or "0"),
+                        )
+                        return True
                     logger.info(
-                        "Skip NPC %s — heal_wounded flash-locked (нужен клик в клиенте).",
+                        "Story-check NPC %s under flash heal_wounded — "
+                        "ищу новые точки / приказ военачальника.",
                         npc_id,
                     )
-                    self.quests.mark_npc_exhausted(
-                        npc_id,
-                        global_npc=int(payload.get("global_npc", 0) or 0),
-                        link_id=str(payload.get("link_id") or "0"),
-                    )
-                    if not self.brain.farm_push_active():
-                        self.brain.push_farm(300.0)
-                    return True
+                    self.quests.clear_world_objective_npc_ban(npc_id)
+                    # fall through to walk_npc_api (story check inside)
                 # Under farm_open, story NPC (often same id as heal_wounded giver, e.g. 409)
                 # must be talkable again — Flash heal stays soft side-quest.
                 if npc_id in wo_npcs and not farm_open:

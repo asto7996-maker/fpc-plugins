@@ -964,6 +964,119 @@ class QuestTracker:
                 return ch
         return None
 
+    def _is_heal_wounded_point(self, title: str = "", desc: str = "") -> bool:
+        blob = f"{title} {desc}".lower()
+        return any(
+            k in blob
+            for k in ("излечен", "ранен", "снадоб", "ополчен", "поле боя")
+        )
+
+    async def _story_check_flash_heal_npc(
+        self,
+        npc_id: str,
+        *,
+        global_npc: int = 0,
+        link_id: str = "0",
+        f_id: str = "0",
+        area_id: str = "0",
+        href: str = "",
+        key: str = "",
+        point_list: Optional[list] = None,
+    ) -> int:
+        """
+        While heal_wounded is Flash-locked, poll the giver for *other* story
+        points. If only the heal dialogue remains, return 0 (no re-accept spam).
+        """
+        points = list(point_list or [])
+        other = []
+        for p in points:
+            title = str(p.get("title") or "")
+            if self._is_heal_wounded_point(title):
+                continue
+            other.append(p)
+
+        if not other:
+            logger.info(
+                "NPC %s: story check — только Flash «излечение», жду клик/приказ.",
+                npc_id,
+            )
+            return 0
+
+        logger.info(
+            "NPC %s: story check — новые точки поверх Flash heal: %s",
+            npc_id,
+            ", ".join(str(p.get("title") or p.get("id"))[:40] for p in other[:4]),
+        )
+        # Heal side-quest no longer owns the planner — advance real story
+        self.clear_world_objective("story_advanced_past_flash_heal")
+        self._exhausted_dialogues.discard(key)
+        self._soft_ban_until.pop(key, None)
+        self._world_objective_keys.discard(key)
+
+        steps = 0
+        for nxt in other[:4]:
+            try:
+                raw = await self._client.npc_point(
+                    npc_id,
+                    quest_id=nxt.get("quest_id") or 0,
+                    point_id=nxt.get("id"),
+                    global_npc=global_npc,
+                    link_id=link_id,
+                    f_id=f_id,
+                )
+            except Exception as exc:
+                logger.debug("story_check npc_point: %s", exc)
+                continue
+            pt = raw.get("npc|point") or {}
+            children = self._as_child_list(pt.get("child_list"))
+            child = self._pick_child(children)
+            if child is None:
+                continue
+            child_title = str(child.get("title") or child.get("message") or "")
+            if self._is_heal_wounded_point(child_title):
+                continue
+            logger.info("→ Сюжет: %s", child_title[:80])
+            to_point = str(child.get("to_point_id") or "")
+            if to_point:
+                try:
+                    html_steps, last_redir = await self._client.walk_npc_html(
+                        npc_id,
+                        global_npc=global_npc,
+                        link_id=link_id,
+                        f_id=f_id,
+                        href=href,
+                        max_steps=6,
+                    )
+                except Exception as exc:
+                    logger.debug("story_check walk_html: %s", exc)
+                    html_steps, last_redir = 0, ""
+                if html_steps:
+                    steps += html_steps
+                    self.session.dialogues_handled += html_steps
+                    self.clear_hunt_gate()
+                    logger.info(
+                        "Story HTML NPC %s: %d шаг(ов), last=%s",
+                        npc_id, html_steps, (last_redir or "")[:80],
+                    )
+                    break
+            else:
+                try:
+                    raw_ans = await self._client.npc_answer(
+                        npc_id,
+                        quest_id=child.get("quest_id") or nxt.get("quest_id") or 0,
+                        point_id=child.get("id") or nxt.get("id"),
+                        global_npc=global_npc,
+                        link_id=link_id,
+                        f_id=f_id,
+                    )
+                    ans = raw_ans.get("npc|answer") or {}
+                    if int(ans.get("status", 0) or 0) == STATUS_OK:
+                        steps += 1
+                        self.session.dialogues_handled += 1
+                except Exception as exc:
+                    logger.debug("story_check answer: %s", exc)
+        return steps
+
     async def walk_npc_api(
         self,
         npc_id: str,
@@ -1018,18 +1131,27 @@ class QuestTracker:
         self.session.npcs_visited += 1
         npc_href = href or ""
 
-        # Already tracking Flash heal_wounded — don't re-open the same accept loop
+        # Flash heal_wounded: still poll NPC for NEW story points / turn-in,
+        # but never re-accept the same «излечение ополченцев» loop.
         if self.has_world_objective("heal_wounded"):
             wo = self.pending_world_objective or {}
             if wo.get("flash_only") or wo.get("http_impossible"):
                 wo_npc = str(wo.get("npc_id") or "")
                 if not wo_npc or wo_npc == str(npc_id):
-                    logger.info(
-                        "NPC %s: heal_wounded already flash-locked — skip re-accept.",
+                    advanced = await self._story_check_flash_heal_npc(
                         npc_id,
+                        global_npc=global_npc,
+                        link_id=link_id,
+                        f_id=f_id,
+                        area_id=area_id,
+                        href=npc_href,
+                        key=key,
+                        point_list=point_list,
                     )
+                    if advanced:
+                        return advanced
                     self._exhausted_dialogues.add(key)
-                    self._soft_ban_until[key] = time.time() + 900.0
+                    self._soft_ban_until[key] = time.time() + 180.0
                     return 0
 
         for _ in range(max_steps):

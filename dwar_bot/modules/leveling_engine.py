@@ -355,8 +355,12 @@ class LevelingEngine:
                     and blocked
                     and npc in blocked
                 ):
-                    # Flash heal giver: no HTTP progress — never prefer over hunt/loot
-                    continue
+                    if flash_open:
+                        # Keep giver for story-check / turn-in (handled below)
+                        pass
+                    else:
+                        # Hard Flash wait — never prefer heal-giver over hunt
+                        continue
                 if world_objective_flash_only and o.action in (
                     ActionType.COMBAT_AREA,
                     ActionType.AREA_ACTION,
@@ -413,10 +417,15 @@ class LevelingEngine:
                     o.score = max(float(o.score), 920.0)
                     o.detail = f"lv{level} gear · {o.detail}"
                 if flash_open and o.action == ActionType.QUEST_NPC:
-                    # Local story (Вождь / Военачальник) — keep competitive vs hunt
-                    # need_quest_unlock path already ~1000–1050 from brain
-                    o.score = min(max(float(o.score), 880.0), 1100.0)
-                    o.detail = f"lv{level} story · {o.detail}"
+                    npc = str((o.payload or {}).get("npc_id") or "")
+                    if npc and blocked and npc in blocked:
+                        # Keep giver as periodic story-check (turn-in / next quest)
+                        o.score = min(max(float(o.score), 700.0), 900.0)
+                        o.detail = f"lv{level} story-check · {o.detail}"
+                    else:
+                        # Local story (Вождь / Военачальник) — keep competitive vs hunt
+                        o.score = min(max(float(o.score), 880.0), 1100.0)
+                        o.detail = f"lv{level} story · {o.detail}"
                 filtered.append(o)
             options = filtered
             idle_opt = next((o for o in options if o.action == ActionType.IDLE), None)
