@@ -112,7 +112,12 @@ class PureFarmEngine:
         )
 
     def clear_flash_quest(self, quests: Any) -> None:
-        """Drop HTTP-impossible heal_wounded so it cannot own the planner."""
+        """Mark Flash heal as ignored for hunt ticks — do NOT wipe WO state.
+
+        Wiping pending_world_objective broke later story-checks after stall.
+        Keep the objective (stalled_until / flash_only) so the bot can re-poll
+        Торгор when the stall expires.
+        """
         if self._cleared_wo:
             return
         wo = getattr(quests, "pending_world_objective", None) or {}
@@ -124,17 +129,22 @@ class PureFarmEngine:
             wo.get("flash_only") or wo.get("http_impossible") or wo.get("farm_open")
         ):
             try:
-                quests.pending_world_objective = {}
+                # Ensure stall so planner won't spin empty story-checks mid-hunt
+                import time as _time
+                wo = dict(wo)
+                if float(wo.get("stalled_until") or 0) < _time.time():
+                    wo["stalled_until"] = _time.time() + 900.0
+                wo["farm_open"] = True
+                quests.pending_world_objective = wo
                 if hasattr(quests, "_persist_world_objective"):
                     quests._persist_world_objective()
-                if hasattr(quests, "clear_world_objective_npc_ban"):
-                    quests.clear_world_objective_npc_ban()
-                logger.warning(
-                    "PureFarm: cleared flash world_objective '%s' — hunt-only mode.",
+                logger.info(
+                    "PureFarm: keeping flash WO '%s' stalled — hunt now, "
+                    "story-check later.",
                     kind,
                 )
             except Exception as exc:
-                logger.debug("PureFarm clear WO: %s", exc)
+                logger.debug("PureFarm stall WO: %s", exc)
         self._cleared_wo = True
 
     async def run_tick(self, bot: Any) -> bool:
