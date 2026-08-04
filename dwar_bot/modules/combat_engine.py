@@ -619,9 +619,17 @@ class CombatEngine:
             total = int(cap.get("total") or 0)
         except (TypeError, ValueError):
             return 0
-        if total <= 0 or used <= total:
+        if total <= 0:
             return 0
-        need = max(0, used - total + int(target_free))
+        # Need headroom for travel / kit opens — free even at exact capacity.
+        free_now = total - used
+        want_free = max(1, int(target_free))
+        if free_now >= want_free:
+            return 0
+        need = want_free - free_now
+        # Also clear any hard overweight
+        if used > total:
+            need = max(need, used - total + want_free)
         arts = bag.get("artifact_list") or []
         # Prefer dropping junk artikuls; keep one of each if possible
         seen_junk: set[str] = set()
@@ -669,16 +677,49 @@ class CombatEngine:
                     break
 
         dropped = 0
+        # Keep (iid, count) — stacked junk often rejects count=1 as «неверное количество»
+        drop_plan: list[tuple[str, int]] = []
+        by_id = {
+            str(a.get("id") or ""): a
+            for a in arts
+            if isinstance(a, dict) and a.get("id")
+        }
         for iid in drop_ids[:max_drops]:
+            a = by_id.get(iid) or {}
             try:
-                resp = await self._client.drop_artifact(iid, count=1)
+                cnt = int(a.get("cnt") or 1)
+            except (TypeError, ValueError):
+                cnt = 1
+            # cnt=0 gear-like rows still occupy weight — try 1
+            drop_plan.append((iid, max(1, cnt) if cnt > 0 else 1))
+
+        for iid, cnt in drop_plan:
+            try:
+                resp = await self._client.drop_artifact(iid, count=cnt)
                 err = str(resp.redirect_error or resp.error or "")
-                if resp.status == STATUS_OK and (
-                    not err or err.lower() in ("false", "none")
-                ):
+                ca = (resp.raw or {}).get("common|action") or {}
+                ca_err = str(ca.get("redirect_error") or ca.get("error") or err or "")
+                # status 0 or missing error = ok; game often returns 100 with empty err on success
+                ok = (
+                    (resp.status == STATUS_OK and ca_err.lower() in ("", "false", "none"))
+                    or (
+                        int(ca.get("status") or resp.status or 0) in (0, 100)
+                        and ca_err.lower() in ("", "false", "none")
+                    )
+                )
+                if ok and "неверн" not in ca_err.lower() and "нельзя" not in ca_err.lower():
                     dropped += 1
+                elif "неверн" in ca_err.lower() and cnt != 1:
+                    # retry single unit
+                    resp2 = await self._client.drop_artifact(iid, count=1)
+                    ca2 = (resp2.raw or {}).get("common|action") or {}
+                    err2 = str(ca2.get("redirect_error") or ca2.get("error") or "")
+                    if err2.lower() in ("", "false", "none"):
+                        dropped += 1
+                    else:
+                        logger.debug("DROP %s → %s", iid, err2[:80])
                 else:
-                    logger.debug("DROP %s → %s", iid, err[:80])
+                    logger.debug("DROP %s → %s", iid, ca_err[:80])
             except Exception as exc:
                 logger.debug("DROP %s failed: %s", iid, exc)
             await asyncio.sleep(random.uniform(0.2, 0.5))
