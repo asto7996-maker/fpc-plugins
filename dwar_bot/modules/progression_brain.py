@@ -642,8 +642,8 @@ class ProgressionBrain:
                     default_hunt_mob,
                     village_hunt_mob,
                 )
-                area = str(getattr(state, "area_id", "") or "")
-                if area in {"930", "931", "932"}:
+                area_id_str = str(getattr(state, "area_id", "") or "")
+                if area_id_str in {"930", "931", "932"}:
                     default_mob = village_hunt_mob(lvl)
                 else:
                     default_mob = default_hunt_mob(lvl)
@@ -908,7 +908,9 @@ class ProgressionBrain:
         focus: Optional[GameOption],
         in_battle: bool,
     ) -> str:
-        where = area.title or f"area {state.area_id}"
+        where = getattr(area, "title", None) or f"area {state.area_id}"
+        if not isinstance(where, str):
+            where = f"area {state.area_id}"
         base = f"{char.nick or '?'} Lv{char.level} @ {where} · HP {char.hp}/{char.hp_max}"
         if in_battle:
             return f"{base} · ⚔️ в бою"

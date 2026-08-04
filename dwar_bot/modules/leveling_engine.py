@@ -419,8 +419,8 @@ class LevelingEngine:
                 if flash_open and o.action == ActionType.QUEST_NPC:
                     npc = str((o.payload or {}).get("npc_id") or "")
                     if npc and blocked and npc in blocked:
-                        # Keep giver as periodic story-check (turn-in / next quest)
-                        o.score = min(max(float(o.score), 700.0), 900.0)
+                        # Story-check must beat gear(~940) and hunt(~520)
+                        o.score = min(max(float(o.score), 980.0), 1100.0)
                         o.detail = f"lv{level} story-check · {o.detail}"
                     else:
                         # Local story (Вождь / Военачальник) — keep competitive vs hunt
