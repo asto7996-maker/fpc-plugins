@@ -1015,15 +1015,21 @@ class DwarBot:
                 )
             handled = await self.pure_farm.run_tick(self)
             if handled:
+                # Never invent Exp from empty Cretas wins — that made
+                # Level-Up / telemetry show nonsense (±0 / negative Exp/h).
                 self.telemetry.note_economy(
                     gold=float(self._state.money or 0),
-                    exp_proxy=float(self.pure_farm.stats.wins) * 50.0,
+                    exp_proxy=0.0,
                     battles=self.combat.session.battles_joined,
                     wins=max(self.combat.session.wins, self.pure_farm.stats.wins),
                     potions_used=self.combat.session.potions_used,
                     quests_completed=self.quests.session.quests_completed,
                 )
-                await _sleep(1.0, 2.5)
+                # Zero-reward idle already slept; keep loop calm
+                if getattr(self.pure_farm.stats, "zero_reward", False):
+                    await _sleep(2.0, 5.0)
+                else:
+                    await _sleep(1.0, 2.5)
                 return
         elif farm.auto_quests and self._iteration <= 2:
             logger.info(
@@ -1467,18 +1473,40 @@ class DwarBot:
                 logger.debug("idle multitasking: %s", exc)
 
         # Periodic Telegram Level-Up Update (rich + telemetry rates)
+        # Skip when Flash-stalled village farm produces 0 Exp/Gold — spam only.
         if self.leveling.should_report() and self.settings.notify.level_up:
             try:
-                text = self.rich.format_level_up_rich(
-                    level=self.leveling.progress.level,
-                    exp_pct=self.leveling.progress.exp_pct,
-                    exp_per_hour=self.leveling.progress.exp_per_hour,
-                    eta_seconds=self.leveling.progress.eta_seconds,
-                    priority=self.leveling.progress.priority_title,
-                    directive_state=self.controller.directive_summary().get("state", ""),
+                wo = self.quests.pending_world_objective or {}
+                flash_stall = (
+                    str(wo.get("kind") or "") == "heal_wounded"
+                    and bool(wo.get("flash_only") or wo.get("farm_open"))
                 )
-                await self.notify(text, "level_up")
-                self.leveling.mark_reported()
+                zero_pf = bool(getattr(self.pure_farm.stats, "zero_reward", False))
+                eph = float(self.leveling.progress.exp_per_hour or 0)
+                rates = self.telemetry.rates() if self.telemetry else {}
+                tel_eph = float((rates or {}).get("exp_per_hour") or 0)
+                gph = float((rates or {}).get("gold_per_hour") or 0)
+                if (flash_stall or zero_pf) and eph <= 0.5 and gph <= 0.01:
+                    # Mark reported so we don't retry every tick; quiet for interval
+                    self.leveling.mark_reported()
+                    logger.info(
+                        "Skip Level-Up TG: flash/0-reward stall "
+                        "(eph=%.0f tel=%.0f gph=%.2f).",
+                        eph, tel_eph, gph,
+                    )
+                else:
+                    text = self.rich.format_level_up_rich(
+                        level=self.leveling.progress.level,
+                        exp_pct=self.leveling.progress.exp_pct,
+                        exp_per_hour=self.leveling.progress.exp_per_hour,
+                        eta_seconds=self.leveling.progress.eta_seconds,
+                        priority=self.leveling.progress.priority_title,
+                        directive_state=self.controller.directive_summary().get(
+                            "state", ""
+                        ),
+                    )
+                    await self.notify(text, "level_up")
+                    self.leveling.mark_reported()
             except Exception as exc:
                 logger.debug("level-up update: %s", exc)
 

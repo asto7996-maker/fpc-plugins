@@ -681,7 +681,10 @@ class DwarGameClient:
                 if attempt == MAX_RETRIES:
                     raise
                 wait = DELAY_RETRY.min * (2 ** (attempt - 1))
-                logger.warning(
+                # Keepalive/dummy blips are routine — don't flood TG with WARNING
+                is_dummy = "action=dummy" in str(path)
+                log_fn = logger.debug if is_dummy else logger.warning
+                log_fn(
                     "%s %s failed (%s), retry %d in %.1fs",
                     method, path, exc, attempt, wait,
                 )

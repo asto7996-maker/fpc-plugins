@@ -1010,7 +1010,8 @@ class QuestTracker:
                     wo["http_impossible"] = True
                     self.pending_world_objective = wo
                     self._persist_world_objective()
-                    logger.warning(
+                    # INFO only — TG WARNING spam was flooding the user
+                    logger.info(
                         "heal_wounded STALLED 15min — hunt/PureFarm until "
                         "client click on wounded or next story-check."
                     )

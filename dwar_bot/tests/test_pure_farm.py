@@ -55,6 +55,38 @@ def test_telegram_stats_show_wins():
     assert "10" in html
 
 
+def test_zero_reward_detection_and_message():
+    s = PureFarmStats(
+        wins=10, money_at_start=158.13, money_now=158.13,
+        level_at_start=3, level_now=3,
+    )
+    assert s.is_zero_reward() is True
+    html = s.telegram_html()
+    assert "остановлена" in html or "0 exp" in html.lower()
+    # Real gold progress — not zero-reward
+    s2 = PureFarmStats(
+        wins=20, money_at_start=100, money_now=120,
+        level_at_start=3, level_now=3,
+    )
+    assert s2.is_zero_reward() is False
+
+
+def test_pure_farm_idles_on_zero_reward():
+    src = (ROOT / "modules" / "pure_farm.py").read_text(encoding="utf-8")
+    assert "_zero_reward_idle" in src
+    assert "ZERO_REWARD_WINS" in src
+    assert "Охота остановлена" in src
+    assert "flash_locked_village" in src
+    assert "Skip Cretas" in src or "Don't grind" in src or "0-exp" in src
+
+
+def test_main_skips_fake_exp_proxy_and_levelup_spam():
+    src = (ROOT / "main.py").read_text(encoding="utf-8")
+    assert "wins) * 50" not in src
+    assert "Skip Level-Up TG" in src
+    assert "exp_proxy=0.0" in src
+
+
 def test_main_wires_story_first():
     src = (ROOT / "main.py").read_text(encoding="utf-8")
     assert "PureFarmEngine" in src

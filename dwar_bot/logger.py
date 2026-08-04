@@ -96,6 +96,8 @@ class _TelegramHandler(logging.Handler):
             "world objective restored kind=heal_wounded",
             "heal_wounded: http use rejected",
             "heal_wounded: flash-only",
+            "heal_wounded stalled",
+            "stalled 15min",
             "не задано действие",
             "hp at 0%",
             "wait regen / finish fight",
@@ -104,6 +106,9 @@ class _TelegramHandler(logging.Handler):
             "autohealer start reason=stagnation",
             "autohealer fail",
             "local recover for stagnation",
+            "action=dummy",
+            "failed (",
+            "retry ",
         )
         if not any(fp in low for fp in fingerprints):
             return False

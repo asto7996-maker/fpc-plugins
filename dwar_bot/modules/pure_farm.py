@@ -4,13 +4,13 @@ PureFarmEngine — hunt-only filler loop.
 Ignores Flash side-quests (heal_wounded) and Level-Up planner spam.
 One job: hunt free map bots, finish fights over WS, report real wins.
 
-Story/quests own the tick when ``auto_quests`` is on. PureFarm runs only
-as a filler when quests are disabled (or ``PURE_FARM_ONLY=1``), and/or
-when ``should_run`` says the area is a farm-only village grind.
+When village fights yield 0 gold/level for several wins, stop hunting and
+idle quietly (bag opens + rare story-check) instead of spamming TG.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from dataclasses import dataclass, field
@@ -19,6 +19,13 @@ from typing import Any, Optional
 logger = logging.getLogger(__name__)
 
 VILLAGE_AREAS = frozenset({"930", "931", "932"})
+
+# After this many wins with no gold/level change — stop Cretas grind.
+ZERO_REWARD_WINS = 8
+# How often to re-try bag opens / exit / story while idling (seconds).
+ZERO_REWARD_IDLE_SEC = 120.0
+# TG reminder about Flash heal while idling (once per this window).
+ZERO_REWARD_TG_SEC = 3600.0
 
 
 @dataclass
@@ -34,11 +41,29 @@ class PureFarmStats:
     level_at_start: int = 0
     level_now: int = 0
     notified_wins: int = 0
+    zero_reward: bool = False
+    zero_reward_notified: bool = False
+    last_zero_tg_at: float = 0.0
+
+    @property
+    def gold_delta(self) -> float:
+        return float(self.money_now) - float(self.money_at_start)
+
+    @property
+    def leveled(self) -> bool:
+        return int(self.level_now) > int(self.level_at_start)
+
+    def is_zero_reward(self) -> bool:
+        return (
+            self.wins >= ZERO_REWARD_WINS
+            and abs(self.gold_delta) < 0.01
+            and not self.leveled
+        )
 
     def telegram_html(self) -> str:
         elapsed = max(1.0, time.time() - self.started_at)
         wph = self.wins / elapsed * 3600.0
-        gold_delta = self.money_now - self.money_at_start
+        gold_delta = self.gold_delta
         lines = [
             "⚔️ <b>Pure Farm</b>",
             f"• Побед: <b>{self.wins}</b> · поражений: {self.losses} · skip: {self.skips}",
@@ -48,10 +73,12 @@ class PureFarmStats:
             f"• Золото: {self.money_at_start:.2f} → <b>{self.money_now:.2f}</b> "
             f"({gold_delta:+.2f})",
         ]
-        if self.wins >= 10 and abs(gold_delta) < 0.01 and self.level_now <= self.level_at_start:
+        if self.zero_reward or self.is_zero_reward():
             lines.append(
-                "• ⚠️ Победы без золота/уровня — деревенские Крэтс дают 0 exp; "
-                "открываем наборы/пленённых, нужен клик по раненым для выхода."
+                "• ⏸ Охота остановлена: деревенские Крэтс дают 0 exp/золота.\n"
+                "  Откройте клиент → клик по <b>раненым ополченцам</b> "
+                "(излечение) → приказ Военачальника на выход.\n"
+                "  Бот ждёт и периодически проверяет сумку/Торгора."
             )
         return "\n".join(lines)
 
@@ -64,13 +91,14 @@ class PureFarmEngine:
     (hunt → fight → report) and returns True so the legacy planner is skipped.
     """
 
-    REPORT_EVERY_WINS = 5
+    REPORT_EVERY_WINS = 10  # only when gold/level actually moves
 
     def __init__(self) -> None:
         self.stats = PureFarmStats()
         self._armed = False
         self._cleared_wo = False
         self._last_report_at = 0.0
+        self._last_idle_work_at = 0.0
 
     def should_run(
         self,
@@ -104,6 +132,9 @@ class PureFarmEngine:
         if self._armed:
             self.stats.level_now = level
             self.stats.money_now = money
+            if self.stats.leveled or abs(self.stats.gold_delta) >= 0.01:
+                # Real progress resumed — allow hunting again
+                self.stats.zero_reward = False
             return
         self._armed = True
         self.stats = PureFarmStats(
@@ -135,7 +166,6 @@ class PureFarmEngine:
             wo.get("flash_only") or wo.get("http_impossible") or wo.get("farm_open")
         ):
             try:
-                # Ensure stall so planner won't spin empty story-checks mid-hunt
                 import time as _time
                 wo = dict(wo)
                 if float(wo.get("stalled_until") or 0) < _time.time():
@@ -152,6 +182,79 @@ class PureFarmEngine:
             except Exception as exc:
                 logger.debug("PureFarm stall WO: %s", exc)
         self._cleared_wo = True
+
+    async def _notify_zero_reward_once(self, bot: Any, *, force: bool = False) -> None:
+        now = time.time()
+        if self.stats.zero_reward_notified and not force:
+            if now - float(self.stats.last_zero_tg_at or 0) < ZERO_REWARD_TG_SEC:
+                return
+        self.stats.zero_reward_notified = True
+        self.stats.last_zero_tg_at = now
+        try:
+            if bot.settings.notify.battles or bot.settings.notify.level_up:
+                await bot.notify(self.stats.telegram_html(), "battles")
+        except Exception as exc:
+            logger.debug("PureFarm zero-reward notify: %s", exc)
+
+    async def _zero_reward_idle(self, bot: Any, *, area: str) -> bool:
+        """Idle instead of farming 0-exp Cretas; rare bag/story/exit probes."""
+        self.stats.zero_reward = True
+        await self._notify_zero_reward_once(bot)
+
+        now = time.time()
+        if now - self._last_idle_work_at >= ZERO_REWARD_IDLE_SEC:
+            self._last_idle_work_at = now
+            try:
+                n_bag = await bot.combat.open_bag_actions(max_actions=3)
+                if n_bag:
+                    logger.info("PureFarm idle: bag actions=%d", n_bag)
+                    await bot.combat.free_backpack(target_free=3, max_drops=15)
+                    await bot.combat.equip_from_bag(max_items=4)
+            except Exception as exc:
+                logger.debug("PureFarm idle bag: %s", exc)
+
+            # Probe exit — if war-chief unlocked, leave village
+            try:
+                tr = await bot._client.go_area("192")
+                ca = (tr.raw or {}).get("common|action") or {}
+                err = str(ca.get("redirect_error") or ca.get("error") or "")
+                if not err or "не задано" in err.lower():
+                    st = await bot._client.get_state()
+                    if str(st.area_id) not in VILLAGE_AREAS:
+                        logger.info(
+                            "PureFarm: left village → area=%s — resume normal farm.",
+                            st.area_id,
+                        )
+                        self.stats.zero_reward = False
+                        self.stats.money_at_start = float(st.money or 0)
+                        self.stats.level_at_start = int(st.level or 0)
+                        bot._state = st
+                        return True
+                else:
+                    logger.debug("PureFarm idle exit probe: %s", err[:100])
+            except Exception as exc:
+                logger.debug("PureFarm idle exit: %s", exc)
+
+            # Soft story-check Торгор if stall expired
+            try:
+                wo = bot.quests.pending_world_objective or {}
+                stalled_until = float(wo.get("stalled_until") or 0)
+                if stalled_until and stalled_until <= time.time():
+                    n = await bot.quests._story_check_flash_heal_npc(
+                        "409", link_id="2960", f_id="4", area_id=area or "932"
+                    )
+                    if n:
+                        self.stats.zero_reward = False
+                        logger.info("PureFarm idle: story advanced (%d steps).", n)
+            except Exception as exc:
+                logger.debug("PureFarm idle story: %s", exc)
+
+        logger.info(
+            "PureFarm idle (0-reward village): wins=%d gold=%.2f — waiting Flash heal.",
+            self.stats.wins, self.stats.money_now,
+        )
+        await asyncio.sleep(45.0)
+        return True
 
     async def run_tick(self, bot: Any) -> bool:
         """
@@ -170,8 +273,6 @@ class PureFarmEngine:
         self.arm(level=level, money=money)
         self.clear_flash_quest(bot.quests)
 
-        # Keep open-farm push, but do not wipe quest/story pins — those are
-        # owned by the planner when auto_quests is on.
         try:
             bot.brain.push_farm(300.0)
         except Exception:
@@ -192,7 +293,6 @@ class PureFarmEngine:
                         max_wait=120,
                     )
                 except Exception:
-                    import asyncio
                     await asyncio.sleep(20)
             return True
 
@@ -203,7 +303,6 @@ class PureFarmEngine:
             return True
 
         # Real progress: open kits/chests/captives BEFORE empty Cretas grind.
-        # Wrong action_id used to make this a no-op («Не задано действие!»).
         try:
             n_bag = await bot.combat.open_bag_actions(max_actions=5)
             if n_bag:
@@ -216,24 +315,41 @@ class PureFarmEngine:
                     await bot.combat.equip_from_bag(max_items=6)
                 except Exception:
                     pass
-                # Re-check money/level after loot
                 try:
                     bot._state = await bot._client.get_state()
                     self.stats.money_now = float(bot._state.money or self.stats.money_now)
                     self.stats.level_now = int(bot._state.level or self.stats.level_now)
+                    if self.stats.leveled or abs(self.stats.gold_delta) >= 0.01:
+                        self.stats.zero_reward = False
                 except Exception:
                     pass
                 return True
         except Exception as exc:
             logger.debug("PureFarm bag actions: %s", exc)
 
-        # Overweight bag blocks travel / some actions
         try:
             await bot.combat.free_backpack(target_free=2, max_drops=15)
         except Exception:
             pass
 
-        # Village: always Крэтс; elsewhere empty needle → SUIS priority / any free
+        # Village + Flash heal lock: Cretas are known 0-exp. Don't grind them.
+        wo = getattr(bot.quests, "pending_world_objective", None) or {}
+        flash_locked_village = (
+            area in VILLAGE_AREAS
+            and str(wo.get("kind") or "") == "heal_wounded"
+            and bool(wo.get("flash_only") or wo.get("http_impossible") or wo.get("farm_open"))
+        )
+        if flash_locked_village:
+            # Skip Cretas entirely while exit is Flash-gated
+            self.stats.zero_reward = True
+            return await self._zero_reward_idle(bot, area=area)
+
+        # Also stop after enough empty wins even without flash WO
+        if area in VILLAGE_AREAS and (
+            self.stats.zero_reward or self.stats.is_zero_reward()
+        ):
+            return await self._zero_reward_idle(bot, area=area)
+
         mob = ""
         if area in VILLAGE_AREAS:
             mob = "Крэтс"
@@ -251,11 +367,18 @@ class PureFarmEngine:
         )
         await self._note_result(bot, result, mob=mob or "any")
 
-        # Periodic TG report so user sees REAL results (wins), not fake Exp%
+        # Enter idle immediately when threshold hit this tick
+        if area in VILLAGE_AREAS and self.stats.is_zero_reward():
+            self.stats.zero_reward = True
+            await self._notify_zero_reward_once(bot)
+            return True
+
+        # TG only when economy actually moves (no spam of 0-gold win counters)
         if (
             self.stats.wins > 0
             and self.stats.wins % self.REPORT_EVERY_WINS == 0
             and self.stats.wins != self.stats.notified_wins
+            and (abs(self.stats.gold_delta) >= 0.01 or self.stats.leveled)
         ):
             self.stats.notified_wins = self.stats.wins
             try:
@@ -282,15 +405,18 @@ class PureFarmEngine:
                 self.stats.money_now = float(bot._state.money or self.stats.money_now)
             except Exception:
                 pass
-            # Keep open-farm push alive
             try:
                 bot.brain.push_farm(300.0)
                 bot.quests.clear_exhausted(local_only=True)
             except Exception:
                 pass
             logger.info(
-                "PureFarm WIN #%d «%s» Lv%d gold=%.2f",
-                self.stats.wins, mob, self.stats.level_now, self.stats.money_now,
+                "PureFarm WIN #%d «%s» Lv%d gold=%.2f%s",
+                self.stats.wins,
+                mob,
+                self.stats.level_now,
+                self.stats.money_now,
+                " [0-reward]" if self.stats.is_zero_reward() else "",
             )
         elif result == BattleResult.LOSE:
             self.stats.losses += 1
@@ -303,12 +429,10 @@ class PureFarmEngine:
             except Exception:
                 rem = 0.0
             if rem > 1:
-                import asyncio
                 wait = min(rem, 60.0)
                 logger.info("PureFarm hygiene wait %.0fs", wait)
                 await asyncio.sleep(wait)
             else:
-                import asyncio
                 await asyncio.sleep(8)
         else:
             logger.info("PureFarm result=%s «%s»", name, mob)
