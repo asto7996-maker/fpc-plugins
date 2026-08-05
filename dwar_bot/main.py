@@ -950,6 +950,21 @@ class DwarBot:
         pure_farm_force = os.getenv("PURE_FARM_ONLY", "0").strip().lower() in (
             "1", "true", "yes", "on",
         )
+        # Post-village open farm: area 227 spiders etc. give real gold;
+        # flavor NPCs must not block hunting after heal/arsenal unlock.
+        try:
+            area_now = str(self._state.area_id or "")
+            wo_empty = not bool(self.quests.pending_world_objective)
+        except Exception:
+            area_now, wo_empty = "", True
+        post_village_open_farm = (
+            area_now in {"192", "227", "226", "159"}
+            and wo_empty
+            and int(self._char.level or 1) >= 3
+            and bool(farm.max_farm and farm.auto_combat and farm.farm_area)
+        )
+        if post_village_open_farm:
+            pure_farm_force = True
         wo_early = {}
         try:
             wo_early = dict(self.quests.pending_world_objective or {})
@@ -993,7 +1008,11 @@ class DwarBot:
             reason = (
                 "Flash heal stalled — hunt for real wins"
                 if story_stalled
-                else ("hunt-only force" if pure_farm_force else "hunt-only filler")
+                else (
+                    "post-village open farm"
+                    if post_village_open_farm
+                    else ("hunt-only force" if pure_farm_force else "hunt-only filler")
+                )
             )
             try:
                 await self.controller.apply_directive(

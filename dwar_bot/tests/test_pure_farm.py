@@ -75,9 +75,21 @@ def test_pure_farm_idles_on_zero_reward():
     src = (ROOT / "modules" / "pure_farm.py").read_text(encoding="utf-8")
     assert "_zero_reward_idle" in src
     assert "ZERO_REWARD_WINS" in src
-    assert "Охота остановлена" in src
+    assert "остановлена" in src
     assert "flash_locked_village" in src
     assert "Skip Cretas" in src or "Don't grind" in src or "0-exp" in src
+    assert "_try_leave_village_now" in src
+    assert "POST_VILLAGE_FARM_AREAS" in src
+
+
+def test_heal_turnin_not_flash_locked():
+    from dwar_bot.modules.quest_tracker import QuestTracker
+
+    qt = QuestTracker.__new__(QuestTracker)
+    assert qt._is_heal_wounded_point("Излечение ополченцев", "дайте снадобье раненым")
+    assert not qt._is_heal_wounded_point(
+        "Лекарство доставлено раненым!", "спасибо за старание"
+    )
 
 
 def test_main_skips_fake_exp_proxy_and_levelup_spam():

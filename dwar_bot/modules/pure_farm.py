@@ -19,6 +19,8 @@ from typing import Any, Optional
 logger = logging.getLogger(__name__)
 
 VILLAGE_AREAS = frozenset({"930", "931", "932"})
+# Post-village farm fronts with real gold (Lv2–3 spiders / Zigred zones).
+POST_VILLAGE_FARM_AREAS = ("227", "226", "159", "192")
 
 # After this many wins with no gold/level change — stop Cretas grind.
 ZERO_REWARD_WINS = 8
@@ -75,10 +77,9 @@ class PureFarmStats:
         ]
         if self.zero_reward or self.is_zero_reward():
             lines.append(
-                "• ⏸ Охота остановлена: деревенские Крэтс дают 0 exp/золота.\n"
-                "  Откройте клиент → клик по <b>раненым ополченцам</b> "
-                "(излечение) → приказ Военачальника на выход.\n"
-                "  Бот ждёт и периодически проверяет сумку/Торгора."
+                "• ⏸ Охота в деревне остановлена (Крэтс = 0 exp).\n"
+                "  Нужен выход в Дымные сопки / ущелье (пауки, Зигред).\n"
+                "  Бот проверяет Торгора, крафт копий и переход."
             )
         return "\n".join(lines)
 
@@ -195,6 +196,50 @@ class PureFarmEngine:
                 await bot.notify(self.stats.telegram_html(), "battles")
         except Exception as exc:
             logger.debug("PureFarm zero-reward notify: %s", exc)
+
+    async def _try_leave_village_now(self, bot: Any, *, area: str) -> bool:
+        """Leave 932/930/931 for Дымные сопки (192) when war-chief unlocked."""
+        try:
+            # Prefer mapped exit from area info
+            info = await bot._client.get_area_info()
+            for item in info.items or []:
+                if str(getattr(item, "code", "") or "") != "COME_IN":
+                    continue
+                dest = str(getattr(item, "area_id", "") or "")
+                low = str(getattr(item, "name", "") or "").lower()
+                if dest not in {"192", "191", "100"} and "сопк" not in low and "дымн" not in low:
+                    continue
+                tr = await bot._client.go_area(dest)
+                err = str(tr.redirect_error or tr.error or "")
+                st = await bot._client.get_state()
+                if str(st.area_id) not in VILLAGE_AREAS:
+                    logger.info(
+                        "PureFarm: left village %s → %s (%s)",
+                        area, st.area_id, getattr(item, "name", dest),
+                    )
+                    self.stats.zero_reward = False
+                    self.stats.money_at_start = float(st.money or 0)
+                    self.stats.level_at_start = int(st.level or 0)
+                    bot._state = st
+                    return True
+                if err:
+                    logger.debug("PureFarm leave %s: %s", dest, err[:100])
+            # Hard probe 192
+            tr = await bot._client.go_area("192")
+            st = await bot._client.get_state()
+            if str(st.area_id) not in VILLAGE_AREAS:
+                logger.info("PureFarm: left village → area=%s", st.area_id)
+                self.stats.zero_reward = False
+                self.stats.money_at_start = float(st.money or 0)
+                self.stats.level_at_start = int(st.level or 0)
+                bot._state = st
+                return True
+            err = str(tr.redirect_error or tr.error or "")
+            if err:
+                logger.debug("PureFarm leave probe: %s", err[:100])
+        except Exception as exc:
+            logger.debug("PureFarm leave village: %s", exc)
+        return False
 
     async def _zero_reward_idle(self, bot: Any, *, area: str) -> bool:
         """Idle instead of farming 0-exp Cretas; rare bag/story/exit probes."""
@@ -344,6 +389,32 @@ class PureFarmEngine:
             self.stats.zero_reward = True
             return await self._zero_reward_idle(bot, area=area)
 
+        # Post-heal / no WO: leave newbie village — Cretas here stay 0-reward.
+        if area in VILLAGE_AREAS and not wo:
+            left = await self._try_leave_village_now(bot, area=area)
+            if left:
+                return True
+            # Still stuck: story NPC then idle (never grind Cretas)
+            try:
+                area_info = await bot._client.get_area_info()
+                for item in area_info.items or []:
+                    if str(getattr(item, "npc_id", "") or "") in {"409", "113", "112"}:
+                        href = getattr(item, "href", "") or ""
+                        steps = await bot.quests.walk_npc_api(
+                            str(item.npc_id),
+                            link_id=str(getattr(item, "link_id", "0") or "0"),
+                            f_id=str(getattr(item, "f_id", "0") or "0"),
+                            area_id=area,
+                            href=href,
+                            max_steps=12,
+                        )
+                        if steps:
+                            logger.info("PureFarm village story steps=%d", steps)
+                            return True
+            except Exception as exc:
+                logger.debug("PureFarm village story: %s", exc)
+            return await self._zero_reward_idle(bot, area=area)
+
         # Also stop after enough empty wins even without flash WO
         if area in VILLAGE_AREAS and (
             self.stats.zero_reward or self.stats.is_zero_reward()
@@ -354,7 +425,49 @@ class PureFarmEngine:
         if area in VILLAGE_AREAS:
             mob = "Крэтс"
         else:
-            mob = str(getattr(bot.combat, "_last_map_hunt_name", "") or "")
+            # Prefer SUIS level pin (Зигред-воин at Lv3+) over leftover Cretas
+            try:
+                from dwar_bot.modules.suis_knowledge import default_hunt_mob
+                mob = default_hunt_mob(level)
+                if mob.lower() == "крэтс" and level >= 3:
+                    mob = "Зигред"
+            except Exception:
+                mob = str(getattr(bot.combat, "_last_map_hunt_name", "") or "")
+                if level >= 3 and (not mob or "рэтс" in mob.lower()):
+                    mob = "Зигред"
+
+        # Area 192 often still spawns only 0-reward Cretas — rotate to ущелье.
+        if area == "192" and level >= 3:
+            try:
+                bots = await bot._client.get_hunt_bots("192")
+                names = {str(b.get("name") or "").lower() for b in bots}
+                only_cretas = bool(names) and all("рэтс" in n for n in names)
+                if only_cretas or not names:
+                    for dest in POST_VILLAGE_FARM_AREAS:
+                        if dest == "192":
+                            continue
+                        tr = await bot._client.go_area(dest)
+                        st = await bot._client.get_state()
+                        if str(st.area_id) == dest:
+                            logger.info(
+                                "PureFarm: 192 Cretas-only → farm area %s", dest,
+                            )
+                            bot._state = st
+                            area = dest
+                            if "зигред" not in (mob or "").lower():
+                                mob = "Огненный паук" if dest == "227" else mob
+                            break
+                        err = str(tr.redirect_error or tr.error or "")
+                        if err:
+                            logger.debug("PureFarm travel %s: %s", dest, err[:80])
+            except Exception as exc:
+                logger.debug("PureFarm post-village travel: %s", exc)
+
+        # Area 227: fire spiders pay gold; avoid Cretas-вожак fallback spam.
+        if area == "227":
+            mob = "Огненный паук"
+        elif area in {"226", "159"} and (not mob or "рэтс" in mob.lower()):
+            mob = "Зигред"
 
         logger.info(
             "PureFarm tick#%d: hunt '%s' area=%s HP=%.0f%% wins=%d",

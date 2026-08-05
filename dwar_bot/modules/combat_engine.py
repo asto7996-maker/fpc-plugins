@@ -420,10 +420,12 @@ class CombatEngine:
         prefer = {
             "10378", "10379", "17972", "46176", "46177", "46314",  # leather / sword / rings
             "3908", "3909", "3910", "3911",
+            "33369", "17993",  # newbie backpack / torba — expands capacity
         }
         wear_kw = (
             "меч", "понож", "куртк", "кольц", "амулет", "щит", "шлем",
             "доспех", "перчат", "сапог", "пояс", "наруч",
+            "рюкзак", "торб",
         )
         ranked: list[tuple[int, dict]] = []
         for a in arts:
@@ -472,6 +474,7 @@ class CombatEngine:
         "прикоснуться",
         "использовать",
         "съесть",
+        "собрать",  # quest craft: копьё ополченца from parts
     )
     _BAG_OPEN_ITEM_KEYWORDS = (
         "набор",
@@ -483,6 +486,10 @@ class CombatEngine:
         "крэтс",
         "душ",
         "яблок",
+        "древко",
+        "наконечник",
+        "бичев",
+        "коп",
     )
     _BAG_SKIP_CODES = frozenset({"PUT_ON", "PUT_OFF", "NPC"})
 
@@ -593,7 +600,12 @@ class CombatEngine:
         "3908", "3909", "3910", "3911",  # starter leather / club / shield
         "18012",  # apple
         "12913", "12914", "12915", "12916", "12917", "12918",  # essays
-        "1012",  # empty summon amulets
+        "1012", "1013",  # empty / summon amulets
+        "17990", "17991", "17992",  # broken luck tokens
+        "110",  # guidebook
+        "7166",  # toy wand
+        "19089",  # decorative pet
+        "25658",  # merchant mark
     }
     _KEEP_ARTIKULS = {
         "18209", "18208",  # quest medicine / lava
@@ -709,17 +721,34 @@ class CombatEngine:
                 )
                 if ok and "неверн" not in ca_err.lower() and "нельзя" not in ca_err.lower():
                     dropped += 1
-                elif "неверн" in ca_err.lower() and cnt != 1:
-                    # retry single unit
-                    resp2 = await self._client.drop_artifact(iid, count=1)
-                    ca2 = (resp2.raw or {}).get("common|action") or {}
-                    err2 = str(ca2.get("redirect_error") or ca2.get("error") or "")
-                    if err2.lower() in ("", "false", "none"):
-                        dropped += 1
-                    else:
-                        logger.debug("DROP %s → %s", iid, err2[:80])
                 else:
-                    logger.debug("DROP %s → %s", iid, ca_err[:80])
+                    # common|DROP often rejects essay stacks — action_run DROP/DESTROY works
+                    freed = False
+                    for act in ("DROP", "DESTROY"):
+                        try:
+                            r2 = await self._client.run_artifact_action(
+                                iid, act, confirmed=True,
+                            )
+                            loc = str(
+                                ((r2.raw or {}).get("action_run") or {}).get("location")
+                                or ""
+                            )
+                            if ((r2.raw or {}).get("action_run") or {}).get("ok") or (
+                                "success=1" in loc
+                            ):
+                                if loc:
+                                    path = loc if loc.startswith("/") else "/" + loc
+                                    try:
+                                        await self._client._get(path)
+                                    except Exception:
+                                        pass
+                                dropped += 1
+                                freed = True
+                                break
+                        except Exception as exc:
+                            logger.debug("action_run %s %s: %s", act, iid, exc)
+                    if not freed:
+                        logger.debug("DROP %s → %s", iid, ca_err[:80])
             except Exception as exc:
                 logger.debug("DROP %s failed: %s", iid, exc)
             await asyncio.sleep(random.uniform(0.2, 0.5))

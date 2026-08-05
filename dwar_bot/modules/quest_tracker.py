@@ -965,6 +965,20 @@ class QuestTracker:
 
     def _is_heal_wounded_point(self, title: str = "", desc: str = "") -> bool:
         blob = f"{title} {desc}".lower()
+        # Turn-in / completion must be walked (HTML award), not Flash-stalled.
+        if any(
+            k in blob
+            for k in (
+                "доставлен",
+                "спасибо",
+                "встанут в строй",
+                "целитель",
+                "копья готов",
+                "приняв",
+                "благодарю",
+            )
+        ):
+            return False
         return any(
             k in blob
             for k in ("излечен", "ранен", "снадоб", "ополчен", "поле боя")
@@ -995,6 +1009,42 @@ class QuestTracker:
             other.append(p)
 
         if not other:
+            # Heal turn-in (award claim) still looks like «ранен» — walk HTML anyway.
+            turn_in = []
+            for p in points:
+                title = str(p.get("title") or "")
+                low = title.lower()
+                if any(
+                    k in low
+                    for k in ("доставлен", "готов", "спасибо", "приняв", "благодар")
+                ):
+                    turn_in.append(p)
+            if turn_in:
+                logger.info(
+                    "NPC %s: heal turn-in ready — HTML walk (%s).",
+                    npc_id,
+                    ", ".join(str(p.get("title") or p.get("id"))[:40] for p in turn_in[:3]),
+                )
+                try:
+                    html_steps, last_redir = await self._client.walk_npc_html(
+                        npc_id,
+                        global_npc=global_npc,
+                        link_id=link_id,
+                        f_id=f_id,
+                        href=href,
+                        max_steps=10,
+                    )
+                except Exception as exc:
+                    logger.debug("heal turn-in walk_html: %s", exc)
+                    html_steps, last_redir = 0, ""
+                if html_steps:
+                    self.clear_world_objective("heal_turn_in_complete")
+                    self.session.dialogues_handled += html_steps
+                    logger.info(
+                        "Heal turn-in HTML NPC %s: %d шаг(ов), last=%s",
+                        npc_id, html_steps, (last_redir or "")[:80],
+                    )
+                    return html_steps
             logger.info(
                 "NPC %s: story check — только Flash «излечение», жду клик/приказ.",
                 npc_id,
