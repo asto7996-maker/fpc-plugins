@@ -409,7 +409,15 @@ class CombatEngine:
 
         Newbie village often shows 0 inventory items while bag has leather /
         sword / rings — put them on so story fights are less empty-handed.
+
+        Skips items already in a slot and rate-limits repeats so MaxFarm
+        side ticks do not re-equip the same bag copies every minute.
         """
+        now = time.time()
+        # Avoid thrashing: re-equip at most every 10 minutes unless forced fresh.
+        last = float(getattr(self, "_last_equip_from_bag_at", 0) or 0)
+        if last and (now - last) < 600.0:
+            return 0
         try:
             bag = await self._client.get_bag()
         except Exception as exc:
@@ -427,6 +435,12 @@ class CombatEngine:
             "доспех", "перчат", "сапог", "пояс", "наруч",
             "рюкзак", "торб",
         )
+        # Artikuls already worn (slot_id set) — do not PUT_ON bag duplicates.
+        worn_artikuls = {
+            str(a.get("artikul_id") or "")
+            for a in arts
+            if isinstance(a, dict) and str(a.get("slot_id") or "").strip()
+        }
         ranked: list[tuple[int, dict]] = []
         for a in arts:
             if not isinstance(a, dict):
@@ -436,18 +450,39 @@ class CombatEngine:
             iid = str(a.get("id") or "")
             if not iid:
                 continue
-            # Skip quest medicine / consumables / chests
+            # Already equipped in a body/effect slot
+            if str(a.get("slot_id") or "").strip():
+                continue
+            if aid and aid in worn_artikuls:
+                continue
+            # Skip quest medicine / consumables / chests / summon junk
             if aid in self._KEEP_ARTIKULS:
                 continue
             tl = title.lower()
-            if any(k in tl for k in ("снадоб", "эликсир", "яблок", "сундук", "набор", "свиток", "очерк", "сфера", "знамя", "оберег")):
+            if any(
+                k in tl
+                for k in (
+                    "снадоб", "эликсир", "яблок", "сундук", "набор", "свиток",
+                    "очерк", "сфера", "знамя", "оберег", "вызова", "пхадд",
+                )
+            ):
                 continue
+            # Prefer items that expose PUT_ON in bag actions
+            acts = a.get("artifact_actions") or {}
+            has_put_on = False
+            if isinstance(acts, dict):
+                for meta in acts.values():
+                    if isinstance(meta, dict) and str(meta.get("code") or "") == CODE_PUT_ON:
+                        has_put_on = True
+                        break
             score = 0
             if aid in prefer:
                 score += 100
             if any(k in tl for k in wear_kw):
                 score += 50
-            if score <= 0:
+            if has_put_on:
+                score += 30
+            if score < 50:
                 continue
             ranked.append((score, a))
         ranked.sort(key=lambda x: -x[0])
@@ -461,6 +496,7 @@ class CombatEngine:
             if await self.equip_item(art):
                 equipped += 1
             await asyncio.sleep(random.uniform(0.3, 0.8))
+        self._last_equip_from_bag_at = now
         if equipped:
             logger.info("equip_from_bag: надето %d предмет(ов) из сумки.", equipped)
         return equipped
@@ -497,18 +533,36 @@ class CombatEngine:
         "очерк",
         "торб",
     )
-    _BAG_SKIP_CODES = frozenset({"PUT_ON", "PUT_OFF", "NPC"})
+    # High-value opens that may warrant delaying a hunt once (not food).
+    _BAG_PRIORITY_KEYWORDS = (
+        "набор", "сундук", "шкатул", "пленен", "поручен", "душ",
+        "древко", "наконечник", "бичев", "коп", "торб",
+    )
+    _BAG_SKIP_CODES = frozenset({"PUT_ON", "PUT_OFF", "NPC", "BONUS", "ADD_HP", "ADD_HP_MP"})
+    _BAG_SKIP_ACTION_KW = (
+        "взлом", "взломать", "подарить", "съесть", "яблок",
+    )
 
-    async def open_bag_actions(self, *, max_actions: int = 6) -> int:
+    async def open_bag_actions(
+        self,
+        *,
+        max_actions: int = 6,
+        include_food: bool = False,
+    ) -> int:
         """
         Open kits/chests and finish captives via ``action_run.php``.
 
         Uses ``artifact_actions[].id`` (not the dict key). Wrong id yields
         «Не задано действие!» and was why village loot never progressed.
         Returns number of successful actions.
+
+        By default skips food (apples) and lockpick — those hung MaxFarm
+        in a bag loop and starved hunts.
         """
         if await self.is_in_battle():
             return 0
+        if not hasattr(self, "_bag_action_blacklist"):
+            self._bag_action_blacklist: set[str] = set()
         try:
             bag = await self._client.get_bag()
         except Exception as exc:
@@ -528,13 +582,22 @@ class CombatEngine:
                 if not isinstance(meta, dict):
                     continue
                 code = str(meta.get("code") or "")
-                if code in self._BAG_SKIP_CODES:
+                if code in self._BAG_SKIP_CODES and not (
+                    include_food and code in {"ADD_HP", "ADD_HP_MP"}
+                ):
                     continue
                 real_id = self._client.bag_action_real_id(meta)
                 if not real_id:
                     continue
+                bl_key = f"{art_id}:{real_id}"
+                if bl_key in self._bag_action_blacklist:
+                    continue
                 atitle = str(meta.get("title") or "")
                 blob = f"{art_title} {atitle}".lower()
+                if any(k in blob for k in self._BAG_SKIP_ACTION_KW) and not (
+                    include_food and ("яблок" in blob or "съесть" in blob)
+                ):
+                    continue
                 if not any(k in blob for k in self._BAG_OPEN_ITEM_KEYWORDS):
                     continue
                 if str(meta.get("visible") or "1") == "0":
@@ -548,6 +611,9 @@ class CombatEngine:
                     score += 40
                 if any(k in atitle.lower() for k in self._BAG_OPEN_KEYWORDS):
                     score += 10
+                # Food is low priority even when allowed
+                if "яблок" in blob or "съесть" in blob:
+                    score -= 40
                 plans.append((score, art_id, real_id, f"{art_title}/{atitle}", meta))
 
         plans.sort(key=lambda x: -x[0])
@@ -555,6 +621,7 @@ class CombatEngine:
         for _score, art_id, real_id, label, meta in plans[: max(1, int(max_actions))]:
             if await self.is_in_battle():
                 break
+            bl_key = f"{art_id}:{real_id}"
             try:
                 resp = await self._client.run_artifact_action(art_id, real_id)
                 ok = bool((resp.raw or {}).get("action_run", {}).get("ok")) or (
@@ -578,18 +645,19 @@ class CombatEngine:
                 else:
                     low = err.lower()
                     # Soft skips — expected gates, not protocol bugs
-                    if any(
-                        x in low
-                        for x in (
-                            "не задано",
-                            "ключом",
-                            "звания",
-                            "уровн",
-                            "символов",
-                            "чаще",
-                            "бою",
-                        )
-                    ):
+                    soft = (
+                        "не задано",
+                        "ключом",
+                        "звания",
+                        "уровн",
+                        "символов",
+                        "чаще",
+                        "бою",
+                        "професс",
+                        "взломщик",
+                    )
+                    if any(x in low for x in soft):
+                        self._bag_action_blacklist.add(bl_key)
                         logger.debug("Bag action skip %s: %s", label, err[:120])
                     else:
                         logger.info("Bag action fail %s: %s", label, err[:120])

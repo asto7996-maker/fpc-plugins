@@ -17,8 +17,9 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def test_junk_npc_blacklist_in_brain():
     src = (ROOT / "modules" / "progression_brain.py").read_text(encoding="utf-8")
-    assert '_JUNK_NPC_IDS = {"816", "817"}' in src
+    assert '"816"' in src and '"817"' in src
     assert "_is_junk_npc" in src
+    assert '"121"' in src and '"132"' in src  # flavor Сугор/Лука
 
 
 def test_leveling_world_objective_early_return():

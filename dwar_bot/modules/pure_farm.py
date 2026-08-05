@@ -23,8 +23,8 @@ VILLAGE_AREAS = frozenset({"930", "931", "932"})
 POST_VILLAGE_FARM_AREAS = ("227", "226", "159", "192")
 
 # Max-farm side work (loot / events / quests) cadence.
-SIDE_EVERY_WINS = 3
-SIDE_EVERY_SEC = 55.0
+SIDE_EVERY_WINS = 5
+SIDE_EVERY_SEC = 90.0
 
 # Area hotspot loot keywords (skip PvP bandits / lava stream).
 AREA_LOOT_KEYWORDS = (
@@ -144,16 +144,18 @@ class PureFarmEngine:
         done = 0
         farm = bot.settings.farm
 
-        # 1) Bag loot / craft / equip / free space
+        # 1) Bag loot / craft / equip / free space (no food — hunts first)
         if farm.auto_loot or farm.auto_equip:
             try:
-                n_bag = await bot.combat.open_bag_actions(max_actions=8)
+                n_bag = await bot.combat.open_bag_actions(
+                    max_actions=4, include_food=False,
+                )
                 if n_bag:
                     done += n_bag
                     logger.info("MaxFarm side: bag actions=%d", n_bag)
                 await bot.combat.free_backpack(target_free=4, max_drops=20)
-                if farm.auto_equip:
-                    await bot.combat.equip_from_bag(max_items=8)
+                if farm.auto_equip and n_bag:
+                    await bot.combat.equip_from_bag(max_items=4)
             except Exception as exc:
                 logger.debug("MaxFarm bag: %s", exc)
 
@@ -578,8 +580,14 @@ class PureFarmEngine:
             return True
 
         # Real progress: open kits/chests/captives BEFORE empty Cretas grind.
+        # In post-village MaxFarm never early-return on bag — eating apples /
+        # opening junk used to skip hunts and look like a hang.
+        post_village = area in {"192", "227", "226", "159", "228"}
         try:
-            n_bag = await bot.combat.open_bag_actions(max_actions=5)
+            n_bag = await bot.combat.open_bag_actions(
+                max_actions=5 if not post_village else 3,
+                include_food=False,
+            )
             if n_bag:
                 logger.info("PureFarm: bag actions opened=%d", n_bag)
                 try:
@@ -598,7 +606,9 @@ class PureFarmEngine:
                         self.stats.zero_reward = False
                 except Exception:
                     pass
-                return True
+                # Village only: bag progress beats 0-gold Cretas; open farm hunts.
+                if not post_village and not (farm.aggressive or farm.max_farm):
+                    return True
         except Exception as exc:
             logger.debug("PureFarm bag actions: %s", exc)
 

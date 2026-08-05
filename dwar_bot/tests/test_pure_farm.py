@@ -110,6 +110,24 @@ def test_pure_farm_skips_flavor_npcs():
     assert any("сугор" in kw for kw in FLAVOR_NPC_NAME_KW)
 
 
+def test_bag_actions_skip_food_and_lockpick():
+    from dwar_bot.modules.combat_engine import CombatEngine
+
+    src = (ROOT / "modules" / "combat_engine.py").read_text(encoding="utf-8")
+    assert "include_food" in src
+    assert "ADD_HP" in CombatEngine._BAG_SKIP_CODES
+    assert any("взлом" in k for k in CombatEngine._BAG_SKIP_ACTION_KW)
+    assert "_bag_action_blacklist" in src
+    assert "_last_equip_from_bag_at" in src
+
+
+def test_pure_farm_does_not_skip_hunt_on_bag_in_post_village():
+    src = (ROOT / "modules" / "pure_farm.py").read_text(encoding="utf-8")
+    assert "post_village" in src
+    assert "include_food=False" in src
+    assert "not post_village and not (farm.aggressive" in src
+
+
 def test_main_skips_fake_exp_proxy_and_levelup_spam():
     src = (ROOT / "main.py").read_text(encoding="utf-8")
     assert "wins) * 50" not in src

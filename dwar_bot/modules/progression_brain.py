@@ -399,8 +399,12 @@ class ProgressionBrain:
 
         # --- Story / quests ---
         # Junk global NPCs (seasonal chronicle / long-CD arena) — never "story"
-        _JUNK_NPC_IDS = {"816", "817"}
-        _JUNK_TITLE_KW = ("летопис", "сезонн", "арену - зной", "адский зверинец")
+        # Plus post-village flavor (Сугор / Лука) that stalls MaxFarm planner.
+        _JUNK_NPC_IDS = {"816", "817", "121", "132"}
+        _JUNK_TITLE_KW = (
+            "летопис", "сезонн", "арену - зной", "адский зверинец",
+            "сугор", "лука", "сиротск", "дом сугора",
+        )
 
         def _is_junk_npc(npc_id: str = "", title: str = "") -> bool:
             if str(npc_id or "") in _JUNK_NPC_IDS:
