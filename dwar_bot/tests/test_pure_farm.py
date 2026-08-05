@@ -100,6 +100,14 @@ def test_main_maxfarm_planner_hybrid():
     assert "post_village_open_farm" in src
     assert "planner_tick" in src
     assert "MaxFarm planner tick" in src
+    assert "% 12 ==" in src
+
+
+def test_pure_farm_skips_flavor_npcs():
+    from dwar_bot.modules.pure_farm import FLAVOR_NPC_IDS, FLAVOR_NPC_NAME_KW
+
+    assert "121" in FLAVOR_NPC_IDS and "132" in FLAVOR_NPC_IDS
+    assert any("сугор" in kw for kw in FLAVOR_NPC_NAME_KW)
 
 
 def test_main_skips_fake_exp_proxy_and_levelup_spam():

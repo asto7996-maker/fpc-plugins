@@ -488,6 +488,20 @@ class ProgressionBrain:
                 )
                 if area_now in {"930", "931", "932"}:
                     nscore = max(nscore, 1100)
+                # Post-village farm fronts: flavor locals (Сугор/Лука) must not
+                # outrank spider hunts when no WO / turn-in is pending.
+                post_farm = area_now in {"192", "227", "226", "159", "228"}
+                flavor_kw = ("сугор", "лука", "сиротск", "дом сугора")
+                if (
+                    post_farm
+                    and not self.awaiting_quest_turnin
+                    and not self.need_quest_unlock
+                    and (
+                        str(item.npc_id) in {"121", "132"}
+                        or any(kw in name.lower() for kw in flavor_kw)
+                    )
+                ):
+                    nscore = 40
                 options.append(GameOption(
                     ActionType.QUEST_NPC,
                     f"NPC: {name}",

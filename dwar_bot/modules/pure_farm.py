@@ -23,8 +23,8 @@ VILLAGE_AREAS = frozenset({"930", "931", "932"})
 POST_VILLAGE_FARM_AREAS = ("227", "226", "159", "192")
 
 # Max-farm side work (loot / events / quests) cadence.
-SIDE_EVERY_WINS = 4
-SIDE_EVERY_SEC = 75.0
+SIDE_EVERY_WINS = 3
+SIDE_EVERY_SEC = 55.0
 
 # Area hotspot loot keywords (skip PvP bandits / lava stream).
 AREA_LOOT_KEYWORDS = (
@@ -34,6 +34,12 @@ AREA_LOOT_KEYWORDS = (
 )
 AREA_LOOT_SKIP = (
     "лав", "бандит", "боро", "никс", "вельмож", "крумп",
+)
+
+# Flavor NPCs in farm fronts — dialogue only, no quest progress / gold.
+FLAVOR_NPC_IDS = frozenset({"121", "132"})  # Лука, Сугор
+FLAVOR_NPC_NAME_KW = (
+    "сугор", "лука", "сиротск", "дом сугора",
 )
 
 # After this many wins with no gold/level change — stop Cretas grind.
@@ -250,13 +256,19 @@ class PureFarmEngine:
             except Exception as exc:
                 logger.debug("MaxFarm area loot: %s", exc)
 
-        # 3) Local quest NPCs (story / daily)
+        # 3) Local quest NPCs (skip flavor: Сугор / Лука / orphan cave)
         if farm.auto_quests:
             try:
                 info = await bot._client.get_area_info()
                 for item in info.items or []:
                     npc_id = str(getattr(item, "npc_id", "") or "")
                     if not npc_id:
+                        continue
+                    name = str(getattr(item, "name", "") or "")
+                    low = name.lower()
+                    if npc_id in FLAVOR_NPC_IDS or any(
+                        kw in low for kw in FLAVOR_NPC_NAME_KW
+                    ):
                         continue
                     href = getattr(item, "href", "") or ""
                     steps = await bot.quests.walk_npc_api(
@@ -271,7 +283,7 @@ class PureFarmEngine:
                         done += steps
                         logger.info(
                             "MaxFarm quest NPC %s (%s) steps=%d",
-                            npc_id, getattr(item, "name", ""), steps,
+                            npc_id, name, steps,
                         )
                         break  # one NPC per side tick
             except Exception as exc:
