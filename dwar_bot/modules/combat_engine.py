@@ -490,6 +490,12 @@ class CombatEngine:
         "наконечник",
         "бичев",
         "коп",
+        "мешочек",
+        "корм",
+        "билет",
+        "сказан",
+        "очерк",
+        "торб",
     )
     _BAG_SKIP_CODES = frozenset({"PUT_ON", "PUT_OFF", "NPC"})
 

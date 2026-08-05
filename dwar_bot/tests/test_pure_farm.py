@@ -80,6 +80,9 @@ def test_pure_farm_idles_on_zero_reward():
     assert "Skip Cretas" in src or "Don't grind" in src or "0-exp" in src
     assert "_try_leave_village_now" in src
     assert "POST_VILLAGE_FARM_AREAS" in src
+    assert "_max_side_progress" in src
+    assert "SIDE_EVERY_WINS" in src
+    assert "Переполох" in src or "сарай" in src or "event barn" in src
 
 
 def test_heal_turnin_not_flash_locked():
@@ -90,6 +93,13 @@ def test_heal_turnin_not_flash_locked():
     assert not qt._is_heal_wounded_point(
         "Лекарство доставлено раненым!", "спасибо за старание"
     )
+
+
+def test_main_maxfarm_planner_hybrid():
+    src = (ROOT / "main.py").read_text(encoding="utf-8")
+    assert "post_village_open_farm" in src
+    assert "planner_tick" in src
+    assert "MaxFarm planner tick" in src
 
 
 def test_main_skips_fake_exp_proxy_and_levelup_spam():

@@ -49,11 +49,11 @@ class FarmSettings:
     auto_heal: bool = True
     auto_loot: bool = True
     max_farm: bool = True
-    idle_pauses: bool = True
-    aggressive: bool = False
-    hp_retreat: float = 15.0
-    hp_heal: float = 40.0
-    max_battles_row: int = 20
+    idle_pauses: bool = False  # max farm: no random idle breaks
+    aggressive: bool = True
+    hp_retreat: float = 10.0
+    hp_heal: float = 30.0
+    max_battles_row: int = 50
 
 
 @dataclass

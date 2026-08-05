@@ -952,19 +952,27 @@ class DwarBot:
         )
         # Post-village open farm: area 227 spiders etc. give real gold;
         # flavor NPCs must not block hunting after heal/arsenal unlock.
+        # Every 5th tick yield to full planner (quests / events / fronts).
         try:
             area_now = str(self._state.area_id or "")
             wo_empty = not bool(self.quests.pending_world_objective)
         except Exception:
             area_now, wo_empty = "", True
         post_village_open_farm = (
-            area_now in {"192", "227", "226", "159"}
+            area_now in {"192", "227", "226", "159", "228"}
             and wo_empty
             and int(self._char.level or 1) >= 3
             and bool(farm.max_farm and farm.auto_combat and farm.farm_area)
         )
-        if post_village_open_farm:
+        planner_tick = (int(getattr(self, "_iteration", 0) or 0) % 5 == 0)
+        if post_village_open_farm and not planner_tick:
             pure_farm_force = True
+        elif post_village_open_farm and planner_tick:
+            pure_farm_force = False
+            logger.info(
+                "MaxFarm planner tick#%d — quests/events/fronts this cycle.",
+                getattr(self, "_iteration", 0),
+            )
         wo_early = {}
         try:
             wo_early = dict(self.quests.pending_world_objective or {})

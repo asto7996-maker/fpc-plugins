@@ -22,6 +22,20 @@ VILLAGE_AREAS = frozenset({"930", "931", "932"})
 # Post-village farm fronts with real gold (Lv2–3 spiders / Zigred zones).
 POST_VILLAGE_FARM_AREAS = ("227", "226", "159", "192")
 
+# Max-farm side work (loot / events / quests) cadence.
+SIDE_EVERY_WINS = 4
+SIDE_EVERY_SEC = 75.0
+
+# Area hotspot loot keywords (skip PvP bandits / lava stream).
+AREA_LOOT_KEYWORDS = (
+    "коряг", "колес", "череп", "окошк", "арк", "сарай",
+    "амбар", "пристрой", "лужиц", "обыскать", "заглянуть",
+    "изучить", "покрутить", "осмотреть",
+)
+AREA_LOOT_SKIP = (
+    "лав", "бандит", "боро", "никс", "вельмож", "крумп",
+)
+
 # After this many wins with no gold/level change — stop Cretas grind.
 ZERO_REWARD_WINS = 8
 # How often to re-try bag opens / exit / story while idling (seconds).
@@ -100,6 +114,210 @@ class PureFarmEngine:
         self._cleared_wo = False
         self._last_report_at = 0.0
         self._last_idle_work_at = 0.0
+        self._last_side_at = 0.0
+        self._side_wins_marker = 0
+        self._area_loot_tried: set[str] = set()
+        self._event_barn_hits = 0
+
+    def _need_side_progress(self) -> bool:
+        now = time.time()
+        if now - float(self._last_side_at or 0) >= SIDE_EVERY_SEC:
+            return True
+        if self.stats.wins - int(self._side_wins_marker or 0) >= SIDE_EVERY_WINS:
+            return True
+        return False
+
+    async def _max_side_progress(self, bot: Any, *, area: str) -> int:
+        """
+        Between hunts: loot hotspots, barn event, bag opens, local quests, arena.
+
+        Returns number of productive actions.
+        """
+        self._last_side_at = time.time()
+        self._side_wins_marker = int(self.stats.wins or 0)
+        done = 0
+        farm = bot.settings.farm
+
+        # 1) Bag loot / craft / equip / free space
+        if farm.auto_loot or farm.auto_equip:
+            try:
+                n_bag = await bot.combat.open_bag_actions(max_actions=8)
+                if n_bag:
+                    done += n_bag
+                    logger.info("MaxFarm side: bag actions=%d", n_bag)
+                await bot.combat.free_backpack(target_free=4, max_drops=20)
+                if farm.auto_equip:
+                    await bot.combat.equip_from_bag(max_items=8)
+            except Exception as exc:
+                logger.debug("MaxFarm bag: %s", exc)
+
+        # Essay collection exchange (frees stacks → rewards)
+        try:
+            bag = await bot._client.get_bag()
+            for a in bag.get("artifact_list") or []:
+                if not isinstance(a, dict):
+                    continue
+                acts = a.get("artifact_actions") or {}
+                if not isinstance(acts, dict):
+                    continue
+                for meta in acts.values():
+                    if not isinstance(meta, dict):
+                        continue
+                    title = str(meta.get("title") or "").lower()
+                    if "бмен" not in title and "коллекц" not in title:
+                        continue
+                    real = bot._client.bag_action_real_id(meta)
+                    if not real:
+                        continue
+                    resp = await bot._client.run_artifact_action(
+                        a.get("id"), real, confirmed=True,
+                    )
+                    ok = bool((resp.raw or {}).get("action_run", {}).get("ok"))
+                    if ok:
+                        done += 1
+                        logger.info(
+                            "MaxFarm side: exchanged «%s»",
+                            a.get("title") or real,
+                        )
+                    break
+        except Exception as exc:
+            logger.debug("MaxFarm essay exchange: %s", exc)
+
+        # 2) Area loot + barn event («Переполох в сарае»)
+        if farm.auto_loot or farm.farm_area:
+            try:
+                info = await bot._client.get_area_info()
+                for item in info.items or []:
+                    name = str(getattr(item, "name", "") or "")
+                    low = name.lower()
+                    act_id = str(getattr(item, "action_id", "") or "")
+                    if not act_id:
+                        continue
+                    if any(s in low for s in AREA_LOOT_SKIP):
+                        continue
+                    # Barn: always try when off CD (event animals)
+                    is_barn = "сарай" in low
+                    is_loot = any(k in low for k in AREA_LOOT_KEYWORDS)
+                    if not (is_barn or is_loot):
+                        continue
+                    # Respect client cooldown (ltime/dtime)
+                    try:
+                        ltime = int(getattr(item, "ltime", 0) or 0)
+                        dtime = int(getattr(item, "dtime", 0) or 0)
+                    except (TypeError, ValueError):
+                        ltime, dtime = 0, 0
+                    if ltime > 0 and dtime > int(time.time()):
+                        continue
+                    key = f"{act_id}:{getattr(item, 'link_id', '')}"
+                    if key in self._area_loot_tried and not is_barn:
+                        continue
+                    resp = await bot._client.run_area_action(
+                        object_id=getattr(item, "object_id", None)
+                        or info.area_id
+                        or area,
+                        action_id=act_id,
+                        link_id=getattr(item, "link_id", "") or "",
+                        object_class=getattr(item, "object_class", None) or "AREA",
+                    )
+                    err = str(resp.redirect_error or resp.error or "")
+                    loot = []
+                    try:
+                        loot = list(resp.loot_lines() or [])
+                    except Exception:
+                        loot = []
+                    if is_barn and (not err or err.lower() in ("false", "none", "")):
+                        self._event_barn_hits += 1
+                        done += 1
+                        logger.info(
+                            "MaxFarm event barn «%s» hit#%d",
+                            name, self._event_barn_hits,
+                        )
+                    elif loot:
+                        done += 1
+                        self._area_loot_tried.add(key)
+                        logger.info(
+                            "MaxFarm loot «%s»: %s",
+                            name, (loot[0] if loot else "")[:100],
+                        )
+                    elif err and "бурный поток" not in err.lower():
+                        self._area_loot_tried.add(key)
+                        logger.debug("MaxFarm hotspot «%s»: %s", name, err[:80])
+                    else:
+                        self._area_loot_tried.add(key)
+                    # Cap hotspot spam per side tick
+                    if done >= 6:
+                        break
+            except Exception as exc:
+                logger.debug("MaxFarm area loot: %s", exc)
+
+        # 3) Local quest NPCs (story / daily)
+        if farm.auto_quests:
+            try:
+                info = await bot._client.get_area_info()
+                for item in info.items or []:
+                    npc_id = str(getattr(item, "npc_id", "") or "")
+                    if not npc_id:
+                        continue
+                    href = getattr(item, "href", "") or ""
+                    steps = await bot.quests.walk_npc_api(
+                        npc_id,
+                        link_id=str(getattr(item, "link_id", "0") or "0"),
+                        f_id=str(getattr(item, "f_id", "0") or "0"),
+                        area_id=area,
+                        href=href,
+                        max_steps=8,
+                    )
+                    if steps:
+                        done += steps
+                        logger.info(
+                            "MaxFarm quest NPC %s (%s) steps=%d",
+                            npc_id, getattr(item, "name", ""), steps,
+                        )
+                        break  # one NPC per side tick
+            except Exception as exc:
+                logger.debug("MaxFarm quests: %s", exc)
+
+        # 4) Arena / event NPC from hunt_conf when ready
+        if farm.farm_arena:
+            try:
+                hunt = await bot._client.get_hunt_conf()
+                for npc in hunt.get("npcs", []) or []:
+                    title = str(npc.get("title") or "")
+                    left = int(npc.get("time_left") or 0)
+                    if left > 0:
+                        continue
+                    low = title.lower()
+                    if "арен" not in low and "battleground" not in low:
+                        continue
+                    npc_id = str(npc.get("npc_id") or "")
+                    url = str(npc.get("url") or "")
+                    hash_flag = ""
+                    for p in url.split("&"):
+                        if "=" not in p and p and "npc.php" not in p:
+                            hash_flag = p
+                    if npc_id:
+                        await bot._client.join_arena(int(npc_id), hash_flag)
+                        done += 1
+                        logger.info("MaxFarm arena open «%s»", title)
+                        break
+                # Live hunt event title (barn panic etc.)
+                ev = hunt.get("event") or {}
+                if ev.get("title"):
+                    logger.debug(
+                        "MaxFarm live event: %s id=%s",
+                        ev.get("title"), ev.get("id"),
+                    )
+            except Exception as exc:
+                logger.debug("MaxFarm arena/event: %s", exc)
+
+        if done:
+            try:
+                bot._state = await bot._client.get_state()
+                self.stats.money_now = float(bot._state.money or self.stats.money_now)
+                self.stats.level_now = int(bot._state.level or self.stats.level_now)
+            except Exception:
+                pass
+        return done
 
     def should_run(
         self,
@@ -377,6 +595,28 @@ class PureFarmEngine:
         except Exception:
             pass
 
+        # Aggressive / max farm: raise SUIS session so we don't skip every 12 kills
+        try:
+            if farm.aggressive or farm.max_farm:
+                from dwar_bot import config as _cfg
+                _cfg.COMBAT.suis_session_kill_limit = max(
+                    int(getattr(_cfg.COMBAT, "suis_session_kill_limit", 0) or 0),
+                    80,
+                )
+                _cfg.COMBAT.max_consecutive_battles = max(
+                    int(getattr(_cfg.COMBAT, "max_consecutive_battles", 0) or 0),
+                    int(farm.max_battles_row or 50),
+                )
+        except Exception:
+            pass
+
+        # Side progress: loot / barn event / quests / arena between hunts
+        if self._need_side_progress():
+            n_side = await self._max_side_progress(bot, area=area)
+            if n_side:
+                logger.info("MaxFarm side progress actions=%d", n_side)
+                return True
+
         # Village + Flash heal lock: Cretas are known 0-exp. Don't grind them.
         wo = getattr(bot.quests, "pending_world_objective", None) or {}
         flash_locked_village = (
@@ -541,11 +781,12 @@ class PureFarmEngine:
                 rem = float(bot.combat.hygiene_remaining_sec() or 0)
             except Exception:
                 rem = 0.0
+            aggressive = bool(getattr(bot.settings.farm, "aggressive", False))
             if rem > 1:
-                wait = min(rem, 60.0)
+                wait = min(rem, 20.0 if aggressive else 60.0)
                 logger.info("PureFarm hygiene wait %.0fs", wait)
                 await asyncio.sleep(wait)
             else:
-                await asyncio.sleep(8)
+                await asyncio.sleep(2.0 if aggressive else 8.0)
         else:
             logger.info("PureFarm result=%s «%s»", name, mob)
