@@ -161,33 +161,51 @@ class PureFarmEngine:
 
         # Essay collection exchange (frees stacks → rewards)
         try:
-            bag = await bot._client.get_bag()
-            for a in bag.get("artifact_list") or []:
-                if not isinstance(a, dict):
-                    continue
-                acts = a.get("artifact_actions") or {}
-                if not isinstance(acts, dict):
-                    continue
-                for meta in acts.values():
-                    if not isinstance(meta, dict):
+            if not hasattr(self, "_essay_exchange_cd_until"):
+                self._essay_exchange_cd_until = 0.0
+            if time.time() >= float(self._essay_exchange_cd_until or 0):
+                bag = await bot._client.get_bag()
+                exchanged = False
+                for a in bag.get("artifact_list") or []:
+                    if not isinstance(a, dict):
                         continue
-                    title = str(meta.get("title") or "").lower()
-                    if "бмен" not in title and "коллекц" not in title:
+                    acts = a.get("artifact_actions") or {}
+                    if not isinstance(acts, dict):
                         continue
-                    real = bot._client.bag_action_real_id(meta)
-                    if not real:
-                        continue
-                    resp = await bot._client.run_artifact_action(
-                        a.get("id"), real, confirmed=True,
-                    )
-                    ok = bool((resp.raw or {}).get("action_run", {}).get("ok"))
-                    if ok:
-                        done += 1
-                        logger.info(
-                            "MaxFarm side: exchanged «%s»",
-                            a.get("title") or real,
+                    for meta in acts.values():
+                        if not isinstance(meta, dict):
+                            continue
+                        title = str(meta.get("title") or "").lower()
+                        if "бмен" not in title and "коллекц" not in title:
+                            continue
+                        real = bot._client.bag_action_real_id(meta)
+                        if not real:
+                            continue
+                        resp = await bot._client.run_artifact_action(
+                            a.get("id"), real, confirmed=True,
                         )
-                    break
+                        ok = bool((resp.raw or {}).get("action_run", {}).get("ok"))
+                        err = str(
+                            getattr(resp, "error", "")
+                            or getattr(resp, "redirect_error", "")
+                            or ""
+                        ).lower()
+                        if ok:
+                            done += 1
+                            exchanged = True
+                            logger.info(
+                                "MaxFarm side: exchanged «%s»",
+                                a.get("title") or real,
+                            )
+                        elif any(
+                            x in err
+                            for x in ("очерков", "собраний", "шести", "не хвата")
+                        ):
+                            # Missing full set — back off 30 min
+                            self._essay_exchange_cd_until = time.time() + 1800.0
+                        break
+                    if exchanged or time.time() < float(self._essay_exchange_cd_until or 0):
+                        break
         except Exception as exc:
             logger.debug("MaxFarm essay exchange: %s", exc)
 

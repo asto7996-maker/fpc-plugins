@@ -541,6 +541,7 @@ class CombatEngine:
     _BAG_SKIP_CODES = frozenset({"PUT_ON", "PUT_OFF", "NPC", "BONUS", "ADD_HP", "ADD_HP_MP"})
     _BAG_SKIP_ACTION_KW = (
         "взлом", "взломать", "подарить", "съесть", "яблок",
+        "обменять коллекц", "обменять собрани",
     )
 
     async def open_bag_actions(
@@ -655,6 +656,12 @@ class CombatEngine:
                         "бою",
                         "професс",
                         "взломщик",
+                        "очерков",
+                        "собраний",
+                        "коллекц",
+                        "нехватает",
+                        "не хватает",
+                        "шести разных",
                     )
                     if any(x in low for x in soft):
                         self._bag_action_blacklist.add(bl_key)
