@@ -2,6 +2,9 @@
 .env
 *.env.local
 
+# vkbottle runtime
+.vkbottle/
+
 # Python
 __pycache__/
 *.py[cod]
