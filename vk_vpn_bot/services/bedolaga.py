@@ -112,6 +112,7 @@ class BedolagaClient:
             return await self._request("GET", f"/users/by-telegram-id/{telegram_id}")
         except RuntimeError as exc:
             if "404" in str(exc):
+                logger.debug("Bedolaga user tg_id=%s not found", telegram_id)
                 return None
             raise
 
@@ -165,7 +166,18 @@ class BedolagaClient:
                 "replace_existing": replace_existing,
             },
         )
-        return self._parse_subscription(data)
+        sub = self._parse_subscription(data)
+        # Иногда ссылка появляется после синка с Remnawave — добираем GET'ом
+        if not sub.key_link:
+            import asyncio
+
+            for delay in (0.8, 1.5, 2.5):
+                await asyncio.sleep(delay)
+                fresh = await self.get_user(bedolaga_user_id)
+                sub = self._parse_subscription(fresh)
+                if sub.key_link:
+                    break
+        return sub
 
     async def create_paid_subscription(
         self,
@@ -183,7 +195,17 @@ class BedolagaClient:
                 "replace_existing": replace_existing,
             },
         )
-        return self._parse_subscription(data)
+        sub = self._parse_subscription(data)
+        if not sub.key_link:
+            import asyncio
+
+            for delay in (0.8, 1.5, 2.5):
+                await asyncio.sleep(delay)
+                fresh = await self.get_user(bedolaga_user_id)
+                sub = self._parse_subscription(fresh)
+                if sub.key_link:
+                    break
+        return sub
 
     async def get_user(self, bedolaga_user_id: int) -> dict[str, Any]:
         return await self._request("GET", f"/users/{bedolaga_user_id}")
@@ -203,11 +225,36 @@ class BedolagaClient:
 
     @staticmethod
     def _parse_subscription(data: dict[str, Any]) -> BedolagaSubscription:
-        # Ответ может быть обёрнут или содержать вложенную subscription
-        sub = data.get("subscription") if isinstance(data.get("subscription"), dict) else data
+        """
+        Ответ POST /users/{id}/subscription часто возвращает UserResponse:
+        { subscription: {...}|null, subscriptions: [ {...} ] }
+        либо сам объект подписки.
+        """
+        sub: dict[str, Any] | None = None
+        if isinstance(data.get("subscription"), dict):
+            sub = data["subscription"]
+        elif isinstance(data.get("subscriptions"), list) and data["subscriptions"]:
+            # Берём активную / первую
+            active = [
+                s
+                for s in data["subscriptions"]
+                if isinstance(s, dict)
+                and str(s.get("actual_status") or s.get("status") or "") == "active"
+            ]
+            sub = active[0] if active else data["subscriptions"][0]
+        elif "subscription_url" in data or "is_trial" in data:
+            sub = data
+
+        if not isinstance(sub, dict):
+            sub = data if isinstance(data, dict) else {}
+
         return BedolagaSubscription(
             id=int(sub.get("id") or 0),
-            user_id=int(sub.get("user_id") or 0),
+            user_id=int(
+                sub.get("user_id")
+                or data.get("id")
+                or 0
+            ),
             is_trial=bool(sub.get("is_trial")),
             status=str(sub.get("status") or sub.get("actual_status") or ""),
             end_date=sub.get("end_date"),
