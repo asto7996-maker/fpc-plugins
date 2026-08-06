@@ -12,9 +12,9 @@ from __future__ import annotations
 from handlers.style import bullet, footer_hint, header, soft_rule, step, subhead
 
 GUIDE_INTRO = (
-    f"{header('📖', 'Гайд')}\n\n"
-    f"Ключ — ссылка-подписка (sub.paskod.ru). Добавьте в Happ как подписку, "
-    f"не как отдельный сервер — клиент сам обновит серверы.\n\n"
+    f"{header('📱', 'Гайд')}\n\n"
+    f"Ключ — ссылка-подписка. Добавьте в Happ как подписку — "
+    f"клиент сам обновит серверы.\n\n"
     f"{footer_hint('выберите ОС')}"
 )
 

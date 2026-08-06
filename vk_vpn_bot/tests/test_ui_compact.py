@@ -11,9 +11,12 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from keyboards.menus import (
+    BTN_CABINET,
+    BTN_GUIDE,
     BTN_HELP,
+    BTN_INFO,
     BTN_PAY_SBP,
-    BTN_REFERRAL,
+    BTN_SUBSCRIPTION,
     help_keyboard,
     main_menu_keyboard,
     pay_methods_keyboard,
@@ -26,11 +29,24 @@ def _reply_buttons(raw: str) -> list[int]:
     return [len(row) for row in data["buttons"]]
 
 
+def test_main_menu_labels() -> None:
+    labels = [
+        b["action"]["label"]
+        for row in json.loads(main_menu_keyboard(""))["buttons"]
+        for b in row
+    ]
+    assert BTN_CABINET in labels
+    assert BTN_SUBSCRIPTION in labels
+    assert BTN_INFO in labels
+    assert BTN_HELP in labels
+    assert BTN_GUIDE in labels
+
+
 def test_main_menu_compact() -> None:
     rows = _reply_buttons(main_menu_keyboard(""))
     assert len(rows) == 3
+    assert sum(rows) == 5
     assert all(n <= 2 for n in rows)
-    assert max(rows) <= 2
 
 
 def test_pay_methods_one_row() -> None:
@@ -40,15 +56,17 @@ def test_pay_methods_one_row() -> None:
 
 
 def test_help_hub() -> None:
+    from keyboards.menus import BTN_ASK, BTN_PROMO
+
     kb = help_keyboard("")
     labels = [
         b["action"]["label"]
         for row in json.loads(kb)["buttons"]
         for b in row
     ]
-    assert BTN_HELP not in labels
-    assert BTN_REFERRAL in labels
-    assert len(labels) <= 7
+    assert BTN_ASK in labels
+    assert BTN_PROMO in labels
+    assert len(labels) <= 5
 
 
 def test_short_payment_labels() -> None:
@@ -57,6 +75,7 @@ def test_short_payment_labels() -> None:
 
 
 def main() -> None:
+    test_main_menu_labels()
     test_main_menu_compact()
     test_pay_methods_one_row()
     test_help_hub()

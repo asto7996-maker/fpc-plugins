@@ -14,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from handlers.helpers import format_info_menu, format_welcome
 from handlers.style import brand, header, step
 from keyboards.menus import (
+    BTN_GUIDE,
     BTN_HELP,
     BTN_INFO,
     BTN_PRIVACY,
@@ -64,12 +65,12 @@ def test_menus_and_copy() -> None:
     assert "Алекс" in welcome
     assert "✨" in welcome
     # Без каталога тексты обходятся без цифр, но остаются осмысленными
-    assert "10 ГБ" in welcome
+    assert "10 ГБ" in welcome or "10 ГБ" in welcome.replace(" ", "")
     assert "1 устройство" in welcome
 
     info = format_info_menu(settings)
-    assert "Политика" in info or "приват" in info.lower()
-    assert "Инфо" in info or "документ" in info.lower()
+    assert "Инфо" in info
+    assert "документ" in info.lower() or "реферал" in info.lower()
 
     assert "ℹ️" in BTN_INFO
     assert "🛡️" in BTN_PRIVACY
@@ -81,6 +82,7 @@ def test_menus_and_copy() -> None:
     data = json.loads(kb)
     labels = [btn["action"]["label"] for row in data["buttons"] for btn in row]
     assert BTN_HELP in labels
+    assert BTN_GUIDE in labels
 
     ik = info_inline_keyboard()
     idata = json.loads(ik)
@@ -90,7 +92,7 @@ def test_menus_and_copy() -> None:
         for btn in row
     ]
     assert any("Приватность" in x for x in ilabels)
-    assert any("Соглашение" in x for x in ilabels)
+    assert any("Рефералка" in x for x in ilabels)
     assert info_keyboard()  # reply — только «Назад»
 
 def test_miniapp_files() -> None:

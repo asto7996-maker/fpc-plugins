@@ -145,6 +145,7 @@ def check_routing() -> None:
         M.BTN_SUPPORT: "cmd_help",
         M.BTN_INFO: "cmd_info",
         M.BTN_CONNECT: "cmd_connect",
+        M.BTN_CONNECT_LONG: "cmd_connect",
         M.BTN_SUBSCRIPTION: "cmd_subscription",
         M.BTN_PAY: "cmd_pay",
         M.BTN_TARIFFS: "cmd_buy",

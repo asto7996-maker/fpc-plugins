@@ -1,8 +1,8 @@
 """
 Клавиатуры VK-бота — компактный интерфейс (до 5 кнопок на экран).
 
-Главное меню: 6 пунктов + админ. Вложенные экраны — не больше 5 кнопок.
-Тарифы и документы — inline, чтобы не раздувать reply-клавиатуру.
+Главное меню: Кабинет · Подписка · Инфо · Помощь · Гайд (+ админ).
+Вложенные экраны — не больше 5 кнопок. Тарифы и документы — inline.
 """
 
 from __future__ import annotations
@@ -14,23 +14,26 @@ from vkbottle import Callback, Keyboard, KeyboardButtonColor, OpenLink, Text
 if TYPE_CHECKING:
     from services.catalog import Offer
 
-# ---- Главное меню ----
-BTN_CONNECT = "🚀 Подключиться"
-BTN_SUBSCRIPTION = "📦 Подписка"
-BTN_TARIFFS = "💎 Тарифы"
-BTN_PAY = "💳 Оплатить"
-BTN_HELP = "📖 Помощь"
+# ---- Главное меню (5 кнопок) ----
 BTN_CABINET = "🌐 Кабинет"
+BTN_SUBSCRIPTION = "📦 Подписка"
+BTN_INFO = "ℹ️ Инфо"
+BTN_HELP = "💬 Помощь"
+BTN_GUIDE = "📱 Гайд"
 BTN_BACK = "◀️ Назад"
 
-# ---- Вложенные действия ----
+# ---- Подписка ----
+BTN_CONNECT = "🚀 Подключить"
+BTN_TARIFFS = "💎 Тарифы"
+BTN_PAY = "💳 Оплатить"
 BTN_TRIAL = "🎁 Триал"
 BTN_MY_KEY = "🔑 Ключ"
 BTN_RENEW = "♻️ Продлить"
+
+# ---- Помощь / инфо ----
 BTN_ASK = "✍️ Вопрос"
-BTN_GUIDE = "📖 Гайд"
-BTN_INFO = "ℹ️ Документы"
 BTN_PROMO = "🎟 Промо"
+BTN_REFERRAL = "👥 Рефералка"
 
 # Оплата
 BTN_PAY_SBP = "🏦 СБП"
@@ -67,10 +70,11 @@ BTN_SUPPORT = BTN_HELP
 BTN_APPS = BTN_GUIDE
 BTN_GET_KEY = BTN_MY_KEY
 BTN_CONNECT_OLD = "🚀 Подключить VPN"
+BTN_CONNECT_LONG = "🚀 Подключиться"
 BTN_CABINET_LOGIN = "🔐 Войти"
 BTN_PROFILE = "👤 Профиль"
-BTN_REFERRAL = "👥 Рефералка"
 BTN_DEVICES = "📲 Устройства"
+BTN_INFO_DOCS = "ℹ️ Документы"
 
 
 def cabinet_path(base: str, path: str) -> str:
@@ -82,17 +86,16 @@ def legal_url(cabinet_url: str, slug: str) -> str:
 
 
 def main_menu_keyboard(cabinet_url: str, *, show_admin: bool = False) -> str:
-    """6 кнопок: подключение, подписка, тарифы, оплата, помощь, кабинет."""
+    """5 кнопок: кабинет, подписка, инфо, помощь, гайд."""
     _ = cabinet_url
     kb = Keyboard(one_time=False, inline=False)
-    kb.add(Text(BTN_CONNECT), color=KeyboardButtonColor.POSITIVE)
+    kb.add(Text(BTN_CABINET), color=KeyboardButtonColor.POSITIVE)
     kb.add(Text(BTN_SUBSCRIPTION), color=KeyboardButtonColor.POSITIVE)
     kb.row()
-    kb.add(Text(BTN_TARIFFS), color=KeyboardButtonColor.PRIMARY)
-    kb.add(Text(BTN_PAY), color=KeyboardButtonColor.PRIMARY)
+    kb.add(Text(BTN_INFO), color=KeyboardButtonColor.PRIMARY)
+    kb.add(Text(BTN_HELP), color=KeyboardButtonColor.PRIMARY)
     kb.row()
-    kb.add(Text(BTN_HELP), color=KeyboardButtonColor.SECONDARY)
-    kb.add(Text(BTN_CABINET), color=KeyboardButtonColor.SECONDARY)
+    kb.add(Text(BTN_GUIDE), color=KeyboardButtonColor.SECONDARY)
     if show_admin:
         kb.row()
         kb.add(Text(BTN_ADMIN), color=KeyboardButtonColor.NEGATIVE)
@@ -100,15 +103,11 @@ def main_menu_keyboard(cabinet_url: str, *, show_admin: bool = False) -> str:
 
 
 def help_keyboard(support_url: str = "") -> str:
-    """Хаб помощи: вопрос, гайд, документы, рефералка, промо."""
+    """Помощь: вопрос, промо."""
     kb = Keyboard(one_time=False, inline=False)
     kb.add(Text(BTN_ASK), color=KeyboardButtonColor.POSITIVE)
-    kb.add(Text(BTN_GUIDE), color=KeyboardButtonColor.POSITIVE)
-    kb.row()
-    kb.add(Text(BTN_INFO), color=KeyboardButtonColor.PRIMARY)
-    kb.add(Text(BTN_REFERRAL), color=KeyboardButtonColor.PRIMARY)
-    kb.row()
     kb.add(Text(BTN_PROMO), color=KeyboardButtonColor.SECONDARY)
+    kb.row()
     kb.add(Text(BTN_BACK), color=KeyboardButtonColor.SECONDARY)
     if support_url:
         kb.row()
@@ -117,7 +116,7 @@ def help_keyboard(support_url: str = "") -> str:
 
 
 def info_inline_keyboard() -> str:
-    """Документы — inline, reply остаётся только «Назад»."""
+    """Инфо: документы и рефералка — inline."""
     return (
         Keyboard(inline=True)
         .add(Callback(BTN_PRIVACY, payload={"cmd": "doc", "slug": "privacy", "page": 1}))
@@ -127,6 +126,7 @@ def info_inline_keyboard() -> str:
         .add(Callback(BTN_RULES, payload={"cmd": "doc", "slug": "rules", "page": 1}))
         .row()
         .add(Callback(BTN_FAQ, payload={"cmd": "doc", "slug": "faq", "page": 1}))
+        .add(Callback(BTN_REFERRAL, payload={"cmd": "referral"}))
         .get_json()
     )
 
@@ -248,6 +248,29 @@ def auto_login_keyboard(
     )
 
 
+def subscription_hub_keyboard(
+    *,
+    has_active: bool,
+    trial_available: bool,
+) -> str:
+    """Хаб подписки: ключ/подключение, тарифы, оплата."""
+    kb = Keyboard(one_time=False, inline=False)
+    if has_active:
+        kb.add(Text(BTN_MY_KEY), color=KeyboardButtonColor.POSITIVE)
+        kb.add(Text(BTN_RENEW), color=KeyboardButtonColor.PRIMARY)
+    elif trial_available:
+        kb.add(Text(BTN_TRIAL), color=KeyboardButtonColor.POSITIVE)
+        kb.add(Text(BTN_CONNECT), color=KeyboardButtonColor.PRIMARY)
+    else:
+        kb.add(Text(BTN_CONNECT), color=KeyboardButtonColor.POSITIVE)
+    kb.row()
+    kb.add(Text(BTN_TARIFFS), color=KeyboardButtonColor.PRIMARY)
+    kb.add(Text(BTN_PAY), color=KeyboardButtonColor.PRIMARY)
+    kb.row()
+    kb.add(Text(BTN_BACK), color=KeyboardButtonColor.SECONDARY)
+    return kb.get_json()
+
+
 def connect_keyboard(
     *,
     has_active: bool,
@@ -255,44 +278,28 @@ def connect_keyboard(
     cabinet_url: str,
 ) -> str:
     _ = cabinet_url
-    kb = Keyboard(one_time=False, inline=False)
-    if has_active:
-        kb.add(Text(BTN_MY_KEY), color=KeyboardButtonColor.POSITIVE)
-        kb.add(Text(BTN_RENEW), color=KeyboardButtonColor.PRIMARY)
-    elif trial_available:
-        kb.add(Text(BTN_TRIAL), color=KeyboardButtonColor.POSITIVE)
-    else:
-        kb.add(Text(BTN_TARIFFS), color=KeyboardButtonColor.POSITIVE)
-        kb.add(Text(BTN_PAY), color=KeyboardButtonColor.PRIMARY)
-    kb.row()
-    kb.add(Text(BTN_BACK), color=KeyboardButtonColor.SECONDARY)
-    return kb.get_json()
+    return subscription_hub_keyboard(
+        has_active=has_active,
+        trial_available=trial_available,
+    )
 
 
-def subscription_keyboard(cabinet_url: str, has_key: bool = False) -> str:
+def subscription_keyboard(
+    cabinet_url: str,
+    has_key: bool = False,
+    *,
+    trial_available: bool = False,
+) -> str:
     _ = cabinet_url
-    kb = Keyboard(one_time=False, inline=False)
-    if has_key:
-        kb.add(Text(BTN_MY_KEY), color=KeyboardButtonColor.POSITIVE)
-        kb.add(Text(BTN_RENEW), color=KeyboardButtonColor.PRIMARY)
-    else:
-        kb.add(Text(BTN_TARIFFS), color=KeyboardButtonColor.POSITIVE)
-    kb.row()
-    kb.add(Text(BTN_PAY), color=KeyboardButtonColor.PRIMARY)
-    kb.add(Text(BTN_BACK), color=KeyboardButtonColor.SECONDARY)
-    return kb.get_json()
+    return subscription_hub_keyboard(
+        has_active=has_key,
+        trial_available=trial_available and not has_key,
+    )
 
 
 def referral_keyboard(cabinet_url: str = "") -> str:
-    """Экран рефералки: кабинет + назад."""
     _ = cabinet_url
-    return (
-        Keyboard(one_time=False, inline=False)
-        .add(Text(BTN_CABINET), color=KeyboardButtonColor.PRIMARY)
-        .row()
-        .add(Text(BTN_BACK), color=KeyboardButtonColor.SECONDARY)
-        .get_json()
-    )
+    return back_keyboard()
 
 
 def promo_keyboard(cabinet_url: str) -> str:

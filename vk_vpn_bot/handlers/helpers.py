@@ -25,7 +25,6 @@ from handlers.style import (
     success_banner,
     warn_banner,
 )
-from legal.documents import ALL_DOCS
 from services.catalog import Catalog, Offer
 from services.payments import (
     PLATEGA_METHOD_CARD,
@@ -90,26 +89,22 @@ def format_welcome(
     bot = brand(settings.bot_name) if settings.bot_name.isascii() else settings.bot_name
 
     trial = (
-        f"{settings.trial_days} дня, {settings.trial_traffic_gb} ГБ трафика, "
+        f"{settings.trial_days} дн., {settings.trial_traffic_gb} ГБ, "
         f"{_plural_devices(settings.trial_devices)}"
     )
     price = catalog.entry_price_label if catalog else ""
-    tariff_line = (
-        f"Дальше тарифы с безлимитным трафиком — от {price} в месяц, "
-        f"до {_plural_devices(catalog.max_devices)} на одной подписке. "
-        if price and catalog and catalog.max_devices
-        else "Дальше можно перейти на тариф с безлимитным трафиком. "
-    )
 
     return (
         f"✨  {hello}\n"
         f"{card_rule()}\n\n"
-        f"{bot} — VPN через Happ (VLESS). Триал: {trial}, без карты.\n"
-        f"{tariff_line}"
-        f"Оплата: СБП, карта или крипта от {(catalog.min_topup_kopeks // 100) if catalog else 50} ₽.\n\n"
-        f"{bullet('🚀 Подключиться — ключ за минуту')}\n"
-        f"{bullet('📦 Подписка — статус и баланс')}\n"
-        f"{bullet('📖 Помощь — гайд, FAQ, поддержка')}\n\n"
+        f"{bot} — VPN через Happ (VLESS).\n"
+        f"Триал: {trial}. Тарифы"
+        f"{f' от {price}/мес' if price else ''}.\n"
+        f"Оплата: СБП, карта, крипта от {(catalog.min_topup_kopeks // 100) if catalog else 50} ₽.\n\n"
+        f"{bullet('🌐 Кабинет — вход без пароля')}\n"
+        f"{bullet('📦 Подписка — ключ, тарифы, оплата')}\n"
+        f"{bullet('ℹ️ Инфо — документы, рефералка')}\n"
+        f"{bullet('💬 Помощь · 📱 Гайд')}\n\n"
         f"{footer_hint()}"
     )
 
@@ -245,7 +240,7 @@ def format_subscription_card(
     key_preview = mask_key(user.vpn_key) if user.vpn_key else "ещё не выдан"
 
     lines = [
-        header("📦", "Моя подписка"),
+        header("📦", "Подписка"),
         "",
         kv("Статус", status),
         kv("Триал", trial),
@@ -290,20 +285,14 @@ def format_subscription_card(
 
     lines.append("")
     if active:
-        lines.append(
-            "Доступ работает. «🔑 Ключ» — ссылка, «♻️ Продлить» — продление. "
-            "Ключ не меняется при оплате."
-        )
+        lines.append("«🔑 Ключ» — ссылка. «♻️ Продлить» — продление.")
     elif not user.is_trial_used:
         lines.append(
-            f"Триал доступен: {settings.trial_days} дн., "
-            f"{settings.trial_traffic_gb} ГБ, {_plural_devices(settings.trial_devices)}. "
-            f"«🚀 Подключиться» → «🎁 Триал»."
+            f"Триал: {settings.trial_days} дн., {settings.trial_traffic_gb} ГБ. "
+            f"«🎁 Триал» или «🚀 Подключить»."
         )
     else:
-        lines.append(
-            "Подписка неактивна. «💳 Оплатить» → «💎 Тарифы». Ключ сохранится."
-        )
+        lines.append("Неактивна. «💎 Тарифы» или «💳 Оплатить».")
 
     lines.append("")
     lines.append(f"🌐  {settings.cabinet_url}/subscription")
@@ -321,8 +310,7 @@ def format_connect_screen(
         return (
             f"{header('🚀', 'Подключение')}\n\n"
             f"{success_banner('Подписка активна')}\n\n"
-            f"«🔑 Ключ» — ссылка-подписка для Happ. Добавьте один раз, "
-            f"клиент сам обновляет серверы.\n\n"
+            f"«🔑 Ключ» — ссылка для Happ. Клиент сам обновляет серверы.\n\n"
             f"{footer_hint()}"
         )
     if not user.is_trial_used:
@@ -330,18 +318,17 @@ def format_connect_screen(
             f"{header('🚀', 'Подключение')}\n\n"
             f"{success_banner('Триал доступен')}\n\n"
             f"{settings.trial_days} дн., {settings.trial_traffic_gb} ГБ, "
-            f"{_plural_devices(settings.trial_devices)}. Без карты — "
-            f"нажмите «🎁 Триал».\n\n"
+            f"{_plural_devices(settings.trial_devices)}. Без карты — «🎁 Триал».\n\n"
             f"{footer_hint()}"
         )
 
     price = catalog.entry_price_label if catalog else ""
-    tail = f"Тарифы от {price}/мес. " if price else ""
+    tail = f"Тарифы от {price}. " if price else ""
     return (
         f"{header('🚀', 'Подключение')}\n\n"
         f"{warn_banner('Триал использован')}\n\n"
         f"{tail}"
-        f"«💳 Оплатить» → «💎 Тарифы». Ключ не меняется.\n\n"
+        f"«💎 Тарифы» или «💳 Оплатить».\n\n"
         f"{footer_hint()}"
     )
 
@@ -393,7 +380,7 @@ def format_key_message(
         f"{step(2, 'Happ → «+» → из буфера')}\n"
         f"{step(3, 'Включите VPN, разрешите в системе')}\n\n"
         f"Подписка обновляет серверы сама. Проверка — 2ip.ru. "
-        f"Гайд по ОС — «📖 Помощь» → «📖 Гайд»."
+        f"Гайд — «📱 Гайд»."
     )
 
 
@@ -431,12 +418,11 @@ def format_pay_intro(catalog: Catalog | None = None) -> str:
     crypto = method_copy(PLATEGA_METHOD_CRYPTO)
     return (
         f"{header('💳', 'Оплата')}\n\n"
-        f"Пополнение баланса (Platega). С баланса списывается тариф.\n\n"
+        f"Пополнение баланса (Platega). Тариф списывается с баланса.\n\n"
         f"{bullet(f'{method_label(PLATEGA_METHOD_SBP_QR)} — {sbp['summary']}')}\n"
         f"{bullet(f'{method_label(PLATEGA_METHOD_CARD)} — {card['summary']}')}\n"
         f"{bullet(f'{method_label(PLATEGA_METHOD_CRYPTO)} — {crypto['summary']}')}\n\n"
-        f"Выберите способ → сумма ({amounts} или своё, от {minimum} ₽). "
-        f"Данные карты бот не видит.\n\n"
+        f"Способ → сумма ({amounts}, от {minimum} ₽).\n\n"
         f"{footer_hint()}"
     )
 
@@ -510,20 +496,16 @@ def format_referral(
 
     if stats and stats.referral_code:
         body += (
-            f"{subhead('🔗', 'Ваша ссылка')}\n"
+            f"{subhead('🔗', 'Ссылка')}\n"
             f"{stats.vk_link}\n\n"
             f"{kv('Код', stats.referral_code)}\n"
             f"{kv('Приглашено', stats.total_referrals)}\n"
             f"{kv('Активных', stats.active_referrals)}\n"
             f"{kv('Заработано', f'{stats.total_earnings_rubles:.0f} ₽')}\n\n"
-            f"Скопируйте ссылку и отправьте другу — он должен открыть бот "
-            f"по ней, чтобы вы получили бонус.\n\n"
+            f"Отправьте ссылку другу — он должен открыть бот по ней.\n\n"
         )
     else:
-        body += (
-            "Личная ссылка появится после входа в кабинет. "
-            "Нажмите «🌐 Кабинет» ниже или подождите пару секунд.\n\n"
-        )
+        body += "Ссылка появится после входа в кабинет.\n\n"
 
     return f"{body}{footer_hint()}"
 
@@ -557,13 +539,9 @@ def format_promo_prompt(settings: Settings) -> str:
     _ = settings
     return (
         f"{header('🎟', 'Промокод')}\n\n"
-        f"Отправьте код одним сообщением — например, {brand('PASKOD2026')}. "
-        f"Регистр не важен, пробелы по краям я уберу сам.\n\n"
-        f"Промокоды бывают трёх видов: скидка на покупку тарифа, "
-        f"зачисление на баланс и добавочные дни к подписке. "
-        f"Что именно даёт ваш код, будет видно при активации в кабинете — "
-        f"я открою нужный раздел сразу после проверки.\n\n"
-        f"{footer_hint('ждём ваш код')}"
+        f"Отправьте код одним сообщением. Регистр не важен.\n"
+        f"Скидка, баланс или дни — видно при активации в кабинете.\n\n"
+        f"{footer_hint('ждём код')}"
     )
 
 
@@ -622,12 +600,9 @@ def format_renew_stub(settings: Settings, catalog: Catalog | None = None) -> str
 def format_help_menu(settings: Settings) -> str:
     _ = settings
     return (
-        f"{header('📖', 'Помощь')}\n\n"
+        f"{header('💬', 'Помощь')}\n\n"
         f"{settings.support_text}\n\n"
-        f"{bullet('✍️ Вопрос — напишите в чат, передам команде')}\n"
-        f"{bullet('📖 Гайд — установка Happ по ОС')}\n"
-        f"{bullet('ℹ️ Документы — оферта, FAQ, приватность')}\n"
-        f"{bullet('👥 Рефералка — бонус за друзей')}\n"
+        f"{bullet('✍️ Вопрос — напишите в чат')}\n"
         f"{bullet('🎟 Промо — активация кода')}\n\n"
         f"{footer_hint()}"
     )
@@ -640,16 +615,15 @@ def format_support(settings: Settings) -> str:
 def format_support_prompt() -> str:
     return (
         f"{header('✍️', 'Вопрос')}\n\n"
-        f"Опишите проблему одним сообщением (можно со скриншотом). "
-        f"«◀️ Назад» — отмена."
+        f"Опишите проблему одним сообщением. «◀️ Назад» — отмена."
     )
 
 
 def format_support_received(delivered: bool) -> str:
-    tail = "Уведомление отправлено." if delivered else "Сообщение в диалоге сообщества."
+    tail = "Уведомление отправлено." if delivered else "Сообщение в диалоге."
     return (
         f"{header('✅', 'Принято')}\n\n"
-        f"{tail} Ответ придёт сюда. Пока ждёте — FAQ в «ℹ️ Документы»."
+        f"{tail} Ответ придёт сюда. FAQ — «ℹ️ Инфо»."
     )
 
 
@@ -665,17 +639,16 @@ def format_admin_menu(settings: Settings) -> str:
 def format_admin_denied() -> str:
     return (
         f"{warn_banner('Только для админа')}\n\n"
-        f"Нужна помощь — «📖 Помощь»."
+        f"Нужна помощь — «💬 Помощь»."
     )
 
 
 def format_info_menu(settings: Settings) -> str:
     _ = settings
-    docs = " · ".join(f"{d.emoji} {d.title}" for d in ALL_DOCS)
     return (
-        f"{header('ℹ️', 'Документы')}\n\n"
-        f"{docs}\n\n"
-        f"Нажмите документ под сообщением. Длинные тексты листаются кнопками.\n\n"
+        f"{header('ℹ️', 'Инфо')}\n\n"
+        f"Документы и рефералка — кнопки ниже. "
+        f"Длинные тексты листаются «⬅️» / «➡️».\n\n"
         f"{footer_hint()}"
     )
 
@@ -729,7 +702,7 @@ def format_guide_outro() -> str:
 def format_fallback() -> str:
     return (
         f"{header('🤔', 'Не понял')}\n\n"
-        f"Кнопки внизу. Нет меню — /start. Вопрос — «📖 Помощь».\n\n"
+        f"Кнопки внизу или /start. Вопрос — «💬 Помощь».\n\n"
         f"{footer_hint()}"
     )
 
@@ -737,7 +710,7 @@ def format_fallback() -> str:
 def format_trial_used() -> str:
     return (
         f"{header('🎁', 'Триал использован')}\n\n"
-        f"«💎 Тарифы» или «💳 Оплатить» — доступ вернётся, ключ тот же.\n\n"
+        f"«💎 Тарифы» или «💳 Оплатить» — ключ сохранится.\n\n"
         f"{footer_hint()}"
     )
 

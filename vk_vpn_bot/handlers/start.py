@@ -72,6 +72,7 @@ from keyboards import (
     BTN_CABINET,
     BTN_CABINET_LOGIN,
     BTN_CONNECT,
+    BTN_CONNECT_LONG,
     BTN_CONNECT_OLD,
     BTN_DOC_LIST,
     BTN_DOC_NEXT,
@@ -81,6 +82,7 @@ from keyboards import (
     BTN_GUIDE,
     BTN_HELP,
     BTN_INFO,
+    BTN_INFO_DOCS,
     BTN_MY_KEY,
     BTN_OFFER,
     BTN_PAY,
@@ -102,6 +104,7 @@ from keyboards import (
     apps_keyboard,
     admin_keyboard,
     auto_login_keyboard,
+    back_keyboard,
     connect_keyboard,
     doc_keyboard,
     doc_nav_keyboard,
@@ -307,23 +310,41 @@ async def _ensure_panel_silent(user, message: Message | None = None) -> None:
             logger.warning("silent panel register failed: %s", exc)
 
 
+async def _send_referral_screen(
+    *,
+    api,
+    peer_id: int,
+    vk_user_id: int,
+    first_name: str | None,
+) -> None:
+    settings = get_settings()
+    stats = None
+    catalog = None
+    if settings.cabinet_jwt_secret:
+        try:
+            bedolaga_id = await ensure_bedolaga_id_for_payments(vk_user_id, first_name)
+            stats = await fetch_referral_stats(settings, bedolaga_id)
+            catalog = await fetch_catalog(settings, bedolaga_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("referral screen: %s", exc)
+
+    await api.messages.send(
+        peer_id=peer_id,
+        message=format_referral(settings, stats, catalog),
+        random_id=0,
+        keyboard=referral_keyboard(_cab()),
+    )
+
+
 async def _show_referral(message: Message) -> None:
     settings = get_settings()
     user = await _ensure_user(message)
     await _ensure_panel_silent(user, message)
-    stats = None
-    if settings.cabinet_jwt_secret:
-        try:
-            bedolaga_id = await ensure_bedolaga_id_for_payments(
-                user.user_id, user.first_name
-            )
-            stats = await fetch_referral_stats(settings, bedolaga_id)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("referral screen: %s", exc)
-
-    await message.answer(
-        format_referral(settings, stats, await _catalog(message)),
-        keyboard=referral_keyboard(_cab()),
+    await _send_referral_screen(
+        api=message.ctx_api,
+        peer_id=message.from_id,
+        vk_user_id=user.user_id,
+        first_name=user.first_name,
     )
 
 
@@ -411,7 +432,9 @@ async def cmd_start(message: Message):
 @labeler.private_message(
     text=[
         BTN_CONNECT,
+        BTN_CONNECT_LONG,
         BTN_CONNECT_OLD,
+        "🚀 Подключить",
         "🚀 Подключиться",
         "Подключиться",
         "подключить vpn",
@@ -550,7 +573,11 @@ async def cmd_subscription(message: Message):
 
     await message.answer(
         format_subscription_card(user, settings, panel),
-        keyboard=subscription_keyboard(_cab(), has_key=bool(user.vpn_key)),
+        keyboard=subscription_keyboard(
+            _cab(),
+            has_key=user.is_subscription_active(),
+            trial_available=not user.is_trial_used,
+        ),
     )
 
 
@@ -590,7 +617,9 @@ async def cmd_cabinet_login(message: Message):
 @labeler.private_message(
     text=[
         BTN_INFO,
+        BTN_INFO_DOCS,
         "ℹ️ Инфо",
+        "ℹ️ Документы",
         "Инфо",
         "инфо",
         "информация",
@@ -604,6 +633,10 @@ async def cmd_info(message: Message):
     await message.answer(
         format_info_menu(settings),
         keyboard=info_inline_keyboard(),
+    )
+    await message.answer(
+        format_guide_outro(),
+        keyboard=back_keyboard(),
     )
 
 
@@ -1084,7 +1117,7 @@ async def cmd_apps(message: Message):
 
 
 @labeler.private_message(
-    text=[BTN_GUIDE, "📖 Инструкция", "📖 Гайд", "Гайд", "инструкция", "гайд"]
+    text=[BTN_GUIDE, "📱 Гайд", "📖 Инструкция", "📖 Гайд", "Гайд", "инструкция", "гайд"]
 )
 async def cmd_guide(message: Message):
     await message.answer(GUIDE_INTRO, keyboard=guide_os_keyboard())
@@ -1318,6 +1351,14 @@ async def on_message_event(event: GroupTypes.MessageEvent):
         except Exception as exc:  # noqa: BLE001
             logger.warning("cabinet callback failed: %s", exc)
             snack = "Ошибка"
+    elif cmd == "referral":
+        snack = "👥 Рефералка"
+        await _send_referral_screen(
+            api=event.ctx_api,
+            peer_id=event.object.peer_id,
+            vk_user_id=event.object.user_id,
+            first_name=None,
+        )
     elif cmd == "doc":
         slug = str(payload.get("slug") or "")
         page = int(payload.get("page") or 1)
