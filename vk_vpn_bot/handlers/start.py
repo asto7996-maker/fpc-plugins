@@ -50,6 +50,9 @@ from keyboards import (
     BTN_CABINET_LOGIN,
     BTN_CONNECT,
     BTN_CONNECT_OLD,
+    BTN_DOC_LIST,
+    BTN_DOC_NEXT,
+    BTN_DOC_PREV,
     BTN_FAQ,
     BTN_GET_KEY,
     BTN_GUIDE,
@@ -75,6 +78,7 @@ from keyboards import (
     auto_login_keyboard,
     connect_keyboard,
     doc_keyboard,
+    doc_nav_keyboard,
     guide_os_keyboard,
     info_keyboard,
     main_menu_keyboard,
@@ -109,6 +113,8 @@ labeler.vbml_ignore_case = True
 _waiting_promo: set[int] = set()
 # Ожидание суммы оплаты: vk_id → код метода Platega (2/11/13)
 _pending_pay_method: dict[int, int] = {}
+# Чтение документа в боте: vk_id → {"slug": str, "page": int, "total": int}
+_reading_doc: dict[int, dict[str, int | str]] = {}
 
 # Кнопка текста → slug документа
 _DOC_BUTTONS: dict[str, str] = {
@@ -147,22 +153,21 @@ def _cab() -> str:
 
 
 async def _send_doc(message: Message, slug: str, page: int = 1) -> None:
+    """Показывает документ целиком в VK-чате с кнопками листания."""
     doc = DOCS_BY_SLUG.get(slug)
     if not doc:
+        _reading_doc.pop(message.from_id, None)
         await message.answer(
             format_error("Документ не найден."),
             keyboard=info_keyboard(_cab()),
         )
         return
     text, total = format_doc_for_bot(doc, page=page)
+    page = max(1, min(page, total))
+    _reading_doc[message.from_id] = {"slug": slug, "page": page, "total": total}
     await message.answer(
         text,
-        keyboard=doc_keyboard(_cab(), slug, page=page, total=total),
-    )
-    # Reply-клавиатура раздела Инфо остаётся доступной
-    await message.answer(
-        "📄  Документ выше · можно листать или открыть в мини-приложении",
-        keyboard=info_keyboard(_cab()),
+        keyboard=doc_nav_keyboard(page=page, total=total),
     )
 
 
@@ -228,6 +233,7 @@ async def cmd_start(message: Message):
     settings = get_settings()
     _waiting_promo.discard(message.from_id)
     _pending_pay_method.pop(message.from_id, None)
+    _reading_doc.pop(message.from_id, None)
     user = await _ensure_user(message)
 
     if settings.cabinet_jwt_secret and settings.bedolaga_api_key:
@@ -451,9 +457,51 @@ async def cmd_document(message: Message):
     raw = (message.text or "").strip()
     slug = _DOC_BUTTONS.get(raw) or _DOC_BUTTONS.get(raw.lower())
     if not slug:
-        await message.answer(format_info_menu(get_settings()), keyboard=info_keyboard(_cab()))
+        await message.answer(
+            format_info_menu(get_settings()), keyboard=info_keyboard(_cab())
+        )
         return
     await _send_doc(message, slug, page=1)
+
+
+@labeler.private_message(text=[BTN_DOC_NEXT, "➡️ Далее", "далее"])
+async def cmd_doc_next(message: Message):
+    state = _reading_doc.get(message.from_id)
+    if not state:
+        await message.answer(
+            format_info_menu(get_settings()), keyboard=info_keyboard(_cab())
+        )
+        return
+    page = int(state["page"]) + 1
+    await _send_doc(message, str(state["slug"]), page=page)
+
+
+@labeler.private_message(text=[BTN_DOC_PREV, "⬅️ Назад"])
+async def cmd_doc_prev(message: Message):
+    """«⬅️ Назад» при чтении документа = предыдущая страница; иначе в меню."""
+    state = _reading_doc.get(message.from_id)
+    if state and int(state["page"]) > 1:
+        await _send_doc(message, str(state["slug"]), page=int(state["page"]) - 1)
+        return
+    # Если страница 1 или документа нет — ведём себя как обычный «Назад»
+    _reading_doc.pop(message.from_id, None)
+    settings = get_settings()
+    user = await _ensure_user(message)
+    await message.answer(
+        format_welcome(settings, user.first_name),
+        keyboard=main_menu_keyboard(_cab()),
+    )
+
+
+@labeler.private_message(text=[BTN_DOC_LIST, "📚 К документам", "к документам"])
+async def cmd_doc_list(message: Message):
+    _reading_doc.pop(message.from_id, None)
+    settings = get_settings()
+    await _ensure_user(message)
+    await message.answer(
+        format_info_menu(settings),
+        keyboard=info_keyboard(_cab()),
+    )
 
 
 
@@ -763,6 +811,7 @@ async def on_message_event(event: GroupTypes.MessageEvent):
             )
     elif cmd == "info":
         snack = "ℹ️ Инфо"
+        _reading_doc.pop(event.object.user_id, None)
         await event.ctx_api.messages.send(
             peer_id=event.object.peer_id,
             message=format_info_menu(settings),
@@ -775,14 +824,18 @@ async def on_message_event(event: GroupTypes.MessageEvent):
         doc = DOCS_BY_SLUG.get(slug)
         if doc:
             text, total = format_doc_for_bot(doc, page=page)
+            page = max(1, min(page, total))
+            _reading_doc[event.object.user_id] = {
+                "slug": slug,
+                "page": page,
+                "total": total,
+            }
             snack = f"{doc.emoji} {page}/{total}"
             await event.ctx_api.messages.send(
                 peer_id=event.object.peer_id,
                 message=text,
                 random_id=0,
-                keyboard=doc_keyboard(
-                    settings.cabinet_url, slug, page=page, total=total
-                ),
+                keyboard=doc_nav_keyboard(page=page, total=total),
             )
         else:
             snack = "Не найдено"

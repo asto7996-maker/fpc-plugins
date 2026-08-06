@@ -58,17 +58,15 @@ def test_menus_and_copy() -> None:
 
     info = format_info_menu(settings)
     assert "Политика" in info or "приват" in info.lower()
-    assert "legal/index.html" in info
+    assert "Инфо" in info or "документ" in info.lower()
 
     assert "ℹ️" in BTN_INFO
     assert "🛡️" in BTN_PRIVACY
     assert "📜" in BTN_TERMS
 
-    kb = main_menu_keyboard(settings.cabinet_url)
-    assert "\\u0438\\u043d\\u0444\\u043e" in kb.lower() or "Инфо" in kb.encode().decode("unicode_escape", errors="ignore") or "info" in kb.lower()
-    # vkbottle JSON-экранирует unicode — достаточно проверить наличие кнопки Инфо после decode
     import json
 
+    kb = main_menu_keyboard(settings.cabinet_url)
     data = json.loads(kb)
     labels = [btn["action"]["label"] for row in data["buttons"] for btn in row]
     assert BTN_INFO in labels
@@ -76,11 +74,12 @@ def test_menus_and_copy() -> None:
     ik = info_keyboard(settings.cabinet_url)
     idata = json.loads(ik)
     ilabels = [
-        (btn["action"].get("label") or btn["action"].get("link") or "")
+        (btn["action"].get("label") or "")
         for row in idata["buttons"]
         for btn in row
     ]
-    assert any("Приватность" in x or "privacy" in x for x in ilabels)
+    assert any("Приватность" in x for x in ilabels)
+    assert any("Соглашение" in x for x in ilabels)
 
 def test_miniapp_files() -> None:
     root = Path(__file__).resolve().parents[1] / "miniapp" / "legal"

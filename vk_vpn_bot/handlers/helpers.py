@@ -66,7 +66,8 @@ def format_welcome(settings: Settings, first_name: str | None = None) -> str:
         f"быстрый VPN без лишней суеты.\n\n"
         f"{bullet(f'Триал {settings.trial_days} дня для новых')}\n"
         f"{bullet('Оплата СБП · карта · крипта')}\n"
-        f"{bullet('Кабинет без регистрации')}\n\n"
+        f"{bullet('Кабинет без регистрации')}\n"
+        f"{bullet('Документы — кнопка «ℹ️ Инфо»')}\n\n"
         f"{soft_rule()}\n"
         f"{footer_hint('меню внизу экрана')}"
     )
@@ -291,10 +292,12 @@ def format_support(settings: Settings) -> str:
 
 
 def format_info_menu(settings: Settings) -> str:
+    _ = settings
     lines = [
         header("ℹ️", "Инфо и документы"),
         "",
-        "Всё важное — в боте и в мини-приложении.",
+        "Читайте прямо здесь, в боте ВКонтакте.",
+        "Выберите документ кнопкой ниже 👇",
         "",
     ]
     for doc in ALL_DOCS:
@@ -302,9 +305,7 @@ def format_info_menu(settings: Settings) -> str:
         lines.append(f"     {doc.summary}")
         lines.append("")
     lines.append(soft_rule())
-    lines.append(f"📂  {settings.cabinet_url}/legal/index.html")
-    lines.append("")
-    lines.append(footer_hint("выберите документ"))
+    lines.append(footer_hint("откройте нужный документ"))
     return "\n".join(lines)
 
 

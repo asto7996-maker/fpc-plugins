@@ -1,5 +1,6 @@
 """
 Клавиатуры VK-бота — выразительный интерфейс Paskod с эмодзи.
+Документы читаются прямо в боте (reply-клавиатура), без зависимости от мини-приложения.
 """
 
 from __future__ import annotations
@@ -30,12 +31,15 @@ BTN_PAY_CRYPTO = "🪙 Крипта"
 BTN_RENEW = "♻️ Продлить"
 BTN_DEVICES = "📲 Устройства"
 
-# Документы
+# Документы (всё в VK-боте)
 BTN_PRIVACY = "🛡️ Приватность"
 BTN_TERMS = "📜 Соглашение"
 BTN_OFFER = "📄 Оферта"
 BTN_RULES = "📋 Правила"
 BTN_FAQ = "💬 FAQ"
+BTN_DOC_PREV = "⬅️ Назад"
+BTN_DOC_NEXT = "➡️ Далее"
+BTN_DOC_LIST = "📚 К документам"
 
 PAY_AMOUNT_BUTTONS: dict[str, int] = {
     "💵 50 ₽": 5000,
@@ -47,52 +51,6 @@ PAY_AMOUNT_BUTTONS: dict[str, int] = {
 # Совместимость со старыми подписями клавиатур VK
 BTN_GET_KEY = "🔑 Получить ключ"
 BTN_CONNECT_OLD = "🚀 Подключить VPN"
-_LEGACY = (
-    "Подключиться",
-    "Бесплатный триал",
-    "Подписка",
-    "Купить",
-    "Баланс",
-    "Партнёрам",
-    "Промокод",
-    "Приложения",
-    "Гайд",
-    "Помощь",
-    "Профиль",
-    "Мой ключ",
-    "Назад",
-    "Кабинет",
-    "Войти",
-    "Оплатить",
-    "СБП · QR",
-    "Карта",
-    "Крипта",
-    "Продлить",
-    "🚀 Подключиться",
-    "🎁 Активировать триал",
-    "📦 Моя подписка",
-    "💳 Купить",
-    "💰 Баланс",
-    "👥 Партнёрка",
-    "🎟 Промокод",
-    "📱 Приложения",
-    "📖 Инструкция",
-    "💬 Поддержка",
-    "👤 Профиль",
-    "🔑 Мой ключ",
-    "◀️ Назад в меню",
-    "🌐 Кабинет",
-    "🔐 Войти без регистрации",
-    "💳 Оплатить",
-    "🏦 СБП (QR)",
-    "💳 Банк. карта",
-    "🪙 Крипта",
-    "♻️ Продлить",
-    "50 ₽",
-    "100 ₽",
-    "150 ₽",
-    "500 ₽",
-)
 
 
 def cabinet_path(base: str, path: str) -> str:
@@ -100,12 +58,12 @@ def cabinet_path(base: str, path: str) -> str:
 
 
 def legal_url(cabinet_url: str, slug: str) -> str:
-    """URL документа в мини-приложении / на статике кабинета."""
+    """URL документа (опционально, если развёрнута статика /legal)."""
     return cabinet_path(cabinet_url, f"legal/{slug}.html")
 
 
 def main_menu_keyboard(cabinet_url: str) -> str:
-    """Главное меню: 2 колонки, яркая иерархия."""
+    """Главное меню: документы сразу видны (кнопка Инфо)."""
     _ = cabinet_url
     return (
         Keyboard(one_time=False, inline=False)
@@ -118,55 +76,61 @@ def main_menu_keyboard(cabinet_url: str) -> str:
         .add(Text(BTN_CABINET), color=KeyboardButtonColor.PRIMARY)
         .add(Text(BTN_BALANCE), color=KeyboardButtonColor.PRIMARY)
         .row()
+        .add(Text(BTN_INFO), color=KeyboardButtonColor.POSITIVE)
+        .add(Text(BTN_SUPPORT), color=KeyboardButtonColor.PRIMARY)
+        .row()
         .add(Text(BTN_APPS), color=KeyboardButtonColor.SECONDARY)
         .add(Text(BTN_GUIDE), color=KeyboardButtonColor.SECONDARY)
         .row()
         .add(Text(BTN_PROMO), color=KeyboardButtonColor.SECONDARY)
         .add(Text(BTN_REFERRAL), color=KeyboardButtonColor.SECONDARY)
-        .row()
-        .add(Text(BTN_INFO), color=KeyboardButtonColor.SECONDARY)
-        .add(Text(BTN_SUPPORT), color=KeyboardButtonColor.SECONDARY)
         .get_json()
     )
 
 
-def info_keyboard(cabinet_url: str) -> str:
-    """Раздел документов — в боте и ссылки в мини-приложение."""
+def info_keyboard(cabinet_url: str = "") -> str:
+    """Раздел документов — только кнопки VK, тексты внутри бота."""
+    _ = cabinet_url
     return (
         Keyboard(one_time=False, inline=False)
-        .add(Text(BTN_PRIVACY), color=KeyboardButtonColor.PRIMARY)
-        .add(Text(BTN_TERMS), color=KeyboardButtonColor.PRIMARY)
+        .add(Text(BTN_PRIVACY), color=KeyboardButtonColor.POSITIVE)
+        .add(Text(BTN_TERMS), color=KeyboardButtonColor.POSITIVE)
         .row()
         .add(Text(BTN_OFFER), color=KeyboardButtonColor.PRIMARY)
         .add(Text(BTN_RULES), color=KeyboardButtonColor.PRIMARY)
         .row()
-        .add(Text(BTN_FAQ), color=KeyboardButtonColor.POSITIVE)
-        .add(
-            OpenLink(cabinet_path(cabinet_url, "legal/index.html"), "📂 Все документы"),
-        )
+        .add(Text(BTN_FAQ), color=KeyboardButtonColor.PRIMARY)
         .row()
         .add(Text(BTN_BACK), color=KeyboardButtonColor.SECONDARY)
         .get_json()
     )
 
 
-def doc_keyboard(cabinet_url: str, slug: str, *, page: int, total: int) -> str:
-    """Навигация по документу + открытие в мини-приложении."""
-    kb = Keyboard(inline=True)
-    nav: list[tuple[str, dict]] = []
+def doc_nav_keyboard(*, page: int, total: int) -> str:
+    """Листание документа прямо в боте (reply-кнопки)."""
+    kb = Keyboard(one_time=False, inline=False)
     if page > 1:
-        nav.append(("⬅️", {"cmd": "doc", "slug": slug, "page": page - 1}))
+        kb.add(Text(BTN_DOC_PREV), color=KeyboardButtonColor.PRIMARY)
     if page < total:
-        nav.append(("➡️", {"cmd": "doc", "slug": slug, "page": page + 1}))
-    if nav:
-        for i, (label, payload) in enumerate(nav):
-            kb.add(Callback(label, payload=payload))
-            if i < len(nav) - 1:
-                pass
+        kb.add(Text(BTN_DOC_NEXT), color=KeyboardButtonColor.POSITIVE)
+    if page > 1 or page < total:
         kb.row()
-    kb.add(OpenLink(legal_url(cabinet_url, slug), "🌐 В мини-приложении"))
-    kb.row()
-    kb.add(Callback("ℹ️ К документам", payload={"cmd": "info"}))
+    kb.add(Text(BTN_DOC_LIST), color=KeyboardButtonColor.SECONDARY)
+    kb.add(Text(BTN_BACK), color=KeyboardButtonColor.SECONDARY)
+    return kb.get_json()
+
+
+def doc_keyboard(cabinet_url: str, slug: str, *, page: int, total: int) -> str:
+    """Совместимость: inline-навигация (если нужна)."""
+    _ = cabinet_url
+    kb = Keyboard(inline=True)
+    if page > 1:
+        kb.add(Callback("⬅️", payload={"cmd": "doc", "slug": slug, "page": page - 1}))
+    if page < total:
+        kb.add(Callback("➡️", payload={"cmd": "doc", "slug": slug, "page": page + 1}))
+    if page > 1 or page < total:
+        kb.row()
+    kb.add(Callback("📚 К документам", payload={"cmd": "info"}))
     return kb.get_json()
 
 
@@ -306,7 +270,7 @@ def support_keyboard(support_url: str, cabinet_url: str) -> str:
         Keyboard(one_time=False, inline=False)
         .add(OpenLink(support_url, "💌 Написать нам"))
         .row()
-        .add(Text(BTN_INFO), color=KeyboardButtonColor.SECONDARY)
+        .add(Text(BTN_INFO), color=KeyboardButtonColor.POSITIVE)
         .add(Text(BTN_BACK), color=KeyboardButtonColor.SECONDARY)
         .get_json()
     )
