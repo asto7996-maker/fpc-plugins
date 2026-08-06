@@ -1,4 +1,4 @@
-"""Пакет клавиатур VK — паритет с Bedolaga."""
+"""Пакет клавиатур VK — компактный интерфейс."""
 
 from keyboards.menus import (
     BTN_ADMIN,
@@ -21,6 +21,7 @@ from keyboards.menus import (
     BTN_FAQ,
     BTN_GET_KEY,
     BTN_GUIDE,
+    BTN_HELP,
     BTN_INFO,
     BTN_MY_KEY,
     BTN_OFFER,
@@ -36,6 +37,7 @@ from keyboards.menus import (
     BTN_RULES,
     BTN_SUBSCRIPTION,
     BTN_SUPPORT,
+    BTN_TARIFFS,
     BTN_TERMS,
     BTN_TRIAL,
     PAY_AMOUNT_BUTTONS,
@@ -48,6 +50,8 @@ from keyboards.menus import (
     doc_keyboard,
     doc_nav_keyboard,
     guide_os_keyboard,
+    help_keyboard,
+    info_inline_keyboard,
     info_keyboard,
     legal_url,
     main_menu_keyboard,
@@ -58,6 +62,7 @@ from keyboards.menus import (
     subscription_keyboard,
     support_keyboard,
     support_wait_keyboard,
+    tariffs_inline_keyboard,
     tariffs_keyboard,
 )
 
@@ -82,6 +87,7 @@ __all__ = [
     "BTN_FAQ",
     "BTN_GET_KEY",
     "BTN_GUIDE",
+    "BTN_HELP",
     "BTN_INFO",
     "BTN_MY_KEY",
     "BTN_OFFER",
@@ -97,6 +103,7 @@ __all__ = [
     "BTN_RULES",
     "BTN_SUBSCRIPTION",
     "BTN_SUPPORT",
+    "BTN_TARIFFS",
     "BTN_TERMS",
     "BTN_TRIAL",
     "PAY_AMOUNT_BUTTONS",
@@ -109,6 +116,8 @@ __all__ = [
     "doc_keyboard",
     "doc_nav_keyboard",
     "guide_os_keyboard",
+    "help_keyboard",
+    "info_inline_keyboard",
     "info_keyboard",
     "legal_url",
     "main_menu_keyboard",
@@ -119,5 +128,6 @@ __all__ = [
     "subscription_keyboard",
     "support_keyboard",
     "support_wait_keyboard",
+    "tariffs_inline_keyboard",
     "tariffs_keyboard",
 ]

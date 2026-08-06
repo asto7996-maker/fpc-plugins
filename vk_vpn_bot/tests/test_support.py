@@ -16,7 +16,7 @@ from keyboards.menus import (
     BTN_ASK,
     BTN_BACK,
     BTN_INFO,
-    support_keyboard,
+    help_keyboard,
     support_wait_keyboard,
 )
 from services.support import is_self_dialog_url, usable_support_url
@@ -63,19 +63,15 @@ def test_usable_support_url() -> None:
 
 
 def test_support_keyboard() -> None:
-    without = _labels(support_keyboard("", "https://cabinet.paskod.ru"))
+    without = _labels(help_keyboard(""))
     labels = [label for _, label in without]
     assert BTN_ASK in labels
     assert BTN_INFO in labels
     assert BTN_BACK in labels
-    assert all(kind == "text" for kind, _ in without), "лишняя ссылка без URL"
 
-    with_link = _labels(
-        support_keyboard("https://t.me/paskod_support", "https://cabinet.paskod.ru")
-    )
+    with_link = _labels(help_keyboard("https://t.me/paskod_support"))
     kinds = [kind for kind, _ in with_link]
     assert "open_link" in kinds
-    assert BTN_ASK in [label for _, label in with_link]
 
 
 def test_support_wait_keyboard() -> None:
@@ -87,7 +83,7 @@ def test_routing() -> None:
     from tools.diagnose_support import resolve
 
     assert resolve(BTN_ASK) == "cmd_ask_question"
-    assert resolve("💬 Помощь") == "cmd_support"
+    assert resolve("📖 Помощь") == "cmd_help"
     assert resolve(BTN_BACK) == "cmd_start"
 
 

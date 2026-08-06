@@ -62,13 +62,13 @@ def test_troubleshooting_covers_real_symptoms() -> None:
         "маршрутизации",       # трафик не идёт
         "пуст",                # добавлено как сервер, а не подписка
         "рвётся",              # обрывы соединения
-        "Задать вопрос",       # куда идти, если ничего не помогло
+        "Вопрос",               # куда идти, если ничего не помогло
     ):
         assert marker in trouble, marker
 
 
 def test_intro_explains_subscription_model() -> None:
-    for marker in ("подписк", "sub.paskod.ru", "QR"):
+    for marker in ("подписк", "sub.paskod.ru", "Happ"):
         assert marker in GUIDE_INTRO, marker
 
 

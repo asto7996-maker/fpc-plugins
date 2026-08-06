@@ -50,9 +50,9 @@ def _offer() -> Offer:
 
 
 def test_method_labels_match_cabinet() -> None:
-    assert method_label(PLATEGA_METHOD_SBP_QR) == "🏦 СБП (QR)"
-    assert method_label(PLATEGA_METHOD_CARD) == "💳 Карты (RUB)"
-    assert method_label(PLATEGA_METHOD_CRYPTO) == "🪙 Криптовалюта"
+    assert method_label(PLATEGA_METHOD_SBP_QR) == "🏦 СБП"
+    assert method_label(PLATEGA_METHOD_CARD) == "💳 Карта"
+    assert method_label(PLATEGA_METHOD_CRYPTO) == "🪙 Крипта"
     for code in (PLATEGA_METHOD_SBP_QR, PLATEGA_METHOD_CARD, PLATEGA_METHOD_CRYPTO):
         copy = METHOD_COPY[code]
         assert copy["summary"] and copy["how"] and copy["timing"]

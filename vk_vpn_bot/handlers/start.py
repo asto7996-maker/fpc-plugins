@@ -34,6 +34,7 @@ from handlers.helpers import (
     format_error,
     format_fallback,
     format_guide_outro,
+    format_help_menu,
     format_info_menu,
     format_key_message,
     format_min_amount,
@@ -75,6 +76,7 @@ from keyboards import (
     BTN_FAQ,
     BTN_GET_KEY,
     BTN_GUIDE,
+    BTN_HELP,
     BTN_INFO,
     BTN_MY_KEY,
     BTN_OFFER,
@@ -91,6 +93,7 @@ from keyboards import (
     BTN_SUBSCRIPTION,
     BTN_SUPPORT,
     BTN_TERMS,
+    BTN_TARIFFS,
     BTN_TRIAL,
     PAY_AMOUNT_BUTTONS,
     apps_keyboard,
@@ -100,6 +103,8 @@ from keyboards import (
     doc_keyboard,
     doc_nav_keyboard,
     guide_os_keyboard,
+    help_keyboard,
+    info_inline_keyboard,
     info_keyboard,
     main_menu_keyboard,
     pay_amounts_keyboard,
@@ -107,8 +112,8 @@ from keyboards import (
     payment_link_keyboard,
     promo_keyboard,
     subscription_keyboard,
-    support_keyboard,
     support_wait_keyboard,
+    tariffs_inline_keyboard,
     tariffs_keyboard,
 )
 from legal.documents import DOCS_BY_SLUG, format_doc_for_bot
@@ -225,7 +230,7 @@ async def _send_doc(message: Message, slug: str, page: int = 1) -> None:
     _reading_doc[message.from_id] = {"slug": slug, "page": page, "total": total}
     await message.answer(
         text,
-        keyboard=doc_nav_keyboard(page=page, total=total),
+        keyboard=doc_nav_keyboard(page=page, total=total, slug=slug),
     )
 
 
@@ -508,7 +513,29 @@ async def cmd_info(message: Message):
     await _ensure_user(message)
     await message.answer(
         format_info_menu(settings),
-        keyboard=info_keyboard(_cab()),
+        keyboard=info_inline_keyboard(),
+    )
+
+
+@labeler.private_message(
+    text=[
+        BTN_HELP,
+        BTN_SUPPORT,
+        "💬 Поддержка",
+        "💬 Помощь",
+        "Помощь",
+        "поддержка",
+        "саппорт",
+        "помощь",
+    ]
+)
+async def cmd_help(message: Message):
+    settings = get_settings()
+    await _ensure_user(message)
+    _waiting_support.discard(message.from_id)
+    await message.answer(
+        format_help_menu(settings),
+        keyboard=help_keyboard(usable_support_url(settings)),
     )
 
 
@@ -577,28 +604,74 @@ def _clear_pay_state(vk_id: int) -> None:
 
 
 async def _show_tariffs(message: Message, *, renew: bool) -> None:
-    """Экран выбора тарифа с кнопками-офферами."""
+    """Тарифы inline — reply-клавиатура не раздувается."""
     settings = get_settings()
     _waiting_promo.discard(message.from_id)
     _pending_pay_method.pop(message.from_id, None)
     catalog = await _catalog(message)
     if not catalog or not catalog.offers():
-        # Кабинет недоступен — открываем покупку там же
         await message.answer(
             format_tariff_menu(None, settings, renew=renew),
-            keyboard=subscription_keyboard(_cab(), has_key=False),
+            keyboard=_main_kb(message.from_id),
         )
         await _open_cabinet(
             message,
             redirect="/subscription/purchase",
-            title="✨ Открываю тарифы…",
-            button_text="💎 Выбрать тариф",
+            title="✨ Тарифы…",
+            button_text="💎 Кабинет",
         )
         return
-    labels = [o.label for o in catalog.offers()]
     await message.answer(
         format_tariff_menu(catalog, settings, renew=renew),
-        keyboard=tariffs_keyboard(labels),
+        keyboard=tariffs_inline_keyboard(catalog.offers()),
+    )
+
+
+async def _pick_tariff(
+    api,
+    *,
+    peer_id: int,
+    user_id: int,
+    tid: int,
+    days: int,
+) -> None:
+    """Выбор тарифа из inline-кнопки."""
+    from database import get_or_create_user
+
+    settings = get_settings()
+    user = await get_or_create_user(user_id)
+    catalog: Catalog | None = None
+    if settings.cabinet_jwt_secret:
+        try:
+            bedolaga_id = await ensure_bedolaga_id_for_payments(
+                user.user_id, user.first_name
+            )
+            catalog = await fetch_catalog(settings, bedolaga_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("каталог при выборе тарифа: %s", exc)
+
+    offer = None
+    if catalog:
+        for o in catalog.offers(limit=99):
+            if o.tariff.id == tid and o.period.days == days:
+                offer = o
+                break
+    if offer is None:
+        await api.messages.send(
+            peer_id=peer_id,
+            message=format_error("Тариф недоступен — выберите другой."),
+            random_id=0,
+            keyboard=_main_kb(user_id),
+        )
+        return
+
+    _pending_tariff[user_id] = {"tid": tid, "days": days}
+    _pending_pay_method.pop(user_id, None)
+    await api.messages.send(
+        peer_id=peer_id,
+        message=format_tariff_chosen(offer),
+        random_id=0,
+        keyboard=pay_methods_keyboard(),
     )
 
 
@@ -825,7 +898,10 @@ async def cmd_pay_crypto(message: Message):
     await _start_pay_amount(message, PLATEGA_METHOD_CRYPTO)
 
 
-@labeler.private_message(text=list(PAY_AMOUNT_BUTTONS.keys()) + ["50 ₽", "100 ₽", "150 ₽", "500 ₽"])
+@labeler.private_message(text=list(PAY_AMOUNT_BUTTONS.keys()) + [
+    "50 ₽", "100 ₽", "150 ₽", "500 ₽",
+    "💵 50 ₽", "💵 100 ₽", "💎 150 ₽", "💎 500 ₽",
+])
 async def cmd_pay_quick_amount(message: Message):
     method_code = _pending_pay_method.get(message.from_id)
     if method_code is None:
@@ -843,6 +919,10 @@ async def cmd_pay_quick_amount(message: Message):
             "100 ₽": 10000,
             "150 ₽": 15000,
             "500 ₽": 50000,
+            "💵 50 ₽": 5000,
+            "💵 100 ₽": 10000,
+            "💎 150 ₽": 15000,
+            "💎 500 ₽": 50000,
         }
         amount = legacy.get(raw)
     if not amount:
@@ -852,28 +932,26 @@ async def cmd_pay_quick_amount(message: Message):
     )
 
 
+@labeler.private_message(text=[BTN_BALANCE, "💰 Баланс", "Баланс", "баланс"])
+async def cmd_balance(message: Message):
+    await cmd_pay(message)
+
+
 @labeler.private_message(
-    text=[BTN_BUY, "💳 Купить", "💎 Купить", "Купить", "купить", "тарифы", "тариф"]
+    text=[
+        BTN_BUY,
+        BTN_TARIFFS,
+        "💳 Купить",
+        "💎 Купить",
+        "Купить",
+        "купить",
+        "тарифы",
+        "тариф",
+    ]
 )
 async def cmd_buy(message: Message):
     await _ensure_user(message)
     await _show_tariffs(message, renew=False)
-
-
-@labeler.private_message(text=[BTN_BALANCE, "💰 Баланс", "Баланс", "баланс"])
-async def cmd_balance(message: Message):
-    settings = get_settings()
-    await _ensure_user(message)
-    await message.answer(
-        format_balance(settings, await _catalog(message)),
-        keyboard=pay_methods_keyboard(),
-    )
-    await _open_cabinet(
-        message,
-        redirect="/balance",
-        title="✨ Или откройте кабинет",
-        button_text="💰 Баланс в кабинете",
-    )
 
 
 @labeler.private_message(
@@ -948,31 +1026,10 @@ async def cmd_trouble(message: Message):
 
 @labeler.private_message(
     text=[
-        BTN_SUPPORT,
-        "💬 Поддержка",
-        "💬 Помощь",
-        "Помощь",
-        "поддержка",
-        "саппорт",
-        "помощь",
-    ]
-)
-async def cmd_support(message: Message):
-    settings = get_settings()
-    await _ensure_user(message)
-    _waiting_support.discard(message.from_id)
-    await message.answer(
-        format_support(settings),
-        keyboard=support_keyboard(usable_support_url(settings), _cab()),
-    )
-
-
-@labeler.private_message(
-    text=[
         BTN_ASK,
         "✍️ Задать вопрос",
+        "✍️ Вопрос",
         "задать вопрос",
-        "задать вопрос поддержке",
         "вопрос",
     ]
 )
@@ -1011,7 +1068,7 @@ async def _accept_support_question(message: Message, text: str) -> None:
     )
     await message.answer(
         format_support_received(bool(delivered)),
-        keyboard=support_keyboard(usable_support_url(settings), _cab()),
+        keyboard=help_keyboard(usable_support_url(settings)),
     )
 
 
@@ -1135,14 +1192,46 @@ async def on_message_event(event: GroupTypes.MessageEvent):
                 keyboard=guide_os_keyboard(),
             )
     elif cmd == "info":
-        snack = "ℹ️ Инфо"
+        snack = "ℹ️ Документы"
         _reading_doc.pop(event.object.user_id, None)
         await event.ctx_api.messages.send(
             peer_id=event.object.peer_id,
             message=format_info_menu(settings),
             random_id=0,
-            keyboard=info_keyboard(settings.cabinet_url),
+            keyboard=info_inline_keyboard(),
         )
+    elif cmd == "tariff":
+        tid = int(payload.get("tid") or 0)
+        days = int(payload.get("days") or 0)
+        if tid and days:
+            snack = "💎 Тариф"
+            await _pick_tariff(
+                event.ctx_api,
+                peer_id=event.object.peer_id,
+                user_id=event.object.user_id,
+                tid=tid,
+                days=days,
+            )
+    elif cmd == "cabinet":
+        path = str(payload.get("path") or "/")
+        snack = "🌐 Кабинет"
+        try:
+            await ensure_panel_user(event.object.user_id, None)
+            url, _ = await ensure_auto_login_url(
+                event.object.user_id,
+                None,
+                settings,
+                redirect=path,
+            )
+            await event.ctx_api.messages.send(
+                peer_id=event.object.peer_id,
+                message=format_auto_login_message(url, settings, redirect=path),
+                random_id=0,
+                keyboard=auto_login_keyboard(url, button_text="🌐 Открыть"),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("cabinet callback failed: %s", exc)
+            snack = "Ошибка"
     elif cmd == "doc":
         slug = str(payload.get("slug") or "")
         page = int(payload.get("page") or 1)
@@ -1160,7 +1249,7 @@ async def on_message_event(event: GroupTypes.MessageEvent):
                 peer_id=event.object.peer_id,
                 message=text,
                 random_id=0,
-                keyboard=doc_nav_keyboard(page=page, total=total),
+                keyboard=doc_nav_keyboard(page=page, total=total, slug=slug),
             )
         else:
             snack = "Не найдено"

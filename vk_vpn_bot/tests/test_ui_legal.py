@@ -14,9 +14,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from handlers.helpers import format_info_menu, format_welcome
 from handlers.style import brand, header, step
 from keyboards.menus import (
+    BTN_HELP,
     BTN_INFO,
     BTN_PRIVACY,
     BTN_TERMS,
+    info_inline_keyboard,
     info_keyboard,
     main_menu_keyboard,
 )
@@ -78,9 +80,9 @@ def test_menus_and_copy() -> None:
     kb = main_menu_keyboard(settings.cabinet_url)
     data = json.loads(kb)
     labels = [btn["action"]["label"] for row in data["buttons"] for btn in row]
-    assert BTN_INFO in labels
+    assert BTN_HELP in labels
 
-    ik = info_keyboard(settings.cabinet_url)
+    ik = info_inline_keyboard()
     idata = json.loads(ik)
     ilabels = [
         (btn["action"].get("label") or "")
@@ -89,6 +91,7 @@ def test_menus_and_copy() -> None:
     ]
     assert any("Приватность" in x for x in ilabels)
     assert any("Соглашение" in x for x in ilabels)
+    assert info_keyboard()  # reply — только «Назад»
 
 def test_miniapp_files() -> None:
     root = Path(__file__).resolve().parents[1] / "miniapp" / "legal"
