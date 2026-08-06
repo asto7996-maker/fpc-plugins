@@ -22,17 +22,24 @@ from vkbottle.bot import BotLabeler, Message
 from config import get_settings
 from database import get_or_create_user
 from handlers.helpers import (
+    format_amount_invalid,
     format_apps,
     format_auto_login_message,
     format_balance,
+    format_cabinet_plain,
     format_connect_screen,
+    format_doc_not_found,
     format_error,
     format_fallback,
+    format_guide_outro,
     format_info_menu,
     format_key_message,
+    format_min_amount,
     format_pay_amount_prompt,
     format_pay_intro,
+    format_pay_method_first,
     format_payment_created,
+    format_promo_accepted,
     format_promo_prompt,
     format_renew_stub,
     format_subscription_card,
@@ -158,7 +165,7 @@ async def _send_doc(message: Message, slug: str, page: int = 1) -> None:
     if not doc:
         _reading_doc.pop(message.from_id, None)
         await message.answer(
-            format_error("Документ не найден."),
+            format_doc_not_found(),
             keyboard=info_keyboard(_cab()),
         )
         return
@@ -184,7 +191,7 @@ async def _open_cabinet(
 
     if not settings.cabinet_jwt_secret:
         await message.answer(
-            f"🌐  Кабинет\n━━━━━━━━━━━━━━━━\n\n{settings.cabinet_url}{redirect}",
+            format_cabinet_plain(settings, redirect),
             keyboard=main_menu_keyboard(_cab()),
         )
         return
@@ -205,8 +212,9 @@ async def _open_cabinet(
         logger.exception("cabinet open failed: %s", exc)
         await message.answer(
             format_error(
-                "Не удалось открыть кабинет. Попробуйте чуть позже "
-                "или напишите в «Помощь»."
+                "Кабинет не отвечает — скорее всего, это временный сбой. "
+                "Попробуйте ещё раз через минуту, а если не поможет, "
+                "напишите в «💬 Помощь», и мы посмотрим со своей стороны."
             ),
             keyboard=main_menu_keyboard(_cab()),
         )
@@ -535,14 +543,14 @@ async def _create_and_send_payment(
 
     if amount_kopeks < 5000:
         await message.answer(
-            f"⚠️  Минимум 50 ₽\n━━━━━━━━━━━━━━━━\n\nСейчас: {format_rubles(amount_kopeks)}",
+            format_min_amount(format_rubles(amount_kopeks)),
             keyboard=pay_amounts_keyboard(),
         )
         return
 
     try:
         await message.answer(
-            f"✨ Секунду — готовлю счёт · {format_rubles(amount_kopeks)}"
+            f"✨ Секунду — готовлю счёт на {format_rubles(amount_kopeks)}…"
         )
         bedolaga_id = await ensure_bedolaga_id_for_payments(
             user.user_id, user.first_name
@@ -566,15 +574,21 @@ async def _create_and_send_payment(
         logger.exception("platega topup failed: %s", exc)
         await message.answer(
             format_error(
-                "Не удалось создать оплату. Попробуйте ещё раз "
-                "или откройте кабинет."
+                "Счёт создать не удалось — платёжный сервис вернул ошибку. "
+                "Попробуйте выбрать другой способ оплаты или повторите "
+                "попытку чуть позже. Пополнить баланс также можно "
+                "напрямую в кабинете."
             ),
             keyboard=pay_methods_keyboard(),
         )
     except Exception as exc:  # noqa: BLE001
         logger.exception("platega topup unexpected: %s", exc)
         await message.answer(
-            format_error("Что-то пошло не так. Попробуйте позже."),
+            format_error(
+                "Что-то сломалось на нашей стороне, и счёт не сформировался. "
+                "Деньги при этом не списывались. Попробуйте ещё раз через "
+                "пару минут или напишите в «💬 Помощь»."
+            ),
             keyboard=main_menu_keyboard(_cab()),
         )
 
@@ -617,7 +631,7 @@ async def cmd_pay_quick_amount(message: Message):
     method_code = _pending_pay_method.get(message.from_id)
     if method_code is None:
         await message.answer(
-            "⚠️  Сначала выберите способ оплаты",
+            format_pay_method_first(),
             keyboard=pay_methods_keyboard(),
         )
         return
@@ -716,7 +730,7 @@ async def cmd_apps(message: Message):
 async def cmd_guide(message: Message):
     await message.answer(GUIDE_INTRO, keyboard=guide_os_keyboard())
     await message.answer(
-        "🏠  Или вернитесь в меню",
+        format_guide_outro(),
         keyboard=main_menu_keyboard(_cab()),
     )
 
@@ -767,7 +781,11 @@ async def cmd_renew(message: Message):
         except Exception as exc:  # noqa: BLE001
             logger.exception("renew failed: %s", exc)
             await message.answer(
-                format_error("Не удалось продлить автоматически. Откройте покупку."),
+                format_error(
+                    "Автоматически продлить не получилось — панель не ответила. "
+                    "Оформите продление через покупку тарифа в кабинете: "
+                    "там доступ включится сразу после оплаты."
+                ),
                 keyboard=subscription_keyboard(_cab()),
             )
 
@@ -877,7 +895,7 @@ async def fallback(message: Message):
             )
             return
         await message.answer(
-            "💵  Введите сумму числом · например 100",
+            format_amount_invalid(),
             keyboard=pay_amounts_keyboard(),
         )
         return
@@ -886,11 +904,7 @@ async def fallback(message: Message):
         _waiting_promo.discard(message.from_id)
         code = text.upper()
         await message.answer(
-            f"🎟  Промокод принят\n"
-            f"━━━━━━━━━━━━━━━━\n\n"
-            f"  {code}\n\n"
-            f"Активируем его в кабинете — откройте раздел подписки "
-            f"и введите код. Вход без регистрации.",
+            format_promo_accepted(code),
             keyboard=promo_keyboard(_cab()),
         )
         await _open_cabinet(
