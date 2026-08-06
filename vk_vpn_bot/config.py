@@ -51,6 +51,11 @@ class Settings:
     outline_keys: tuple[str, ...]
     bot_name: str
     welcome_text: str
+    # Интеграция с Bedolaga / Paskod Remnawave
+    bedolaga_api_url: str
+    bedolaga_api_key: str
+    cabinet_url: str
+    renew_days: int
 
 
 def load_settings() -> Settings:
@@ -69,6 +74,12 @@ def load_settings() -> Settings:
     except ValueError as exc:
         raise RuntimeError("TRIAL_DAYS должен быть целым числом") from exc
 
+    renew_raw = _optional("RENEW_DAYS", "30")
+    try:
+        renew_days = max(1, int(renew_raw))
+    except ValueError as exc:
+        raise RuntimeError("RENEW_DAYS должен быть целым числом") from exc
+
     outline_raw = _optional("OUTLINE_KEYS", "")
     outline_keys = tuple(k.strip() for k in outline_raw.split(",") if k.strip())
 
@@ -76,7 +87,6 @@ def load_settings() -> Settings:
     if vpn_key_type not in {"vless", "outline", "wireguard"}:
         raise RuntimeError("VPN_KEY_TYPE должен быть: vless | outline | wireguard")
 
-    # Для SQLite создаём папку data/ заранее
     database_url = _optional(
         "DATABASE_URL",
         f"sqlite+aiosqlite:///{BASE_DIR / 'data' / 'vpn_bot.db'}",
@@ -104,6 +114,13 @@ def load_settings() -> Settings:
             "WELCOME_TEXT",
             "Привет! Я помогу подключить быстрый и стабильный VPN за пару кликов.",
         ),
+        bedolaga_api_url=_optional(
+            "BEDOLAGA_API_URL",
+            "https://cabinet.paskod.ru/api",
+        ),
+        bedolaga_api_key=_optional("BEDOLAGA_API_KEY", ""),
+        cabinet_url=_optional("CABINET_URL", "https://cabinet.paskod.ru"),
+        renew_days=renew_days,
     )
 
 
@@ -116,4 +133,12 @@ def get_settings() -> Settings:
     global _settings
     if _settings is None:
         _settings = load_settings()
+    return _settings
+
+
+def reload_settings() -> Settings:
+    """Перечитывает .env (после обновления секретов)."""
+    global _settings
+    load_dotenv(BASE_DIR / ".env", override=True)
+    _settings = load_settings()
     return _settings

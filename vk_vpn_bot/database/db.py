@@ -8,7 +8,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from config import get_settings
@@ -23,15 +23,24 @@ def _ensure_sqlite_dir(database_url: str) -> None:
     """Для SQLite создаём директорию под файл БД, если её ещё нет."""
     if not database_url.startswith("sqlite"):
         return
-    # sqlite+aiosqlite:///./data/vpn_bot.db  или  sqlite+aiosqlite:////abs/path
     raw = database_url.split(":///", 1)[-1]
     db_path = Path(raw)
     if not db_path.is_absolute():
-        # Относительный путь — от корня проекта
         from config import BASE_DIR
 
         db_path = BASE_DIR / db_path
     db_path.parent.mkdir(parents=True, exist_ok=True)
+
+
+async def _migrate_sqlite(conn) -> None:
+    """Добавляет новые колонки в существующую SQLite-таблицу (без Alembic)."""
+    result = await conn.execute(text("PRAGMA table_info(users)"))
+    rows = result.fetchall()
+    if not rows:
+        return
+    columns = {row[1] for row in rows}
+    if "bedolaga_user_id" not in columns:
+        await conn.execute(text("ALTER TABLE users ADD COLUMN bedolaga_user_id BIGINT"))
 
 
 async def init_db() -> None:
@@ -54,6 +63,8 @@ async def init_db() -> None:
 
     async with _engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        if settings.database_url.startswith("sqlite"):
+            await _migrate_sqlite(conn)
 
 
 async def close_db() -> None:
@@ -102,12 +113,19 @@ async def get_user(user_id: int) -> User | None:
         return result.scalar_one_or_none()
 
 
-async def activate_trial(user_id: int, vpn_key: str, trial_days: int) -> User:
+async def activate_trial(
+    user_id: int,
+    vpn_key: str,
+    trial_days: int,
+    *,
+    bedolaga_user_id: int | None = None,
+    subscription_end: datetime | None = None,
+) -> User:
     """
     Активирует тестовый период:
     - ставит is_trial_used = True
-    - продлевает subscription_end на trial_days
-    - сохраняет vpn_key
+    - продлевает subscription_end на trial_days (или берёт дату из панели)
+    - сохраняет vpn_key и bedolaga_user_id
     """
     async with get_session() as session:
         result = await session.execute(select(User).where(User.user_id == user_id))
@@ -115,27 +133,41 @@ async def activate_trial(user_id: int, vpn_key: str, trial_days: int) -> User:
 
         now = datetime.utcnow()
         user.is_trial_used = True
-        user.subscription_end = now + timedelta(days=trial_days)
+        user.subscription_end = subscription_end or (now + timedelta(days=trial_days))
         user.vpn_key = vpn_key
+        if bedolaga_user_id is not None:
+            user.bedolaga_user_id = bedolaga_user_id
 
         await session.commit()
         await session.refresh(user)
         return user
 
 
-async def renew_subscription(user_id: int, days: int, vpn_key: str | None = None) -> User:
+async def renew_subscription(
+    user_id: int,
+    days: int,
+    vpn_key: str | None = None,
+    *,
+    bedolaga_user_id: int | None = None,
+    subscription_end: datetime | None = None,
+) -> User:
     """Продлевает подписку на N дней (от текущей даты окончания или от сейчас)."""
     async with get_session() as session:
         result = await session.execute(select(User).where(User.user_id == user_id))
         user = result.scalar_one()
 
         now = datetime.utcnow()
-        base = user.subscription_end if user.is_subscription_active(now) else now
-        if base.tzinfo is not None:
-            base = base.replace(tzinfo=None)
-        user.subscription_end = base + timedelta(days=days)
+        if subscription_end is not None:
+            user.subscription_end = subscription_end
+        else:
+            base = user.subscription_end if user.is_subscription_active(now) else now
+            if base.tzinfo is not None:
+                base = base.replace(tzinfo=None)
+            user.subscription_end = base + timedelta(days=days)
         if vpn_key:
             user.vpn_key = vpn_key
+        if bedolaga_user_id is not None:
+            user.bedolaga_user_id = bedolaga_user_id
 
         await session.commit()
         await session.refresh(user)
@@ -148,6 +180,17 @@ async def update_vpn_key(user_id: int, vpn_key: str) -> User:
         result = await session.execute(select(User).where(User.user_id == user_id))
         user = result.scalar_one()
         user.vpn_key = vpn_key
+        await session.commit()
+        await session.refresh(user)
+        return user
+
+
+async def set_bedolaga_user_id(user_id: int, bedolaga_user_id: int) -> User:
+    """Сохраняет связь VK ↔ Bedolaga user id."""
+    async with get_session() as session:
+        result = await session.execute(select(User).where(User.user_id == user_id))
+        user = result.scalar_one()
+        user.bedolaga_user_id = bedolaga_user_id
         await session.commit()
         await session.refresh(user)
         return user

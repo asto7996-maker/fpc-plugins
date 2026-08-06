@@ -7,6 +7,7 @@ from database.db import (
     get_user,
     init_db,
     renew_subscription,
+    set_bedolaga_user_id,
     update_vpn_key,
 )
 from database.models import User
@@ -20,4 +21,5 @@ __all__ = [
     "activate_trial",
     "renew_subscription",
     "update_vpn_key",
+    "set_bedolaga_user_id",
 ]

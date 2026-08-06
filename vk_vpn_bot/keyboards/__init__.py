@@ -2,6 +2,7 @@
 
 from keyboards.menus import (
     BTN_BACK,
+    BTN_CABINET,
     BTN_CONNECT,
     BTN_GET_KEY,
     BTN_GUIDE,
@@ -19,6 +20,7 @@ from keyboards.menus import (
 
 __all__ = [
     "BTN_BACK",
+    "BTN_CABINET",
     "BTN_CONNECT",
     "BTN_GET_KEY",
     "BTN_GUIDE",

@@ -14,16 +14,22 @@ from services.vpn_keys import mask_key
 def format_welcome(settings: Settings, first_name: str | None = None) -> str:
     """Приветствие в стиле «Бедолага»."""
     name = first_name or "друг"
+    mode = (
+        "подключён к панели Paskod/Bedolaga"
+        if settings.bedolaga_api_key
+        else "локальный режим (добавьте BEDOLAGA_API_KEY для реальных ключей)"
+    )
     return (
         f"👋 Привет, {name}!\n\n"
         f"Я — {settings.bot_name}.\n"
         f"{settings.welcome_text}\n\n"
-        f"🎁 Новым пользователям доступен тест на {settings.trial_days} дн.\n\n"
+        f"🎁 Новым пользователям доступен тест на {settings.trial_days} дн.\n"
+        f"⚙️ Режим: {mode}\n\n"
         "Выберите действие в меню ниже 👇"
     )
 
 
-def format_profile(user: User) -> str:
+def format_profile(user: User, settings: Settings) -> str:
     """Карточка профиля пользователя."""
     active = user.is_subscription_active()
     if active and user.subscription_end:
@@ -42,6 +48,10 @@ def format_profile(user: User) -> str:
         created = created.replace(tzinfo=None)
     created_str = created.strftime("%d.%m.%Y") if created else "—"
 
+    bedolaga = (
+        f"#{user.bedolaga_user_id}" if user.bedolaga_user_id else "не связан"
+    )
+
     return (
         "👤 Мой профиль\n\n"
         f"🆔 VK ID: {user.user_id}\n"
@@ -49,6 +59,8 @@ def format_profile(user: User) -> str:
         f"📦 Подписка: {status}\n"
         f"🎁 Тестовый период: {trial}\n"
         f"🔑 Ключ: {key_preview}\n"
+        f"🖥 Панель: {bedolaga}\n"
+        f"🌐 Кабинет: {settings.cabinet_url}"
     )
 
 
@@ -71,35 +83,49 @@ def format_connect_screen(user: User, settings: Settings) -> str:
     return (
         "🚀 Подключение VPN\n\n"
         "Тестовый период уже использован, активной подписки нет.\n"
-        "Нажмите «Продлить подписку», чтобы получить доступ."
+        "Нажмите «Продлить подписку» или откройте личный кабинет."
     )
 
 
-def format_key_message(key: str, settings: Settings, *, is_trial: bool) -> str:
+def format_key_message(
+    key: str,
+    settings: Settings,
+    *,
+    is_trial: bool,
+    source: str = "local",
+) -> str:
     """Сообщение с выданным ключом."""
     header = (
         f"🎁 Тест на {settings.trial_days} дн. активирован!\n\n"
         if is_trial
         else "✅ Ваш VPN-ключ:\n\n"
     )
+    source_line = (
+        "Источник: панель Paskod/Bedolaga\n"
+        if source == "bedolaga"
+        else "Источник: локальный генератор (демо)\n"
+    )
     tip = (
-        "\n\n📋 Скопируйте ключ целиком и импортируйте в приложение.\n"
+        "\n\n📋 Скопируйте ссылку целиком и импортируйте в Happ / v2rayNG.\n"
         "Если не знаете как — откройте «📖 Инструкция»."
     )
-    # Ключ в отдельном блоке — удобно копировать
-    return f"{header}🔑 Тип: {settings.vpn_key_type.upper()}\n\n{key}{tip}"
+    return f"{header}{source_line}🔑 Тип: {settings.vpn_key_type.upper()}\n\n{key}{tip}"
 
 
-def format_renew_stub() -> str:
-    """Заглушка оплаты (можно заменить на платёжный модуль)."""
+def format_renew_stub(settings: Settings) -> str:
+    """Экран продления: кабинет + подсказка по API."""
+    if settings.bedolaga_api_key:
+        return (
+            "💳 Продление подписки\n\n"
+            f"Доступно автопродление на {settings.renew_days} дн. через панель.\n"
+            "Напишите «продлить сейчас» или откройте кабинет для оплаты картой.\n\n"
+            f"🌐 {settings.cabinet_url}"
+        )
     return (
         "💳 Продление подписки\n\n"
-        "Оплата пока в режиме ручной выдачи.\n"
-        "Напишите в поддержку — подберём тариф и активируем ключ.\n\n"
-        "Тарифы (пример):\n"
-        "• 30 дней — уточняйте у оператора\n"
-        "• 90 дней — выгоднее\n"
-        "• 365 дней — максимум экономии"
+        "Оплатите и управляйте подпиской в личном кабинете Paskod:\n"
+        f"{settings.cabinet_url}\n\n"
+        "Или напишите в поддержку — активируем вручную."
     )
 
 
@@ -108,7 +134,8 @@ def format_support(settings: Settings) -> str:
     return (
         "💬 Поддержка\n\n"
         f"{settings.support_text}\n\n"
-        f"Ссылка: {settings.support_url}"
+        f"Ссылка: {settings.support_url}\n"
+        f"Кабинет: {settings.cabinet_url}"
     )
 
 
