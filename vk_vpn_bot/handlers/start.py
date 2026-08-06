@@ -22,6 +22,7 @@ from config import get_settings
 from database import get_or_create_user
 from handlers.helpers import (
     format_apps,
+    format_auto_login_message,
     format_balance,
     format_buy,
     format_connect_screen,
@@ -39,6 +40,7 @@ from keyboards import (
     BTN_BACK,
     BTN_BALANCE,
     BTN_BUY,
+    BTN_CABINET_LOGIN,
     BTN_CONNECT,
     BTN_CONNECT_OLD,
     BTN_GET_KEY,
@@ -52,6 +54,7 @@ from keyboards import (
     BTN_SUPPORT,
     BTN_TRIAL,
     apps_keyboard,
+    auto_login_keyboard,
     connect_keyboard,
     guide_os_keyboard,
     main_menu_keyboard,
@@ -60,6 +63,7 @@ from keyboards import (
     support_keyboard,
 )
 from services.bedolaga import get_bedolaga_client
+from services.cabinet_auth import ensure_auto_login_url
 from services.keys_service import issue_renewal, issue_trial_or_key
 
 logger = logging.getLogger(__name__)
@@ -231,6 +235,50 @@ async def cmd_subscription(message: Message):
         format_subscription_card(user, settings, panel),
         keyboard=subscription_keyboard(_cab(), has_key=bool(user.vpn_key)),
     )
+
+
+@labeler.private_message(
+    text=[
+        BTN_CABINET_LOGIN,
+        "войти",
+        "кабинет",
+        "войти в кабинет",
+        "автологин",
+        "без регистрации",
+    ]
+)
+async def cmd_cabinet_login(message: Message):
+    """
+    Автологин в cabinet.paskod.ru без email/пароля —
+    аналог входа Telegram-пользователей через Mini App.
+    """
+    settings = get_settings()
+    user = await _ensure_user(message)
+
+    if not settings.cabinet_jwt_secret:
+        await message.answer(
+            "Автологин пока не настроен (нет CABINET_JWT_SECRET).\n"
+            f"Откройте кабинет вручную: {settings.cabinet_url}/login",
+            keyboard=main_menu_keyboard(_cab()),
+        )
+        return
+
+    try:
+        await message.answer("⏳ Готовлю вход в кабинет…")
+        url, _bedolaga_id = await ensure_auto_login_url(
+            user.user_id, user.first_name, settings
+        )
+        await message.answer(
+            format_auto_login_message(url, settings),
+            keyboard=auto_login_keyboard(url),
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("auto-login failed: %s", exc)
+        await message.answer(
+            f"Не удалось создать вход: {exc}\n"
+            f"Попробуйте открыть {settings.cabinet_url}/login",
+            keyboard=main_menu_keyboard(_cab()),
+        )
 
 
 # ---------------------------------------------------------------------------

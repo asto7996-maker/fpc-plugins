@@ -11,6 +11,17 @@ from database.models import User
 from services.vpn_keys import mask_key
 
 
+def format_auto_login_message(url: str, settings: Settings) -> str:
+    return (
+        "🔐 Вход в кабинет без регистрации\n\n"
+        "Как у пользователей Telegram: один тап — и вы уже внутри "
+        "личного кабинета Paskod, без email и пароля.\n\n"
+        "Нажмите кнопку ниже «Открыть кабинет».\n"
+        "Ссылка действует 72 часа и привязана к вашему VK-аккаунту.\n\n"
+        f"Если кнопка не открылась, скопируйте:\n{url}"
+    )
+
+
 def format_welcome(settings: Settings, first_name: str | None = None) -> str:
     name = first_name or "друг"
     return (
@@ -19,7 +30,8 @@ def format_welcome(settings: Settings, first_name: str | None = None) -> str:
         f"(тот же функционал, что в Telegram-боте Бедолага).\n\n"
         f"{settings.welcome_text}\n\n"
         f"🎁 Триал: {settings.trial_days} дн. для новых пользователей\n"
-        f"🌐 Кабинет: {settings.cabinet_url}\n\n"
+        f"🔐 Вход в кабинет — без регистрации (как в Telegram)\n"
+        f"🌐 {settings.cabinet_url}\n\n"
         "Выберите раздел в меню 👇"
     )
 

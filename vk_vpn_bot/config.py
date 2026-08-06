@@ -55,6 +55,7 @@ class Settings:
     bedolaga_api_url: str
     bedolaga_api_key: str
     cabinet_url: str
+    cabinet_jwt_secret: str
     renew_days: int
 
 
@@ -120,6 +121,7 @@ def load_settings() -> Settings:
         ),
         bedolaga_api_key=_optional("BEDOLAGA_API_KEY", ""),
         cabinet_url=_optional("CABINET_URL", "https://cabinet.paskod.ru"),
+        cabinet_jwt_secret=_optional("CABINET_JWT_SECRET", ""),
         renew_days=renew_days,
     )
 

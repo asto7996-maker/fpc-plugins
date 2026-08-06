@@ -24,6 +24,7 @@ BTN_PROFILE = "👤 Профиль"
 BTN_MY_KEY = "🔑 Мой ключ"
 BTN_BACK = "◀️ Назад в меню"
 BTN_CABINET = "🌐 Кабинет"
+BTN_CABINET_LOGIN = "🔐 Войти без регистрации"
 BTN_RENEW = "♻️ Продлить"
 BTN_DEVICES = "📲 Устройства"
 
@@ -57,9 +58,20 @@ def main_menu_keyboard(cabinet_url: str) -> str:
         .add(Text(BTN_GUIDE), color=KeyboardButtonColor.SECONDARY)
         .row()
         .add(Text(BTN_SUPPORT), color=KeyboardButtonColor.SECONDARY)
-        .add(OpenLink(cabinet_url, BTN_CABINET))
+        .add(Text(BTN_CABINET_LOGIN), color=KeyboardButtonColor.PRIMARY)
     )
     return kb.get_json()
+
+
+def auto_login_keyboard(auto_login_url: str) -> str:
+    """Клавиатура с одноразовой ссылкой входа (как Telegram WebApp auth)."""
+    return (
+        Keyboard(one_time=False, inline=False)
+        .add(OpenLink(auto_login_url, "🚀 Открыть кабинет"))
+        .row()
+        .add(Text(BTN_BACK), color=KeyboardButtonColor.SECONDARY)
+        .get_json()
+    )
 
 
 def connect_keyboard(
