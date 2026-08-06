@@ -8,14 +8,12 @@
 <style>
 :root{
   --bg:#070b14;
-  --bg2:#0d1524;
   --card:rgba(255,255,255,.04);
   --line:rgba(255,255,255,.08);
   --text:#e8eef7;
   --muted:#93a0b5;
   --accent:#5b9fff;
   --accent2:#7c5cff;
-  --ok:#3dd68c;
   --radius:18px;
   --font:'Segoe UI',system-ui,-apple-system,sans-serif;
 }
@@ -47,13 +45,12 @@ body{
 .card h2{margin:0 0 8px;font-size:1.35rem}
 .meta{color:var(--muted);font-size:.86rem;margin-bottom:18px}
 .doc{white-space:pre-wrap;font-size:.98rem;color:#d7e0ee}
-.nav{display:flex;flex-wrap:wrap;gap:10px;margin:18px 0 8px}
-.nav a,.back{
-  text-decoration:none;color:var(--text);border:1px solid var(--line);
+.back{
+  display:inline-block;text-decoration:none;color:var(--text);border:1px solid var(--line);
   background:rgba(255,255,255,.03);padding:10px 14px;border-radius:999px;
   font-size:.9rem;transition:.2s ease;
 }
-.nav a:hover,.back:hover{border-color:rgba(91,159,255,.5);background:rgba(91,159,255,.12)}
+.back:hover{border-color:rgba(91,159,255,.5);background:rgba(91,159,255,.12)}
 .grid{display:grid;gap:12px}
 .item{
   display:block;text-decoration:none;color:inherit;
@@ -85,7 +82,7 @@ body{
 <a class="item" href="rules.html"><div class="e">📋</div><h3>Правила сервиса</h3><p>Короткие правила для комфортной работы всех пользователей.</p></a>
 <a class="item" href="faq.html"><div class="e">💬</div><h3>Частые вопросы</h3><p>Быстрые ответы по подключению, оплате и кабинету.</p></a></div>
     </div>
-    <div class="footer">Также доступно в VK-боте · раздел «Инфо»</div>
+    <div class="footer">Также доступно в VK-боте · раздел «ℹ️ Инфо»</div>
   </div>
 </body>
 </html>

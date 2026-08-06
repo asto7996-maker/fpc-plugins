@@ -1,11 +1,23 @@
-<!doctype html>
-<html lang="ru">
-<head>
-<meta charset="utf-8"/>
-<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"/>
-<meta name="theme-color" content="#070b14"/>
-<title>💬 Частые вопросы · Paskod</title>
-<style>
+#!/usr/bin/env python3
+"""
+Генерирует HTML-страницы документов для мини-приложения из legal/documents.py.
+
+Запуск из папки vk_vpn_bot:
+    python3 tools/build_legal_pages.py
+Результат: miniapp/legal/*.html
+"""
+
+from __future__ import annotations
+
+import html
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from legal.documents import ALL_DOCS, LegalDoc
+
+CSS = """
 :root{
   --bg:#070b14;
   --card:rgba(255,255,255,.04);
@@ -62,7 +74,19 @@ body{
 .item h3{margin:8px 0 4px;font-size:1.05rem}
 .item p{margin:0;color:var(--muted);font-size:.9rem}
 .footer{margin-top:28px;color:var(--muted);font-size:.8rem;text-align:center}
-</style>
+"""
+
+
+def doc_page(doc: LegalDoc) -> str:
+    body = html.escape(doc.body.strip())
+    return f"""<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"/>
+<meta name="theme-color" content="#070b14"/>
+<title>{doc.emoji} {doc.title} · Paskod</title>
+<style>{CSS}</style>
 </head>
 <body>
   <div class="wrap">
@@ -75,34 +99,60 @@ body{
     </div>
     <a class="back" href="index.html">← Ко всем документам</a>
     <div class="card" style="margin-top:14px">
-      <h2>💬 Частые вопросы</h2>
-      <div class="meta">Быстрые ответы по подключению, оплате и кабинету.<br/>Обновлено 06.08.2026</div>
-      <div class="doc">❓ Как начать?
-Нажмите «Подключиться» → активируйте триал или купите тариф → импортируйте
-ключ в Happ.
-
-❓ Где взять ключ?
-Раздел «Мой ключ» / «Подписка». Также ключ есть в кабинете.
-
-❓ Не открываются сайты через VPN
-Смените режим маршрутизации / сервер в клиенте. На Android иногда помогает
-Hiddify или v2rayNG.
-
-❓ Как оплатить?
-«Оплатить» в боте: СБП (QR), карта или крипта — как в мини-приложении.
-Либо пополните баланс в кабинете.
-
-❓ Нужна ли регистрация в кабинете?
-Нет. Из VK-бота кабинет открывается уже авторизованным.
-
-❓ Промокод не сработал
-Проверьте регистр и срок действия. Активируйте код в кабинете в разделе
-подписки или напишите в поддержку.
-
-❓ Сколько устройств?
-Зависит от тарифа — смотрите карточку «Подписка» или кабинет.</div>
+      <h2>{doc.emoji} {doc.title}</h2>
+      <div class="meta">{html.escape(doc.summary)}<br/>Обновлено {doc.updated}</div>
+      <div class="doc">{body}</div>
     </div>
     <div class="footer">© Paskod · Пользуясь сервисом, вы принимаете условия документов</div>
   </div>
 </body>
-</html>
+</html>"""
+
+
+def index_page() -> str:
+    items = "\n".join(
+        f'<a class="item" href="{d.slug}.html">'
+        f'<div class="e">{d.emoji}</div>'
+        f"<h3>{d.title}</h3><p>{html.escape(d.summary)}</p></a>"
+        for d in ALL_DOCS
+    )
+    return f"""<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"/>
+<meta name="theme-color" content="#070b14"/>
+<title>Документы · Paskod</title>
+<style>{CSS}</style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="brand">
+      <div class="logo">✦</div>
+      <div>
+        <h1>Paskod VPN</h1>
+        <p>Пользовательские документы</p>
+      </div>
+    </div>
+    <div class="card">
+      <h2>📂 Документы</h2>
+      <div class="meta">Пользовательское соглашение, политика конфиденциальности и другие материалы сервиса.</div>
+      <div class="grid">{items}</div>
+    </div>
+    <div class="footer">Также доступно в VK-боте · раздел «ℹ️ Инфо»</div>
+  </div>
+</body>
+</html>"""
+
+
+def main() -> None:
+    out = Path(__file__).resolve().parents[1] / "miniapp" / "legal"
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "index.html").write_text(index_page(), encoding="utf-8")
+    for doc in ALL_DOCS:
+        (out / f"{doc.slug}.html").write_text(doc_page(doc), encoding="utf-8")
+    print(f"Built {len(ALL_DOCS) + 1} pages in {out}")
+
+
+if __name__ == "__main__":
+    main()
