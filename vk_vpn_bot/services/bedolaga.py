@@ -188,6 +188,19 @@ class BedolagaClient:
     async def get_user(self, bedolaga_user_id: int) -> dict[str, Any]:
         return await self._request("GET", f"/users/{bedolaga_user_id}")
 
+    async def get_panel_user_for_vk(
+        self, vk_user_id: int, first_name: str | None = None
+    ) -> dict[str, Any]:
+        """Гарантирует пользователя в панели и возвращает карточку с подпиской."""
+        user = await self.ensure_user(vk_user_id, first_name=first_name)
+        user_id = int(user.get("id") or 0)
+        if user_id:
+            try:
+                return await self.get_user(user_id)
+            except Exception:  # noqa: BLE001
+                return user
+        return user
+
     @staticmethod
     def _parse_subscription(data: dict[str, Any]) -> BedolagaSubscription:
         # Ответ может быть обёрнут или содержать вложенную subscription
