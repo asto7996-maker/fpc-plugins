@@ -261,6 +261,8 @@ def guide_os_keyboard() -> str:
         .row()
         .add(Callback("💻 Windows", payload={"cmd": "guide", "os": "windows"}))
         .add(Callback("🖥 macOS", payload={"cmd": "guide", "os": "macos"}))
+        .row()
+        .add(Callback("❓ Не работает", payload={"cmd": "guide", "os": "trouble"}))
         .get_json()
     )
 

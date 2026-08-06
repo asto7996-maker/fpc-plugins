@@ -776,6 +776,22 @@ async def cmd_guide(message: Message):
 
 @labeler.private_message(
     text=[
+        "не работает",
+        "не подключается",
+        "не подключается vpn",
+        "нет интернета",
+        "диагностика",
+        "app not supported",
+    ]
+)
+async def cmd_trouble(message: Message):
+    """Разбор типовых сбоев — тем же текстом, что и по кнопке в гайде."""
+    await _ensure_user(message)
+    await message.answer(GUIDES["trouble"], keyboard=guide_os_keyboard())
+
+
+@labeler.private_message(
+    text=[
         BTN_SUPPORT,
         "💬 Поддержка",
         "💬 Помощь",
@@ -909,11 +925,13 @@ async def on_message_event(event: GroupTypes.MessageEvent):
         os_name = payload.get("os")
         if os_name in GUIDES:
             snack = OS_TITLES.get(os_name, os_name)
+            # Инлайн-клавиатуру оставляем: из гайда можно уйти в другую ОС
+            # или в раздел диагностики, не возвращаясь в меню.
             await event.ctx_api.messages.send(
                 peer_id=event.object.peer_id,
                 message=GUIDES[os_name],
                 random_id=0,
-                keyboard=main_menu_keyboard(settings.cabinet_url),
+                keyboard=guide_os_keyboard(),
             )
     elif cmd == "info":
         snack = "ℹ️ Инфо"
