@@ -20,6 +20,18 @@ logger = logging.getLogger(__name__)
 CACHE_TTL_SECONDS = 600
 
 
+TIER_EMOJI = {1: "🥉", 2: "🥈", 3: "🥇"}
+
+
+def short_period(days: int) -> str:
+    table = {30: "1 мес", 90: "3 мес", 180: "6 мес", 365: "1 год", 360: "1 год"}
+    if days in table:
+        return table[days]
+    if days % 30 == 0:
+        return f"{days // 30} мес"
+    return f"{days} дн"
+
+
 @dataclass(frozen=True)
 class Period:
     days: int
@@ -42,10 +54,37 @@ class Tariff:
     periods: tuple[Period, ...] = field(default_factory=tuple)
 
     @property
+    def emoji(self) -> str:
+        return TIER_EMOJI.get(self.tier, "▸")
+
+    @property
     def cheapest(self) -> Period | None:
         if not self.periods:
             return None
         return min(self.periods, key=lambda p: p.price_kopeks or 10**9)
+
+
+@dataclass(frozen=True)
+class Offer:
+    """Конкретная покупка: тариф + период + цена."""
+
+    tariff: "Tariff"
+    period: Period
+
+    @property
+    def label(self) -> str:
+        """Подпись кнопки. Должна воспроизводиться детерминированно."""
+        return (
+            f"{self.tariff.emoji} {self.tariff.name} · "
+            f"{short_period(self.period.days)} · {self.period.price_label}"
+        )
+
+    @property
+    def per_month_note(self) -> str:
+        pm = self.period.per_month_label
+        if pm and pm != self.period.price_label:
+            return f"{pm}/мес"
+        return ""
 
 
 @dataclass(frozen=True)
@@ -71,6 +110,18 @@ class Catalog:
     @property
     def max_devices(self) -> int:
         return max((t.device_limit for t in self.tariffs), default=0)
+
+    def offers(self, limit: int = 9) -> list[Offer]:
+        """Все покупки (тариф × период), от дешёвых к дорогим."""
+        res = [Offer(t, p) for t in self.tariffs for p in t.periods]
+        res.sort(key=lambda o: o.period.price_kopeks or 10**9)
+        return res[:limit]
+
+    def find_offer(self, label: str) -> Offer | None:
+        for offer in self.offers(limit=99):
+            if offer.label == label:
+                return offer
+        return None
 
 
 _cache: tuple[float, Catalog] | None = None

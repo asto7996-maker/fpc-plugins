@@ -1,6 +1,10 @@
 """Пакет клавиатур VK — паритет с Bedolaga."""
 
 from keyboards.menus import (
+    BTN_ADMIN,
+    BTN_ADMIN_PANEL,
+    BTN_ADMIN_TICKETS,
+    BTN_ADMIN_USERS,
     BTN_APPS,
     BTN_ASK,
     BTN_BACK,
@@ -35,6 +39,7 @@ from keyboards.menus import (
     BTN_TERMS,
     BTN_TRIAL,
     PAY_AMOUNT_BUTTONS,
+    admin_keyboard,
     apps_keyboard,
     auto_login_keyboard,
     back_keyboard,
@@ -53,9 +58,14 @@ from keyboards.menus import (
     subscription_keyboard,
     support_keyboard,
     support_wait_keyboard,
+    tariffs_keyboard,
 )
 
 __all__ = [
+    "BTN_ADMIN",
+    "BTN_ADMIN_PANEL",
+    "BTN_ADMIN_TICKETS",
+    "BTN_ADMIN_USERS",
     "BTN_APPS",
     "BTN_ASK",
     "BTN_BACK",
@@ -90,6 +100,7 @@ __all__ = [
     "BTN_TERMS",
     "BTN_TRIAL",
     "PAY_AMOUNT_BUTTONS",
+    "admin_keyboard",
     "apps_keyboard",
     "auto_login_keyboard",
     "back_keyboard",
@@ -108,4 +119,5 @@ __all__ = [
     "subscription_keyboard",
     "support_keyboard",
     "support_wait_keyboard",
+    "tariffs_keyboard",
 ]

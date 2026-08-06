@@ -31,6 +31,10 @@ BTN_PAY_CRYPTO = "🪙 Крипта"
 BTN_RENEW = "♻️ Продлить"
 BTN_DEVICES = "📲 Устройства"
 BTN_ASK = "✍️ Задать вопрос"
+BTN_ADMIN = "🛠 Админ"
+BTN_ADMIN_PANEL = "📊 Панель кабинета"
+BTN_ADMIN_USERS = "👥 Пользователи"
+BTN_ADMIN_TICKETS = "🎫 Тикеты"
 
 # Документы (всё в VK-боте)
 BTN_PRIVACY = "🛡️ Приватность"
@@ -63,30 +67,31 @@ def legal_url(cabinet_url: str, slug: str) -> str:
     return cabinet_path(cabinet_url, f"legal/{slug}.html")
 
 
-def main_menu_keyboard(cabinet_url: str) -> str:
+def main_menu_keyboard(cabinet_url: str, *, show_admin: bool = False) -> str:
     """Главное меню: документы сразу видны (кнопка Инфо)."""
     _ = cabinet_url
-    return (
-        Keyboard(one_time=False, inline=False)
-        .add(Text(BTN_CONNECT), color=KeyboardButtonColor.POSITIVE)
-        .add(Text(BTN_SUBSCRIPTION), color=KeyboardButtonColor.POSITIVE)
-        .row()
-        .add(Text(BTN_PAY), color=KeyboardButtonColor.PRIMARY)
-        .add(Text(BTN_BUY), color=KeyboardButtonColor.PRIMARY)
-        .row()
-        .add(Text(BTN_CABINET), color=KeyboardButtonColor.PRIMARY)
-        .add(Text(BTN_BALANCE), color=KeyboardButtonColor.PRIMARY)
-        .row()
-        .add(Text(BTN_INFO), color=KeyboardButtonColor.POSITIVE)
-        .add(Text(BTN_SUPPORT), color=KeyboardButtonColor.PRIMARY)
-        .row()
-        .add(Text(BTN_APPS), color=KeyboardButtonColor.SECONDARY)
-        .add(Text(BTN_GUIDE), color=KeyboardButtonColor.SECONDARY)
-        .row()
-        .add(Text(BTN_PROMO), color=KeyboardButtonColor.SECONDARY)
-        .add(Text(BTN_REFERRAL), color=KeyboardButtonColor.SECONDARY)
-        .get_json()
-    )
+    kb = Keyboard(one_time=False, inline=False)
+    kb.add(Text(BTN_CONNECT), color=KeyboardButtonColor.POSITIVE)
+    kb.add(Text(BTN_SUBSCRIPTION), color=KeyboardButtonColor.POSITIVE)
+    kb.row()
+    kb.add(Text(BTN_PAY), color=KeyboardButtonColor.PRIMARY)
+    kb.add(Text(BTN_BUY), color=KeyboardButtonColor.PRIMARY)
+    kb.row()
+    kb.add(Text(BTN_CABINET), color=KeyboardButtonColor.PRIMARY)
+    kb.add(Text(BTN_BALANCE), color=KeyboardButtonColor.PRIMARY)
+    kb.row()
+    kb.add(Text(BTN_INFO), color=KeyboardButtonColor.POSITIVE)
+    kb.add(Text(BTN_SUPPORT), color=KeyboardButtonColor.PRIMARY)
+    kb.row()
+    kb.add(Text(BTN_APPS), color=KeyboardButtonColor.SECONDARY)
+    kb.add(Text(BTN_GUIDE), color=KeyboardButtonColor.SECONDARY)
+    kb.row()
+    kb.add(Text(BTN_PROMO), color=KeyboardButtonColor.SECONDARY)
+    kb.add(Text(BTN_REFERRAL), color=KeyboardButtonColor.SECONDARY)
+    if show_admin:
+        kb.row()
+        kb.add(Text(BTN_ADMIN), color=KeyboardButtonColor.NEGATIVE)
+    return kb.get_json()
 
 
 def info_keyboard(cabinet_url: str = "") -> str:
@@ -132,6 +137,22 @@ def doc_keyboard(cabinet_url: str, slug: str, *, page: int, total: int) -> str:
     if page > 1 or page < total:
         kb.row()
     kb.add(Callback("📚 К документам", payload={"cmd": "info"}))
+    return kb.get_json()
+
+
+def tariffs_keyboard(offer_labels: list[str]) -> str:
+    """Список тарифов: по кнопке на оффер (тариф + период + цена)."""
+    kb = Keyboard(one_time=False, inline=False)
+    for i, label in enumerate(offer_labels[:9]):
+        color = (
+            KeyboardButtonColor.POSITIVE
+            if i == 0
+            else KeyboardButtonColor.PRIMARY
+        )
+        kb.add(Text(label), color=color)
+        kb.row()
+    kb.add(Text(BTN_CABINET), color=KeyboardButtonColor.SECONDARY)
+    kb.add(Text(BTN_BACK), color=KeyboardButtonColor.SECONDARY)
     return kb.get_json()
 
 
@@ -291,6 +312,20 @@ def support_wait_keyboard() -> str:
     """Пока ждём текст вопроса — только выход из режима."""
     return (
         Keyboard(one_time=False, inline=False)
+        .add(Text(BTN_BACK), color=KeyboardButtonColor.SECONDARY)
+        .get_json()
+    )
+
+
+def admin_keyboard() -> str:
+    """Раздел администратора в VK-боте."""
+    return (
+        Keyboard(one_time=False, inline=False)
+        .add(Text(BTN_ADMIN_PANEL), color=KeyboardButtonColor.POSITIVE)
+        .row()
+        .add(Text(BTN_ADMIN_USERS), color=KeyboardButtonColor.PRIMARY)
+        .add(Text(BTN_ADMIN_TICKETS), color=KeyboardButtonColor.PRIMARY)
+        .row()
         .add(Text(BTN_BACK), color=KeyboardButtonColor.SECONDARY)
         .get_json()
     )

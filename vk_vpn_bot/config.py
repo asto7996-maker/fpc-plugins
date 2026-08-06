@@ -50,6 +50,8 @@ class Settings:
     support_url: str
     support_text: str
     support_admin_ids: tuple[int, ...]
+    main_admin_vk_id: int
+    main_admin_username: str
     vless_template: str
     outline_keys: tuple[str, ...]
     bot_name: str
@@ -106,6 +108,14 @@ def load_settings() -> Settings:
         if part.strip().lstrip("-").isdigit()
     )
 
+    # Главный админ: все тикеты идут только ему; в боте видит раздел «Админ».
+    main_admin_username = _optional("MAIN_ADMIN_USERNAME", "xylophaze").lstrip("@")
+    main_admin_raw = _optional("MAIN_ADMIN_VK_ID", "634094665")
+    try:
+        main_admin_vk_id = int(main_admin_raw) if main_admin_raw else 0
+    except ValueError as exc:
+        raise RuntimeError("MAIN_ADMIN_VK_ID должен быть целым числом") from exc
+
     vpn_key_type = _optional("VPN_KEY_TYPE", "vless").lower()
     if vpn_key_type not in {"vless", "outline", "wireguard"}:
         raise RuntimeError("VPN_KEY_TYPE должен быть: vless | outline | wireguard")
@@ -129,6 +139,8 @@ def load_settings() -> Settings:
             "Напишите в поддержку сообщества — поможем с подключением.",
         ),
         support_admin_ids=support_admin_ids,
+        main_admin_vk_id=main_admin_vk_id,
+        main_admin_username=main_admin_username,
         vless_template=_optional(
             "VLESS_TEMPLATE",
             "vless://{uuid}@vpn.example.com:443?encryption=none&security=reality"

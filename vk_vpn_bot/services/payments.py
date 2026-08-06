@@ -180,6 +180,55 @@ class CabinetPaymentClient:
             )
         return methods
 
+    async def purchase_tariff(
+        self,
+        bedolaga_user_id: int,
+        *,
+        tariff_id: int,
+        period_days: int,
+    ) -> dict[str, Any]:
+        """
+        Покупает тариф за счёт баланса кабинета.
+
+        Возвращает:
+          {"status": "activated", "raw": ...}          — подписка активирована
+          {"status": "insufficient", "missing_kopeks"} — не хватает на балансе
+                                                          (корзина сохранена)
+          {"status": "error", "raw": ...}              — иная ошибка
+        """
+        token = await self._cabinet_access_token(bedolaga_user_id)
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        }
+        body = {"tariff_id": int(tariff_id), "period_days": int(period_days)}
+        async with aiohttp.ClientSession(timeout=self._timeout) as session:
+            async with session.post(
+                f"{self.base}/cabinet/subscription/purchase-tariff",
+                json=body,
+                headers=headers,
+            ) as resp:
+                status = resp.status
+                try:
+                    data = await resp.json(content_type=None)
+                except Exception:  # noqa: BLE001
+                    data = {}
+        if status < 400:
+            return {"status": "activated", "raw": data}
+        detail = data.get("detail") if isinstance(data, dict) else None
+        if (
+            status == 402
+            and isinstance(detail, dict)
+            and detail.get("code") == "insufficient_funds"
+        ):
+            return {
+                "status": "insufficient",
+                "missing_kopeks": int(detail.get("missing_amount") or 0),
+            }
+        logger.error("purchase-tariff %s: %s", status, str(data)[:300])
+        return {"status": "error", "raw": data}
+
     async def create_platega_topup(
         self,
         bedolaga_user_id: int,

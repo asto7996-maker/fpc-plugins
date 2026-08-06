@@ -33,6 +33,8 @@ class _Settings:
     support_text = "support"
     support_url = "https://vk.com"
     support_admin_ids = ()
+    main_admin_vk_id = 634094665
+    main_admin_username = "xylophaze"
     group_id = 240702990
     renew_days = 30
     bedolaga_api_key = ""

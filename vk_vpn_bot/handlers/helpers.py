@@ -26,7 +26,7 @@ from handlers.style import (
     warn_banner,
 )
 from legal.documents import ALL_DOCS
-from services.catalog import Catalog
+from services.catalog import Catalog, Offer
 from services.vpn_keys import mask_key
 
 
@@ -36,6 +36,12 @@ def _plural_devices(n: int) -> str:
     if n % 10 in (2, 3, 4) and n % 100 not in (12, 13, 14):
         return f"{n} устройства"
     return f"{n} устройств"
+
+
+def _devices_upto(n: int) -> str:
+    """Родительный падеж после «до»: до 1 устройства / до 5 устройств."""
+    word = "устройства" if n % 10 == 1 and n % 100 != 11 else "устройств"
+    return f"до {n} {word}"
 
 
 def format_auto_login_message(
@@ -53,6 +59,9 @@ def format_auto_login_message(
         "/balance/top-up": "пополнение баланса",
         "/legal/index.html": "документы",
         "/info": "информацию о сервисе",
+        "/admin": "админ-панель",
+        "/admin/users": "список пользователей",
+        "/admin/tickets": "тикеты поддержки",
     }.get(redirect or "/", redirect or "кабинет")
 
     return (
@@ -104,6 +113,80 @@ def format_welcome(
         f"{bullet('Документы и FAQ — «ℹ️ Инфо»')}\n\n"
         f"{soft_rule()}\n"
         f"{footer_hint('меню внизу экрана')}"
+    )
+
+
+def format_tariff_menu(catalog: Catalog | None, settings: Settings, *, renew: bool) -> str:
+    """Экран выбора тарифа: коротко, с кнопками-офферами под сообщением."""
+    if not catalog or not catalog.offers():
+        return (
+            f"{header('💎', 'Тарифы')}\n\n"
+            f"Список тарифов и цены — в кабинете, открою уже авторизованным.\n\n"
+            f"{footer_hint('кнопка ниже')}"
+        )
+
+    title = "Продление" if renew else "Тарифы"
+    lines = [
+        header("💎", title),
+        "",
+        "Все тарифы — с безлимитным трафиком, отличаются числом устройств. "
+        "Чем длиннее период, тем дешевле месяц. Выберите вариант кнопкой "
+        "ниже — цена уже с учётом периода.",
+        "",
+    ]
+    for offer in catalog.offers():
+        t = offer.tariff
+        note = f"  ·  {offer.per_month_note}" if offer.per_month_note else ""
+        lines.append(
+            f"{offer.tariff.emoji}  {t.name} · {offer.period.label} — "
+            f"{offer.period.price_label}{note}"
+        )
+        lines.append(f"       {_devices_upto(t.device_limit)}, безлимит трафика")
+    lines.append("")
+    lines.append(soft_rule())
+    lines.append(
+        "После выбора тарифа предложу способ оплаты. Оплата спишется "
+        "с баланса; если его не хватает — пополните на нужную сумму, "
+        "и тариф активируется автоматически."
+    )
+    return "\n".join(lines)
+
+
+def format_tariff_chosen(offer: Offer) -> str:
+    t = offer.tariff
+    note = f" ({offer.per_month_note})" if offer.per_month_note else ""
+    return (
+        f"{header('💳', f'{t.name} · {offer.period.label}')}\n\n"
+        f"{kv('Цена', offer.period.price_label + note)}\n"
+        f"{kv('Трафик', t.traffic_label or '♾️ Безлимит')}\n"
+        f"{kv('Устройства', _devices_upto(t.device_limit))}\n\n"
+        f"Выберите способ оплаты. Если на балансе уже есть нужная сумма, "
+        f"тариф активируется сразу без оплаты.\n\n"
+        f"{footer_hint('способ оплаты ниже')}"
+    )
+
+
+def format_tariff_activated(offer: Offer, settings: Settings) -> str:
+    t = offer.tariff
+    return (
+        f"{header('✅', 'Тариф активирован')}\n\n"
+        f"{kv('Тариф', t.name)}\n"
+        f"{kv('Период', offer.period.label)}\n"
+        f"{kv('Устройств', f'до {t.device_limit}')}\n\n"
+        f"Доступ уже работает. Нажмите «🔑 Мой ключ», чтобы получить "
+        f"ссылку-подписку, или откройте «📦 Подписка» — там срок и трафик."
+    )
+
+
+def format_tariff_needs_topup(offer: Offer, missing_rubles: str) -> str:
+    return (
+        f"{header('💳', 'Нужно пополнить баланс')}\n\n"
+        f"Тариф «{offer.tariff.name} · {offer.period.label}» стоит "
+        f"{offer.period.price_label}. Не хватает {missing_rubles} — "
+        f"сформировал счёт ровно на эту сумму.\n\n"
+        f"Оплатите по кнопке ниже. Как только деньги поступят, тариф "
+        f"активируется сам: корзина уже сохранена, повторно выбирать "
+        f"ничего не нужно. Обычно это занимает до минуты."
     )
 
 
@@ -572,6 +655,32 @@ def format_support_received(delivered: bool) -> str:
         f"Ответ придёт сюда же, в этот чат, — обычно в течение дня.\n\n"
         f"Пока ждёте, можно посмотреть «💬 FAQ» в разделе «ℹ️ Инфо»: "
         f"частые вопросы там уже разобраны."
+    )
+
+
+def format_admin_menu(settings: Settings) -> str:
+    """Экран администратора — только для главного админа."""
+    username = settings.main_admin_username or "администратор"
+    pseudo = 8_000_000_000 + settings.main_admin_vk_id
+    return (
+        f"{header('🛠', 'Администрирование')}\n\n"
+        f"Привет, @{username}! Здесь управление сервисом Paskod: "
+        f"тарифы, пользователи, тикеты и настройки мини-приложения.\n\n"
+        f"{bullet('Все вопросы из «Помощи» приходят вам в личку')}\n"
+        f"{bullet('Панель кабинета открывается с автовходом')}\n\n"
+        f"{subhead('📊', 'Кабинет')}\n"
+        f"Кнопки ниже ведут в админ-панель {brand('Paskod')} — "
+        f"тот же интерфейс, что в браузере. Если доступа нет, проверьте "
+        f"ADMIN_IDS в Bedolaga: для VK нужен псевдо-ID {pseudo}.\n\n"
+        f"{footer_hint('выберите раздел')}"
+    )
+
+
+def format_admin_denied() -> str:
+    return (
+        f"{warn_banner('Раздел только для администратора')}\n\n"
+        f"Эта кнопка доступна главному админу сервиса. "
+        f"Если вам нужна помощь — откройте «💬 Помощь»."
     )
 
 

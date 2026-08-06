@@ -287,7 +287,7 @@ async def check_group(settings) -> None:
     try:
         from vkbottle import API
 
-        from services.support import resolve_admin_ids
+        from services.admin import resolve_ticket_recipients
 
         api = API(token=settings.vk_token)
         gid = abs(int(settings.group_id))
@@ -313,8 +313,13 @@ async def check_group(settings) -> None:
             ("Выключены: " + ", ".join(bad)) if bad else "",
         )
 
-        admins = await resolve_admin_ids(api, settings)
-        source = "SUPPORT_ADMIN_IDS" if settings.support_admin_ids else "groups.getMembers"
+        admins = await resolve_ticket_recipients(api, settings)
+        if settings.main_admin_vk_id:
+            source = f"MAIN_ADMIN_VK_ID (@{settings.main_admin_username})"
+        elif settings.support_admin_ids:
+            source = "SUPPORT_ADMIN_IDS"
+        else:
+            source = "groups.getMembers"
         report(
             OK if admins else WARN,
             f"адресаты уведомлений: {admins or 'не найдены'} (источник: {source})",

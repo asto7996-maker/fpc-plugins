@@ -100,7 +100,9 @@ async def notify_admins(
     Ноль — не потеря обращения: сообщение пользователя всё равно осталось
     в диалоге сообщества, просто уведомление не ушло.
     """
-    admins = await resolve_admin_ids(api, settings)
+    from services.admin import resolve_ticket_recipients
+
+    admins = await resolve_ticket_recipients(api, settings)
     if not admins:
         logger.warning("нет администраторов для уведомления о вопросе")
         return 0

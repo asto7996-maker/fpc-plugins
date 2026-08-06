@@ -22,6 +22,8 @@ from vkbottle.bot import BotLabeler, Message
 from config import get_settings
 from database import get_or_create_user
 from handlers.helpers import (
+    format_admin_denied,
+    format_admin_menu,
     format_amount_invalid,
     format_apps,
     format_auto_login_message,
@@ -41,10 +43,12 @@ from handlers.helpers import (
     format_payment_created,
     format_promo_accepted,
     format_promo_prompt,
-    format_renew_stub,
     format_subscription_card,
     format_support,
-    format_tariffs,
+    format_tariff_activated,
+    format_tariff_chosen,
+    format_tariff_menu,
+    format_tariff_needs_topup,
     format_support_prompt,
     format_support_received,
     format_trial_used,
@@ -52,6 +56,10 @@ from handlers.helpers import (
 )
 from handlers.texts import GUIDE_INTRO, GUIDES, OS_TITLES
 from keyboards import (
+    BTN_ADMIN,
+    BTN_ADMIN_PANEL,
+    BTN_ADMIN_TICKETS,
+    BTN_ADMIN_USERS,
     BTN_APPS,
     BTN_ASK,
     BTN_BACK,
@@ -86,6 +94,7 @@ from keyboards import (
     BTN_TRIAL,
     PAY_AMOUNT_BUTTONS,
     apps_keyboard,
+    admin_keyboard,
     auto_login_keyboard,
     connect_keyboard,
     doc_keyboard,
@@ -100,8 +109,10 @@ from keyboards import (
     subscription_keyboard,
     support_keyboard,
     support_wait_keyboard,
+    tariffs_keyboard,
 )
 from legal.documents import DOCS_BY_SLUG, format_doc_for_bot
+from services.admin import is_main_admin
 from services.bedolaga import get_bedolaga_client
 from services.cabinet_auth import ensure_auto_login_url, ensure_panel_user
 from services.catalog import Catalog, fetch_catalog
@@ -127,6 +138,8 @@ labeler.vbml_ignore_case = True
 _waiting_promo: set[int] = set()
 # Ожидание суммы оплаты: vk_id → код метода Platega (2/11/13)
 _pending_pay_method: dict[int, int] = {}
+# Выбранный тариф к оплате: vk_id → {"tid": int, "days": int}
+_pending_tariff: dict[int, dict[str, int]] = {}
 # Чтение документа в боте: vk_id → {"slug": str, "page": int, "total": int}
 _reading_doc: dict[int, dict[str, int | str]] = {}
 # Ожидание текста вопроса в поддержку
@@ -166,6 +179,14 @@ async def _ensure_user(message: Message):
 
 def _cab() -> str:
     return get_settings().cabinet_url
+
+
+def _main_kb(vk_user_id: int) -> str:
+    settings = get_settings()
+    return main_menu_keyboard(
+        _cab(),
+        show_admin=is_main_admin(vk_user_id, settings),
+    )
 
 
 async def _catalog(message: Message) -> Catalog | None:
@@ -222,7 +243,7 @@ async def _open_cabinet(
     if not settings.cabinet_jwt_secret:
         await message.answer(
             format_cabinet_plain(settings, redirect),
-            keyboard=main_menu_keyboard(_cab()),
+            keyboard=_main_kb(message.from_id),
         )
         return
 
@@ -246,7 +267,7 @@ async def _open_cabinet(
                 "Попробуйте ещё раз через минуту, а если не поможет, "
                 "напишите в «💬 Помощь», и мы посмотрим со своей стороны."
             ),
-            keyboard=main_menu_keyboard(_cab()),
+            keyboard=_main_kb(message.from_id),
         )
 
 
@@ -271,6 +292,7 @@ async def cmd_start(message: Message):
     settings = get_settings()
     _waiting_promo.discard(message.from_id)
     _pending_pay_method.pop(message.from_id, None)
+    _pending_tariff.pop(message.from_id, None)
     _reading_doc.pop(message.from_id, None)
     _waiting_support.discard(message.from_id)
     user = await _ensure_user(message)
@@ -283,7 +305,7 @@ async def cmd_start(message: Message):
 
     await message.answer(
         format_welcome(settings, user.first_name, await _catalog(message)),
-        keyboard=main_menu_keyboard(_cab()),
+        keyboard=_main_kb(message.from_id),
     )
 
 
@@ -528,7 +550,7 @@ async def cmd_doc_prev(message: Message):
     user = await _ensure_user(message)
     await message.answer(
         format_welcome(settings, user.first_name, await _catalog(message)),
-        keyboard=main_menu_keyboard(_cab()),
+        keyboard=_main_kb(message.from_id),
     )
 
 
@@ -551,6 +573,109 @@ async def cmd_doc_list(message: Message):
 
 def _clear_pay_state(vk_id: int) -> None:
     _pending_pay_method.pop(vk_id, None)
+    _pending_tariff.pop(vk_id, None)
+
+
+async def _show_tariffs(message: Message, *, renew: bool) -> None:
+    """Экран выбора тарифа с кнопками-офферами."""
+    settings = get_settings()
+    _waiting_promo.discard(message.from_id)
+    _pending_pay_method.pop(message.from_id, None)
+    catalog = await _catalog(message)
+    if not catalog or not catalog.offers():
+        # Кабинет недоступен — открываем покупку там же
+        await message.answer(
+            format_tariff_menu(None, settings, renew=renew),
+            keyboard=subscription_keyboard(_cab(), has_key=False),
+        )
+        await _open_cabinet(
+            message,
+            redirect="/subscription/purchase",
+            title="✨ Открываю тарифы…",
+            button_text="💎 Выбрать тариф",
+        )
+        return
+    labels = [o.label for o in catalog.offers()]
+    await message.answer(
+        format_tariff_menu(catalog, settings, renew=renew),
+        keyboard=tariffs_keyboard(labels),
+    )
+
+
+async def _purchase_with_method(
+    message: Message, sel: dict[str, int], method_code: int
+) -> None:
+    """Покупка тарифа: сразу с баланса либо счёт на недостающую сумму."""
+    settings = get_settings()
+    user = await _ensure_user(message)
+    catalog = await _catalog(message)
+    offer = None
+    if catalog:
+        for o in catalog.offers(limit=99):
+            if o.tariff.id == sel["tid"] and o.period.days == sel["days"]:
+                offer = o
+                break
+    if offer is None:
+        _pending_tariff.pop(message.from_id, None)
+        await message.answer(
+            format_error("Тариф больше недоступен. Выберите другой."),
+            keyboard=_main_kb(message.from_id),
+        )
+        return
+
+    try:
+        await message.answer("✨ Секунду — оформляю тариф…")
+        bedolaga_id = await ensure_bedolaga_id_for_payments(
+            user.user_id, user.first_name
+        )
+        client = CabinetPaymentClient(settings)
+        result = await client.purchase_tariff(
+            bedolaga_id, tariff_id=offer.tariff.id, period_days=offer.period.days
+        )
+
+        if result["status"] == "activated":
+            _clear_pay_state(message.from_id)
+            await message.answer(
+                format_tariff_activated(offer, settings),
+                keyboard=connect_keyboard(
+                    has_active=True, trial_available=False, cabinet_url=_cab()
+                ),
+            )
+            return
+
+        if result["status"] == "insufficient":
+            missing = int(result.get("missing_kopeks") or offer.period.price_kopeks)
+            if missing < 5000:
+                missing = 5000  # минимум Platega
+            topup = await client.create_platega_topup(
+                bedolaga_id, amount_kopeks=missing, payment_option=method_code
+            )
+            _pending_tariff.pop(message.from_id, None)
+            await message.answer(
+                format_tariff_needs_topup(offer, format_rubles(missing)),
+                keyboard=payment_link_keyboard(topup.payment_url),
+            )
+            return
+
+        raise CabinetPaymentError(str(result.get("raw"))[:200])
+    except CabinetPaymentError as exc:
+        logger.exception("tariff purchase failed: %s", exc)
+        await message.answer(
+            format_error(
+                "Не получилось оформить тариф. Попробуйте другой способ "
+                "оплаты или откройте покупку в кабинете."
+            ),
+            keyboard=pay_methods_keyboard(),
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("tariff purchase unexpected: %s", exc)
+        await message.answer(
+            format_error(
+                "Что-то пошло не так, тариф не оформлен. Деньги не списывались. "
+                "Попробуйте позже или напишите в «💬 Помощь»."
+            ),
+            keyboard=_main_kb(message.from_id),
+        )
 
 
 async def _start_pay_amount(message: Message, method_code: int) -> None:
@@ -620,7 +745,7 @@ async def _create_and_send_payment(
                 "Деньги при этом не списывались. Попробуйте ещё раз через "
                 "пару минут или напишите в «💬 Помощь»."
             ),
-            keyboard=main_menu_keyboard(_cab()),
+            keyboard=_main_kb(message.from_id),
         )
 
 
@@ -640,6 +765,10 @@ async def cmd_pay(message: Message):
 )
 async def cmd_pay_sbp(message: Message):
     await _ensure_user(message)
+    sel = _pending_tariff.get(message.from_id)
+    if sel:
+        await _purchase_with_method(message, sel, PLATEGA_METHOD_SBP_QR)
+        return
     await _start_pay_amount(message, PLATEGA_METHOD_SBP_QR)
 
 
@@ -648,6 +777,10 @@ async def cmd_pay_sbp(message: Message):
 )
 async def cmd_pay_card(message: Message):
     await _ensure_user(message)
+    sel = _pending_tariff.get(message.from_id)
+    if sel:
+        await _purchase_with_method(message, sel, PLATEGA_METHOD_CARD)
+        return
     await _start_pay_amount(message, PLATEGA_METHOD_CARD)
 
 
@@ -656,6 +789,10 @@ async def cmd_pay_card(message: Message):
 )
 async def cmd_pay_crypto(message: Message):
     await _ensure_user(message)
+    sel = _pending_tariff.get(message.from_id)
+    if sel:
+        await _purchase_with_method(message, sel, PLATEGA_METHOD_CRYPTO)
+        return
     await _start_pay_amount(message, PLATEGA_METHOD_CRYPTO)
 
 
@@ -690,18 +827,8 @@ async def cmd_pay_quick_amount(message: Message):
     text=[BTN_BUY, "💳 Купить", "💎 Купить", "Купить", "купить", "тарифы", "тариф"]
 )
 async def cmd_buy(message: Message):
-    settings = get_settings()
-    catalog = await _catalog(message)
-    await message.answer(
-        format_tariffs(catalog, settings),
-        keyboard=subscription_keyboard(_cab(), has_key=False),
-    )
-    await _open_cabinet(
-        message,
-        redirect="/subscription/purchase",
-        title="✨ Открываю тарифы…",
-        button_text="💎 Выбрать тариф",
-    )
+    await _ensure_user(message)
+    await _show_tariffs(message, renew=False)
 
 
 @labeler.private_message(text=[BTN_BALANCE, "💰 Баланс", "Баланс", "баланс"])
@@ -770,7 +897,7 @@ async def cmd_guide(message: Message):
     await message.answer(GUIDE_INTRO, keyboard=guide_os_keyboard())
     await message.answer(
         format_guide_outro(),
-        keyboard=main_menu_keyboard(_cab()),
+        keyboard=_main_kb(message.from_id),
     )
 
 
@@ -863,39 +990,84 @@ async def _accept_support_question(message: Message, text: str) -> None:
     text=[BTN_RENEW, "♻️ Продлить", "Продлить", "продлить", "продлить сейчас"]
 )
 async def cmd_renew(message: Message):
+    """«Продлить» — показывает тарифы; оплата активирует подписку."""
+    await _ensure_user(message)
+    await _show_tariffs(message, renew=True)
+
+
+# ---------------------------------------------------------------------------
+# Администрирование (только главный админ)
+# ---------------------------------------------------------------------------
+
+
+async def _require_admin(message: Message) -> bool:
     settings = get_settings()
-    user = await _ensure_user(message)
-    text = (message.text or "").lower()
+    if is_main_admin(message.from_id, settings):
+        return True
+    await message.answer(format_admin_denied(), keyboard=_main_kb(message.from_id))
+    return False
 
-    if settings.bedolaga_api_key and "сейчас" in text:
-        try:
-            await message.answer("✨ Секунду — продлеваю…")
-            result = await issue_renewal(user, settings)
-            await message.answer(
-                format_key_message(
-                    result.key, settings, is_trial=False, source=result.source
-                ),
-                keyboard=connect_keyboard(
-                    has_active=True,
-                    trial_available=False,
-                    cabinet_url=_cab(),
-                ),
-            )
-            return
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("renew failed: %s", exc)
-            await message.answer(
-                format_error(
-                    "Автоматически продлить не получилось — панель не ответила. "
-                    "Оформите продление через покупку тарифа в кабинете: "
-                    "там доступ включится сразу после оплаты."
-                ),
-                keyboard=subscription_keyboard(_cab()),
-            )
 
+@labeler.private_message(
+    text=[BTN_ADMIN, "/admin", "🛠 Админ", "админ", "Админ"]
+)
+async def cmd_admin(message: Message):
+    """Панель главного администратора."""
+    settings = get_settings()
+    await _ensure_user(message)
+    if not is_main_admin(message.from_id, settings):
+        await message.answer(format_admin_denied(), keyboard=_main_kb(message.from_id))
+        return
     await message.answer(
-        format_renew_stub(settings, await _catalog(message)),
-        keyboard=support_keyboard(usable_support_url(settings), _cab()),
+        format_admin_menu(settings),
+        keyboard=admin_keyboard(),
+    )
+
+
+@labeler.private_message(
+    text=[
+        BTN_ADMIN_PANEL,
+        "📊 Панель кабинета",
+        "панель кабинета",
+        "админ панель",
+    ]
+)
+async def cmd_admin_panel(message: Message):
+    if not await _require_admin(message):
+        return
+    await _open_cabinet(
+        message,
+        redirect="/admin",
+        title="🛠 Открываю админ-панель…",
+        button_text="🛠 Админ-панель",
+    )
+
+
+@labeler.private_message(
+    text=[BTN_ADMIN_USERS, "👥 Пользователи", "пользователи"]
+)
+async def cmd_admin_users(message: Message):
+    if not await _require_admin(message):
+        return
+    await _open_cabinet(
+        message,
+        redirect="/admin/users",
+        title="👥 Открываю пользователей…",
+        button_text="👥 Пользователи",
+    )
+
+
+@labeler.private_message(
+    text=[BTN_ADMIN_TICKETS, "🎫 Тикеты", "тикеты"]
+)
+async def cmd_admin_tickets(message: Message):
+    if not await _require_admin(message):
+        return
+    await _open_cabinet(
+        message,
+        redirect="/admin/tickets",
+        title="🎫 Открываю тикеты…",
+        button_text="🎫 Тикеты",
     )
 
 
@@ -1003,6 +1175,23 @@ async def fallback(message: Message):
         await _accept_support_question(message, text)
         return
 
+    # Нажатие кнопки-оффера тарифа (подпись содержит « · » и «₽»).
+    if "·" in text and "₽" in text:
+        catalog = await _catalog(message)
+        offer = catalog.find_offer(text) if catalog else None
+        if offer:
+            _pending_tariff[message.from_id] = {
+                "tid": offer.tariff.id,
+                "days": offer.period.days,
+            }
+            _pending_pay_method.pop(message.from_id, None)
+            _waiting_promo.discard(message.from_id)
+            await message.answer(
+                format_tariff_chosen(offer),
+                keyboard=pay_methods_keyboard(),
+            )
+            return
+
     method_code = _pending_pay_method.get(message.from_id)
     if method_code is not None:
         m = _AMOUNT_RE.match(text.replace(" ", ""))
@@ -1037,5 +1226,5 @@ async def fallback(message: Message):
 
     await message.answer(
         format_fallback(),
-        keyboard=main_menu_keyboard(_cab()),
+        keyboard=_main_kb(message.from_id),
     )
