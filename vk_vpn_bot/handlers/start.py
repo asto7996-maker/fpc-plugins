@@ -24,14 +24,14 @@ from handlers.helpers import (
     format_apps,
     format_auto_login_message,
     format_balance,
-    format_buy,
     format_connect_screen,
+    format_error,
+    format_fallback,
     format_key_message,
     format_pay_amount_prompt,
     format_pay_intro,
     format_payment_created,
     format_promo_prompt,
-    format_referral,
     format_renew_stub,
     format_subscription_card,
     format_support,
@@ -118,19 +118,16 @@ async def _open_cabinet(
     message: Message,
     *,
     redirect: str = "/",
-    title: str = "Открываю кабинет…",
-    button_text: str = "🚀 Открыть",
+    title: str = "Секунду…",
+    button_text: str = "Открыть",
 ) -> None:
-    """
-    Авторегистрация + автологин в мини-приложение без email/пароля.
-    Пользователь сразу попадает в нужный раздел кабинета.
-    """
+    """Авторегистрация + автологин в кабинет без email/пароля."""
     settings = get_settings()
     user = await _ensure_user(message)
 
     if not settings.cabinet_jwt_secret:
         await message.answer(
-            f"Кабинет: {settings.cabinet_url}{redirect}",
+            f"Кабинет\n· · ·\n\n{settings.cabinet_url}{redirect}",
             keyboard=main_menu_keyboard(_cab()),
         )
         return
@@ -150,10 +147,13 @@ async def _open_cabinet(
     except Exception as exc:  # noqa: BLE001
         logger.exception("cabinet open failed: %s", exc)
         await message.answer(
-            f"Не удалось открыть кабинет автоматически: {exc}\n"
-            f"Попробуйте позже или напишите в поддержку.",
+            format_error(
+                "Не удалось открыть кабинет. Попробуйте чуть позже "
+                "или напишите в «Помощь»."
+            ),
             keyboard=main_menu_keyboard(_cab()),
         )
+
 
 
 # ---------------------------------------------------------------------------
@@ -161,14 +161,22 @@ async def _open_cabinet(
 # ---------------------------------------------------------------------------
 
 
-@labeler.private_message(text=["/start", "начать", "старт", "меню", BTN_BACK])
+@labeler.private_message(
+    text=[
+        "/start",
+        "начать",
+        "старт",
+        "меню",
+        BTN_BACK,
+        "◀️ Назад в меню",
+    ]
+)
 async def cmd_start(message: Message):
     settings = get_settings()
     _waiting_promo.discard(message.from_id)
     _pending_pay_method.pop(message.from_id, None)
     user = await _ensure_user(message)
 
-    # Тихая авторегистрация в панели — без email/пароля (как TG Mini App)
     if settings.cabinet_jwt_secret and settings.bedolaga_api_key:
         try:
             await ensure_panel_user(user.user_id, user.first_name)
@@ -181,6 +189,7 @@ async def cmd_start(message: Message):
     )
 
 
+
 # ---------------------------------------------------------------------------
 # Подключиться / триал / ключ
 # ---------------------------------------------------------------------------
@@ -190,6 +199,7 @@ async def cmd_start(message: Message):
     text=[
         BTN_CONNECT,
         BTN_CONNECT_OLD,
+        "🚀 Подключиться",
         "подключить vpn",
         "подключить",
         "подключиться",
@@ -213,6 +223,9 @@ async def cmd_connect(message: Message):
         BTN_TRIAL,
         BTN_GET_KEY,
         BTN_MY_KEY,
+        "🎁 Активировать триал",
+        "🔑 Мой ключ",
+        "🔑 Получить ключ",
         "получить ключ",
         "мой ключ",
         "активировать триал",
@@ -223,7 +236,7 @@ async def cmd_get_key(message: Message):
     settings = get_settings()
     user = await _ensure_user(message)
     text = (message.text or "").lower()
-    want_trial = any(x in text for x in ("триал", "trial", "активировать"))
+    want_trial = any(x in text for x in ("триал", "trial", "активировать", "бесплатный"))
     want_key_only = "ключ" in text and not want_trial
 
     if user.is_subscription_active() and user.vpn_key and not want_trial:
@@ -243,7 +256,7 @@ async def cmd_get_key(message: Message):
         return
 
     if not user.is_trial_used:
-        await message.answer("⏳ Активирую триал, как в Telegram-боте…")
+        await message.answer("Секунду — готовлю триал…")
         result = await issue_trial_or_key(user, settings)
         await message.answer(
             format_key_message(
@@ -274,9 +287,9 @@ async def cmd_get_key(message: Message):
         return
 
     await message.answer(
-        "⏳ Триал уже использован.\n"
-        "Купите тариф в кабинете или нажмите «Продлить» — "
-        "как в Telegram Paskod.",
+        "Триал уже использован\n"
+        "· · ·\n\n"
+        "Можно купить тариф или пополнить баланс.",
         keyboard=connect_keyboard(
             has_active=False,
             trial_available=False,
@@ -285,13 +298,14 @@ async def cmd_get_key(message: Message):
     )
 
 
+
 # ---------------------------------------------------------------------------
 # Подписка / профиль
 # ---------------------------------------------------------------------------
 
 
 @labeler.private_message(
-    text=[BTN_SUBSCRIPTION, BTN_PROFILE, "профиль", "подписка", "моя подписка"]
+    text=[BTN_SUBSCRIPTION, BTN_PROFILE, "📦 Моя подписка", "👤 Профиль", "профиль", "подписка", "моя подписка"]
 )
 async def cmd_subscription(message: Message):
     settings = get_settings()
@@ -316,6 +330,8 @@ async def cmd_subscription(message: Message):
     text=[
         BTN_CABINET,
         BTN_CABINET_LOGIN,
+        "🌐 Кабинет",
+        "🔐 Войти без регистрации",
         "войти",
         "кабинет",
         "войти в кабинет",
@@ -329,8 +345,8 @@ async def cmd_cabinet_login(message: Message):
     await _open_cabinet(
         message,
         redirect="/",
-        title="⏳ Готовлю вход в кабинет (без регистрации)…",
-        button_text="🚀 Открыть кабинет",
+        title="Секунду…",
+        button_text="Открыть кабинет",
     )
 
 
@@ -362,18 +378,17 @@ async def _create_and_send_payment(
 ) -> None:
     settings = get_settings()
     user = await _ensure_user(message)
-    label = METHOD_LABELS.get(method_code, f"Platega {method_code}")
 
     if amount_kopeks < 5000:
         await message.answer(
-            f"Минимальная сумма — 50 ₽ (сейчас {format_rubles(amount_kopeks)}).",
+            f"Минимум 50 ₽\n· · ·\n\nСейчас: {format_rubles(amount_kopeks)}",
             keyboard=pay_amounts_keyboard(),
         )
         return
 
     try:
         await message.answer(
-            f"⏳ Создаю счёт {label} на {format_rubles(amount_kopeks)}…"
+            f"Секунду — готовлю счёт · {format_rubles(amount_kopeks)}"
         )
         bedolaga_id = await ensure_bedolaga_id_for_payments(
             user.user_id, user.first_name
@@ -396,20 +411,22 @@ async def _create_and_send_payment(
     except CabinetPaymentError as exc:
         logger.exception("platega topup failed: %s", exc)
         await message.answer(
-            f"Не удалось создать оплату: {exc}\n"
-            f"Попробуйте через кабинет: {settings.cabinet_url}/balance/top-up",
+            format_error(
+                "Не удалось создать оплату. Попробуйте ещё раз "
+                "или откройте кабинет."
+            ),
             keyboard=pay_methods_keyboard(),
         )
     except Exception as exc:  # noqa: BLE001
         logger.exception("platega topup unexpected: %s", exc)
         await message.answer(
-            f"Ошибка оплаты: {exc}",
+            format_error("Что-то пошло не так. Попробуйте позже."),
             keyboard=main_menu_keyboard(_cab()),
         )
 
 
 @labeler.private_message(
-    text=[BTN_PAY, "оплатить", "оплата", "сбп", "пополнить баланс"]
+    text=[BTN_PAY, "💳 Оплатить", "оплатить", "оплата", "сбп", "пополнить баланс"]
 )
 async def cmd_pay(message: Message):
     await _ensure_user(message)
@@ -417,21 +434,25 @@ async def cmd_pay(message: Message):
     await message.answer(format_pay_intro(), keyboard=pay_methods_keyboard())
 
 
-@labeler.private_message(text=[BTN_PAY_SBP, "сбп qr", "сбп (qr)", "qr"])
+@labeler.private_message(
+    text=[BTN_PAY_SBP, "🏦 СБП (QR)", "сбп qr", "сбп (qr)", "qr"]
+)
 async def cmd_pay_sbp(message: Message):
     await _ensure_user(message)
     await _start_pay_amount(message, PLATEGA_METHOD_SBP_QR)
 
 
 @labeler.private_message(
-    text=[BTN_PAY_CARD, "карта", "банк. карта", "банковская карта"]
+    text=[BTN_PAY_CARD, "💳 Банк. карта", "карта", "банк. карта", "банковская карта"]
 )
 async def cmd_pay_card(message: Message):
     await _ensure_user(message)
     await _start_pay_amount(message, PLATEGA_METHOD_CARD)
 
 
-@labeler.private_message(text=[BTN_PAY_CRYPTO, "крипта", "криптовалюта"])
+@labeler.private_message(
+    text=[BTN_PAY_CRYPTO, "🪙 Крипта", "крипта", "криптовалюта"]
+)
 async def cmd_pay_crypto(message: Message):
     await _ensure_user(message)
     await _start_pay_amount(message, PLATEGA_METHOD_CRYPTO)
@@ -442,7 +463,7 @@ async def cmd_pay_quick_amount(message: Message):
     method_code = _pending_pay_method.get(message.from_id)
     if method_code is None:
         await message.answer(
-            "Сначала выберите способ оплаты.",
+            "Сначала выберите способ оплаты",
             keyboard=pay_methods_keyboard(),
         )
         return
@@ -454,23 +475,19 @@ async def cmd_pay_quick_amount(message: Message):
     )
 
 
-# ---------------------------------------------------------------------------
-# Купить / Баланс / Партнёрка (кабинет = Telegram Mini App)
-# ---------------------------------------------------------------------------
-
-
-@labeler.private_message(text=[BTN_BUY, "купить", "тарифы", "тариф"])
+@labeler.private_message(
+    text=[BTN_BUY, "💳 Купить", "купить", "тарифы", "тариф"]
+)
 async def cmd_buy(message: Message):
-    """Покупка в кабинете — сразу с автологином, без регистрации."""
     await _open_cabinet(
         message,
         redirect="/subscription/purchase",
-        title="⏳ Открываю покупку (вход без регистрации)…",
-        button_text="💳 Купить в кабинете",
+        title="Секунду…",
+        button_text="К тарифам",
     )
 
 
-@labeler.private_message(text=[BTN_BALANCE, "баланс"])
+@labeler.private_message(text=[BTN_BALANCE, "💰 Баланс", "баланс"])
 async def cmd_balance(message: Message):
     settings = get_settings()
     await _ensure_user(message)
@@ -478,32 +495,34 @@ async def cmd_balance(message: Message):
         format_balance(settings),
         keyboard=pay_methods_keyboard(),
     )
-    # Параллельно даём автологин в раздел баланса кабинета
     await _open_cabinet(
         message,
         redirect="/balance",
-        title="⏳ Или откройте баланс в кабинете…",
-        button_text="💰 Баланс в кабинете",
+        title="Или откройте кабинет",
+        button_text="Баланс в кабинете",
     )
 
 
-@labeler.private_message(text=[BTN_REFERRAL, "партнёрка", "реферал", "рефералка"])
+@labeler.private_message(
+    text=[
+        BTN_REFERRAL,
+        "👥 Партнёрка",
+        "партнёрка",
+        "реферал",
+        "рефералка",
+        "партнёрам",
+    ]
+)
 async def cmd_referral(message: Message):
     await _open_cabinet(
         message,
         redirect="/referral",
-        title="⏳ Открываю партнёрку (без регистрации)…",
-        button_text="👥 Партнёрка",
+        title="Секунду…",
+        button_text="Партнёрка",
     )
 
 
-
-# ---------------------------------------------------------------------------
-# Промокод
-# ---------------------------------------------------------------------------
-
-
-@labeler.private_message(text=[BTN_PROMO, "промокод", "промо"])
+@labeler.private_message(text=[BTN_PROMO, "🎟 Промокод", "промокод", "промо"])
 async def cmd_promo(message: Message):
     settings = get_settings()
     await _ensure_user(message)
@@ -514,28 +533,29 @@ async def cmd_promo(message: Message):
     )
 
 
-# ---------------------------------------------------------------------------
-# Приложения / инструкция / поддержка / продление
-# ---------------------------------------------------------------------------
-
-
-@labeler.private_message(text=[BTN_APPS, "приложения", "happ", "скачать"])
+@labeler.private_message(
+    text=[BTN_APPS, "📱 Приложения", "приложения", "happ", "скачать"]
+)
 async def cmd_apps(message: Message):
     settings = get_settings()
     await _ensure_user(message)
     await message.answer(format_apps(settings), keyboard=apps_keyboard(_cab()))
 
 
-@labeler.private_message(text=[BTN_GUIDE, "инструкция", "гайд", "помощь"])
+@labeler.private_message(
+    text=[BTN_GUIDE, "📖 Инструкция", "инструкция", "гайд"]
+)
 async def cmd_guide(message: Message):
     await message.answer(GUIDE_INTRO, keyboard=guide_os_keyboard())
     await message.answer(
-        "Или вернитесь в меню.",
+        "Или вернитесь в меню",
         keyboard=main_menu_keyboard(_cab()),
     )
 
 
-@labeler.private_message(text=[BTN_SUPPORT, "поддержка", "саппорт"])
+@labeler.private_message(
+    text=[BTN_SUPPORT, "💬 Поддержка", "поддержка", "саппорт", "помощь"]
+)
 async def cmd_support(message: Message):
     settings = get_settings()
     await _ensure_user(message)
@@ -546,7 +566,7 @@ async def cmd_support(message: Message):
 
 
 @labeler.private_message(
-    text=[BTN_RENEW, "продлить", "продлить сейчас"]
+    text=[BTN_RENEW, "♻️ Продлить", "продлить", "продлить сейчас"]
 )
 async def cmd_renew(message: Message):
     settings = get_settings()
@@ -555,7 +575,7 @@ async def cmd_renew(message: Message):
 
     if settings.bedolaga_api_key and "сейчас" in text:
         try:
-            await message.answer("⏳ Продлеваю через панель Bedolaga…")
+            await message.answer("Секунду — продлеваю…")
             result = await issue_renewal(user, settings)
             await message.answer(
                 format_key_message(
@@ -571,8 +591,8 @@ async def cmd_renew(message: Message):
         except Exception as exc:  # noqa: BLE001
             logger.exception("renew failed: %s", exc)
             await message.answer(
-                f"Не удалось продлить автоматически: {exc}\n"
-                f"Откройте покупку: {settings.cabinet_url}/subscription/purchase"
+                format_error("Не удалось продлить автоматически. Откройте покупку."),
+                keyboard=subscription_keyboard(_cab()),
             )
 
     await message.answer(
@@ -605,7 +625,7 @@ async def on_message_event(event: GroupTypes.MessageEvent):
     snack = "Готово"
 
     if cmd == "guide" and os_name in GUIDES:
-        snack = f"Инструкция: {OS_TITLES.get(os_name, os_name)}"
+        snack = OS_TITLES.get(os_name, os_name)
         await event.ctx_api.messages.send(
             peer_id=event.object.peer_id,
             message=GUIDES[os_name],
@@ -613,7 +633,7 @@ async def on_message_event(event: GroupTypes.MessageEvent):
             keyboard=main_menu_keyboard(settings.cabinet_url),
         )
     else:
-        snack = "Неизвестная кнопка"
+        snack = "Готово"
 
     await event.ctx_api.messages.send_message_event_answer(
         event_id=event.object.event_id,
@@ -652,7 +672,7 @@ async def fallback(message: Message):
             )
             return
         await message.answer(
-            "Введите сумму числом (например 100) или выберите кнопку.",
+            "Введите сумму числом · например 100",
             keyboard=pay_amounts_keyboard(),
         )
         return
@@ -661,21 +681,22 @@ async def fallback(message: Message):
         _waiting_promo.discard(message.from_id)
         code = text.upper()
         await message.answer(
-            "🎟 Промокод принят: "
+            f"Промокод принят\n"
+            f"· · ·\n\n"
             f"{code}\n\n"
-            "Активация промокодов выполняется в кабинете Paskod "
-            "(как в Telegram Mini App), потому что привязана к аккаунту панели.\n\n"
-            f"1) Откройте {settings.cabinet_url}\n"
-            f"2) Войдите / зарегистрируйтесь\n"
-            f"3) Введите промокод {code} в разделе подписки\n\n"
-            "Если нужен триал прямо здесь — нажмите «Подключиться».",
+            f"Активируем его в кабинете — откройте раздел подписки "
+            f"и введите код. Вход без регистрации.",
             keyboard=promo_keyboard(_cab()),
+        )
+        await _open_cabinet(
+            message,
+            redirect="/subscription",
+            title="Секунду…",
+            button_text="Открыть кабинет",
         )
         return
 
     await message.answer(
-        "Не совсем понял 🤔\n"
-        "Откройте меню или отправьте /start — "
-        "разделы такие же, как в Telegram-боте Paskod.",
+        format_fallback(),
         keyboard=main_menu_keyboard(_cab()),
     )

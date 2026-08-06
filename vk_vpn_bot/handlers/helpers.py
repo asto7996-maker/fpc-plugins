@@ -1,5 +1,5 @@
 """
-Форматирование ответов — тексты как в Telegram Bedolaga.
+Тексты сообщений — спокойный минималистичный тон Paskod.
 """
 
 from __future__ import annotations
@@ -11,89 +11,91 @@ from database.models import User
 from services.vpn_keys import mask_key
 
 
+def _rule() -> str:
+    return "· · ·"
+
+
 def format_auto_login_message(
     url: str,
     settings: Settings,
     *,
     redirect: str | None = "/",
 ) -> str:
-    where = redirect if redirect and redirect not in {"/", ""} else "главную"
-    if where.startswith("/"):
-        where = {
-            "/": "главную",
-            "/subscription": "подписку",
-            "/subscription/purchase": "покупку",
-            "/balance": "баланс",
-            "/referral": "партнёрку",
-            "/balance/top-up": "пополнение",
-        }.get(where, where)
+    where = {
+        "/": "кабинет",
+        "/subscription": "подписку",
+        "/subscription/purchase": "покупку",
+        "/balance": "баланс",
+        "/referral": "партнёрку",
+        "/balance/top-up": "пополнение",
+    }.get(redirect or "/", redirect or "кабинет")
+
     return (
-        "🔐 Вход без регистрации\n\n"
-        "Аккаунт создан автоматически (как у пользователей Telegram).\n"
-        f"Один тап — и вы уже в кабинете Paskod ({where}), "
-        "без email и пароля.\n\n"
-        "Нажмите кнопку ниже.\n"
-        "Ссылка действует 72 часа и привязана к вашему VK.\n\n"
-        f"Если кнопка не открылась:\n{url}"
+        f"Вход без регистрации\n"
+        f"{_rule()}\n\n"
+        f"Аккаунт уже готов. Откройте {where} — "
+        f"email и пароль не нужны.\n\n"
+        f"Ссылка действует 72 часа.\n\n"
+        f"Если кнопка не сработала:\n{url}"
     )
 
 
 def format_welcome(settings: Settings, first_name: str | None = None) -> str:
-    name = first_name or "друг"
+    name = (first_name or "").strip()
+    hello = f"Привет, {name}" if name else "Привет"
+
     return (
-        f"👋 Привет, {name}!\n\n"
-        f"Я — {settings.bot_name}, VK-версия сервиса Paskod "
-        f"(тот же функционал, что в Telegram-боте Бедолага).\n\n"
-        f"{settings.welcome_text}\n\n"
-        f"🎁 Триал: {settings.trial_days} дн. для новых пользователей\n"
-        f"🔐 Кабинет открывается без регистрации (аккаунт создаётся сам)\n"
-        f"💳 Оплата СБП (QR) / картой через Platega — прямо в боте\n"
-        f"🌐 {settings.cabinet_url}\n\n"
-        "Выберите раздел в меню 👇"
+        f"{hello}\n"
+        f"{_rule()}\n\n"
+        f"{settings.bot_name} — быстрый VPN без лишних шагов.\n\n"
+        f"Триал {settings.trial_days} дня · оплата СБП · "
+        f"кабинет без регистрации\n\n"
+        f"Выберите действие ниже"
     )
 
 
-def format_subscription_card(user: User, settings: Settings, panel: dict | None = None) -> str:
-    """Карточка подписки (аналог экрана Subscription в TG/Cabinet)."""
-    active = user.is_subscription_active()
-    if active and user.subscription_end:
+def format_subscription_card(
+    user: User, settings: Settings, panel: dict | None = None
+) -> str:
+    if user.is_subscription_active() and user.subscription_end:
         end = user.subscription_end
         if end.tzinfo is not None:
             end = end.replace(tzinfo=None)
-        status = f"✅ Активна до {end.strftime('%d.%m.%Y %H:%M')} UTC"
+        status = f"активна до {end.strftime('%d.%m.%Y')}"
     else:
-        status = "❌ Нет активной подписки"
+        status = "не активна"
 
-    trial = "использован" if user.is_trial_used else "доступен"
-    key_preview = mask_key(user.vpn_key) if user.vpn_key else "— не выдан —"
+    trial = "уже использован" if user.is_trial_used else "доступен"
+    key_preview = mask_key(user.vpn_key) if user.vpn_key else "ещё не выдан"
 
     lines = [
-        "📦 Моя подписка\n",
-        f"🆔 VK ID: {user.user_id}",
-        f"Статус: {status}",
-        f"Триал: {trial}",
-        f"Ключ: {key_preview}",
+        "Подписка",
+        _rule(),
+        "",
+        f"Статус · {status}",
+        f"Триал · {trial}",
+        f"Ключ · {key_preview}",
     ]
 
-    if user.bedolaga_user_id:
-        lines.append(f"ID в панели: #{user.bedolaga_user_id}")
-
     if panel:
-        sub = panel.get("subscription") if isinstance(panel.get("subscription"), dict) else None
+        sub = (
+            panel.get("subscription")
+            if isinstance(panel.get("subscription"), dict)
+            else None
+        )
         if sub:
+            if sub.get("tariff_name"):
+                lines.append(f"Тариф · {sub.get('tariff_name')}")
             if sub.get("traffic_limit_gb") is not None:
                 used = sub.get("traffic_used_gb", 0)
                 limit = sub.get("traffic_limit_gb")
-                lines.append(f"Трафик: {used} / {limit} ГБ")
+                lines.append(f"Трафик · {used} / {limit} ГБ")
             if sub.get("device_limit") is not None:
-                lines.append(f"Устройства: до {sub.get('device_limit')}")
-            if sub.get("tariff_name"):
-                lines.append(f"Тариф: {sub.get('tariff_name')}")
+                lines.append(f"Устройства · до {sub.get('device_limit')}")
         bal = panel.get("balance_rubles")
         if bal is not None:
-            lines.append(f"Баланс: {bal} ₽")
+            lines.append(f"Баланс · {bal} ₽")
 
-    lines.append(f"\n🌐 Полный кабинет: {settings.cabinet_url}/subscription")
     return "\n".join(lines)
 
 
@@ -104,23 +106,23 @@ def format_profile(user: User, settings: Settings) -> str:
 def format_connect_screen(user: User, settings: Settings) -> str:
     if user.is_subscription_active():
         return (
-            "🚀 Подключение\n\n"
-            "Подписка уже активна.\n"
-            "Скопируйте ключ или откройте раздел подписки в кабинете "
-            "(там же Happ и устройства) — как в Telegram-боте."
+            f"Подключение\n"
+            f"{_rule()}\n\n"
+            f"Подписка уже активна.\n"
+            f"Откройте ключ или кабинет — и подключайтесь в Happ."
         )
     if not user.is_trial_used:
         return (
-            "🚀 Подключение\n\n"
-            f"Доступен бесплатный триал на {settings.trial_days} дн.\n"
-            "Нажмите «Активировать триал» — создам доступ и пришлю ссылку "
-            "для Happ (как кнопка триала в Telegram)."
+            f"Подключение\n"
+            f"{_rule()}\n\n"
+            f"Вам доступен бесплатный триал на {settings.trial_days} дня.\n"
+            f"Один тап — и пришлём ссылку для Happ."
         )
     return (
-        "🚀 Подключение\n\n"
-        "Триал уже использован.\n"
-        "Купите тариф в кабинете или продлите подписку — "
-        "тот же сценарий, что в Telegram Paskod/Bedolaga."
+        f"Подключение\n"
+        f"{_rule()}\n\n"
+        f"Триал уже использован.\n"
+        f"Можно купить тариф или пополнить баланс."
     )
 
 
@@ -132,62 +134,56 @@ def format_key_message(
     source: str = "local",
 ) -> str:
     header = (
-        f"🎁 Триал на {settings.trial_days} дн. активирован!\n\n"
+        f"Триал на {settings.trial_days} дня готов"
         if is_trial
-        else "✅ Ссылка подключения:\n\n"
+        else "Ссылка подключения"
     )
-    source_line = (
-        "Источник: панель Paskod (Remnawave/Bedolaga)\n"
-        if source == "bedolaga"
-        else "Источник: локальный режим (задайте BEDOLAGA_API_KEY для боевых ключей)\n"
+    return (
+        f"{header}\n"
+        f"{_rule()}\n\n"
+        f"{key}\n\n"
+        f"Как подключить\n"
+        f"1. Скопируйте ссылку целиком\n"
+        f"2. Happ → «+» → из буфера\n"
+        f"3. Включите VPN"
     )
-    tip = (
-        "\n\n📋 Импорт в Happ:\n"
-        "1) Скопируйте ссылку целиком\n"
-        "2) Happ → «+» → из буфера\n"
-        "3) Подключитесь\n\n"
-        f"Кабинет: {settings.cabinet_url}/subscription"
-    )
-    return f"{header}{source_line}\n{key}{tip}"
 
 
 def format_buy(settings: Settings) -> str:
+    _ = settings
     return (
-        "💳 Купить подписку\n\n"
-        "Тарифы и оплата — в личном кабинете Paskod "
-        "(тот же кабинет, что открывает Telegram Mini App).\n\n"
-        f"👉 {settings.cabinet_url}/subscription/purchase\n\n"
-        "После оплаты ключ появится в «Моя подписка» / кабинете."
+        f"Покупка\n"
+        f"{_rule()}\n\n"
+        f"Откроем кабинет уже авторизованным.\n"
+        f"Выберите тариф — и готово."
     )
 
 
 def format_balance(settings: Settings) -> str:
+    _ = settings
     return (
-        "💰 Баланс\n\n"
-        "Пополнить можно прямо здесь — «💳 Оплатить» "
-        "(СБП QR / карта через Platega, как в мини-приложении).\n\n"
-        f"История и детали — в кабинете:\n{settings.cabinet_url}/balance"
+        f"Баланс\n"
+        f"{_rule()}\n\n"
+        f"Пополните прямо здесь через СБП или карту.\n"
+        f"Либо откройте баланс в кабинете."
     )
 
 
 def format_pay_intro() -> str:
     return (
-        "💳 Оплата через Platega\n\n"
-        "Те же способы, что в мини-приложении Paskod:\n"
-        "• 🏦 СБП (QR) — оплата по QR в банковском приложении\n"
-        "• 💳 Банк. карта\n"
-        "• 🪙 Крипта\n\n"
-        "Выберите способ 👇"
+        f"Оплата\n"
+        f"{_rule()}\n\n"
+        f"Выберите удобный способ — "
+        f"те же, что в мини-приложении."
     )
 
 
 def format_pay_amount_prompt(method_label: str) -> str:
     return (
-        f"{method_label}\n\n"
-        "Выберите сумму пополнения "
-        "(минимум 50 ₽, как в кабинете):\n"
-        "50 / 100 / 150 / 500 ₽\n\n"
-        "Или напишите свою сумму числом, например: 200"
+        f"{method_label}\n"
+        f"{_rule()}\n\n"
+        f"Сумма пополнения\n"
+        f"от 50 ₽ · или введите свою, например 200"
     )
 
 
@@ -203,69 +199,86 @@ def format_payment_created(
         else f"{amount_rubles:.2f} ₽"
     )
     return (
-        f"✅ Счёт создан ({method_label})\n\n"
-        f"Сумма: {amount}\n"
-        "Нажмите «Оплатить сейчас» — откроется страница Platega "
-        "(СБП QR / карта).\n\n"
-        "После оплаты баланс появится в кабинете автоматически "
-        "(обычно до минуты).\n\n"
-        f"Если кнопка не открылась:\n{payment_url}"
+        f"Счёт готов\n"
+        f"{_rule()}\n\n"
+        f"{method_label} · {amount}\n\n"
+        f"Нажмите «Оплатить» — откроется безопасная страница.\n"
+        f"Баланс обновится обычно в течение минуты.\n\n"
+        f"Если кнопка не сработала:\n{payment_url}"
     )
 
 
 def format_referral(settings: Settings) -> str:
+    _ = settings
     return (
-        "👥 Партнёрская программа\n\n"
-        "Реферальная ссылка, статистика и вывод — в кабинете:\n"
-        f"{settings.cabinet_url}/referral\n\n"
-        "Условия те же, что в Telegram-боте Bedolaga."
+        f"Партнёрам\n"
+        f"{_rule()}\n\n"
+        f"Реферальная ссылка, статистика и вывод — "
+        f"в кабинете, без отдельной регистрации."
     )
 
 
 def format_promo_prompt(settings: Settings) -> str:
+    _ = settings
     return (
-        "🎟 Промокод\n\n"
-        "Отправьте промокод сообщением в этот чат — "
-        "или активируйте его в кабинете:\n"
-        f"{settings.cabinet_url}/subscription\n\n"
-        "Напишите код одним сообщением (например: PASKOD2026)."
+        f"Промокод\n"
+        f"{_rule()}\n\n"
+        f"Отправьте код одним сообщением.\n"
+        f"Например: PASKOD2026"
     )
 
 
 def format_apps(settings: Settings) -> str:
+    _ = settings
     return (
-        "📱 Приложения\n\n"
-        "Рекомендуем Happ — официальный клиент Paskod.\n"
-        "Скачивание и импорт конфигурации:\n"
-        f"{settings.cabinet_url}/subscription\n\n"
-        "Также подойдут: v2rayNG, Hiddify, Streisand, V2Box.\n"
-        "Откройте «Инструкция» для пошагового гайда по ОС."
+        f"Приложения\n"
+        f"{_rule()}\n\n"
+        f"Рекомендуем Happ — спокойный и стабильный клиент.\n\n"
+        f"Также подойдут v2rayNG, Hiddify, Streisand и V2Box.\n"
+        f"Откройте «Гайд», если нужна пошаговая настройка."
     )
 
 
 def format_renew_stub(settings: Settings) -> str:
     if settings.bedolaga_api_key:
         return (
-            "♻️ Продление\n\n"
-            f"Автопродление через панель на {settings.renew_days} дн.: "
-            "напишите «продлить сейчас».\n"
-            "Или оплатите тариф в кабинете:\n"
-            f"{settings.cabinet_url}/subscription/purchase"
+            f"Продление\n"
+            f"{_rule()}\n\n"
+            f"Автопродление на {settings.renew_days} дн. — "
+            f"напишите «продлить сейчас».\n\n"
+            f"Или купите тариф в кабинете."
         )
     return (
-        "♻️ Продление\n\n"
-        "Оплатите тариф в кабинете Paskod — как в Telegram:\n"
-        f"{settings.cabinet_url}/subscription/purchase\n\n"
-        "После оплаты ключ обновится автоматически в панели."
+        f"Продление\n"
+        f"{_rule()}\n\n"
+        f"Откройте покупку в кабинете — "
+        f"ключ обновится автоматически."
     )
 
 
 def format_support(settings: Settings) -> str:
     return (
-        "💬 Поддержка\n\n"
+        f"Помощь\n"
+        f"{_rule()}\n\n"
         f"{settings.support_text}\n\n"
-        f"VK: {settings.support_url}\n"
-        f"Кабинет: {settings.cabinet_url}"
+        f"Мы рядом — напишите в любое время."
+    )
+
+
+def format_loading(text: str = "Секунду…") -> str:
+    return text
+
+
+def format_error(text: str) -> str:
+    return f"Не получилось\n{_rule()}\n\n{text}"
+
+
+def format_fallback() -> str:
+    return (
+        f"Не совсем понял\n"
+        f"{_rule()}\n\n"
+        f"Откройте меню или отправьте /start — "
+        f"там всё по полочкам."
     )
 
 
