@@ -2,6 +2,7 @@
 
 from keyboards.menus import (
     BTN_APPS,
+    BTN_ASK,
     BTN_BACK,
     BTN_BALANCE,
     BTN_BUY,
@@ -51,10 +52,12 @@ from keyboards.menus import (
     promo_keyboard,
     subscription_keyboard,
     support_keyboard,
+    support_wait_keyboard,
 )
 
 __all__ = [
     "BTN_APPS",
+    "BTN_ASK",
     "BTN_BACK",
     "BTN_BALANCE",
     "BTN_BUY",
@@ -104,4 +107,5 @@ __all__ = [
     "promo_keyboard",
     "subscription_keyboard",
     "support_keyboard",
+    "support_wait_keyboard",
 ]

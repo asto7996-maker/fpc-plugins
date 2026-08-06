@@ -30,6 +30,7 @@ BTN_PAY_CARD = "💳 Карта"
 BTN_PAY_CRYPTO = "🪙 Крипта"
 BTN_RENEW = "♻️ Продлить"
 BTN_DEVICES = "📲 Устройства"
+BTN_ASK = "✍️ Задать вопрос"
 
 # Документы (всё в VK-боте)
 BTN_PRIVACY = "🛡️ Приватность"
@@ -265,12 +266,29 @@ def guide_os_keyboard() -> str:
 
 
 def support_keyboard(support_url: str, cabinet_url: str) -> str:
+    """
+    Клавиатура «Помощи».
+
+    Вопрос задаётся прямо здесь. Внешняя ссылка добавляется только если она
+    действительно куда-то ведёт: ссылка на диалог с этим же сообществом
+    вернула бы пользователя туда, где он уже стоит.
+    """
     _ = cabinet_url
+    kb = Keyboard(one_time=False, inline=False)
+    kb.add(Text(BTN_ASK), color=KeyboardButtonColor.POSITIVE)
+    kb.row()
+    if support_url:
+        kb.add(OpenLink(support_url, "💌 Написать в поддержку"))
+        kb.row()
+    kb.add(Text(BTN_INFO), color=KeyboardButtonColor.PRIMARY)
+    kb.add(Text(BTN_BACK), color=KeyboardButtonColor.SECONDARY)
+    return kb.get_json()
+
+
+def support_wait_keyboard() -> str:
+    """Пока ждём текст вопроса — только выход из режима."""
     return (
         Keyboard(one_time=False, inline=False)
-        .add(OpenLink(support_url, "💌 Написать нам"))
-        .row()
-        .add(Text(BTN_INFO), color=KeyboardButtonColor.POSITIVE)
         .add(Text(BTN_BACK), color=KeyboardButtonColor.SECONDARY)
         .get_json()
     )

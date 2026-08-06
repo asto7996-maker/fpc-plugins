@@ -47,6 +47,7 @@ class Settings:
     vpn_key_type: str
     support_url: str
     support_text: str
+    support_admin_ids: tuple[int, ...]
     vless_template: str
     outline_keys: tuple[str, ...]
     bot_name: str
@@ -84,6 +85,14 @@ def load_settings() -> Settings:
     outline_raw = _optional("OUTLINE_KEYS", "")
     outline_keys = tuple(k.strip() for k in outline_raw.split(",") if k.strip())
 
+    # Кому пересылать вопросы из «Помощи». Пусто — спросим управляющих у VK.
+    admins_raw = _optional("SUPPORT_ADMIN_IDS", "")
+    support_admin_ids: tuple[int, ...] = tuple(
+        int(part.strip())
+        for part in admins_raw.replace(";", ",").split(",")
+        if part.strip().lstrip("-").isdigit()
+    )
+
     vpn_key_type = _optional("VPN_KEY_TYPE", "vless").lower()
     if vpn_key_type not in {"vless", "outline", "wireguard"}:
         raise RuntimeError("VPN_KEY_TYPE должен быть: vless | outline | wireguard")
@@ -99,11 +108,12 @@ def load_settings() -> Settings:
         database_url=database_url,
         trial_days=trial_days,
         vpn_key_type=vpn_key_type,
-        support_url=_optional("SUPPORT_URL", "https://vk.com"),
+        support_url=_optional("SUPPORT_URL", ""),
         support_text=_optional(
             "SUPPORT_TEXT",
             "Напишите в поддержку сообщества — поможем с подключением.",
         ),
+        support_admin_ids=support_admin_ids,
         vless_template=_optional(
             "VLESS_TEMPLATE",
             "vless://{uuid}@vpn.example.com:443?encryption=none&security=reality"

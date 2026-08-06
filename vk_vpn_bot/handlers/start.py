@@ -44,12 +44,15 @@ from handlers.helpers import (
     format_renew_stub,
     format_subscription_card,
     format_support,
+    format_support_prompt,
+    format_support_received,
     format_trial_used,
     format_welcome,
 )
 from handlers.texts import GUIDE_INTRO, GUIDES, OS_TITLES
 from keyboards import (
     BTN_APPS,
+    BTN_ASK,
     BTN_BACK,
     BTN_BALANCE,
     BTN_BUY,
@@ -95,11 +98,13 @@ from keyboards import (
     promo_keyboard,
     subscription_keyboard,
     support_keyboard,
+    support_wait_keyboard,
 )
 from legal.documents import DOCS_BY_SLUG, format_doc_for_bot
 from services.bedolaga import get_bedolaga_client
 from services.cabinet_auth import ensure_auto_login_url, ensure_panel_user
 from services.keys_service import issue_renewal, issue_trial_or_key
+from services.support import notify_admins, usable_support_url
 from services.payments import (
     METHOD_LABELS,
     PLATEGA_METHOD_CARD,
@@ -122,6 +127,8 @@ _waiting_promo: set[int] = set()
 _pending_pay_method: dict[int, int] = {}
 # Чтение документа в боте: vk_id → {"slug": str, "page": int, "total": int}
 _reading_doc: dict[int, dict[str, int | str]] = {}
+# Ожидание текста вопроса в поддержку
+_waiting_support: set[int] = set()
 
 # Кнопка текста → slug документа
 _DOC_BUTTONS: dict[str, str] = {
@@ -242,6 +249,7 @@ async def cmd_start(message: Message):
     _waiting_promo.discard(message.from_id)
     _pending_pay_method.pop(message.from_id, None)
     _reading_doc.pop(message.from_id, None)
+    _waiting_support.discard(message.from_id)
     user = await _ensure_user(message)
 
     if settings.cabinet_jwt_secret and settings.bedolaga_api_key:
@@ -749,9 +757,58 @@ async def cmd_guide(message: Message):
 async def cmd_support(message: Message):
     settings = get_settings()
     await _ensure_user(message)
+    _waiting_support.discard(message.from_id)
     await message.answer(
         format_support(settings),
-        keyboard=support_keyboard(settings.support_url, _cab()),
+        keyboard=support_keyboard(usable_support_url(settings), _cab()),
+    )
+
+
+@labeler.private_message(
+    text=[
+        BTN_ASK,
+        "✍️ Задать вопрос",
+        "задать вопрос",
+        "задать вопрос поддержке",
+        "вопрос",
+    ]
+)
+async def cmd_ask_question(message: Message):
+    """Переводит бота в режим приёма обращения."""
+    await _ensure_user(message)
+    _waiting_promo.discard(message.from_id)
+    _pending_pay_method.pop(message.from_id, None)
+    _reading_doc.pop(message.from_id, None)
+    _waiting_support.add(message.from_id)
+    await message.answer(
+        format_support_prompt(),
+        keyboard=support_wait_keyboard(),
+    )
+
+
+async def _accept_support_question(message: Message, text: str) -> None:
+    settings = get_settings()
+    user = await _ensure_user(message)
+    _waiting_support.discard(message.from_id)
+
+    delivered = 0
+    try:
+        delivered = await notify_admins(
+            message.ctx_api,
+            settings,
+            vk_user_id=user.user_id,
+            first_name=user.first_name,
+            question=text,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("не удалось уведомить админов о вопросе: %s", exc)
+
+    logger.info(
+        "support question from vk=%s delivered_to=%s", user.user_id, delivered
+    )
+    await message.answer(
+        format_support_received(bool(delivered)),
+        keyboard=support_keyboard(usable_support_url(settings), _cab()),
     )
 
 
@@ -791,7 +848,7 @@ async def cmd_renew(message: Message):
 
     await message.answer(
         format_renew_stub(settings),
-        keyboard=support_keyboard(settings.support_url, _cab()),
+        keyboard=support_keyboard(usable_support_url(settings), _cab()),
     )
 
 
@@ -882,6 +939,20 @@ async def fallback(message: Message):
     settings = get_settings()
     await _ensure_user(message)
     text = (message.text or "").strip()
+
+    # Режим поддержки проверяем первым: иначе короткий латинский вопрос
+    # вроде «help» будет распознан как промокод.
+    if message.from_id in _waiting_support:
+        if not text and getattr(message, "attachments", None):
+            text = "(без текста, приложены вложения)"
+        if not text:
+            await message.answer(
+                format_support_prompt(),
+                keyboard=support_wait_keyboard(),
+            )
+            return
+        await _accept_support_question(message, text)
+        return
 
     method_code = _pending_pay_method.get(message.from_id)
     if method_code is not None:
