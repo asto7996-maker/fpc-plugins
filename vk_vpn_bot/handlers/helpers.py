@@ -31,6 +31,7 @@ def format_welcome(settings: Settings, first_name: str | None = None) -> str:
         f"{settings.welcome_text}\n\n"
         f"🎁 Триал: {settings.trial_days} дн. для новых пользователей\n"
         f"🔐 Вход в кабинет — без регистрации (как в Telegram)\n"
+        f"💳 Оплата СБП (QR) / картой через Platega — прямо в боте\n"
         f"🌐 {settings.cabinet_url}\n\n"
         "Выберите раздел в меню 👇"
     )
@@ -147,10 +148,52 @@ def format_buy(settings: Settings) -> str:
 def format_balance(settings: Settings) -> str:
     return (
         "💰 Баланс\n\n"
-        "Пополнение баланса и история платежей — в кабинете:\n"
-        f"{settings.cabinet_url}/balance\n\n"
-        "Войдите тем же аккаунтом, что в Telegram, "
-        "или зарегистрируйтесь по email."
+        "Пополнить можно прямо здесь — «💳 Оплатить» "
+        "(СБП QR / карта через Platega, как в мини-приложении).\n\n"
+        f"История и детали — в кабинете:\n{settings.cabinet_url}/balance"
+    )
+
+
+def format_pay_intro() -> str:
+    return (
+        "💳 Оплата через Platega\n\n"
+        "Те же способы, что в мини-приложении Paskod:\n"
+        "• 🏦 СБП (QR) — оплата по QR в банковском приложении\n"
+        "• 💳 Банк. карта\n"
+        "• 🪙 Крипта\n\n"
+        "Выберите способ 👇"
+    )
+
+
+def format_pay_amount_prompt(method_label: str) -> str:
+    return (
+        f"{method_label}\n\n"
+        "Выберите сумму пополнения "
+        "(минимум 50 ₽, как в кабинете):\n"
+        "50 / 100 / 150 / 500 ₽\n\n"
+        "Или напишите свою сумму числом, например: 200"
+    )
+
+
+def format_payment_created(
+    *,
+    method_label: str,
+    amount_rubles: float,
+    payment_url: str,
+) -> str:
+    amount = (
+        f"{int(amount_rubles)} ₽"
+        if amount_rubles == int(amount_rubles)
+        else f"{amount_rubles:.2f} ₽"
+    )
+    return (
+        f"✅ Счёт создан ({method_label})\n\n"
+        f"Сумма: {amount}\n"
+        "Нажмите «Оплатить сейчас» — откроется страница Platega "
+        "(СБП QR / карта).\n\n"
+        "После оплаты баланс появится в кабинете автоматически "
+        "(обычно до минуты).\n\n"
+        f"Если кнопка не открылась:\n{payment_url}"
     )
 
 

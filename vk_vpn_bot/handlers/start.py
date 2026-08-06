@@ -27,6 +27,9 @@ from handlers.helpers import (
     format_buy,
     format_connect_screen,
     format_key_message,
+    format_pay_amount_prompt,
+    format_pay_intro,
+    format_payment_created,
     format_promo_prompt,
     format_referral,
     format_renew_stub,
@@ -46,6 +49,10 @@ from keyboards import (
     BTN_GET_KEY,
     BTN_GUIDE,
     BTN_MY_KEY,
+    BTN_PAY,
+    BTN_PAY_CARD,
+    BTN_PAY_CRYPTO,
+    BTN_PAY_SBP,
     BTN_PROFILE,
     BTN_PROMO,
     BTN_REFERRAL,
@@ -53,11 +60,15 @@ from keyboards import (
     BTN_SUBSCRIPTION,
     BTN_SUPPORT,
     BTN_TRIAL,
+    PAY_AMOUNT_BUTTONS,
     apps_keyboard,
     auto_login_keyboard,
     connect_keyboard,
     guide_os_keyboard,
     main_menu_keyboard,
+    pay_amounts_keyboard,
+    pay_methods_keyboard,
+    payment_link_keyboard,
     promo_keyboard,
     subscription_keyboard,
     support_keyboard,
@@ -65,6 +76,16 @@ from keyboards import (
 from services.bedolaga import get_bedolaga_client
 from services.cabinet_auth import ensure_auto_login_url
 from services.keys_service import issue_renewal, issue_trial_or_key
+from services.payments import (
+    METHOD_LABELS,
+    PLATEGA_METHOD_CARD,
+    PLATEGA_METHOD_CRYPTO,
+    PLATEGA_METHOD_SBP_QR,
+    CabinetPaymentClient,
+    CabinetPaymentError,
+    ensure_bedolaga_id_for_payments,
+    format_rubles,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +94,8 @@ labeler.vbml_ignore_case = True
 
 # Ожидание промокода от пользователя (vk_id → True)
 _waiting_promo: set[int] = set()
+# Ожидание суммы оплаты: vk_id → код метода Platega (2/11/13)
+_pending_pay_method: dict[int, int] = {}
 
 
 async def _ensure_user(message: Message):
@@ -99,6 +122,7 @@ def _cab() -> str:
 async def cmd_start(message: Message):
     settings = get_settings()
     _waiting_promo.discard(message.from_id)
+    _pending_pay_method.pop(message.from_id, None)
     user = await _ensure_user(message)
     await message.answer(
         format_welcome(settings, user.first_name),
@@ -282,6 +306,125 @@ async def cmd_cabinet_login(message: Message):
 
 
 # ---------------------------------------------------------------------------
+# Оплата Platega: СБП (QR) / карта / крипта — как в мини-приложении
+# ---------------------------------------------------------------------------
+
+
+def _clear_pay_state(vk_id: int) -> None:
+    _pending_pay_method.pop(vk_id, None)
+
+
+async def _start_pay_amount(message: Message, method_code: int) -> None:
+    _waiting_promo.discard(message.from_id)
+    _pending_pay_method[message.from_id] = method_code
+    label = METHOD_LABELS.get(method_code, f"Platega {method_code}")
+    await message.answer(
+        format_pay_amount_prompt(label),
+        keyboard=pay_amounts_keyboard(),
+    )
+
+
+async def _create_and_send_payment(
+    message: Message,
+    *,
+    method_code: int,
+    amount_kopeks: int,
+) -> None:
+    settings = get_settings()
+    user = await _ensure_user(message)
+    label = METHOD_LABELS.get(method_code, f"Platega {method_code}")
+
+    if amount_kopeks < 5000:
+        await message.answer(
+            f"Минимальная сумма — 50 ₽ (сейчас {format_rubles(amount_kopeks)}).",
+            keyboard=pay_amounts_keyboard(),
+        )
+        return
+
+    try:
+        await message.answer(
+            f"⏳ Создаю счёт {label} на {format_rubles(amount_kopeks)}…"
+        )
+        bedolaga_id = await ensure_bedolaga_id_for_payments(
+            user.user_id, user.first_name
+        )
+        client = CabinetPaymentClient(settings)
+        result = await client.create_platega_topup(
+            bedolaga_id,
+            amount_kopeks=amount_kopeks,
+            payment_option=method_code,
+        )
+        _clear_pay_state(message.from_id)
+        await message.answer(
+            format_payment_created(
+                method_label=result.method_label,
+                amount_rubles=result.amount_rubles,
+                payment_url=result.payment_url,
+            ),
+            keyboard=payment_link_keyboard(result.payment_url),
+        )
+    except CabinetPaymentError as exc:
+        logger.exception("platega topup failed: %s", exc)
+        await message.answer(
+            f"Не удалось создать оплату: {exc}\n"
+            f"Попробуйте через кабинет: {settings.cabinet_url}/balance/top-up",
+            keyboard=pay_methods_keyboard(),
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("platega topup unexpected: %s", exc)
+        await message.answer(
+            f"Ошибка оплаты: {exc}",
+            keyboard=main_menu_keyboard(_cab()),
+        )
+
+
+@labeler.private_message(
+    text=[BTN_PAY, "оплатить", "оплата", "сбп", "пополнить баланс"]
+)
+async def cmd_pay(message: Message):
+    await _ensure_user(message)
+    _waiting_promo.discard(message.from_id)
+    await message.answer(format_pay_intro(), keyboard=pay_methods_keyboard())
+
+
+@labeler.private_message(text=[BTN_PAY_SBP, "сбп qr", "сбп (qr)", "qr"])
+async def cmd_pay_sbp(message: Message):
+    await _ensure_user(message)
+    await _start_pay_amount(message, PLATEGA_METHOD_SBP_QR)
+
+
+@labeler.private_message(
+    text=[BTN_PAY_CARD, "карта", "банк. карта", "банковская карта"]
+)
+async def cmd_pay_card(message: Message):
+    await _ensure_user(message)
+    await _start_pay_amount(message, PLATEGA_METHOD_CARD)
+
+
+@labeler.private_message(text=[BTN_PAY_CRYPTO, "крипта", "криптовалюта"])
+async def cmd_pay_crypto(message: Message):
+    await _ensure_user(message)
+    await _start_pay_amount(message, PLATEGA_METHOD_CRYPTO)
+
+
+@labeler.private_message(text=list(PAY_AMOUNT_BUTTONS.keys()))
+async def cmd_pay_quick_amount(message: Message):
+    method_code = _pending_pay_method.get(message.from_id)
+    if method_code is None:
+        await message.answer(
+            "Сначала выберите способ оплаты.",
+            keyboard=pay_methods_keyboard(),
+        )
+        return
+    amount = PAY_AMOUNT_BUTTONS.get((message.text or "").strip())
+    if not amount:
+        return
+    await _create_and_send_payment(
+        message, method_code=method_code, amount_kopeks=amount
+    )
+
+
+# ---------------------------------------------------------------------------
 # Купить / Баланс / Партнёрка (кабинет = Telegram Mini App)
 # ---------------------------------------------------------------------------
 
@@ -302,7 +445,7 @@ async def cmd_balance(message: Message):
     await _ensure_user(message)
     await message.answer(
         format_balance(settings),
-        keyboard=main_menu_keyboard(_cab()),
+        keyboard=pay_methods_keyboard(),
     )
 
 
@@ -364,7 +507,7 @@ async def cmd_support(message: Message):
 
 
 @labeler.private_message(
-    text=[BTN_RENEW, "продлить", "оплатить", "продлить сейчас"]
+    text=[BTN_RENEW, "продлить", "продлить сейчас"]
 )
 async def cmd_renew(message: Message):
     settings = get_settings()
@@ -446,6 +589,10 @@ async def on_message_event(event: GroupTypes.MessageEvent):
 # ---------------------------------------------------------------------------
 
 _PROMO_RE = re.compile(r"^[A-Za-z0-9_\-]{3,32}$")
+_AMOUNT_RE = re.compile(
+    r"^(?:сумма\s*)?(\d+(?:[.,]\d{1,2})?)\s*(?:₽|руб\.?|rur|rub)?$",
+    re.IGNORECASE,
+)
 
 
 @labeler.private_message()
@@ -453,6 +600,23 @@ async def fallback(message: Message):
     settings = get_settings()
     await _ensure_user(message)
     text = (message.text or "").strip()
+
+    method_code = _pending_pay_method.get(message.from_id)
+    if method_code is not None:
+        m = _AMOUNT_RE.match(text.replace(" ", ""))
+        if m:
+            raw = m.group(1).replace(",", ".")
+            rubles = float(raw)
+            amount_kopeks = int(round(rubles * 100))
+            await _create_and_send_payment(
+                message, method_code=method_code, amount_kopeks=amount_kopeks
+            )
+            return
+        await message.answer(
+            "Введите сумму числом (например 100) или выберите кнопку.",
+            keyboard=pay_amounts_keyboard(),
+        )
+        return
 
     if message.from_id in _waiting_promo or _PROMO_RE.match(text or ""):
         _waiting_promo.discard(message.from_id)
