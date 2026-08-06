@@ -11,14 +11,30 @@ from database.models import User
 from services.vpn_keys import mask_key
 
 
-def format_auto_login_message(url: str, settings: Settings) -> str:
+def format_auto_login_message(
+    url: str,
+    settings: Settings,
+    *,
+    redirect: str | None = "/",
+) -> str:
+    where = redirect if redirect and redirect not in {"/", ""} else "главную"
+    if where.startswith("/"):
+        where = {
+            "/": "главную",
+            "/subscription": "подписку",
+            "/subscription/purchase": "покупку",
+            "/balance": "баланс",
+            "/referral": "партнёрку",
+            "/balance/top-up": "пополнение",
+        }.get(where, where)
     return (
-        "🔐 Вход в кабинет без регистрации\n\n"
-        "Как у пользователей Telegram: один тап — и вы уже внутри "
-        "личного кабинета Paskod, без email и пароля.\n\n"
-        "Нажмите кнопку ниже «Открыть кабинет».\n"
-        "Ссылка действует 72 часа и привязана к вашему VK-аккаунту.\n\n"
-        f"Если кнопка не открылась, скопируйте:\n{url}"
+        "🔐 Вход без регистрации\n\n"
+        "Аккаунт создан автоматически (как у пользователей Telegram).\n"
+        f"Один тап — и вы уже в кабинете Paskod ({where}), "
+        "без email и пароля.\n\n"
+        "Нажмите кнопку ниже.\n"
+        "Ссылка действует 72 часа и привязана к вашему VK.\n\n"
+        f"Если кнопка не открылась:\n{url}"
     )
 
 
@@ -30,7 +46,7 @@ def format_welcome(settings: Settings, first_name: str | None = None) -> str:
         f"(тот же функционал, что в Telegram-боте Бедолага).\n\n"
         f"{settings.welcome_text}\n\n"
         f"🎁 Триал: {settings.trial_days} дн. для новых пользователей\n"
-        f"🔐 Вход в кабинет — без регистрации (как в Telegram)\n"
+        f"🔐 Кабинет открывается без регистрации (аккаунт создаётся сам)\n"
         f"💳 Оплата СБП (QR) / картой через Platega — прямо в боте\n"
         f"🌐 {settings.cabinet_url}\n\n"
         "Выберите раздел в меню 👇"

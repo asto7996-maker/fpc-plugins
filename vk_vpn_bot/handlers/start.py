@@ -43,6 +43,7 @@ from keyboards import (
     BTN_BACK,
     BTN_BALANCE,
     BTN_BUY,
+    BTN_CABINET,
     BTN_CABINET_LOGIN,
     BTN_CONNECT,
     BTN_CONNECT_OLD,
@@ -74,7 +75,7 @@ from keyboards import (
     support_keyboard,
 )
 from services.bedolaga import get_bedolaga_client
-from services.cabinet_auth import ensure_auto_login_url
+from services.cabinet_auth import ensure_auto_login_url, ensure_panel_user
 from services.keys_service import issue_renewal, issue_trial_or_key
 from services.payments import (
     METHOD_LABELS,
@@ -113,6 +114,48 @@ def _cab() -> str:
     return get_settings().cabinet_url
 
 
+async def _open_cabinet(
+    message: Message,
+    *,
+    redirect: str = "/",
+    title: str = "Открываю кабинет…",
+    button_text: str = "🚀 Открыть",
+) -> None:
+    """
+    Авторегистрация + автологин в мини-приложение без email/пароля.
+    Пользователь сразу попадает в нужный раздел кабинета.
+    """
+    settings = get_settings()
+    user = await _ensure_user(message)
+
+    if not settings.cabinet_jwt_secret:
+        await message.answer(
+            f"Кабинет: {settings.cabinet_url}{redirect}",
+            keyboard=main_menu_keyboard(_cab()),
+        )
+        return
+
+    try:
+        await message.answer(title)
+        url, _bid = await ensure_auto_login_url(
+            user.user_id,
+            user.first_name,
+            settings,
+            redirect=redirect,
+        )
+        await message.answer(
+            format_auto_login_message(url, settings, redirect=redirect),
+            keyboard=auto_login_keyboard(url, button_text=button_text),
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("cabinet open failed: %s", exc)
+        await message.answer(
+            f"Не удалось открыть кабинет автоматически: {exc}\n"
+            f"Попробуйте позже или напишите в поддержку.",
+            keyboard=main_menu_keyboard(_cab()),
+        )
+
+
 # ---------------------------------------------------------------------------
 # Старт / меню
 # ---------------------------------------------------------------------------
@@ -124,6 +167,14 @@ async def cmd_start(message: Message):
     _waiting_promo.discard(message.from_id)
     _pending_pay_method.pop(message.from_id, None)
     user = await _ensure_user(message)
+
+    # Тихая авторегистрация в панели — без email/пароля (как TG Mini App)
+    if settings.cabinet_jwt_secret and settings.bedolaga_api_key:
+        try:
+            await ensure_panel_user(user.user_id, user.first_name)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("silent panel register failed: %s", exc)
+
     await message.answer(
         format_welcome(settings, user.first_name),
         keyboard=main_menu_keyboard(_cab()),
@@ -263,46 +314,25 @@ async def cmd_subscription(message: Message):
 
 @labeler.private_message(
     text=[
+        BTN_CABINET,
         BTN_CABINET_LOGIN,
         "войти",
         "кабинет",
         "войти в кабинет",
         "автологин",
         "без регистрации",
+        "открыть кабинет",
     ]
 )
 async def cmd_cabinet_login(message: Message):
-    """
-    Автологин в cabinet.paskod.ru без email/пароля —
-    аналог входа Telegram-пользователей через Mini App.
-    """
-    settings = get_settings()
-    user = await _ensure_user(message)
+    """Автологин в cabinet.paskod.ru — аккаунт создаётся сам."""
+    await _open_cabinet(
+        message,
+        redirect="/",
+        title="⏳ Готовлю вход в кабинет (без регистрации)…",
+        button_text="🚀 Открыть кабинет",
+    )
 
-    if not settings.cabinet_jwt_secret:
-        await message.answer(
-            "Автологин пока не настроен (нет CABINET_JWT_SECRET).\n"
-            f"Откройте кабинет вручную: {settings.cabinet_url}/login",
-            keyboard=main_menu_keyboard(_cab()),
-        )
-        return
-
-    try:
-        await message.answer("⏳ Готовлю вход в кабинет…")
-        url, _bedolaga_id = await ensure_auto_login_url(
-            user.user_id, user.first_name, settings
-        )
-        await message.answer(
-            format_auto_login_message(url, settings),
-            keyboard=auto_login_keyboard(url),
-        )
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("auto-login failed: %s", exc)
-        await message.answer(
-            f"Не удалось создать вход: {exc}\n"
-            f"Попробуйте открыть {settings.cabinet_url}/login",
-            keyboard=main_menu_keyboard(_cab()),
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -431,15 +461,16 @@ async def cmd_pay_quick_amount(message: Message):
 
 @labeler.private_message(text=[BTN_BUY, "купить", "тарифы", "тариф"])
 async def cmd_buy(message: Message):
-    settings = get_settings()
-    await _ensure_user(message)
-    await message.answer(
-        format_buy(settings),
-        keyboard=subscription_keyboard(_cab()),
+    """Покупка в кабинете — сразу с автологином, без регистрации."""
+    await _open_cabinet(
+        message,
+        redirect="/subscription/purchase",
+        title="⏳ Открываю покупку (вход без регистрации)…",
+        button_text="💳 Купить в кабинете",
     )
 
 
-@labeler.private_message(text=[BTN_BALANCE, "баланс", "пополнить"])
+@labeler.private_message(text=[BTN_BALANCE, "баланс"])
 async def cmd_balance(message: Message):
     settings = get_settings()
     await _ensure_user(message)
@@ -447,16 +478,24 @@ async def cmd_balance(message: Message):
         format_balance(settings),
         keyboard=pay_methods_keyboard(),
     )
+    # Параллельно даём автологин в раздел баланса кабинета
+    await _open_cabinet(
+        message,
+        redirect="/balance",
+        title="⏳ Или откройте баланс в кабинете…",
+        button_text="💰 Баланс в кабинете",
+    )
 
 
 @labeler.private_message(text=[BTN_REFERRAL, "партнёрка", "реферал", "рефералка"])
 async def cmd_referral(message: Message):
-    settings = get_settings()
-    await _ensure_user(message)
-    await message.answer(
-        format_referral(settings),
-        keyboard=main_menu_keyboard(_cab()),
+    await _open_cabinet(
+        message,
+        redirect="/referral",
+        title="⏳ Открываю партнёрку (без регистрации)…",
+        button_text="👥 Партнёрка",
     )
+
 
 
 # ---------------------------------------------------------------------------

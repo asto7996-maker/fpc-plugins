@@ -52,22 +52,24 @@ def cabinet_path(base: str, path: str) -> str:
 
 def main_menu_keyboard(cabinet_url: str) -> str:
     """
-    Главное меню как у Bedolaga (default/cabinet hybrid):
-    действия в боте + ссылки в веб-кабинет.
+    Главное меню: действия в боте.
+    Разделы кабинета открываются через автологин (см. хендлеры),
+    без email/пароля — как Telegram Mini App.
     """
+    _ = cabinet_url  # совместимость вызовов
     kb = (
         Keyboard(one_time=False, inline=False)
         .add(Text(BTN_CONNECT), color=KeyboardButtonColor.POSITIVE)
         .add(Text(BTN_SUBSCRIPTION), color=KeyboardButtonColor.POSITIVE)
         .row()
         .add(Text(BTN_PAY), color=KeyboardButtonColor.POSITIVE)
-        .add(OpenLink(cabinet_path(cabinet_url, "subscription/purchase"), BTN_BUY))
+        .add(Text(BTN_BUY), color=KeyboardButtonColor.POSITIVE)
         .row()
-        .add(OpenLink(cabinet_path(cabinet_url, "balance"), BTN_BALANCE))
-        .add(OpenLink(cabinet_path(cabinet_url, "referral"), BTN_REFERRAL))
+        .add(Text(BTN_BALANCE), color=KeyboardButtonColor.PRIMARY)
+        .add(Text(BTN_REFERRAL), color=KeyboardButtonColor.PRIMARY)
         .row()
         .add(Text(BTN_PROMO), color=KeyboardButtonColor.PRIMARY)
-        .add(Text(BTN_CABINET_LOGIN), color=KeyboardButtonColor.PRIMARY)
+        .add(Text(BTN_CABINET), color=KeyboardButtonColor.PRIMARY)
         .row()
         .add(Text(BTN_APPS), color=KeyboardButtonColor.SECONDARY)
         .add(Text(BTN_GUIDE), color=KeyboardButtonColor.SECONDARY)
@@ -118,11 +120,15 @@ def payment_link_keyboard(payment_url: str) -> str:
     )
 
 
-def auto_login_keyboard(auto_login_url: str) -> str:
-    """Клавиатура с одноразовой ссылкой входа (как Telegram WebApp auth)."""
+def auto_login_keyboard(
+    auto_login_url: str,
+    *,
+    button_text: str = "🚀 Открыть кабинет",
+) -> str:
+    """Клавиатура с автологин-ссылкой (без регистрации)."""
     return (
         Keyboard(one_time=False, inline=False)
-        .add(OpenLink(auto_login_url, "🚀 Открыть кабинет"))
+        .add(OpenLink(auto_login_url, button_text))
         .row()
         .add(Text(BTN_BACK), color=KeyboardButtonColor.SECONDARY)
         .get_json()
@@ -135,38 +141,40 @@ def connect_keyboard(
     trial_available: bool,
     cabinet_url: str,
 ) -> str:
+    _ = cabinet_url
     kb = Keyboard(one_time=False, inline=False)
 
     if has_active:
         kb.add(Text(BTN_MY_KEY), color=KeyboardButtonColor.POSITIVE)
         kb.row()
         kb.add(Text(BTN_RENEW), color=KeyboardButtonColor.PRIMARY)
-        kb.add(OpenLink(cabinet_path(cabinet_url, "subscription"), "⚡ Открыть подписку"))
+        kb.add(Text(BTN_CABINET), color=KeyboardButtonColor.PRIMARY)
     elif trial_available:
         kb.add(Text(BTN_TRIAL), color=KeyboardButtonColor.POSITIVE)
         kb.row()
-        kb.add(OpenLink(cabinet_path(cabinet_url, "subscription/purchase"), BTN_BUY))
+        kb.add(Text(BTN_BUY), color=KeyboardButtonColor.POSITIVE)
     else:
-        kb.add(OpenLink(cabinet_path(cabinet_url, "subscription/purchase"), BTN_BUY))
+        kb.add(Text(BTN_BUY), color=KeyboardButtonColor.POSITIVE)
         kb.row()
         kb.add(Text(BTN_RENEW), color=KeyboardButtonColor.PRIMARY)
 
     kb.row()
-    kb.add(OpenLink(cabinet_path(cabinet_url, "subscription"), "📲 Устройства / Happ"))
+    kb.add(Text(BTN_SUBSCRIPTION), color=KeyboardButtonColor.SECONDARY)
     kb.row()
     kb.add(Text(BTN_BACK), color=KeyboardButtonColor.SECONDARY)
     return kb.get_json()
 
 
 def subscription_keyboard(cabinet_url: str, has_key: bool = False) -> str:
+    _ = cabinet_url
     kb = Keyboard(one_time=False, inline=False)
     if has_key:
         kb.add(Text(BTN_MY_KEY), color=KeyboardButtonColor.POSITIVE)
         kb.row()
-    kb.add(OpenLink(cabinet_path(cabinet_url, "subscription"), "⚡ Кабинет подписки"))
-    kb.add(OpenLink(cabinet_path(cabinet_url, "subscription/purchase"), BTN_BUY))
+    kb.add(Text(BTN_CABINET), color=KeyboardButtonColor.POSITIVE)
+    kb.add(Text(BTN_BUY), color=KeyboardButtonColor.POSITIVE)
     kb.row()
-    kb.add(OpenLink(cabinet_path(cabinet_url, "balance"), BTN_BALANCE))
+    kb.add(Text(BTN_BALANCE), color=KeyboardButtonColor.PRIMARY)
     kb.add(Text(BTN_RENEW), color=KeyboardButtonColor.PRIMARY)
     kb.row()
     kb.add(Text(BTN_BACK), color=KeyboardButtonColor.SECONDARY)
@@ -174,9 +182,10 @@ def subscription_keyboard(cabinet_url: str, has_key: bool = False) -> str:
 
 
 def promo_keyboard(cabinet_url: str) -> str:
+    _ = cabinet_url
     return (
         Keyboard(one_time=False, inline=False)
-        .add(OpenLink(cabinet_path(cabinet_url, "subscription"), "🎟 Ввести в кабинете"))
+        .add(Text(BTN_CABINET), color=KeyboardButtonColor.POSITIVE)
         .row()
         .add(Text(BTN_BACK), color=KeyboardButtonColor.SECONDARY)
         .get_json()
@@ -184,10 +193,10 @@ def promo_keyboard(cabinet_url: str) -> str:
 
 
 def apps_keyboard(cabinet_url: str) -> str:
-    """Ссылки на приложения / кабинет (Happ)."""
+    _ = cabinet_url
     return (
         Keyboard(one_time=False, inline=False)
-        .add(OpenLink(cabinet_path(cabinet_url, "subscription"), "⬇️ Скачать Happ"))
+        .add(Text(BTN_CABINET), color=KeyboardButtonColor.POSITIVE)
         .row()
         .add(Text(BTN_GUIDE), color=KeyboardButtonColor.SECONDARY)
         .add(Text(BTN_BACK), color=KeyboardButtonColor.SECONDARY)
@@ -208,11 +217,12 @@ def guide_os_keyboard() -> str:
 
 
 def support_keyboard(support_url: str, cabinet_url: str) -> str:
+    _ = cabinet_url
     return (
         Keyboard(one_time=False, inline=False)
         .add(OpenLink(support_url, "✉️ Написать в поддержку"))
         .row()
-        .add(OpenLink(cabinet_url, BTN_CABINET))
+        .add(Text(BTN_CABINET), color=KeyboardButtonColor.PRIMARY)
         .row()
         .add(Text(BTN_BACK), color=KeyboardButtonColor.SECONDARY)
         .get_json()

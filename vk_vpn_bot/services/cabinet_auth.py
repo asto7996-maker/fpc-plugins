@@ -45,14 +45,31 @@ def create_auto_login_token(
     return jwt.encode(payload, cabinet_jwt_secret, algorithm=JWT_ALGORITHM)
 
 
+def _safe_redirect(redirect: str | None) -> str:
+    """Только относительные пути внутри кабинета (anti open-redirect)."""
+    if not redirect:
+        return "/"
+    path = redirect.strip() or "/"
+    if not path.startswith("/") or path.startswith("//"):
+        return "/"
+    if any(ch in path for ch in ("\\", "\n", "\r")):
+        return "/"
+    return path
+
+
 def build_auto_login_url(
     bedolaga_user_id: int,
     settings: Settings,
     *,
     ttl_hours: int = DEFAULT_TTL_HOURS,
-    path: str = "/auto-login",
+    redirect: str | None = "/",
 ) -> str:
-    """Полная ссылка входа в кабинет без регистрации/пароля."""
+    """
+    Полная ссылка входа в кабинет без регистрации/пароля.
+
+    После успешного auto-login SPA уходит на `redirect`
+    (например /subscription/purchase).
+    """
     if not settings.cabinet_jwt_secret:
         raise RuntimeError("CABINET_JWT_SECRET не задан")
     token = create_auto_login_token(
@@ -61,17 +78,19 @@ def build_auto_login_url(
         ttl_hours=ttl_hours,
     )
     base = settings.cabinet_url.rstrip("/")
-    return f"{base}{path}?token={quote(token, safe='')}"
+    target = _safe_redirect(redirect)
+    return (
+        f"{base}/auto-login"
+        f"?token={quote(token, safe='')}"
+        f"&redirect={quote(target, safe='')}"
+    )
 
 
-async def ensure_auto_login_url(
+async def ensure_panel_user(
     vk_user_id: int,
     first_name: str | None,
-    settings: Settings,
-) -> tuple[str, int]:
-    """
-    Гарантирует пользователя в Bedolaga и возвращает (url, bedolaga_user_id).
-    """
+) -> int:
+    """Тихая авторегистрация VK-пользователя в панели Bedolaga."""
     from database import get_or_create_user, set_bedolaga_user_id
     from services.bedolaga import get_bedolaga_client
 
@@ -80,17 +99,31 @@ async def ensure_auto_login_url(
         raise RuntimeError("Bedolaga API недоступен — нужен BEDOLAGA_API_KEY")
 
     await get_or_create_user(vk_user_id, first_name=first_name)
-
     panel_user = await client.ensure_user(vk_user_id, first_name=first_name)
     bedolaga_id = int(panel_user.get("id") or 0)
     if not bedolaga_id:
         raise RuntimeError(f"Не удалось создать пользователя панели: {panel_user}")
-
     await set_bedolaga_user_id(vk_user_id, bedolaga_id)
-    url = build_auto_login_url(bedolaga_id, settings)
+    return bedolaga_id
+
+
+async def ensure_auto_login_url(
+    vk_user_id: int,
+    first_name: str | None,
+    settings: Settings,
+    *,
+    redirect: str | None = "/",
+) -> tuple[str, int]:
+    """
+    Гарантирует пользователя в Bedolaga и возвращает (url, bedolaga_user_id).
+    Регистрация происходит автоматически — без email/пароля.
+    """
+    bedolaga_id = await ensure_panel_user(vk_user_id, first_name)
+    url = build_auto_login_url(bedolaga_id, settings, redirect=redirect)
     logger.info(
-        "Auto-login URL for vk=%s bedolaga=%s",
+        "Auto-login URL for vk=%s bedolaga=%s redirect=%s",
         vk_user_id,
         bedolaga_id,
+        _safe_redirect(redirect),
     )
     return url, bedolaga_id
