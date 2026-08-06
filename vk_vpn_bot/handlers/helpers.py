@@ -1,5 +1,5 @@
 """
-Тексты сообщений — спокойный минималистичный тон Paskod.
+Тексты сообщений — выразительный тон Paskod с эмодзи и чёткой структурой.
 """
 
 from __future__ import annotations
@@ -8,11 +8,22 @@ from datetime import datetime
 
 from config import Settings
 from database.models import User
+from handlers.style import (
+    brand,
+    bullet,
+    card_rule,
+    error_banner,
+    footer_hint,
+    header,
+    kv,
+    soft_rule,
+    step,
+    subhead,
+    success_banner,
+    warn_banner,
+)
+from legal.documents import ALL_DOCS
 from services.vpn_keys import mask_key
-
-
-def _rule() -> str:
-    return "· · ·"
 
 
 def format_auto_login_message(
@@ -28,29 +39,36 @@ def format_auto_login_message(
         "/balance": "баланс",
         "/referral": "партнёрку",
         "/balance/top-up": "пополнение",
+        "/legal/index.html": "документы",
+        "/info": "инфо",
     }.get(redirect or "/", redirect or "кабинет")
 
     return (
-        f"Вход без регистрации\n"
-        f"{_rule()}\n\n"
-        f"Аккаунт уже готов. Откройте {where} — "
-        f"email и пароль не нужны.\n\n"
-        f"Ссылка действует 72 часа.\n\n"
+        f"{header('🔐', 'Вход без регистрации')}\n\n"
+        f"Аккаунт уже готов — как в Telegram Mini App.\n"
+        f"Откройте {where}: email и пароль не нужны.\n\n"
+        f"{bullet('Ссылка действует 72 часа')}\n"
+        f"{bullet('Привязана к вашему VK')}\n\n"
+        f"{soft_rule()}\n"
         f"Если кнопка не сработала:\n{url}"
     )
 
 
 def format_welcome(settings: Settings, first_name: str | None = None) -> str:
     name = (first_name or "").strip()
-    hello = f"Привет, {name}" if name else "Привет"
+    hello = f"Привет, {name}!" if name else "Привет!"
+    bot = brand(settings.bot_name) if settings.bot_name.isascii() else settings.bot_name
 
     return (
-        f"{hello}\n"
-        f"{_rule()}\n\n"
-        f"{settings.bot_name} — быстрый VPN без лишних шагов.\n\n"
-        f"Триал {settings.trial_days} дня · оплата СБП · "
-        f"кабинет без регистрации\n\n"
-        f"Выберите действие ниже"
+        f"✨  {hello}\n"
+        f"{card_rule()}\n\n"
+        f"Я — {bot}\n"
+        f"быстрый VPN без лишней суеты.\n\n"
+        f"{bullet(f'Триал {settings.trial_days} дня для новых')}\n"
+        f"{bullet('Оплата СБП · карта · крипта')}\n"
+        f"{bullet('Кабинет без регистрации')}\n\n"
+        f"{soft_rule()}\n"
+        f"{footer_hint('меню внизу экрана')}"
     )
 
 
@@ -61,20 +79,19 @@ def format_subscription_card(
         end = user.subscription_end
         if end.tzinfo is not None:
             end = end.replace(tzinfo=None)
-        status = f"активна до {end.strftime('%d.%m.%Y')}"
+        status = f"✅ активна до {end.strftime('%d.%m.%Y')}"
     else:
-        status = "не активна"
+        status = "⛔️ не активна"
 
-    trial = "уже использован" if user.is_trial_used else "доступен"
+    trial = "уже использован" if user.is_trial_used else "🎁 доступен"
     key_preview = mask_key(user.vpn_key) if user.vpn_key else "ещё не выдан"
 
     lines = [
-        "Подписка",
-        _rule(),
+        header("📦", "Моя подписка"),
         "",
-        f"Статус · {status}",
-        f"Триал · {trial}",
-        f"Ключ · {key_preview}",
+        kv("Статус", status),
+        kv("Триал", trial),
+        kv("Ключ", key_preview),
     ]
 
     if panel:
@@ -85,17 +102,20 @@ def format_subscription_card(
         )
         if sub:
             if sub.get("tariff_name"):
-                lines.append(f"Тариф · {sub.get('tariff_name')}")
+                lines.append(kv("Тариф", str(sub.get("tariff_name"))))
             if sub.get("traffic_limit_gb") is not None:
                 used = sub.get("traffic_used_gb", 0)
                 limit = sub.get("traffic_limit_gb")
-                lines.append(f"Трафик · {used} / {limit} ГБ")
+                lines.append(kv("Трафик", f"{used} / {limit} ГБ"))
             if sub.get("device_limit") is not None:
-                lines.append(f"Устройства · до {sub.get('device_limit')}")
+                lines.append(kv("Устройства", f"до {sub.get('device_limit')}"))
         bal = panel.get("balance_rubles")
         if bal is not None:
-            lines.append(f"Баланс · {bal} ₽")
+            lines.append(kv("Баланс", f"{bal} ₽"))
 
+    lines.append("")
+    lines.append(soft_rule())
+    lines.append(f"🌐  Полный кабинет: {settings.cabinet_url}/subscription")
     return "\n".join(lines)
 
 
@@ -106,23 +126,23 @@ def format_profile(user: User, settings: Settings) -> str:
 def format_connect_screen(user: User, settings: Settings) -> str:
     if user.is_subscription_active():
         return (
-            f"Подключение\n"
-            f"{_rule()}\n\n"
-            f"Подписка уже активна.\n"
-            f"Откройте ключ или кабинет — и подключайтесь в Happ."
+            f"{header('🚀', 'Подключение')}\n\n"
+            f"{success_banner('Подписка уже активна')}\n\n"
+            f"Откройте ключ или кабинет — и подключайтесь в Happ.\n\n"
+            f"{footer_hint()}"
         )
     if not user.is_trial_used:
         return (
-            f"Подключение\n"
-            f"{_rule()}\n\n"
-            f"Вам доступен бесплатный триал на {settings.trial_days} дня.\n"
-            f"Один тап — и пришлём ссылку для Happ."
+            f"{header('🚀', 'Подключение')}\n\n"
+            f"{success_banner(f'Вам доступен триал на {settings.trial_days} дня')}\n\n"
+            f"Один тап — и пришлём ссылку для Happ.\n\n"
+            f"{footer_hint('активируйте триал')}"
         )
     return (
-        f"Подключение\n"
-        f"{_rule()}\n\n"
-        f"Триал уже использован.\n"
-        f"Можно купить тариф или пополнить баланс."
+        f"{header('🚀', 'Подключение')}\n\n"
+        f"{warn_banner('Триал уже использован')}\n\n"
+        f"Можно купить тариф или пополнить баланс.\n\n"
+        f"{footer_hint()}"
     )
 
 
@@ -133,57 +153,61 @@ def format_key_message(
     is_trial: bool,
     source: str = "local",
 ) -> str:
-    header = (
-        f"Триал на {settings.trial_days} дня готов"
-        if is_trial
-        else "Ссылка подключения"
-    )
+    if is_trial:
+        head = header("🎁", f"Триал на {settings.trial_days} дня готов")
+    else:
+        head = header("🔑", "Ссылка подключения")
+
     return (
-        f"{header}\n"
-        f"{_rule()}\n\n"
+        f"{head}\n\n"
         f"{key}\n\n"
-        f"Как подключить\n"
-        f"1. Скопируйте ссылку целиком\n"
-        f"2. Happ → «+» → из буфера\n"
-        f"3. Включите VPN"
+        f"{subhead('📋', 'Как подключить')}\n"
+        f"{step(1, 'Скопируйте ссылку целиком')}\n"
+        f"{step(2, 'Happ → «+» → из буфера')}\n"
+        f"{step(3, 'Включите VPN')}\n\n"
+        f"{soft_rule()}\n"
+        f"Нужна помощь по ОС? Откройте «📖 Гайд»"
     )
 
 
 def format_buy(settings: Settings) -> str:
     _ = settings
     return (
-        f"Покупка\n"
-        f"{_rule()}\n\n"
+        f"{header('💎', 'Покупка')}\n\n"
         f"Откроем кабинет уже авторизованным.\n"
-        f"Выберите тариф — и готово."
+        f"Выберите тариф — и готово.\n\n"
+        f"{footer_hint('кнопка ниже')}"
     )
 
 
 def format_balance(settings: Settings) -> str:
     _ = settings
     return (
-        f"Баланс\n"
-        f"{_rule()}\n\n"
+        f"{header('💰', 'Баланс')}\n\n"
         f"Пополните прямо здесь через СБП или карту.\n"
-        f"Либо откройте баланс в кабинете."
+        f"Либо откройте баланс в кабинете — без регистрации.\n\n"
+        f"{footer_hint('выберите способ оплаты')}"
     )
 
 
 def format_pay_intro() -> str:
     return (
-        f"Оплата\n"
-        f"{_rule()}\n\n"
-        f"Выберите удобный способ — "
-        f"те же, что в мини-приложении."
+        f"{header('💳', 'Оплата')}\n\n"
+        f"Те же способы, что в мини-приложении:\n\n"
+        f"{bullet('🏦  СБП · QR — через банк')}\n"
+        f"{bullet('💳  Банковская карта')}\n"
+        f"{bullet('🪙  Криптовалюта')}\n\n"
+        f"{footer_hint()}"
     )
 
 
 def format_pay_amount_prompt(method_label: str) -> str:
     return (
-        f"{method_label}\n"
-        f"{_rule()}\n\n"
-        f"Сумма пополнения\n"
-        f"от 50 ₽ · или введите свою, например 200"
+        f"{header('💵', method_label)}\n\n"
+        f"{subhead('✨', 'Сумма пополнения')}\n"
+        f"{bullet('от 50 ₽')}\n"
+        f"{bullet('или введите свою, например 200')}\n\n"
+        f"{footer_hint('кнопки ниже или числом')}"
     )
 
 
@@ -199,11 +223,12 @@ def format_payment_created(
         else f"{amount_rubles:.2f} ₽"
     )
     return (
-        f"Счёт готов\n"
-        f"{_rule()}\n\n"
-        f"{method_label} · {amount}\n\n"
-        f"Нажмите «Оплатить» — откроется безопасная страница.\n"
+        f"{header('✅', 'Счёт готов')}\n\n"
+        f"{kv('Способ', method_label)}\n"
+        f"{kv('Сумма', amount)}\n\n"
+        f"Нажмите «Оплатить сейчас» — откроется безопасная страница.\n"
         f"Баланс обновится обычно в течение минуты.\n\n"
+        f"{soft_rule()}\n"
         f"Если кнопка не сработала:\n{payment_url}"
     )
 
@@ -211,74 +236,100 @@ def format_payment_created(
 def format_referral(settings: Settings) -> str:
     _ = settings
     return (
-        f"Партнёрам\n"
-        f"{_rule()}\n\n"
-        f"Реферальная ссылка, статистика и вывод — "
-        f"в кабинете, без отдельной регистрации."
+        f"{header('👥', 'Партнёрам')}\n\n"
+        f"Реферальная ссылка, статистика и вывод —\n"
+        f"в кабинете, без отдельной регистрации.\n\n"
+        f"{footer_hint()}"
     )
 
 
 def format_promo_prompt(settings: Settings) -> str:
     _ = settings
     return (
-        f"Промокод\n"
-        f"{_rule()}\n\n"
-        f"Отправьте код одним сообщением.\n"
-        f"Например: PASKOD2026"
+        f"{header('🎟', 'Промокод')}\n\n"
+        f"Отправьте код одним сообщением.\n\n"
+        f"  Например:  {brand('PASKOD2026')}\n\n"
+        f"{footer_hint('ждём ваш код')}"
     )
 
 
 def format_apps(settings: Settings) -> str:
     _ = settings
     return (
-        f"Приложения\n"
-        f"{_rule()}\n\n"
+        f"{header('📱', 'Приложения')}\n\n"
         f"Рекомендуем Happ — спокойный и стабильный клиент.\n\n"
-        f"Также подойдут v2rayNG, Hiddify, Streisand и V2Box.\n"
-        f"Откройте «Гайд», если нужна пошаговая настройка."
+        f"{bullet('v2rayNG')}\n"
+        f"{bullet('Hiddify')}\n"
+        f"{bullet('Streisand')}\n"
+        f"{bullet('V2Box')}\n\n"
+        f"Откройте «📖 Гайд», если нужна пошаговая настройка."
     )
 
 
 def format_renew_stub(settings: Settings) -> str:
     if settings.bedolaga_api_key:
         return (
-            f"Продление\n"
-            f"{_rule()}\n\n"
-            f"Автопродление на {settings.renew_days} дн. — "
+            f"{header('♻️', 'Продление')}\n\n"
+            f"Автопродление на {settings.renew_days} дн. —\n"
             f"напишите «продлить сейчас».\n\n"
             f"Или купите тариф в кабинете."
         )
     return (
-        f"Продление\n"
-        f"{_rule()}\n\n"
-        f"Откройте покупку в кабинете — "
+        f"{header('♻️', 'Продление')}\n\n"
+        f"Откройте покупку в кабинете —\n"
         f"ключ обновится автоматически."
     )
 
 
 def format_support(settings: Settings) -> str:
     return (
-        f"Помощь\n"
-        f"{_rule()}\n\n"
+        f"{header('💬', 'Помощь')}\n\n"
         f"{settings.support_text}\n\n"
-        f"Мы рядом — напишите в любое время."
+        f"{bullet('Мы рядом — напишите в любое время')}\n"
+        f"{bullet('Документы и FAQ — в разделе «Инфо»')}"
     )
 
 
-def format_loading(text: str = "Секунду…") -> str:
+def format_info_menu(settings: Settings) -> str:
+    lines = [
+        header("ℹ️", "Инфо и документы"),
+        "",
+        "Всё важное — в боте и в мини-приложении.",
+        "",
+    ]
+    for doc in ALL_DOCS:
+        lines.append(f"{doc.emoji}  {doc.title}")
+        lines.append(f"     {doc.summary}")
+        lines.append("")
+    lines.append(soft_rule())
+    lines.append(f"📂  {settings.cabinet_url}/legal/index.html")
+    lines.append("")
+    lines.append(footer_hint("выберите документ"))
+    return "\n".join(lines)
+
+
+def format_loading(text: str = "✨ Секунду…") -> str:
     return text
 
 
 def format_error(text: str) -> str:
-    return f"Не получилось\n{_rule()}\n\n{text}"
+    return f"{header('❌', 'Не получилось')}\n\n{text}"
 
 
 def format_fallback() -> str:
     return (
-        f"Не совсем понял\n"
-        f"{_rule()}\n\n"
-        f"Откройте меню или отправьте /start — "
-        f"там всё по полочкам."
+        f"{header('🤔', 'Не совсем понял')}\n\n"
+        f"Откройте меню или отправьте /start —\n"
+        f"там всё по полочкам.\n\n"
+        f"{footer_hint()}"
+    )
+
+
+def format_trial_used() -> str:
+    return (
+        f"{header('🎁', 'Триал уже использован')}\n\n"
+        f"Можно купить тариф или пополнить баланс.\n\n"
+        f"{footer_hint()}"
     )
 
 

@@ -1,57 +1,59 @@
 """
-Инструкции по ОС — коротко и спокойно.
+Инструкции по ОС — выразительно и по шагам.
 """
 
 from __future__ import annotations
 
+from handlers.style import footer_hint, header, soft_rule, step
+
 GUIDE_INTRO = (
-    "Гайд\n"
-    "· · ·\n\n"
-    "Выберите систему — пришлю короткие шаги."
+    f"{header('📖', 'Гайд по подключению')}\n\n"
+    f"Выберите систему — пришлю короткие шаги.\n\n"
+    f"{footer_hint('кнопки ниже')}"
 )
 
 GUIDES: dict[str, str] = {
     "ios": (
-        "iOS\n"
-        "· · ·\n\n"
-        "1. Установите Happ из App Store\n"
-        "2. Скопируйте ключ из бота\n"
-        "3. В Happ: «+» → из буфера\n"
-        "4. Включите профиль и разрешите VPN\n\n"
-        "Готово."
+        f"{header('🍎', 'iOS')}\n\n"
+        f"{step(1, 'Установите Happ из App Store')}\n"
+        f"{step(2, 'Скопируйте ключ из бота')}\n"
+        f"{step(3, 'В Happ: «+» → из буфера')}\n"
+        f"{step(4, 'Включите профиль и разрешите VPN')}\n\n"
+        f"{soft_rule()}\n"
+        f"✨ Готово — можно пользоваться."
     ),
     "android": (
-        "Android\n"
-        "· · ·\n\n"
-        "1. Установите Happ (или v2rayNG / Hiddify)\n"
-        "2. Скопируйте ключ из бота\n"
-        "3. «+» → импорт из буфера\n"
-        "4. Подключитесь\n\n"
-        "Если трафик не идёт — смените режим маршрутизации."
+        f"{header('🤖', 'Android')}\n\n"
+        f"{step(1, 'Установите Happ (или v2rayNG / Hiddify)')}\n"
+        f"{step(2, 'Скопируйте ключ из бота')}\n"
+        f"{step(3, '«+» → импорт из буфера')}\n"
+        f"{step(4, 'Подключитесь')}\n\n"
+        f"{soft_rule()}\n"
+        f"Если трафик не идёт — смените режим маршрутизации."
     ),
     "windows": (
-        "Windows\n"
-        "· · ·\n\n"
-        "1. Скачайте Happ / Hiddify / v2rayN\n"
-        "2. Скопируйте ключ из бота\n"
-        "3. Добавьте профиль из буфера\n"
-        "4. Connect\n\n"
-        "Для браузера удобен System Proxy."
+        f"{header('💻', 'Windows')}\n\n"
+        f"{step(1, 'Скачайте Happ / Hiddify / v2rayN')}\n"
+        f"{step(2, 'Скопируйте ключ из бота')}\n"
+        f"{step(3, 'Добавьте профиль из буфера')}\n"
+        f"{step(4, 'Connect')}\n\n"
+        f"{soft_rule()}\n"
+        f"Для браузера удобен System Proxy."
     ),
     "macos": (
-        "macOS\n"
-        "· · ·\n\n"
-        "1. Установите Happ / Streisand / Hiddify\n"
-        "2. Скопируйте ключ из бота\n"
-        "3. Импортируйте конфиг из буфера\n"
-        "4. Подключитесь и подтвердите VPN\n\n"
-        "Запрос пароля системы при установке — это нормально."
+        f"{header('🖥', 'macOS')}\n\n"
+        f"{step(1, 'Установите Happ / Streisand / Hiddify')}\n"
+        f"{step(2, 'Скопируйте ключ из бота')}\n"
+        f"{step(3, 'Импортируйте конфиг из буфера')}\n"
+        f"{step(4, 'Подключитесь и подтвердите VPN')}\n\n"
+        f"{soft_rule()}\n"
+        f"Запрос пароля системы при установке — это нормально."
     ),
 }
 
 OS_TITLES = {
-    "ios": "iOS",
-    "android": "Android",
-    "windows": "Windows",
-    "macos": "macOS",
+    "ios": "🍎 iOS",
+    "android": "🤖 Android",
+    "windows": "💻 Windows",
+    "macos": "🖥 macOS",
 }

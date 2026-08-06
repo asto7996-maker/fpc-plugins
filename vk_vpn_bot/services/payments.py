@@ -32,9 +32,9 @@ PLATEGA_METHOD_CARD = 11
 PLATEGA_METHOD_CRYPTO = 13
 
 METHOD_LABELS: dict[int, str] = {
-    PLATEGA_METHOD_SBP_QR: "СБП · QR",
-    PLATEGA_METHOD_CARD: "Карта",
-    PLATEGA_METHOD_CRYPTO: "Крипта",
+    PLATEGA_METHOD_SBP_QR: "🏦 СБП · QR",
+    PLATEGA_METHOD_CARD: "💳 Карта",
+    PLATEGA_METHOD_CRYPTO: "🪙 Крипта",
 }
 
 # Быстрые суммы из payment_method_configs.platega.quick_amounts

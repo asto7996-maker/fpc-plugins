@@ -6,7 +6,8 @@
   Моя подписка / профиль
   Купить / Баланс / Партнёрка → кабинет
   Промокод (ввод в чат)
-  Приложения / Инструкция / Поддержка
+  Приложения / Гайд / Поддержка
+  Инфо / документы (соглашение, приватность, оферта, правила, FAQ)
 """
 
 from __future__ import annotations
@@ -27,6 +28,7 @@ from handlers.helpers import (
     format_connect_screen,
     format_error,
     format_fallback,
+    format_info_menu,
     format_key_message,
     format_pay_amount_prompt,
     format_pay_intro,
@@ -35,6 +37,7 @@ from handlers.helpers import (
     format_renew_stub,
     format_subscription_card,
     format_support,
+    format_trial_used,
     format_welcome,
 )
 from handlers.texts import GUIDE_INTRO, GUIDES, OS_TITLES
@@ -47,25 +50,33 @@ from keyboards import (
     BTN_CABINET_LOGIN,
     BTN_CONNECT,
     BTN_CONNECT_OLD,
+    BTN_FAQ,
     BTN_GET_KEY,
     BTN_GUIDE,
+    BTN_INFO,
     BTN_MY_KEY,
+    BTN_OFFER,
     BTN_PAY,
     BTN_PAY_CARD,
     BTN_PAY_CRYPTO,
     BTN_PAY_SBP,
+    BTN_PRIVACY,
     BTN_PROFILE,
     BTN_PROMO,
     BTN_REFERRAL,
     BTN_RENEW,
+    BTN_RULES,
     BTN_SUBSCRIPTION,
     BTN_SUPPORT,
+    BTN_TERMS,
     BTN_TRIAL,
     PAY_AMOUNT_BUTTONS,
     apps_keyboard,
     auto_login_keyboard,
     connect_keyboard,
+    doc_keyboard,
     guide_os_keyboard,
+    info_keyboard,
     main_menu_keyboard,
     pay_amounts_keyboard,
     pay_methods_keyboard,
@@ -74,6 +85,7 @@ from keyboards import (
     subscription_keyboard,
     support_keyboard,
 )
+from legal.documents import DOCS_BY_SLUG, format_doc_for_bot
 from services.bedolaga import get_bedolaga_client
 from services.cabinet_auth import ensure_auto_login_url, ensure_panel_user
 from services.keys_service import issue_renewal, issue_trial_or_key
@@ -98,6 +110,26 @@ _waiting_promo: set[int] = set()
 # Ожидание суммы оплаты: vk_id → код метода Platega (2/11/13)
 _pending_pay_method: dict[int, int] = {}
 
+# Кнопка текста → slug документа
+_DOC_BUTTONS: dict[str, str] = {
+    BTN_PRIVACY: "privacy",
+    BTN_TERMS: "terms",
+    BTN_OFFER: "offer",
+    BTN_RULES: "rules",
+    BTN_FAQ: "faq",
+    "приватность": "privacy",
+    "политика": "privacy",
+    "политика конфиденциальности": "privacy",
+    "соглашение": "terms",
+    "пользовательское соглашение": "terms",
+    "оферта": "offer",
+    "публичная оферта": "offer",
+    "правила": "rules",
+    "правила сервиса": "rules",
+    "faq": "faq",
+    "частые вопросы": "faq",
+}
+
 
 async def _ensure_user(message: Message):
     first_name = None
@@ -114,12 +146,32 @@ def _cab() -> str:
     return get_settings().cabinet_url
 
 
+async def _send_doc(message: Message, slug: str, page: int = 1) -> None:
+    doc = DOCS_BY_SLUG.get(slug)
+    if not doc:
+        await message.answer(
+            format_error("Документ не найден."),
+            keyboard=info_keyboard(_cab()),
+        )
+        return
+    text, total = format_doc_for_bot(doc, page=page)
+    await message.answer(
+        text,
+        keyboard=doc_keyboard(_cab(), slug, page=page, total=total),
+    )
+    # Reply-клавиатура раздела Инфо остаётся доступной
+    await message.answer(
+        "📄  Документ выше · можно листать или открыть в мини-приложении",
+        keyboard=info_keyboard(_cab()),
+    )
+
+
 async def _open_cabinet(
     message: Message,
     *,
     redirect: str = "/",
-    title: str = "Секунду…",
-    button_text: str = "Открыть",
+    title: str = "✨ Секунду…",
+    button_text: str = "✨ Открыть",
 ) -> None:
     """Авторегистрация + автологин в кабинет без email/пароля."""
     settings = get_settings()
@@ -127,7 +179,7 @@ async def _open_cabinet(
 
     if not settings.cabinet_jwt_secret:
         await message.answer(
-            f"Кабинет\n· · ·\n\n{settings.cabinet_url}{redirect}",
+            f"🌐  Кабинет\n━━━━━━━━━━━━━━━━\n\n{settings.cabinet_url}{redirect}",
             keyboard=main_menu_keyboard(_cab()),
         )
         return
@@ -169,6 +221,7 @@ async def _open_cabinet(
         "меню",
         BTN_BACK,
         "◀️ Назад в меню",
+        "Назад",
     ]
 )
 async def cmd_start(message: Message):
@@ -200,6 +253,7 @@ async def cmd_start(message: Message):
         BTN_CONNECT,
         BTN_CONNECT_OLD,
         "🚀 Подключиться",
+        "Подключиться",
         "подключить vpn",
         "подключить",
         "подключиться",
@@ -224,8 +278,11 @@ async def cmd_connect(message: Message):
         BTN_GET_KEY,
         BTN_MY_KEY,
         "🎁 Активировать триал",
+        "🎁 Бесплатный триал",
+        "Бесплатный триал",
         "🔑 Мой ключ",
         "🔑 Получить ключ",
+        "Мой ключ",
         "получить ключ",
         "мой ключ",
         "активировать триал",
@@ -256,7 +313,7 @@ async def cmd_get_key(message: Message):
         return
 
     if not user.is_trial_used:
-        await message.answer("Секунду — готовлю триал…")
+        await message.answer("✨ Секунду — готовлю триал…")
         result = await issue_trial_or_key(user, settings)
         await message.answer(
             format_key_message(
@@ -287,9 +344,7 @@ async def cmd_get_key(message: Message):
         return
 
     await message.answer(
-        "Триал уже использован\n"
-        "· · ·\n\n"
-        "Можно купить тариф или пополнить баланс.",
+        format_trial_used(),
         keyboard=connect_keyboard(
             has_active=False,
             trial_available=False,
@@ -305,7 +360,18 @@ async def cmd_get_key(message: Message):
 
 
 @labeler.private_message(
-    text=[BTN_SUBSCRIPTION, BTN_PROFILE, "📦 Моя подписка", "👤 Профиль", "профиль", "подписка", "моя подписка"]
+    text=[
+        BTN_SUBSCRIPTION,
+        BTN_PROFILE,
+        "📦 Моя подписка",
+        "📦 Подписка",
+        "Подписка",
+        "👤 Профиль",
+        "Профиль",
+        "профиль",
+        "подписка",
+        "моя подписка",
+    ]
 )
 async def cmd_subscription(message: Message):
     settings = get_settings()
@@ -331,7 +397,10 @@ async def cmd_subscription(message: Message):
         BTN_CABINET,
         BTN_CABINET_LOGIN,
         "🌐 Кабинет",
+        "Кабинет",
         "🔐 Войти без регистрации",
+        "🔐 Войти",
+        "Войти",
         "войти",
         "кабинет",
         "войти в кабинет",
@@ -345,9 +414,46 @@ async def cmd_cabinet_login(message: Message):
     await _open_cabinet(
         message,
         redirect="/",
-        title="Секунду…",
-        button_text="Открыть кабинет",
+        title="✨ Секунду…",
+        button_text="🌐 Открыть кабинет",
     )
+
+
+
+# ---------------------------------------------------------------------------
+# Инфо / юридические документы
+# ---------------------------------------------------------------------------
+
+
+@labeler.private_message(
+    text=[
+        BTN_INFO,
+        "ℹ️ Инфо",
+        "Инфо",
+        "инфо",
+        "информация",
+        "документы",
+        "документ",
+    ]
+)
+async def cmd_info(message: Message):
+    settings = get_settings()
+    await _ensure_user(message)
+    await message.answer(
+        format_info_menu(settings),
+        keyboard=info_keyboard(_cab()),
+    )
+
+
+@labeler.private_message(text=list(_DOC_BUTTONS.keys()))
+async def cmd_document(message: Message):
+    await _ensure_user(message)
+    raw = (message.text or "").strip()
+    slug = _DOC_BUTTONS.get(raw) or _DOC_BUTTONS.get(raw.lower())
+    if not slug:
+        await message.answer(format_info_menu(get_settings()), keyboard=info_keyboard(_cab()))
+        return
+    await _send_doc(message, slug, page=1)
 
 
 
@@ -381,14 +487,14 @@ async def _create_and_send_payment(
 
     if amount_kopeks < 5000:
         await message.answer(
-            f"Минимум 50 ₽\n· · ·\n\nСейчас: {format_rubles(amount_kopeks)}",
+            f"⚠️  Минимум 50 ₽\n━━━━━━━━━━━━━━━━\n\nСейчас: {format_rubles(amount_kopeks)}",
             keyboard=pay_amounts_keyboard(),
         )
         return
 
     try:
         await message.answer(
-            f"Секунду — готовлю счёт · {format_rubles(amount_kopeks)}"
+            f"✨ Секунду — готовлю счёт · {format_rubles(amount_kopeks)}"
         )
         bedolaga_id = await ensure_bedolaga_id_for_payments(
             user.user_id, user.first_name
@@ -426,7 +532,7 @@ async def _create_and_send_payment(
 
 
 @labeler.private_message(
-    text=[BTN_PAY, "💳 Оплатить", "оплатить", "оплата", "сбп", "пополнить баланс"]
+    text=[BTN_PAY, "💳 Оплатить", "Оплатить", "оплатить", "оплата", "сбп", "пополнить баланс"]
 )
 async def cmd_pay(message: Message):
     await _ensure_user(message)
@@ -435,7 +541,7 @@ async def cmd_pay(message: Message):
 
 
 @labeler.private_message(
-    text=[BTN_PAY_SBP, "🏦 СБП (QR)", "сбп qr", "сбп (qr)", "qr"]
+    text=[BTN_PAY_SBP, "🏦 СБП (QR)", "🏦 СБП · QR", "СБП · QR", "сбп qr", "сбп (qr)", "qr"]
 )
 async def cmd_pay_sbp(message: Message):
     await _ensure_user(message)
@@ -443,7 +549,7 @@ async def cmd_pay_sbp(message: Message):
 
 
 @labeler.private_message(
-    text=[BTN_PAY_CARD, "💳 Банк. карта", "карта", "банк. карта", "банковская карта"]
+    text=[BTN_PAY_CARD, "💳 Банк. карта", "💳 Карта", "Карта", "карта", "банк. карта", "банковская карта"]
 )
 async def cmd_pay_card(message: Message):
     await _ensure_user(message)
@@ -451,23 +557,33 @@ async def cmd_pay_card(message: Message):
 
 
 @labeler.private_message(
-    text=[BTN_PAY_CRYPTO, "🪙 Крипта", "крипта", "криптовалюта"]
+    text=[BTN_PAY_CRYPTO, "🪙 Крипта", "Крипта", "крипта", "криптовалюта"]
 )
 async def cmd_pay_crypto(message: Message):
     await _ensure_user(message)
     await _start_pay_amount(message, PLATEGA_METHOD_CRYPTO)
 
 
-@labeler.private_message(text=list(PAY_AMOUNT_BUTTONS.keys()))
+@labeler.private_message(text=list(PAY_AMOUNT_BUTTONS.keys()) + ["50 ₽", "100 ₽", "150 ₽", "500 ₽"])
 async def cmd_pay_quick_amount(message: Message):
     method_code = _pending_pay_method.get(message.from_id)
     if method_code is None:
         await message.answer(
-            "Сначала выберите способ оплаты",
+            "⚠️  Сначала выберите способ оплаты",
             keyboard=pay_methods_keyboard(),
         )
         return
-    amount = PAY_AMOUNT_BUTTONS.get((message.text or "").strip())
+    raw = (message.text or "").strip()
+    amount = PAY_AMOUNT_BUTTONS.get(raw)
+    if amount is None:
+        # legacy labels without emoji
+        legacy = {
+            "50 ₽": 5000,
+            "100 ₽": 10000,
+            "150 ₽": 15000,
+            "500 ₽": 50000,
+        }
+        amount = legacy.get(raw)
     if not amount:
         return
     await _create_and_send_payment(
@@ -476,18 +592,18 @@ async def cmd_pay_quick_amount(message: Message):
 
 
 @labeler.private_message(
-    text=[BTN_BUY, "💳 Купить", "купить", "тарифы", "тариф"]
+    text=[BTN_BUY, "💳 Купить", "💎 Купить", "Купить", "купить", "тарифы", "тариф"]
 )
 async def cmd_buy(message: Message):
     await _open_cabinet(
         message,
         redirect="/subscription/purchase",
-        title="Секунду…",
-        button_text="К тарифам",
+        title="✨ Секунду…",
+        button_text="💎 К тарифам",
     )
 
 
-@labeler.private_message(text=[BTN_BALANCE, "💰 Баланс", "баланс"])
+@labeler.private_message(text=[BTN_BALANCE, "💰 Баланс", "Баланс", "баланс"])
 async def cmd_balance(message: Message):
     settings = get_settings()
     await _ensure_user(message)
@@ -498,8 +614,8 @@ async def cmd_balance(message: Message):
     await _open_cabinet(
         message,
         redirect="/balance",
-        title="Или откройте кабинет",
-        button_text="Баланс в кабинете",
+        title="✨ Или откройте кабинет",
+        button_text="💰 Баланс в кабинете",
     )
 
 
@@ -507,6 +623,8 @@ async def cmd_balance(message: Message):
     text=[
         BTN_REFERRAL,
         "👥 Партнёрка",
+        "👥 Партнёрам",
+        "Партнёрам",
         "партнёрка",
         "реферал",
         "рефералка",
@@ -517,12 +635,14 @@ async def cmd_referral(message: Message):
     await _open_cabinet(
         message,
         redirect="/referral",
-        title="Секунду…",
-        button_text="Партнёрка",
+        title="✨ Секунду…",
+        button_text="👥 Партнёрка",
     )
 
 
-@labeler.private_message(text=[BTN_PROMO, "🎟 Промокод", "промокод", "промо"])
+@labeler.private_message(
+    text=[BTN_PROMO, "🎟 Промокод", "Промокод", "промокод", "промо"]
+)
 async def cmd_promo(message: Message):
     settings = get_settings()
     await _ensure_user(message)
@@ -534,7 +654,7 @@ async def cmd_promo(message: Message):
 
 
 @labeler.private_message(
-    text=[BTN_APPS, "📱 Приложения", "приложения", "happ", "скачать"]
+    text=[BTN_APPS, "📱 Приложения", "Приложения", "приложения", "happ", "скачать"]
 )
 async def cmd_apps(message: Message):
     settings = get_settings()
@@ -543,18 +663,26 @@ async def cmd_apps(message: Message):
 
 
 @labeler.private_message(
-    text=[BTN_GUIDE, "📖 Инструкция", "инструкция", "гайд"]
+    text=[BTN_GUIDE, "📖 Инструкция", "📖 Гайд", "Гайд", "инструкция", "гайд"]
 )
 async def cmd_guide(message: Message):
     await message.answer(GUIDE_INTRO, keyboard=guide_os_keyboard())
     await message.answer(
-        "Или вернитесь в меню",
+        "🏠  Или вернитесь в меню",
         keyboard=main_menu_keyboard(_cab()),
     )
 
 
 @labeler.private_message(
-    text=[BTN_SUPPORT, "💬 Поддержка", "поддержка", "саппорт", "помощь"]
+    text=[
+        BTN_SUPPORT,
+        "💬 Поддержка",
+        "💬 Помощь",
+        "Помощь",
+        "поддержка",
+        "саппорт",
+        "помощь",
+    ]
 )
 async def cmd_support(message: Message):
     settings = get_settings()
@@ -566,7 +694,7 @@ async def cmd_support(message: Message):
 
 
 @labeler.private_message(
-    text=[BTN_RENEW, "♻️ Продлить", "продлить", "продлить сейчас"]
+    text=[BTN_RENEW, "♻️ Продлить", "Продлить", "продлить", "продлить сейчас"]
 )
 async def cmd_renew(message: Message):
     settings = get_settings()
@@ -575,7 +703,7 @@ async def cmd_renew(message: Message):
 
     if settings.bedolaga_api_key and "сейчас" in text:
         try:
-            await message.answer("Секунду — продлеваю…")
+            await message.answer("✨ Секунду — продлеваю…")
             result = await issue_renewal(user, settings)
             await message.answer(
                 format_key_message(
@@ -602,7 +730,7 @@ async def cmd_renew(message: Message):
 
 
 # ---------------------------------------------------------------------------
-# Callback: инструкция по ОС
+# Callback: инструкция по ОС + документы
 # ---------------------------------------------------------------------------
 
 
@@ -621,25 +749,49 @@ async def on_message_event(event: GroupTypes.MessageEvent):
         payload = {}
 
     cmd = payload.get("cmd")
-    os_name = payload.get("os")
     snack = "Готово"
 
-    if cmd == "guide" and os_name in GUIDES:
-        snack = OS_TITLES.get(os_name, os_name)
+    if cmd == "guide":
+        os_name = payload.get("os")
+        if os_name in GUIDES:
+            snack = OS_TITLES.get(os_name, os_name)
+            await event.ctx_api.messages.send(
+                peer_id=event.object.peer_id,
+                message=GUIDES[os_name],
+                random_id=0,
+                keyboard=main_menu_keyboard(settings.cabinet_url),
+            )
+    elif cmd == "info":
+        snack = "ℹ️ Инфо"
         await event.ctx_api.messages.send(
             peer_id=event.object.peer_id,
-            message=GUIDES[os_name],
+            message=format_info_menu(settings),
             random_id=0,
-            keyboard=main_menu_keyboard(settings.cabinet_url),
+            keyboard=info_keyboard(settings.cabinet_url),
         )
-    else:
-        snack = "Готово"
+    elif cmd == "doc":
+        slug = str(payload.get("slug") or "")
+        page = int(payload.get("page") or 1)
+        doc = DOCS_BY_SLUG.get(slug)
+        if doc:
+            text, total = format_doc_for_bot(doc, page=page)
+            snack = f"{doc.emoji} {page}/{total}"
+            await event.ctx_api.messages.send(
+                peer_id=event.object.peer_id,
+                message=text,
+                random_id=0,
+                keyboard=doc_keyboard(
+                    settings.cabinet_url, slug, page=page, total=total
+                ),
+            )
+        else:
+            snack = "Не найдено"
 
     await event.ctx_api.messages.send_message_event_answer(
         event_id=event.object.event_id,
         user_id=event.object.user_id,
         peer_id=event.object.peer_id,
-        event_data=ShowSnackbarEvent(text=snack).model_dump_json(),
+        event_data=ShowSnackbarEvent(text=snack[:90]).model_dump_json(),
     )
 
 
@@ -672,7 +824,7 @@ async def fallback(message: Message):
             )
             return
         await message.answer(
-            "Введите сумму числом · например 100",
+            "💵  Введите сумму числом · например 100",
             keyboard=pay_amounts_keyboard(),
         )
         return
@@ -681,9 +833,9 @@ async def fallback(message: Message):
         _waiting_promo.discard(message.from_id)
         code = text.upper()
         await message.answer(
-            f"Промокод принят\n"
-            f"· · ·\n\n"
-            f"{code}\n\n"
+            f"🎟  Промокод принят\n"
+            f"━━━━━━━━━━━━━━━━\n\n"
+            f"  {code}\n\n"
             f"Активируем его в кабинете — откройте раздел подписки "
             f"и введите код. Вход без регистрации.",
             keyboard=promo_keyboard(_cab()),
@@ -691,8 +843,8 @@ async def fallback(message: Message):
         await _open_cabinet(
             message,
             redirect="/subscription",
-            title="Секунду…",
-            button_text="Открыть кабинет",
+            title="✨ Секунду…",
+            button_text="🌐 Открыть кабинет",
         )
         return
 
