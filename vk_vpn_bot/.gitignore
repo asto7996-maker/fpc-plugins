@@ -1,0 +1,31 @@
+# Секреты и окружение
+.env
+*.env.local
+
+# vkbottle runtime
+.vkbottle/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+
+# База данных
+*.db
+*.sqlite
+*.sqlite3
+data/
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+*.log

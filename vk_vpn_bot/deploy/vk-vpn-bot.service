@@ -1,0 +1,23 @@
+[Unit]
+Description=Paskod VK VPN bot (vkbottle)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/vk_vpn_bot
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=/root/vk_vpn_bot/.env
+ExecStart=/root/vk_vpn_bot/.venv/bin/python /root/vk_vpn_bot/main.py
+Restart=always
+RestartSec=5
+KillSignal=SIGINT
+TimeoutStopSec=20
+
+# Логи в journald: journalctl -u vk-vpn-bot -f
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
