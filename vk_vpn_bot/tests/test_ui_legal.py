@@ -26,10 +26,14 @@ from legal.documents import ALL_DOCS, DOCS_BY_SLUG, format_doc_for_bot
 class _Settings:
     bot_name = "Paskod VPN"
     trial_days = 3
+    trial_traffic_gb = 10
+    trial_devices = 1
     cabinet_url = "https://cabinet.paskod.ru"
     welcome_text = "test"
     support_text = "support"
     support_url = "https://vk.com"
+    support_admin_ids = ()
+    group_id = 240702990
     renew_days = 30
     bedolaga_api_key = ""
 
@@ -55,6 +59,9 @@ def test_menus_and_copy() -> None:
     welcome = format_welcome(settings, "Алекс")
     assert "Алекс" in welcome
     assert "✨" in welcome
+    # Без каталога тексты обходятся без цифр, но остаются осмысленными
+    assert "10 ГБ" in welcome
+    assert "1 устройство" in welcome
 
     info = format_info_menu(settings)
     assert "Политика" in info or "приват" in info.lower()

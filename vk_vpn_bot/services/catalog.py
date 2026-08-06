@@ -1,0 +1,171 @@
+"""
+Каталог тарифов и партнёрских условий из кабинета.
+
+Цены и лимиты меняются в админке Bedolaga, поэтому бот не хранит их в тексте,
+а забирает через кабинетное API и коротко кэширует: пользователь видит те же
+цифры, что и в мини-приложении.
+"""
+
+from __future__ import annotations
+
+import logging
+import time
+from dataclasses import dataclass, field
+
+from config import Settings
+from services.payments import CabinetPaymentClient
+
+logger = logging.getLogger(__name__)
+
+CACHE_TTL_SECONDS = 600
+
+
+@dataclass(frozen=True)
+class Period:
+    days: int
+    label: str
+    price_label: str
+    per_month_label: str
+    price_kopeks: int = 0
+
+
+@dataclass(frozen=True)
+class Tariff:
+    id: int
+    name: str
+    tier: int
+    traffic_label: str
+    unlimited_traffic: bool
+    device_limit: int
+    extra_device_kopeks: int
+    servers: tuple[str, ...]
+    periods: tuple[Period, ...] = field(default_factory=tuple)
+
+    @property
+    def cheapest(self) -> Period | None:
+        if not self.periods:
+            return None
+        return min(self.periods, key=lambda p: p.price_kopeks or 10**9)
+
+
+@dataclass(frozen=True)
+class Catalog:
+    tariffs: tuple[Tariff, ...]
+    min_topup_kopeks: int = 5000
+    quick_amounts_kopeks: tuple[int, ...] = ()
+    referral_percent: int = 0
+
+    @property
+    def entry_price_label(self) -> str:
+        """Самая низкая цена в каталоге — «от N ₽»."""
+        prices = [
+            p.price_kopeks
+            for t in self.tariffs
+            for p in t.periods
+            if p.price_kopeks
+        ]
+        if not prices:
+            return ""
+        return f"{min(prices) // 100} ₽"
+
+    @property
+    def max_devices(self) -> int:
+        return max((t.device_limit for t in self.tariffs), default=0)
+
+
+_cache: tuple[float, Catalog] | None = None
+
+
+def _parse_tariff(raw: dict) -> Tariff:
+    periods = tuple(
+        Period(
+            days=int(p.get("days") or 0),
+            label=str(p.get("label") or ""),
+            price_label=str(p.get("price_label") or ""),
+            per_month_label=str(p.get("price_per_month_label") or ""),
+            price_kopeks=int(p.get("price_kopeks") or 0),
+        )
+        for p in (raw.get("periods") or [])
+    )
+    return Tariff(
+        id=int(raw.get("id") or 0),
+        name=str(raw.get("name") or "Тариф"),
+        tier=int(raw.get("tier_level") or 0),
+        traffic_label=str(raw.get("traffic_limit_label") or ""),
+        unlimited_traffic=bool(raw.get("is_unlimited_traffic")),
+        device_limit=int(raw.get("device_limit") or 0),
+        extra_device_kopeks=int(raw.get("device_price_kopeks") or 0),
+        servers=tuple(
+            str(s.get("name")) for s in (raw.get("servers") or []) if s.get("name")
+        ),
+        periods=periods,
+    )
+
+
+async def fetch_catalog(settings: Settings, bedolaga_user_id: int) -> Catalog | None:
+    """
+    Тарифы, лимиты пополнения и процент партнёрки.
+
+    None — если кабинет недоступен: вызывающий код должен уметь обойтись
+    без цифр, а не показывать пустой экран.
+    """
+    global _cache
+
+    now = time.monotonic()
+    if _cache and now - _cache[0] < CACHE_TTL_SECONDS:
+        return _cache[1]
+
+    if not settings.cabinet_jwt_secret:
+        return None
+
+    client = CabinetPaymentClient(settings)
+
+    tariffs: tuple[Tariff, ...] = ()
+    min_topup = 5000
+    quick: tuple[int, ...] = ()
+    percent = 0
+
+    try:
+        options = await client.get_cabinet_json(
+            bedolaga_user_id, "/cabinet/subscription/purchase-options"
+        )
+        tariffs = tuple(
+            _parse_tariff(t)
+            for t in (options.get("tariffs") or [])
+            if t.get("is_available", True)
+        )
+        tariffs = tuple(sorted(tariffs, key=lambda t: t.tier))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("не удалось получить тарифы: %s", exc)
+        return None
+
+    try:
+        methods = await client.get_payment_methods(bedolaga_user_id)
+        if methods:
+            min_topup = min(m.min_amount_kopeks for m in methods)
+            for m in methods:
+                if m.quick_amounts:
+                    quick = tuple(m.quick_amounts)
+                    break
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("не удалось получить методы оплаты: %s", exc)
+
+    try:
+        ref = await client.get_cabinet_json(bedolaga_user_id, "/cabinet/referral")
+        percent = int(ref.get("commission_percent") or 0)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("не удалось получить условия партнёрки: %s", exc)
+
+    catalog = Catalog(
+        tariffs=tariffs,
+        min_topup_kopeks=min_topup,
+        quick_amounts_kopeks=quick,
+        referral_percent=percent,
+    )
+    _cache = (now, catalog)
+    return catalog
+
+
+def reset_cache() -> None:
+    global _cache
+    _cache = None

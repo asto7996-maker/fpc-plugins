@@ -44,6 +44,7 @@ from handlers.helpers import (
     format_renew_stub,
     format_subscription_card,
     format_support,
+    format_tariffs,
     format_support_prompt,
     format_support_received,
     format_trial_used,
@@ -103,6 +104,7 @@ from keyboards import (
 from legal.documents import DOCS_BY_SLUG, format_doc_for_bot
 from services.bedolaga import get_bedolaga_client
 from services.cabinet_auth import ensure_auto_login_url, ensure_panel_user
+from services.catalog import Catalog, fetch_catalog
 from services.keys_service import issue_renewal, issue_trial_or_key
 from services.support import notify_admins, usable_support_url
 from services.payments import (
@@ -164,6 +166,27 @@ async def _ensure_user(message: Message):
 
 def _cab() -> str:
     return get_settings().cabinet_url
+
+
+async def _catalog(message: Message) -> Catalog | None:
+    """
+    Тарифы и лимиты из панели.
+
+    Цены живут в админке, поэтому бот их не хардкодит. Если кабинет не
+    ответил — возвращаем None, и тексты просто обходятся без цифр.
+    """
+    settings = get_settings()
+    if not settings.cabinet_jwt_secret:
+        return None
+    try:
+        user = await _ensure_user(message)
+        bedolaga_id = await ensure_bedolaga_id_for_payments(
+            user.user_id, user.first_name
+        )
+        return await fetch_catalog(settings, bedolaga_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("каталог тарифов недоступен: %s", exc)
+        return None
 
 
 async def _send_doc(message: Message, slug: str, page: int = 1) -> None:
@@ -259,7 +282,7 @@ async def cmd_start(message: Message):
             logger.warning("silent panel register failed: %s", exc)
 
     await message.answer(
-        format_welcome(settings, user.first_name),
+        format_welcome(settings, user.first_name, await _catalog(message)),
         keyboard=main_menu_keyboard(_cab()),
     )
 
@@ -285,7 +308,7 @@ async def cmd_connect(message: Message):
     settings = get_settings()
     user = await _ensure_user(message)
     await message.answer(
-        format_connect_screen(user, settings),
+        format_connect_screen(user, settings, await _catalog(message)),
         keyboard=connect_keyboard(
             has_active=user.is_subscription_active(),
             trial_available=not user.is_trial_used,
@@ -504,7 +527,7 @@ async def cmd_doc_prev(message: Message):
     settings = get_settings()
     user = await _ensure_user(message)
     await message.answer(
-        format_welcome(settings, user.first_name),
+        format_welcome(settings, user.first_name, await _catalog(message)),
         keyboard=main_menu_keyboard(_cab()),
     )
 
@@ -535,7 +558,7 @@ async def _start_pay_amount(message: Message, method_code: int) -> None:
     _pending_pay_method[message.from_id] = method_code
     label = METHOD_LABELS.get(method_code, f"Platega {method_code}")
     await message.answer(
-        format_pay_amount_prompt(label),
+        format_pay_amount_prompt(label, await _catalog(message)),
         keyboard=pay_amounts_keyboard(),
     )
 
@@ -607,7 +630,9 @@ async def _create_and_send_payment(
 async def cmd_pay(message: Message):
     await _ensure_user(message)
     _waiting_promo.discard(message.from_id)
-    await message.answer(format_pay_intro(), keyboard=pay_methods_keyboard())
+    await message.answer(
+        format_pay_intro(await _catalog(message)), keyboard=pay_methods_keyboard()
+    )
 
 
 @labeler.private_message(
@@ -665,11 +690,17 @@ async def cmd_pay_quick_amount(message: Message):
     text=[BTN_BUY, "💳 Купить", "💎 Купить", "Купить", "купить", "тарифы", "тариф"]
 )
 async def cmd_buy(message: Message):
+    settings = get_settings()
+    catalog = await _catalog(message)
+    await message.answer(
+        format_tariffs(catalog, settings),
+        keyboard=subscription_keyboard(_cab(), has_key=False),
+    )
     await _open_cabinet(
         message,
         redirect="/subscription/purchase",
-        title="✨ Секунду…",
-        button_text="💎 К тарифам",
+        title="✨ Открываю тарифы…",
+        button_text="💎 Выбрать тариф",
     )
 
 
@@ -678,7 +709,7 @@ async def cmd_balance(message: Message):
     settings = get_settings()
     await _ensure_user(message)
     await message.answer(
-        format_balance(settings),
+        format_balance(settings, await _catalog(message)),
         keyboard=pay_methods_keyboard(),
     )
     await _open_cabinet(
@@ -847,7 +878,7 @@ async def cmd_renew(message: Message):
             )
 
     await message.answer(
-        format_renew_stub(settings),
+        format_renew_stub(settings, await _catalog(message)),
         keyboard=support_keyboard(usable_support_url(settings), _cab()),
     )
 

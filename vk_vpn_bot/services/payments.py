@@ -141,6 +141,11 @@ class CabinetPaymentClient:
                     return {}
                 return await resp.json(content_type=None)
 
+    async def get_cabinet_json(self, bedolaga_user_id: int, path: str) -> Any:
+        """GET любого кабинетного эндпоинта от имени пользователя."""
+        token = await self._cabinet_access_token(bedolaga_user_id)
+        return await self._request("GET", path, access_token=token)
+
     async def get_payment_methods(
         self, bedolaga_user_id: int
     ) -> list[PaymentMethodInfo]:

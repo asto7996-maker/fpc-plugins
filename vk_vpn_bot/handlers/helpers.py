@@ -26,7 +26,16 @@ from handlers.style import (
     warn_banner,
 )
 from legal.documents import ALL_DOCS
+from services.catalog import Catalog
 from services.vpn_keys import mask_key
+
+
+def _plural_devices(n: int) -> str:
+    if n % 10 == 1 and n % 100 != 11:
+        return f"{n} устройство"
+    if n % 10 in (2, 3, 4) and n % 100 not in (12, 13, 14):
+        return f"{n} устройства"
+    return f"{n} устройств"
 
 
 def format_auto_login_message(
@@ -59,26 +68,91 @@ def format_auto_login_message(
     )
 
 
-def format_welcome(settings: Settings, first_name: str | None = None) -> str:
+def format_welcome(
+    settings: Settings,
+    first_name: str | None = None,
+    catalog: Catalog | None = None,
+) -> str:
     name = (first_name or "").strip()
     hello = f"Привет, {name}!" if name else "Привет!"
     bot = brand(settings.bot_name) if settings.bot_name.isascii() else settings.bot_name
 
+    trial = (
+        f"{settings.trial_days} дня, {settings.trial_traffic_gb} ГБ трафика, "
+        f"{_plural_devices(settings.trial_devices)}"
+    )
+    price = catalog.entry_price_label if catalog else ""
+    tariff_line = (
+        f"Дальше тарифы с безлимитным трафиком — от {price} в месяц, "
+        f"до {_plural_devices(catalog.max_devices)} на одной подписке. "
+        if price and catalog and catalog.max_devices
+        else "Дальше можно перейти на тариф с безлимитным трафиком. "
+    )
+
     return (
         f"✨  {hello}\n"
         f"{card_rule()}\n\n"
-        f"Я — {bot}, помогу подключить быстрый и стабильный VPN за пару минут.\n\n"
-        f"Новым пользователям доступен бесплатный триал на "
-        f"{settings.trial_days} дня: карта не нужна, достаточно нажать "
-        f"«🚀 Подключиться». Дальше подписку можно продлить прямо здесь — "
-        f"оплата проходит через СБП, банковскую карту или криптовалюту. "
-        f"Личный кабинет открывается одним тапом, без email и пароля, "
-        f"потому что аккаунт уже привязан к вашему профилю ВКонтакте.\n\n"
-        f"{bullet('Инструкции по устройствам — «📖 Гайд»')}\n"
-        f"{bullet('Документы сервиса — «ℹ️ Инфо»')}\n\n"
+        f"Я — {bot}. Помогаю подключить VPN по протоколу VLESS: "
+        f"он работает через приложение Happ на iOS, Android, Windows и macOS.\n\n"
+        f"Новым пользователям бесплатный триал: {trial}. "
+        f"Карта не нужна — нажмите «🚀 Подключиться», и ключ придёт в этот чат. "
+        f"{tariff_line}"
+        f"Оплата — СБП по QR, банковской картой или криптовалютой, "
+        f"от {(catalog.min_topup_kopeks // 100) if catalog else 50} ₽.\n\n"
+        f"{bullet('Кабинет открывается без пароля — «🌐 Кабинет»')}\n"
+        f"{bullet('Пошаговая настройка по ОС — «📖 Гайд»')}\n"
+        f"{bullet('Документы и FAQ — «ℹ️ Инфо»')}\n\n"
         f"{soft_rule()}\n"
         f"{footer_hint('меню внизу экрана')}"
     )
+
+
+def format_tariffs(catalog: Catalog | None, settings: Settings) -> str:
+    """Реальные тарифы из панели: трафик, устройства, цены по периодам."""
+    if not catalog or not catalog.tariffs:
+        return (
+            f"{header('💎', 'Тарифы')}\n\n"
+            f"Актуальный список тарифов и цены — в кабинете. "
+            f"Открою его уже авторизованным: регистрация не нужна.\n\n"
+            f"{footer_hint('кнопка ниже')}"
+        )
+
+    lines = [
+        header("💎", "Тарифы"),
+        "",
+        "Все тарифы — с безлимитным трафиком, отличаются числом устройств "
+        "и сроком. Чем дольше период, тем ниже цена месяца.",
+        "",
+    ]
+
+    for tariff in catalog.tariffs:
+        traffic = tariff.traffic_label or ("♾️ Безлимит" if tariff.unlimited_traffic else "—")
+        lines.append(f"▸  {tariff.name}")
+        lines.append(f"     Трафик: {traffic}")
+        lines.append(f"     Устройств: до {tariff.device_limit}")
+        for period in tariff.periods:
+            per_month = (
+                f"  ({period.per_month_label}/мес)"
+                if period.per_month_label
+                and period.per_month_label != period.price_label
+                else ""
+            )
+            lines.append(f"     {period.label}: {period.price_label}{per_month}")
+        if tariff.extra_device_kopeks:
+            lines.append(
+                f"     Доп. устройство: {tariff.extra_device_kopeks // 100} ₽"
+            )
+        lines.append("")
+
+    lines.append(soft_rule())
+    lines.append(
+        f"Оплата тарифа списывается с баланса — пополнить можно кнопкой "
+        f"«💳 Оплатить», от {catalog.min_topup_kopeks // 100} ₽. "
+        f"Выбор тарифа и активация — в кабинете."
+    )
+    lines.append("")
+    lines.append(footer_hint("открыть кабинет кнопкой ниже"))
+    return "\n".join(lines)
 
 
 def format_subscription_card(
@@ -105,6 +179,7 @@ def format_subscription_card(
         kv("Ключ", key_preview),
     ]
 
+    time_left = ""
     if panel:
         sub = (
             panel.get("subscription")
@@ -114,12 +189,28 @@ def format_subscription_card(
         if sub:
             if sub.get("tariff_name"):
                 lines.append(kv("Тариф", str(sub.get("tariff_name"))))
-            if sub.get("traffic_limit_gb") is not None:
+            elif sub.get("is_trial"):
+                lines.append(kv("Тариф", "триал"))
+            if sub.get("traffic_limit_gb"):
                 used = sub.get("traffic_used_gb", 0)
                 limit = sub.get("traffic_limit_gb")
-                lines.append(kv("Трафик", f"{used} / {limit} ГБ"))
+                percent = sub.get("traffic_used_percent")
+                extra = f" ({percent}%)" if percent not in (None, 0) else ""
+                lines.append(kv("Трафик", f"{used} / {limit} ГБ{extra}"))
+            elif sub.get("traffic_limit_gb") == 0:
+                lines.append(kv("Трафик", "♾️ безлимит"))
             if sub.get("device_limit") is not None:
                 lines.append(kv("Устройства", f"до {sub.get('device_limit')}"))
+            if sub.get("time_left_display") and sub.get("is_active"):
+                time_left = str(sub["time_left_display"])
+                lines.append(kv("Осталось", time_left))
+            if sub.get("autopay_enabled") is not None:
+                lines.append(
+                    kv(
+                        "Автоплатёж",
+                        "включён" if sub.get("autopay_enabled") else "выключен",
+                    )
+                )
         bal = panel.get("balance_rubles")
         if bal is not None:
             lines.append(kv("Баланс", f"{bal} ₽"))
@@ -127,24 +218,28 @@ def format_subscription_card(
     lines.append("")
     if active:
         lines.append(
-            "Доступ работает — ключ можно получить кнопкой «🔑 Мой ключ». "
-            "Продлевать подписку лучше заранее, чтобы соединение не прерывалось."
+            "Доступ работает. Ключ — кнопка «🔑 Мой ключ»; это ссылка-подписка, "
+            "она не меняется при продлении. Продлевать лучше заранее: после "
+            "окончания срока сервер отключает доступ сразу, а ключ остаётся "
+            "тем же и снова заработает после оплаты."
         )
     elif not user.is_trial_used:
         lines.append(
-            "Активной подписки пока нет, зато доступен бесплатный триал. "
-            "Нажмите «🚀 Подключиться», и я выдам ключ сразу — оплата не потребуется."
+            f"Активной подписки нет, зато доступен бесплатный триал: "
+            f"{settings.trial_days} дня, {settings.trial_traffic_gb} ГБ, "
+            f"{_plural_devices(settings.trial_devices)}. "
+            f"Нажмите «🚀 Подключиться» — выдам ключ сразу, без оплаты."
         )
     else:
         lines.append(
-            "Подписка неактивна, поэтому доступ сейчас закрыт. "
-            "Выберите тариф в кабинете или пополните баланс — "
-            "ключ обновится автоматически."
+            "Подписка неактивна, доступ закрыт. Чтобы включить его снова: "
+            "пополните баланс кнопкой «💳 Оплатить», затем выберите тариф "
+            "в кабинете. Ключ сохранится — перенастраивать приложение не нужно."
         )
 
     lines.append("")
     lines.append(soft_rule())
-    lines.append(f"🌐  Подробная статистика: {settings.cabinet_url}/subscription")
+    lines.append(f"🌐  Трафик по дням и устройства: {settings.cabinet_url}/subscription")
     return "\n".join(lines)
 
 
@@ -152,36 +247,51 @@ def format_profile(user: User, settings: Settings) -> str:
     return format_subscription_card(user, settings)
 
 
-def format_connect_screen(user: User, settings: Settings) -> str:
+def format_connect_screen(
+    user: User, settings: Settings, catalog: Catalog | None = None
+) -> str:
     if user.is_subscription_active():
         return (
             f"{header('🚀', 'Подключение')}\n\n"
             f"{success_banner('Подписка активна — доступ уже работает')}\n\n"
-            f"Нажмите «🔑 Мой ключ», чтобы получить ссылку для импорта "
-            f"в приложение Happ. Если хотите посмотреть остаток трафика "
-            f"и подключённые устройства, откройте кабинет. "
-            f"Настраиваете VPN впервые? В разделе «📖 Гайд» есть пошаговые "
-            f"инструкции для iOS, Android, Windows и macOS.\n\n"
+            f"Нажмите «🔑 Мой ключ» — пришлю ссылку-подписку вида "
+            f"sub.paskod.ru. Её нужно один раз добавить в Happ: клиент сам "
+            f"подтянет серверы и будет обновлять их при изменениях, "
+            f"заново копировать ничего не придётся.\n\n"
+            f"{bullet('Остаток трафика и устройства — «📦 Подписка»')}\n"
+            f"{bullet('Настройка по вашей ОС — «📖 Гайд»')}\n\n"
             f"{footer_hint()}"
         )
     if not user.is_trial_used:
         return (
             f"{header('🚀', 'Подключение')}\n\n"
-            f"{success_banner(f'Доступен бесплатный триал на {settings.trial_days} дня')}\n\n"
-            f"Карта и предоплата не нужны — просто нажмите "
-            f"«🎁 Бесплатный триал», и я сразу пришлю ссылку подключения. "
-            f"Настройка занимает около минуты: скопировать ссылку, "
-            f"вставить в клиент, включить VPN. Триал даётся один раз, "
-            f"а по его окончании доступ можно продлить любым тарифом.\n\n"
+            f"{success_banner('Бесплатный триал доступен')}\n\n"
+            f"Что входит: {settings.trial_days} дня, "
+            f"{settings.trial_traffic_gb} ГБ трафика, "
+            f"{_plural_devices(settings.trial_devices)}. "
+            f"Ни карты, ни предоплаты — нажмите «🎁 Бесплатный триал», "
+            f"и ссылка придёт сюда же за несколько секунд.\n\n"
+            f"Настройка занимает около минуты: установить Happ, вставить "
+            f"ссылку из буфера, включить VPN. Триал выдаётся один раз "
+            f"на аккаунт; когда он закончится, доступ продлевается тарифом.\n\n"
             f"{footer_hint('активируйте триал')}"
         )
+
+    price = catalog.entry_price_label if catalog else ""
+    tail = (
+        f"Тарифы начинаются от {price} в месяц, трафик безлимитный. "
+        if price
+        else "Тарифы и цены — в кабинете. "
+    )
     return (
         f"{header('🚀', 'Подключение')}\n\n"
         f"{warn_banner('Бесплатный триал уже использован')}\n\n"
-        f"Чтобы подключиться снова, нужен тариф: купите подписку в кабинете "
-        f"или сначала пополните баланс — принимаем СБП, банковские карты "
-        f"и криптовалюту. Если доступ пропал раньше срока или что-то "
-        f"не работает, напишите в «💬 Помощь» — разберёмся.\n\n"
+        f"{tail}"
+        f"Порядок такой: пополняете баланс кнопкой «💳 Оплатить» "
+        f"(СБП, карта или крипта), затем выбираете тариф в кабинете — "
+        f"доступ включается сразу, а ключ остаётся тем же.\n\n"
+        f"Если подписка закончилась раньше срока или ключ перестал "
+        f"подключаться, напишите в «💬 Помощь» — проверим по панели.\n\n"
         f"{footer_hint()}"
     )
 
@@ -192,31 +302,55 @@ def format_key_message(
     *,
     is_trial: bool,
     source: str = "local",
+    limits: dict | None = None,
 ) -> str:
     _ = source
     if is_trial:
         head = header("🎁", f"Триал на {settings.trial_days} дня активирован")
-        intro = (
-            f"Готово — доступ открыт на {settings.trial_days} дня, "
-            f"ссылка ниже уже работает."
-        )
+        intro = f"Доступ открыт на {settings.trial_days} дня и уже работает."
     else:
         head = header("🔑", "Ваша ссылка подключения")
-        intro = "Эту ссылку нужно импортировать в VPN-клиент — она ниже."
+        intro = "Эту ссылку нужно один раз добавить в VPN-клиент."
+
+    facts: list[str] = []
+    if limits:
+        if limits.get("traffic_limit_gb"):
+            used = limits.get("traffic_used_gb") or 0
+            facts.append(
+                kv("Трафик", f"{used} / {limits['traffic_limit_gb']} ГБ")
+            )
+        elif limits.get("unlimited"):
+            facts.append(kv("Трафик", "♾️ безлимит"))
+        if limits.get("device_limit"):
+            facts.append(kv("Устройств", f"до {limits['device_limit']}"))
+        if limits.get("end_date"):
+            facts.append(kv("Действует до", str(limits["end_date"])))
+    elif is_trial:
+        facts = [
+            kv("Трафик", f"{settings.trial_traffic_gb} ГБ"),
+            kv("Устройств", f"до {settings.trial_devices}"),
+        ]
+
+    facts_block = ("\n".join(facts) + "\n\n") if facts else ""
 
     return (
         f"{head}\n\n"
         f"{intro}\n\n"
+        f"{facts_block}"
         f"{key}\n\n"
         f"{subhead('📋', 'Как подключить')}\n"
-        f"{step(1, 'Скопируйте ссылку целиком')}\n"
-        f"{step(2, 'Откройте Happ → «+» → вставить из буфера')}\n"
-        f"{step(3, 'Включите профиль и разрешите VPN')}\n\n"
-        f"Ссылка одна для всех ваших устройств в пределах лимита тарифа. "
-        f"Если соединение не поднимается, смените сервер или режим "
-        f"маршрутизации в приложении.\n\n"
+        f"{step(1, 'Скопируйте ссылку целиком — от https до конца')}\n"
+        f"{step(2, 'Установите Happ, если его ещё нет')}\n"
+        f"{step(3, 'В Happ: «+» → «Добавить из буфера»')}\n"
+        f"{step(4, 'Включите профиль и разрешите VPN в системе')}\n\n"
+        f"Это ссылка-подписка: клиент сам получает список серверов и "
+        f"обновляет их, когда мы что-то меняем. Добавлять её заново не нужно — "
+        f"достаточно нажать «Обновить» в приложении.\n\n"
+        f"Одну и ту же ссылку можно поставить на все свои устройства "
+        f"в пределах лимита тарифа. Проверить, что VPN включился, проще "
+        f"всего на 2ip.ru — страна должна отличаться от вашей.\n\n"
         f"{soft_rule()}\n"
-        f"Пошаговые инструкции по системам — в разделе «📖 Гайд»."
+        f"Инструкции по iOS, Android, Windows и macOS — в «📖 Гайд»."
     )
 
 
@@ -232,38 +366,61 @@ def format_buy(settings: Settings) -> str:
     )
 
 
-def format_balance(settings: Settings) -> str:
+def format_balance(settings: Settings, catalog: Catalog | None = None) -> str:
     _ = settings
+    minimum = (catalog.min_topup_kopeks // 100) if catalog else 50
+    price = catalog.entry_price_label if catalog else ""
+    hint = (
+        f"Для справки: самый доступный тариф стоит {price} за месяц, "
+        f"так что пополнения хватит сразу на подписку. "
+        if price
+        else ""
+    )
     return (
         f"{header('💰', 'Баланс')}\n\n"
-        f"Пополнить баланс можно прямо здесь, в чате: выберите способ оплаты, "
-        f"укажите сумму — и я пришлю ссылку на счёт. Деньги с баланса "
-        f"списываются при покупке или продлении тарифа, поэтому это удобно, "
-        f"если хотите оплатить заранее. Историю операций видно в кабинете.\n\n"
+        f"Баланс — это внутренний счёт, с которого списывается оплата тарифа. "
+        f"Пополнить можно прямо в чате: выберите способ, укажите сумму — "
+        f"и я пришлю ссылку на счёт. Минимум {minimum} ₽. {hint}\n\n"
+        f"Зачисление происходит автоматически после подтверждения платежа, "
+        f"обычно в течение минуты. История операций и текущий остаток "
+        f"видны в кабинете и в карточке «📦 Подписка».\n\n"
         f"{footer_hint('выберите способ оплаты')}"
     )
 
 
-def format_pay_intro() -> str:
+def format_pay_intro(catalog: Catalog | None = None) -> str:
+    minimum = (catalog.min_topup_kopeks // 100) if catalog else 50
+    amounts = (
+        ", ".join(f"{a // 100} ₽" for a in catalog.quick_amounts_kopeks)
+        if catalog and catalog.quick_amounts_kopeks
+        else "50, 100, 150, 500 ₽"
+    )
     return (
         f"{header('💳', 'Оплата')}\n\n"
-        f"Доступны те же способы, что и в мини-приложении — выберите удобный:\n\n"
-        f"{bullet('🏦  СБП · QR — оплата по QR в банковском приложении')}\n"
-        f"{bullet('💳  Банковская карта — обычная оплата онлайн')}\n"
-        f"{bullet('🪙  Криптовалюта — для тех, кому так привычнее')}\n\n"
-        f"После выбора я спрошу сумму и сформирую счёт. "
-        f"Платёж проходит на защищённой странице провайдера — "
-        f"реквизиты карты бот не видит и не хранит.\n\n"
+        f"Три способа, все через платёжного партнёра Platega:\n\n"
+        f"{bullet('🏦  СБП · QR — сканируете QR в приложении банка')}\n"
+        f"{bullet('💳  Банковская карта — карты РФ, оплата онлайн')}\n"
+        f"{bullet('🪙  Криптовалюта — если так удобнее')}\n\n"
+        f"После выбора спрошу сумму: есть готовые кнопки "
+        f"({amounts}) или можно указать свою, от {minimum} ₽. "
+        f"Деньги зачисляются на баланс, с него оплачивается тариф.\n\n"
+        f"Платёж проходит на стороне провайдера: бот не видит и не хранит "
+        f"номер карты, CVV и коды из SMS.\n\n"
         f"{footer_hint()}"
     )
 
 
-def format_pay_amount_prompt(method_label: str) -> str:
+def format_pay_amount_prompt(
+    method_label: str, catalog: Catalog | None = None
+) -> str:
+    minimum = (catalog.min_topup_kopeks // 100) if catalog else 50
+    price = catalog.entry_price_label if catalog else ""
+    hint = f"Месяц самого доступного тарифа — {price}. " if price else ""
     return (
         f"{header('💵', method_label)}\n\n"
-        f"Укажите сумму пополнения: нажмите одну из кнопок ниже "
-        f"или отправьте своё число сообщением, например 200. "
-        f"Минимальная сумма — 50 ₽.\n\n"
+        f"Укажите сумму: нажмите готовую кнопку ниже или отправьте своё "
+        f"число сообщением, например 200. Минимум {minimum} ₽. {hint}"
+        f"Сумма зачисляется на баланс целиком, комиссию сверху мы не берём.\n\n"
         f"{footer_hint('кнопки ниже или числом')}"
     )
 
@@ -293,13 +450,23 @@ def format_payment_created(
     )
 
 
-def format_referral(settings: Settings) -> str:
+def format_referral(settings: Settings, catalog: Catalog | None = None) -> str:
     _ = settings
+    percent = catalog.referral_percent if catalog else 0
+    rate = (
+        f"Вы получаете {percent}% от каждой оплаты приглашённого — "
+        f"не с первой покупки, а со всех последующих тоже. "
+        if percent
+        else "Вы получаете процент от каждой оплаты приглашённого. "
+    )
     return (
         f"{header('👥', 'Партнёрская программа')}\n\n"
-        f"Приводите друзей и получайте вознаграждение за их оплаты. "
-        f"Личная ссылка, статистика переходов и вывод средств — в кабинете, "
-        f"отдельная регистрация не нужна. Открою нужный раздел по кнопке ниже.\n\n"
+        f"{rate}"
+        f"Начисления приходят на внутренний баланс: ими можно оплатить "
+        f"свою подписку или вывести.\n\n"
+        f"В кабинете вы найдёте личную ссылку с промокодом, число переходов, "
+        f"сколько из них стали платящими, и общую сумму заработка. "
+        f"Открою этот раздел по кнопке ниже — вход без регистрации.\n\n"
         f"{footer_hint()}"
     )
 
@@ -309,8 +476,11 @@ def format_promo_prompt(settings: Settings) -> str:
     return (
         f"{header('🎟', 'Промокод')}\n\n"
         f"Отправьте код одним сообщением — например, {brand('PASKOD2026')}. "
-        f"Регистр не важен, но лишние пробелы лучше убрать. "
-        f"После проверки я подскажу, что делать дальше.\n\n"
+        f"Регистр не важен, пробелы по краям я уберу сам.\n\n"
+        f"Промокоды бывают трёх видов: скидка на покупку тарифа, "
+        f"зачисление на баланс и добавочные дни к подписке. "
+        f"Что именно даёт ваш код, будет видно при активации в кабинете — "
+        f"я открою нужный раздел сразу после проверки.\n\n"
         f"{footer_hint('ждём ваш код')}"
     )
 
@@ -319,33 +489,50 @@ def format_apps(settings: Settings) -> str:
     _ = settings
     return (
         f"{header('📱', 'Приложения')}\n\n"
-        f"Рекомендую Happ — он простой, стабильный и есть на всех платформах. "
-        f"Ключ из бота импортируется в него за пару касаний.\n\n"
-        f"Если Happ по какой-то причине не подходит, подойдут и другие клиенты:\n"
-        f"{bullet('v2rayNG — Android')}\n"
-        f"{bullet('Hiddify — Android, Windows, macOS')}\n"
-        f"{bullet('Streisand — iOS, macOS')}\n"
-        f"{bullet('V2Box — iOS')}\n\n"
-        f"Ссылка подключения одинаково работает в любом из них. "
-        f"Пошаговую настройку под вашу систему найдёте в «📖 Гайд»."
+        f"Ключ выдаётся по протоколу VLESS в виде ссылки-подписки, "
+        f"поэтому нужен клиент, который её понимает. Рекомендуем Happ: "
+        f"он есть на всех платформах и сам обновляет список серверов.\n\n"
+        f"{subhead('✅', 'Где взять Happ')}\n"
+        f"{bullet('iOS и macOS — App Store, поиск «Happ»')}\n"
+        f"{bullet('Android — Google Play или APK с happ.su')}\n"
+        f"{bullet('Windows — установщик с happ.su')}\n\n"
+        f"{subhead('🔁', 'Альтернативы, если Happ не подошёл')}\n"
+        f"{bullet('Android — v2rayNG, Hiddify')}\n"
+        f"{bullet('iOS — Streisand, V2Box, Shadowrocket')}\n"
+        f"{bullet('Windows — Hiddify, v2rayN, Nekoray')}\n"
+        f"{bullet('macOS — Hiddify, Streisand, V2Box')}\n\n"
+        f"Ссылка одинаково работает в любом из них: везде нужно добавить "
+        f"её как подписку, а не как отдельный сервер. "
+        f"Пошагово по вашей системе — в «📖 Гайд»."
     )
 
 
-def format_renew_stub(settings: Settings) -> str:
+def format_renew_stub(settings: Settings, catalog: Catalog | None = None) -> str:
+    price = catalog.entry_price_label if catalog else ""
+    prices = f"Тарифы начинаются от {price} за месяц; " if price else ""
+    long_hint = (
+        "на трёх и шести месяцах месяц выходит дешевле."
+        if catalog and catalog.tariffs
+        else "длинные периоды дешевле в пересчёте на месяц."
+    )
+
     if settings.bedolaga_api_key:
         return (
             f"{header('♻️', 'Продление')}\n\n"
-            f"Могу продлить доступ на {settings.renew_days} дней автоматически — "
-            f"напишите «продлить сейчас», и я выдам обновлённый ключ. "
-            f"Если нужен другой срок или тариф, выберите подходящий в кабинете: "
-            f"после оплаты подписка продлится сама.\n\n"
+            f"Быстрый вариант: напишите «продлить сейчас» — продлю доступ "
+            f"на {settings.renew_days} дней и пришлю обновлённый ключ.\n\n"
+            f"Если хотите сменить тариф или взять период подольше, "
+            f"выберите его в кабинете. {prices}{long_hint} "
+            f"Ссылка-подписка при продлении не меняется, так что "
+            f"перенастраивать приложение не нужно.\n\n"
             f"{footer_hint()}"
         )
     return (
         f"{header('♻️', 'Продление')}\n\n"
-        f"Продление оформляется в кабинете: выберите тариф и оплатите — "
-        f"ключ обновится автоматически, заново настраивать приложение "
-        f"не придётся. Открою нужный раздел по кнопке ниже.\n\n"
+        f"Продление оформляется в кабинете: пополняете баланс, выбираете "
+        f"тариф и период. {prices}{long_hint}\n\n"
+        f"Ключ при этом остаётся прежним — приложение подтянет доступ само, "
+        f"заново добавлять подписку не придётся.\n\n"
         f"{footer_hint()}"
     )
 

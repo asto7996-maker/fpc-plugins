@@ -44,6 +44,8 @@ class Settings:
     group_id: int
     database_url: str
     trial_days: int
+    trial_traffic_gb: int
+    trial_devices: int
     vpn_key_type: str
     support_url: str
     support_text: str
@@ -76,6 +78,17 @@ def load_settings() -> Settings:
     except ValueError as exc:
         raise RuntimeError("TRIAL_DAYS должен быть целым числом") from exc
 
+    # Лимиты триала задаются в админке Bedolaga; здесь — чтобы честно
+    # называть их до активации, когда подписки ещё нет.
+    try:
+        trial_traffic_gb = max(1, int(_optional("TRIAL_TRAFFIC_GB", "10")))
+    except ValueError as exc:
+        raise RuntimeError("TRIAL_TRAFFIC_GB должен быть целым числом") from exc
+    try:
+        trial_devices = max(1, int(_optional("TRIAL_DEVICES", "1")))
+    except ValueError as exc:
+        raise RuntimeError("TRIAL_DEVICES должен быть целым числом") from exc
+
     renew_raw = _optional("RENEW_DAYS", "30")
     try:
         renew_days = max(1, int(renew_raw))
@@ -107,6 +120,8 @@ def load_settings() -> Settings:
         group_id=group_id,
         database_url=database_url,
         trial_days=trial_days,
+        trial_traffic_gb=trial_traffic_gb,
+        trial_devices=trial_devices,
         vpn_key_type=vpn_key_type,
         support_url=_optional("SUPPORT_URL", ""),
         support_text=_optional(
