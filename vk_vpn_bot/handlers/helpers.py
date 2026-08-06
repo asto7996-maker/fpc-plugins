@@ -34,6 +34,7 @@ from services.payments import (
     method_copy,
     method_label,
 )
+from services.referral import ReferralStats
 from services.vpn_keys import mask_key
 
 
@@ -477,24 +478,78 @@ def format_payment_created(
     )
 
 
-def format_referral(settings: Settings, catalog: Catalog | None = None) -> str:
-    _ = settings
-    percent = catalog.referral_percent if catalog else 0
-    rate = (
-        f"Вы получаете {percent}% от каждой оплаты приглашённого — "
-        f"не с первой покупки, а со всех последующих тоже. "
-        if percent
-        else "Вы получаете процент от каждой оплаты приглашённого. "
+def format_referral(
+    settings: Settings,
+    stats: ReferralStats | None = None,
+    catalog: Catalog | None = None,
+) -> str:
+    days = settings.referral_inviter_bonus_days
+    percent = (
+        stats.commission_percent
+        if stats
+        else (catalog.referral_percent if catalog else 0)
     )
+
+    bonus_line = (
+        f"{bullet(f'🎁 +{days} дн. к подписке за каждого друга')}\n"
+        if days > 0
+        else ""
+    )
+    commission_line = (
+        f"{bullet(f'💰 {percent}% с оплат приглашённых')}\n"
+        if percent
+        else f"{bullet('💰 процент с оплат приглашённых')}\n"
+    )
+
+    body = (
+        f"{header('👥', 'Рефералка')}\n\n"
+        f"Приглашайте друзей — получайте бонусы.\n\n"
+        f"{bonus_line}"
+        f"{commission_line}\n"
+    )
+
+    if stats and stats.referral_code:
+        body += (
+            f"{subhead('🔗', 'Ваша ссылка')}\n"
+            f"{stats.vk_link}\n\n"
+            f"{kv('Код', stats.referral_code)}\n"
+            f"{kv('Приглашено', stats.total_referrals)}\n"
+            f"{kv('Активных', stats.active_referrals)}\n"
+            f"{kv('Заработано', f'{stats.total_earnings_rubles:.0f} ₽')}\n\n"
+            f"Скопируйте ссылку и отправьте другу — он должен открыть бот "
+            f"по ней, чтобы вы получили бонус.\n\n"
+        )
+    else:
+        body += (
+            "Личная ссылка появится после входа в кабинет. "
+            "Нажмите «🌐 Кабинет» ниже или подождите пару секунд.\n\n"
+        )
+
+    return f"{body}{footer_hint()}"
+
+
+def format_referral_inviter_bonus(settings: Settings) -> str:
+    days = settings.referral_inviter_bonus_days
+    if days <= 0:
+        return ""
     return (
-        f"{header('👥', 'Партнёрская программа')}\n\n"
-        f"{rate}"
-        f"Начисления приходят на внутренний баланс: ими можно оплатить "
-        f"свою подписку или вывести.\n\n"
-        f"В кабинете вы найдёте личную ссылку с промокодом, число переходов, "
-        f"сколько из них стали платящими, и общую сумму заработка. "
-        f"Открою этот раздел по кнопке ниже — вход без регистрации.\n\n"
-        f"{footer_hint()}"
+        f"{success_banner('Реферал засчитан!')}\n\n"
+        f"Спасибо, что пришли по приглашению. "
+        f"Ваш друг получит +{days} дн. к подписке."
+    )
+
+
+def format_referral_bonus_notify(settings: Settings) -> str:
+    days = settings.referral_inviter_bonus_days
+    if days <= 0:
+        return (
+            f"{success_banner('Новый реферал!')}\n\n"
+            f"По вашей ссылке зарегистрировался новый пользователь."
+        )
+    return (
+        f"{success_banner('Новый реферал!')}\n\n"
+        f"По вашей ссылке зарегистрировался друг — "
+        f"мы добавили +{days} дн. к вашей подписке."
     )
 
 
@@ -572,6 +627,7 @@ def format_help_menu(settings: Settings) -> str:
         f"{bullet('✍️ Вопрос — напишите в чат, передам команде')}\n"
         f"{bullet('📖 Гайд — установка Happ по ОС')}\n"
         f"{bullet('ℹ️ Документы — оферта, FAQ, приватность')}\n"
+        f"{bullet('👥 Рефералка — бонус за друзей')}\n"
         f"{bullet('🎟 Промо — активация кода')}\n\n"
         f"{footer_hint()}"
     )

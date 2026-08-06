@@ -13,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from keyboards.menus import (
     BTN_HELP,
     BTN_PAY_SBP,
+    BTN_REFERRAL,
     help_keyboard,
     main_menu_keyboard,
     pay_methods_keyboard,
@@ -46,7 +47,8 @@ def test_help_hub() -> None:
         for b in row
     ]
     assert BTN_HELP not in labels
-    assert len(labels) <= 6
+    assert BTN_REFERRAL in labels
+    assert len(labels) <= 7
 
 
 def test_short_payment_labels() -> None:

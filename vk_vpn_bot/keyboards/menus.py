@@ -69,7 +69,7 @@ BTN_GET_KEY = BTN_MY_KEY
 BTN_CONNECT_OLD = "🚀 Подключить VPN"
 BTN_CABINET_LOGIN = "🔐 Войти"
 BTN_PROFILE = "👤 Профиль"
-BTN_REFERRAL = "👥 Партнёрам"
+BTN_REFERRAL = "👥 Рефералка"
 BTN_DEVICES = "📲 Устройства"
 
 
@@ -100,14 +100,15 @@ def main_menu_keyboard(cabinet_url: str, *, show_admin: bool = False) -> str:
 
 
 def help_keyboard(support_url: str = "") -> str:
-    """Хаб помощи: вопрос, гайд, документы, промо."""
+    """Хаб помощи: вопрос, гайд, документы, рефералка, промо."""
     kb = Keyboard(one_time=False, inline=False)
     kb.add(Text(BTN_ASK), color=KeyboardButtonColor.POSITIVE)
     kb.add(Text(BTN_GUIDE), color=KeyboardButtonColor.POSITIVE)
     kb.row()
     kb.add(Text(BTN_INFO), color=KeyboardButtonColor.PRIMARY)
-    kb.add(Text(BTN_PROMO), color=KeyboardButtonColor.SECONDARY)
+    kb.add(Text(BTN_REFERRAL), color=KeyboardButtonColor.PRIMARY)
     kb.row()
+    kb.add(Text(BTN_PROMO), color=KeyboardButtonColor.SECONDARY)
     kb.add(Text(BTN_BACK), color=KeyboardButtonColor.SECONDARY)
     if support_url:
         kb.row()
@@ -280,6 +281,18 @@ def subscription_keyboard(cabinet_url: str, has_key: bool = False) -> str:
     kb.add(Text(BTN_PAY), color=KeyboardButtonColor.PRIMARY)
     kb.add(Text(BTN_BACK), color=KeyboardButtonColor.SECONDARY)
     return kb.get_json()
+
+
+def referral_keyboard(cabinet_url: str = "") -> str:
+    """Экран рефералки: кабинет + назад."""
+    _ = cabinet_url
+    return (
+        Keyboard(one_time=False, inline=False)
+        .add(Text(BTN_CABINET), color=KeyboardButtonColor.PRIMARY)
+        .row()
+        .add(Text(BTN_BACK), color=KeyboardButtonColor.SECONDARY)
+        .get_json()
+    )
 
 
 def promo_keyboard(cabinet_url: str) -> str:

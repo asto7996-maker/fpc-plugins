@@ -44,6 +44,9 @@ from handlers.helpers import (
     format_payment_created,
     format_promo_accepted,
     format_promo_prompt,
+    format_referral,
+    format_referral_bonus_notify,
+    format_referral_inviter_bonus,
     format_subscription_card,
     format_support,
     format_tariff_activated,
@@ -111,6 +114,7 @@ from keyboards import (
     pay_methods_keyboard,
     payment_link_keyboard,
     promo_keyboard,
+    referral_keyboard,
     subscription_keyboard,
     support_wait_keyboard,
     tariffs_inline_keyboard,
@@ -133,6 +137,11 @@ from services.payments import (
     ensure_bedolaga_id_for_payments,
     format_rubles,
 )
+from services.referral import (
+    apply_referral_for_new_user,
+    extract_referral_code,
+    fetch_referral_stats,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -149,6 +158,8 @@ _pending_tariff: dict[int, dict[str, int]] = {}
 _reading_doc: dict[int, dict[str, int | str]] = {}
 # Ожидание текста вопроса в поддержку
 _waiting_support: set[int] = set()
+# Уже пробовали привязать реферала в этой сессии
+_referral_tried: set[int] = set()
 
 # Кнопка текста → slug документа
 _DOC_BUTTONS: dict[str, str] = {
@@ -234,6 +245,88 @@ async def _send_doc(message: Message, slug: str, page: int = 1) -> None:
     )
 
 
+async def _process_referral_on_start(message: Message, user) -> bool:
+    """Привязка реферала и уведомление пригласившего. True — если применено."""
+    settings = get_settings()
+    code = extract_referral_code(
+        text=message.text,
+        ref=getattr(message, "ref", None),
+    )
+    if not code:
+        return False
+
+    result = await apply_referral_for_new_user(
+        user.user_id,
+        user.first_name,
+        code,
+        settings,
+    )
+    if not result.applied:
+        return False
+
+    bonus_text = format_referral_inviter_bonus(settings)
+    if bonus_text:
+        await message.answer(bonus_text, keyboard=_main_kb(message.from_id))
+
+    if result.inviter_vk_id and result.inviter_bonus_granted:
+        try:
+            await message.ctx_api.messages.send(
+                peer_id=result.inviter_vk_id,
+                message=format_referral_bonus_notify(settings),
+                random_id=0,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "referral notify failed inviter=%s: %s",
+                result.inviter_vk_id,
+                exc,
+            )
+    return True
+
+
+async def _ensure_panel_silent(user, message: Message | None = None) -> None:
+    """Тихая регистрация в Bedolaga + реферал из ref/текста."""
+    settings = get_settings()
+    if not settings.cabinet_jwt_secret or not settings.bedolaga_api_key:
+        return
+
+    referral_applied = False
+    if message is not None and message.from_id not in _referral_tried:
+        code = extract_referral_code(
+            text=message.text,
+            ref=getattr(message, "ref", None),
+        )
+        if code:
+            _referral_tried.add(message.from_id)
+            referral_applied = await _process_referral_on_start(message, user)
+
+    if not referral_applied:
+        try:
+            await ensure_panel_user(user.user_id, user.first_name)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("silent panel register failed: %s", exc)
+
+
+async def _show_referral(message: Message) -> None:
+    settings = get_settings()
+    user = await _ensure_user(message)
+    await _ensure_panel_silent(user, message)
+    stats = None
+    if settings.cabinet_jwt_secret:
+        try:
+            bedolaga_id = await ensure_bedolaga_id_for_payments(
+                user.user_id, user.first_name
+            )
+            stats = await fetch_referral_stats(settings, bedolaga_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("referral screen: %s", exc)
+
+    await message.answer(
+        format_referral(settings, stats, await _catalog(message)),
+        keyboard=referral_keyboard(_cab()),
+    )
+
+
 async def _open_cabinet(
     message: Message,
     *,
@@ -301,12 +394,7 @@ async def cmd_start(message: Message):
     _reading_doc.pop(message.from_id, None)
     _waiting_support.discard(message.from_id)
     user = await _ensure_user(message)
-
-    if settings.cabinet_jwt_secret and settings.bedolaga_api_key:
-        try:
-            await ensure_panel_user(user.user_id, user.first_name)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("silent panel register failed: %s", exc)
+    await _ensure_panel_silent(user, message)
 
     await message.answer(
         format_welcome(settings, user.first_name, await _catalog(message)),
@@ -349,9 +437,11 @@ async def cmd_connect(message: Message):
         BTN_TRIAL,
         BTN_GET_KEY,
         BTN_MY_KEY,
+        "🎁 Триал",
         "🎁 Активировать триал",
         "🎁 Бесплатный триал",
         "Бесплатный триал",
+        "🔑 Ключ",
         "🔑 Мой ключ",
         "🔑 Получить ключ",
         "Мой ключ",
@@ -959,6 +1049,7 @@ async def cmd_buy(message: Message):
         BTN_REFERRAL,
         "👥 Партнёрка",
         "👥 Партнёрам",
+        "👥 Рефералка",
         "Партнёрам",
         "партнёрка",
         "реферал",
@@ -967,12 +1058,7 @@ async def cmd_buy(message: Message):
     ]
 )
 async def cmd_referral(message: Message):
-    await _open_cabinet(
-        message,
-        redirect="/referral",
-        title="✨ Секунду…",
-        button_text="👥 Партнёрка",
-    )
+    await _show_referral(message)
 
 
 @labeler.private_message(

@@ -62,6 +62,7 @@ class Settings:
     cabinet_url: str
     cabinet_jwt_secret: str
     renew_days: int
+    referral_inviter_bonus_days: int
 
 
 def load_settings() -> Settings:
@@ -96,6 +97,14 @@ def load_settings() -> Settings:
         renew_days = max(1, int(renew_raw))
     except ValueError as exc:
         raise RuntimeError("RENEW_DAYS должен быть целым числом") from exc
+
+    referral_bonus_raw = _optional("REFERRAL_INVITER_BONUS_DAYS", "5")
+    try:
+        referral_inviter_bonus_days = max(0, int(referral_bonus_raw))
+    except ValueError as exc:
+        raise RuntimeError(
+            "REFERRAL_INVITER_BONUS_DAYS должен быть целым числом"
+        ) from exc
 
     outline_raw = _optional("OUTLINE_KEYS", "")
     outline_keys = tuple(k.strip() for k in outline_raw.split(",") if k.strip())
@@ -160,6 +169,7 @@ def load_settings() -> Settings:
         cabinet_url=_optional("CABINET_URL", "https://cabinet.paskod.ru"),
         cabinet_jwt_secret=_optional("CABINET_JWT_SECRET", ""),
         renew_days=renew_days,
+        referral_inviter_bonus_days=referral_inviter_bonus_days,
     )
 
 

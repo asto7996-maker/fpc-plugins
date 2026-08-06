@@ -58,6 +58,8 @@ class _Settings:
     cabinet_url = "https://cabinet.paskod.ru"
     bedolaga_api_key = "k"
     renew_days = 30
+    referral_inviter_bonus_days = 5
+    group_id = 240702990
 
 
 def test_parse_tariff() -> None:
@@ -116,8 +118,9 @@ def test_texts_use_real_numbers() -> None:
     pay = format_pay_intro(catalog)
     assert "50 ₽" in pay and "100 ₽" in pay
 
-    ref = format_referral(settings, catalog)
+    ref = format_referral(settings, None, catalog)
     assert "15%" in ref
+    assert "+5 дн." in ref
 
 
 def test_texts_survive_without_catalog() -> None:
@@ -127,8 +130,9 @@ def test_texts_survive_without_catalog() -> None:
     assert "кабинет" in tariffs.lower()
     pay = format_pay_intro(None)
     assert "50 ₽" in pay
-    ref = format_referral(settings, None)
-    assert "процент" in ref.lower()
+    ref = format_referral(settings, None, None)
+    assert "процент" in ref.lower() or "15%" in ref
+    assert "+5 дн." in ref
 
 
 def _make_catalog() -> Catalog:

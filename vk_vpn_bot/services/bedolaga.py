@@ -122,6 +122,7 @@ class BedolagaClient:
         telegram_id: int,
         username: str | None = None,
         first_name: str | None = None,
+        referred_by_id: int | None = None,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "telegram_id": telegram_id,
@@ -131,6 +132,8 @@ class BedolagaClient:
             payload["username"] = username
         if first_name:
             payload["first_name"] = first_name
+        if referred_by_id:
+            payload["referred_by_id"] = int(referred_by_id)
         return await self._request("POST", "/users", json_body=payload)
 
     async def ensure_user(
