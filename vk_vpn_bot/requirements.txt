@@ -1,0 +1,15 @@
+# VK Bot framework (async)
+vkbottle>=4.5.0,<5
+
+# Секреты из .env
+python-dotenv>=1.0.0
+
+# ORM + async драйверы БД
+SQLAlchemy>=2.0.0,<3
+aiosqlite>=0.19.0
+# Для PostgreSQL раскомментируйте:
+# asyncpg>=0.29.0
+
+# Утилиты (приходят транзитивно с vkbottle, фиксируем явно)
+aiohttp>=3.9.0
+pydantic>=2.0.0
