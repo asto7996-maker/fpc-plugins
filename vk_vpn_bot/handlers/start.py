@@ -652,7 +652,9 @@ async def _purchase_with_method(
             )
             _pending_tariff.pop(message.from_id, None)
             await message.answer(
-                format_tariff_needs_topup(offer, format_rubles(missing)),
+                format_tariff_needs_topup(
+                    offer, format_rubles(missing), method_code=method_code
+                ),
                 keyboard=payment_link_keyboard(topup.payment_url),
             )
             return
@@ -681,9 +683,8 @@ async def _purchase_with_method(
 async def _start_pay_amount(message: Message, method_code: int) -> None:
     _waiting_promo.discard(message.from_id)
     _pending_pay_method[message.from_id] = method_code
-    label = METHOD_LABELS.get(method_code, f"Platega {method_code}")
     await message.answer(
-        format_pay_amount_prompt(label, await _catalog(message)),
+        format_pay_amount_prompt(method_code, await _catalog(message)),
         keyboard=pay_amounts_keyboard(),
     )
 
@@ -720,7 +721,7 @@ async def _create_and_send_payment(
         _clear_pay_state(message.from_id)
         await message.answer(
             format_payment_created(
-                method_label=result.method_label,
+                method_code=result.method_code,
                 amount_rubles=result.amount_rubles,
                 payment_url=result.payment_url,
             ),
@@ -761,7 +762,17 @@ async def cmd_pay(message: Message):
 
 
 @labeler.private_message(
-    text=[BTN_PAY_SBP, "🏦 СБП (QR)", "🏦 СБП · QR", "СБП · QR", "сбп qr", "сбп (qr)", "qr"]
+    text=[
+        BTN_PAY_SBP,
+        "🏦 СБП (QR)",
+        "🏦 СБП · QR",
+        "СБП (QR)",
+        "СБП · QR",
+        "сбп qr",
+        "сбп (qr)",
+        "qr",
+        "сбп",
+    ]
 )
 async def cmd_pay_sbp(message: Message):
     await _ensure_user(message)
@@ -773,7 +784,17 @@ async def cmd_pay_sbp(message: Message):
 
 
 @labeler.private_message(
-    text=[BTN_PAY_CARD, "💳 Банк. карта", "💳 Карта", "Карта", "карта", "банк. карта", "банковская карта"]
+    text=[
+        BTN_PAY_CARD,
+        "💳 Банк. карта",
+        "💳 Карты (RUB)",
+        "💳 Карта",
+        "Карты (RUB)",
+        "Карта",
+        "карта",
+        "банк. карта",
+        "банковская карта",
+    ]
 )
 async def cmd_pay_card(message: Message):
     await _ensure_user(message)
@@ -785,7 +806,15 @@ async def cmd_pay_card(message: Message):
 
 
 @labeler.private_message(
-    text=[BTN_PAY_CRYPTO, "🪙 Крипта", "Крипта", "крипта", "криптовалюта"]
+    text=[
+        BTN_PAY_CRYPTO,
+        "🪙 Криптовалюта",
+        "🪙 Крипта",
+        "Криптовалюта",
+        "Крипта",
+        "крипта",
+        "криптовалюта",
+    ]
 )
 async def cmd_pay_crypto(message: Message):
     await _ensure_user(message)

@@ -27,6 +27,13 @@ from handlers.style import (
 )
 from legal.documents import ALL_DOCS
 from services.catalog import Catalog, Offer
+from services.payments import (
+    PLATEGA_METHOD_CARD,
+    PLATEGA_METHOD_CRYPTO,
+    PLATEGA_METHOD_SBP_QR,
+    method_copy,
+    method_label,
+)
 from services.vpn_keys import mask_key
 
 
@@ -160,8 +167,12 @@ def format_tariff_chosen(offer: Offer) -> str:
         f"{kv('Цена', offer.period.price_label + note)}\n"
         f"{kv('Трафик', t.traffic_label or '♾️ Безлимит')}\n"
         f"{kv('Устройства', _devices_upto(t.device_limit))}\n\n"
-        f"Выберите способ оплаты. Если на балансе уже есть нужная сумма, "
-        f"тариф активируется сразу без оплаты.\n\n"
+        f"Выберите способ оплаты:\n"
+        f"{bullet(f'{method_label(PLATEGA_METHOD_SBP_QR)} — быстрый перевод по QR')}\n"
+        f"{bullet(f'{method_label(PLATEGA_METHOD_CARD)} — карта РФ онлайн')}\n"
+        f"{bullet(f'{method_label(PLATEGA_METHOD_CRYPTO)} — USDT и другие монеты')}\n\n"
+        f"Если на балансе уже есть {offer.period.price_label}, тариф "
+        f"активируется сразу. Иначе выставлю счёт на недостающую сумму.\n\n"
         f"{footer_hint('способ оплаты ниже')}"
     )
 
@@ -178,15 +189,18 @@ def format_tariff_activated(offer: Offer, settings: Settings) -> str:
     )
 
 
-def format_tariff_needs_topup(offer: Offer, missing_rubles: str) -> str:
+def format_tariff_needs_topup(offer: Offer, missing_rubles: str, *, method_code: int) -> str:
+    copy = method_copy(method_code)
+    label = method_label(method_code)
     return (
         f"{header('💳', 'Нужно пополнить баланс')}\n\n"
         f"Тариф «{offer.tariff.name} · {offer.period.label}» стоит "
         f"{offer.period.price_label}. Не хватает {missing_rubles} — "
-        f"сформировал счёт ровно на эту сумму.\n\n"
-        f"Оплатите по кнопке ниже. Как только деньги поступят, тариф "
-        f"активируется сам: корзина уже сохранена, повторно выбирать "
-        f"ничего не нужно. Обычно это занимает до минуты."
+        f"сформировал счёт через {label}.\n\n"
+        f"{copy['how']}\n\n"
+        f"Оплатите по кнопке ниже. {copy['timing']} Тариф активируется "
+        f"автоматически — корзина уже сохранена, повторно выбирать ничего "
+        f"не нужно."
     )
 
 
@@ -454,19 +468,24 @@ def format_balance(settings: Settings, catalog: Catalog | None = None) -> str:
     minimum = (catalog.min_topup_kopeks // 100) if catalog else 50
     price = catalog.entry_price_label if catalog else ""
     hint = (
-        f"Для справки: самый доступный тариф стоит {price} за месяц, "
-        f"так что пополнения хватит сразу на подписку. "
+        f"Для справки: самый доступный тариф стоит {price} за месяц — "
+        f"пополнения хватит сразу на подписку. "
         if price
         else ""
     )
+    sbp = method_copy(PLATEGA_METHOD_SBP_QR)
+    card = method_copy(PLATEGA_METHOD_CARD)
+    crypto = method_copy(PLATEGA_METHOD_CRYPTO)
     return (
         f"{header('💰', 'Баланс')}\n\n"
-        f"Баланс — это внутренний счёт, с которого списывается оплата тарифа. "
-        f"Пополнить можно прямо в чате: выберите способ, укажите сумму — "
-        f"и я пришлю ссылку на счёт. Минимум {minimum} ₽. {hint}\n\n"
-        f"Зачисление происходит автоматически после подтверждения платежа, "
-        f"обычно в течение минуты. История операций и текущий остаток "
-        f"видны в кабинете и в карточке «📦 Подписка».\n\n"
+        f"Баланс — внутренний счёт, с которого списывается оплата тарифа. "
+        f"Пополнить можно прямо здесь тремя способами:\n\n"
+        f"{bullet(f'{method_label(PLATEGA_METHOD_SBP_QR)} — {sbp['summary']}')}\n"
+        f"{bullet(f'{method_label(PLATEGA_METHOD_CARD)} — {card['summary']}')}\n"
+        f"{bullet(f'{method_label(PLATEGA_METHOD_CRYPTO)} — {crypto['summary']}')}\n\n"
+        f"Минимум {minimum} ₽. {hint}"
+        f"Зачисление автоматическое, обычно за 1–5 минут. Остаток и история — "
+        f"в кабинете и в «📦 Подписка».\n\n"
         f"{footer_hint('выберите способ оплаты')}"
     )
 
@@ -478,39 +497,49 @@ def format_pay_intro(catalog: Catalog | None = None) -> str:
         if catalog and catalog.quick_amounts_kopeks
         else "50, 100, 150, 500 ₽"
     )
+    sbp = method_copy(PLATEGA_METHOD_SBP_QR)
+    card = method_copy(PLATEGA_METHOD_CARD)
+    crypto = method_copy(PLATEGA_METHOD_CRYPTO)
     return (
         f"{header('💳', 'Оплата')}\n\n"
-        f"Три способа, все через платёжного партнёра Platega:\n\n"
-        f"{bullet('🏦  СБП · QR — сканируете QR в приложении банка')}\n"
-        f"{bullet('💳  Банковская карта — карты РФ, оплата онлайн')}\n"
-        f"{bullet('🪙  Криптовалюта — если так удобнее')}\n\n"
-        f"После выбора спрошу сумму: есть готовые кнопки "
-        f"({amounts}) или можно указать свою, от {minimum} ₽. "
-        f"Деньги зачисляются на баланс, с него оплачивается тариф.\n\n"
-        f"Платёж проходит на стороне провайдера: бот не видит и не хранит "
-        f"номер карты, CVV и коды из SMS.\n\n"
+        f"Пополнение баланса через Platega — те же способы, что в мини-приложении. "
+        f"После зачисления деньги списываются с баланса при покупке тарифа.\n\n"
+        f"{subhead('🏦', sbp['title'])}\n"
+        f"{sbp['summary']} {sbp['note']}\n\n"
+        f"{subhead('💳', card['title'])}\n"
+        f"{card['summary']} {card['note']}\n\n"
+        f"{subhead('🪙', crypto['title'])}\n"
+        f"{crypto['summary']} {crypto['note']}\n\n"
+        f"Выберите способ кнопкой ниже. Потом укажите сумму: готовые "
+        f"({amounts}) или своё число от {minimum} ₽.\n\n"
+        f"Бот не видит и не хранит данные карты, CVV и коды из SMS — "
+        f"всё проходит на стороне платёжного провайдера.\n\n"
         f"{footer_hint()}"
     )
 
 
 def format_pay_amount_prompt(
-    method_label: str, catalog: Catalog | None = None
+    method_code: int, catalog: Catalog | None = None
 ) -> str:
     minimum = (catalog.min_topup_kopeks // 100) if catalog else 50
     price = catalog.entry_price_label if catalog else ""
     hint = f"Месяц самого доступного тарифа — {price}. " if price else ""
+    copy = method_copy(method_code)
+    label = method_label(method_code)
     return (
-        f"{header('💵', method_label)}\n\n"
-        f"Укажите сумму: нажмите готовую кнопку ниже или отправьте своё "
-        f"число сообщением, например 200. Минимум {minimum} ₽. {hint}"
-        f"Сумма зачисляется на баланс целиком, комиссию сверху мы не берём.\n\n"
+        f"{header('💵', label)}\n\n"
+        f"{copy['summary']}\n\n"
+        f"{copy['how']}\n\n"
+        f"Укажите сумму: нажмите готовую кнопку или отправьте число "
+        f"сообщением, например 200. Минимум {minimum} ₽. {hint}"
+        f"{copy['timing']} Сумма зачисляется на баланс целиком.\n\n"
         f"{footer_hint('кнопки ниже или числом')}"
     )
 
 
 def format_payment_created(
     *,
-    method_label: str,
+    method_code: int,
     amount_rubles: float,
     payment_url: str,
 ) -> str:
@@ -519,15 +548,17 @@ def format_payment_created(
         if amount_rubles == int(amount_rubles)
         else f"{amount_rubles:.2f} ₽"
     )
+    copy = method_copy(method_code)
+    label = method_label(method_code)
     return (
         f"{header('✅', 'Счёт готов')}\n\n"
-        f"{kv('Способ', method_label)}\n"
+        f"{kv('Способ', label)}\n"
         f"{kv('Сумма', amount)}\n\n"
-        f"Нажмите «✨ Оплатить сейчас» — откроется защищённая страница "
-        f"платёжного провайдера. Баланс обновится автоматически, "
-        f"обычно в течение минуты после оплаты. Если деньги списались, "
-        f"но баланс не изменился за 10–15 минут, напишите в «💬 Помощь» "
-        f"и приложите время платежа.\n\n"
+        f"Нажмите «✨ Оплатить сейчас» — откроется страница Platega. "
+        f"{copy['how']}\n\n"
+        f"{copy['timing']} Если деньги списались, а баланс не изменился "
+        f"за 10–15 минут, напишите в «💬 Помощь» и укажите время платежа "
+        f"и способ ({copy['title']}).\n\n"
         f"{soft_rule()}\n"
         f"Если кнопка не сработала, откройте ссылку вручную:\n{payment_url}"
     )
@@ -732,9 +763,11 @@ def format_min_amount(current: str, minimum: str = "50 ₽") -> str:
 def format_pay_method_first() -> str:
     return (
         f"{header('💳', 'Сначала выберите способ оплаты')}\n\n"
-        f"Чтобы выставить счёт, мне нужно знать, чем вы будете платить: "
-        f"СБП, картой или криптовалютой. Выберите вариант кнопкой ниже, "
-        f"и я спрошу сумму."
+        f"Чтобы выставить счёт, выберите один из трёх способов:\n\n"
+        f"{bullet(f'{method_label(PLATEGA_METHOD_SBP_QR)} — QR в приложении банка')}\n"
+        f"{bullet(f'{method_label(PLATEGA_METHOD_CARD)} — карта российского банка')}\n"
+        f"{bullet(f'{method_label(PLATEGA_METHOD_CRYPTO)} — криптовалюта')}\n\n"
+        f"После выбора я спрошу сумму пополнения."
     )
 
 
