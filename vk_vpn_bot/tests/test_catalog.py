@@ -67,6 +67,10 @@ def test_parse_tariff() -> None:
     assert t.id == 4
     assert t.name == "Базовый"
     assert t.unlimited_traffic is True
+    assert t.traffic_limit_gb == 0
+    assert t.effective_traffic_gb == 100
+    assert t.traffic_display == "100 ГБ"
+    assert t.has_whitelist_server is False
     assert t.device_limit == 1
     assert t.extra_device_kopeks == 5000
     assert t.servers == ("Base",)
@@ -82,9 +86,10 @@ def test_catalog_aggregates() -> None:
         tier=3,
         traffic_label="♾️ Безлимит",
         unlimited_traffic=True,
+        traffic_limit_gb=0,
         device_limit=5,
         extra_device_kopeks=5000,
-        servers=("prem",),
+        servers=("Белые списки RU",),
         periods=(
             Period(30, "1 месяц", "149 ₽", "149 ₽", 14900),
         ),
@@ -110,6 +115,7 @@ def test_texts_use_real_numbers() -> None:
 
     tariffs = format_tariffs(catalog, settings)
     assert "Базовый" in tariffs
+    assert "100 ГБ" in tariffs
     assert "49 ₽" in tariffs
     assert "229 ₽" in tariffs
     assert "38 ₽" in tariffs, "нужна цена за месяц на длинном периоде"
@@ -143,9 +149,10 @@ def _make_catalog() -> Catalog:
         tier=3,
         traffic_label="♾️ Безлимит",
         unlimited_traffic=True,
+        traffic_limit_gb=0,
         device_limit=5,
         extra_device_kopeks=5000,
-        servers=("prem",),
+        servers=("Белые списки RU",),
         periods=(
             Period(30, "1 месяц", "149 ₽", "149 ₽", 14900),
             Period(180, "6 месяцев", "699 ₽", "116 ₽", 69900),
@@ -190,8 +197,20 @@ def test_tariff_menu_and_choice() -> None:
     offer = cat.offers()[0]
     chosen = format_tariff_chosen(offer)
     assert "Базовый" in chosen
+    assert "100 ГБ" in chosen
     assert "49 ₽" in chosen
     assert "оплатить" in chosen.lower()
+
+
+def test_premium_unlimited_and_whitelist() -> None:
+    cat = _make_catalog()
+    premium = next(t for t in cat.tariffs if t.name == "Премиум")
+    assert premium.traffic_display == "♾️ Бесконечность ГБ"
+    assert premium.has_whitelist_server is True
+
+    tariffs = format_tariffs(cat, _Settings())
+    assert "Бесконечность ГБ" in tariffs
+    assert "белыми списками" in tariffs
 
 
 def main() -> None:
@@ -202,6 +221,7 @@ def main() -> None:
     test_offers_sorted_and_labeled()
     test_short_period()
     test_tariff_menu_and_choice()
+    test_premium_unlimited_and_whitelist()
     print("test_catalog: OK")
 
 

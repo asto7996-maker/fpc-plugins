@@ -124,16 +124,18 @@ def format_tariff_menu(catalog: Catalog | None, settings: Settings, *, renew: bo
     lines = [
         header("💎", title),
         "",
-        "Интернет без ограничений. Чем дольше срок — тем дешевле месяц. "
-        "Нажмите нужный тариф под сообщением.",
+        "У каждого тарифа свой объём интернета и число устройств. "
+        "Чем дольше срок — тем дешевле месяц. Нажмите нужный вариант под сообщением.",
         "",
     ]
     for offer in catalog.offers():
         t = offer.tariff
         note = f" · {offer.per_month_note}" if offer.per_month_note else ""
+        whitelist = " · 📋 белые списки" if t.has_whitelist_server else ""
         lines.append(
             f"{t.emoji}  {t.name} · {offer.period.label} — "
-            f"{offer.period.price_label}{note} · {_devices_upto(t.device_limit)}"
+            f"{offer.period.price_label}{note}\n"
+            f"     {t.traffic_display} · {_devices_upto(t.device_limit)}{whitelist}"
         )
     lines.append("")
     lines.append("Дальше выберите способ оплаты. Если денег на счету не хватает — "
@@ -144,11 +146,18 @@ def format_tariff_menu(catalog: Catalog | None, settings: Settings, *, renew: bo
 def format_tariff_chosen(offer: Offer) -> str:
     t = offer.tariff
     note = f" ({offer.per_month_note})" if offer.per_month_note else ""
+    whitelist = (
+        f"\n{kv('Сервер', 'с белыми списками')}"
+        if t.has_whitelist_server
+        else ""
+    )
     return (
         f"{header('💳', f'{t.name} · {offer.period.label}')}\n\n"
+        f"{t.short_description}\n\n"
         f"{kv('Цена', offer.period.price_label + note)}\n"
-        f"{kv('Интернет', t.traffic_label or '♾️ Без ограничений')}\n"
-        f"{kv('Устройства', _devices_upto(t.device_limit))}\n\n"
+        f"{kv('Интернет', t.traffic_display)}\n"
+        f"{kv('Устройства', _devices_upto(t.device_limit))}"
+        f"{whitelist}\n\n"
         f"Как оплатить: {method_label(PLATEGA_METHOD_SBP_QR)}, "
         f"{method_label(PLATEGA_METHOD_CARD)} или {method_label(PLATEGA_METHOD_CRYPTO)}. "
         f"Если на счету хватает денег — тариф включится сразу, "
@@ -193,16 +202,18 @@ def format_tariffs(catalog: Catalog | None, settings: Settings) -> str:
     lines = [
         header("💎", "Тарифы"),
         "",
-        "Все тарифы — с безлимитным интернетом. Отличаются сроком "
-        "и числом устройств. Чем дольше срок, тем дешевле месяц.",
+        "Тарифы отличаются объёмом интернета, числом устройств и доступными "
+        "серверами. Чем дольше срок, тем дешевле месяц.",
         "",
     ]
 
     for tariff in catalog.tariffs:
-        traffic = tariff.traffic_label or ("♾️ Безлимит" if tariff.unlimited_traffic else "—")
-        lines.append(f"▸  {tariff.name}")
-        lines.append(f"     Трафик: {traffic}")
+        lines.append(f"▸  {tariff.emoji}  {tariff.name}")
+        lines.append(f"     {tariff.short_description}")
+        lines.append(f"     Интернет: {tariff.traffic_display}")
         lines.append(f"     Устройств: до {tariff.device_limit}")
+        if tariff.has_whitelist_server:
+            lines.append("     📋 Есть сервер с белыми списками")
         for period in tariff.periods:
             per_month = (
                 f"  ({period.per_month_label}/мес)"

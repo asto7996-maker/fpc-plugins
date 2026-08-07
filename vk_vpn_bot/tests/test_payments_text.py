@@ -40,6 +40,7 @@ def _offer() -> Offer:
         tier=1,
         traffic_label="♾️ Безлимит",
         unlimited_traffic=True,
+        traffic_limit_gb=0,
         device_limit=1,
         extra_device_kopeks=0,
         servers=("ru",),

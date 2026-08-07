@@ -22,6 +22,23 @@ CACHE_TTL_SECONDS = 600
 
 TIER_EMOJI = {1: "🥉", 2: "🥈", 3: "🥇"}
 
+# Если панель отдаёт «безлимит» не на премиуме — подставляем разумные лимиты по уровню.
+DEFAULT_TRAFFIC_GB_BY_TIER = {1: 100, 2: 300}
+
+WHITELIST_SERVER_MARKERS = (
+    "бел",
+    "whitelist",
+    "white list",
+    "б.с.",
+    " бс",
+    "бс ",
+)
+
+
+def _server_has_whitelist(name: str) -> bool:
+    low = name.lower().replace("ё", "е")
+    return any(marker in low for marker in WHITELIST_SERVER_MARKERS)
+
 
 def short_period(days: int) -> str:
     table = {30: "1 мес", 90: "3 мес", 180: "6 мес", 365: "1 год", 360: "1 год"}
@@ -48,6 +65,7 @@ class Tariff:
     tier: int
     traffic_label: str
     unlimited_traffic: bool
+    traffic_limit_gb: int
     device_limit: int
     extra_device_kopeks: int
     servers: tuple[str, ...]
@@ -56,6 +74,48 @@ class Tariff:
     @property
     def emoji(self) -> str:
         return TIER_EMOJI.get(self.tier, "▸")
+
+    @property
+    def is_premium(self) -> bool:
+        name = self.name.lower().replace("ё", "е")
+        return self.tier >= 3 or "премиум" in name or "premium" in name
+
+    @property
+    def has_whitelist_server(self) -> bool:
+        return any(_server_has_whitelist(server) for server in self.servers)
+
+    @property
+    def effective_traffic_gb(self) -> int | None:
+        """None — безлимит (только премиум)."""
+        if self.is_premium and (self.unlimited_traffic or self.traffic_limit_gb == 0):
+            return None
+        if self.traffic_limit_gb > 0:
+            return self.traffic_limit_gb
+        return DEFAULT_TRAFFIC_GB_BY_TIER.get(self.tier)
+
+    @property
+    def traffic_display(self) -> str:
+        gb = self.effective_traffic_gb
+        if gb is None:
+            return "♾️ Бесконечность ГБ"
+        return f"{gb} ГБ"
+
+    @property
+    def short_description(self) -> str:
+        if self.is_premium:
+            base = (
+                "Максимум устройств и трафик без ограничений — "
+                "для активного пользования на всех гаджетах."
+            )
+        elif self.tier == 2 or self.device_limit == 3:
+            base = (
+                "Для нескольких устройств — телефон, планшет и компьютер."
+            )
+        else:
+            base = "Для одного устройства — телефона или ноутбука."
+        if self.has_whitelist_server:
+            return f"{base} Есть сервер с белыми списками."
+        return base
 
     @property
     def cheapest(self) -> Period | None:
@@ -144,6 +204,7 @@ def _parse_tariff(raw: dict) -> Tariff:
         tier=int(raw.get("tier_level") or 0),
         traffic_label=str(raw.get("traffic_limit_label") or ""),
         unlimited_traffic=bool(raw.get("is_unlimited_traffic")),
+        traffic_limit_gb=int(raw.get("traffic_limit_gb") or 0),
         device_limit=int(raw.get("device_limit") or 0),
         extra_device_kopeks=int(raw.get("device_price_kopeks") or 0),
         servers=tuple(
