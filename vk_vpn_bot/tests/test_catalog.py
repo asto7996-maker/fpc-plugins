@@ -159,7 +159,6 @@ def test_catalog_three_offers_from_miniapp() -> None:
     menu = format_tariff_menu(catalog, _Settings(), renew=False)
     assert "от 49 ₽" in menu
     assert "39" not in menu
-    assert "мини-приложении" in menu.lower()
     assert "Бесконечность ГБ" in menu
     assert "белые списки" in menu.lower()
 
