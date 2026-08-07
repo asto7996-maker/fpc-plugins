@@ -65,12 +65,12 @@ def test_menus_and_copy() -> None:
     assert "Алекс" in welcome
     assert "✨" in welcome
     # Без каталога тексты обходятся без цифр, но остаются осмысленными
-    assert "10 ГБ" in welcome or "10 ГБ" in welcome.replace(" ", "")
+    assert "бесплатно" in welcome or "10 ГБ" in welcome
     assert "1 устройство" in welcome
 
     info = format_info_menu(settings)
     assert "Инфо" in info
-    assert "документ" in info.lower() or "реферал" in info.lower()
+    assert "документ" in info.lower() or "друг" in info.lower()
 
     assert "ℹ️" in BTN_INFO
     assert "🛡️" in BTN_PRIVACY

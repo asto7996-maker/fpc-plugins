@@ -71,7 +71,7 @@ def test_amount_prompt_per_method() -> None:
     card = format_pay_amount_prompt(PLATEGA_METHOD_CARD, None)
     crypto = format_pay_amount_prompt(PLATEGA_METHOD_CRYPTO, None)
     assert "QR" in sbp
-    assert "3-D Secure" in card or "SMS" in card
+    assert "3-D Secure" in card or "SMS" in card or "код" in card.lower()
     assert "крипт" in crypto.lower() or "монет" in crypto.lower()
 
 

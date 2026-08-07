@@ -73,8 +73,8 @@ def format_auto_login_message(
 
     return (
         f"{header('🔐', 'Вход')}\n\n"
-        f"Аккаунт привязан к ВК — пароль не нужен. Откроется {where}.\n"
-        f"Ссылка 72 ч, только для вас.\n\n"
+        f"Откроется {where}. Пароль не нужен — вы уже вошли через ВК.\n"
+        f"Ссылка работает 3 дня, только для вас.\n\n"
         f"{url}"
     )
 
@@ -89,7 +89,7 @@ def format_welcome(
     bot = brand(settings.bot_name) if settings.bot_name.isascii() else settings.bot_name
 
     trial = (
-        f"{settings.trial_days} дн., {settings.trial_traffic_gb} ГБ, "
+        f"{settings.trial_days} дн. бесплатно, {settings.trial_traffic_gb} ГБ, "
         f"{_plural_devices(settings.trial_devices)}"
     )
     price = catalog.entry_price_label if catalog else ""
@@ -97,14 +97,15 @@ def format_welcome(
     return (
         f"✨  {hello}\n"
         f"{card_rule()}\n\n"
-        f"{bot} — VPN через Happ (VLESS).\n"
-        f"Триал: {trial}. Тарифы"
-        f"{f' от {price}/мес' if price else ''}.\n"
-        f"Оплата: СБП, карта, крипта от {(catalog.min_topup_kopeks // 100) if catalog else 50} ₽.\n\n"
-        f"{bullet('🌐 Кабинет — вход без пароля')}\n"
-        f"{bullet('📦 Подписка — ключ, тарифы, оплата')}\n"
-        f"{bullet('ℹ️ Инфо — документы, рефералка')}\n"
-        f"{bullet('💬 Помощь · 📱 Гайд')}\n\n"
+        f"{bot} — быстрый VPN для телефона и компьютера.\n"
+        f"Можно попробовать бесплатно: {trial}.\n"
+        f"Платные тарифы"
+        f"{f' от {price}/мес' if price else ''}. "
+        f"Оплата картой, по QR или криптой от {(catalog.min_topup_kopeks // 100) if catalog else 50} ₽.\n\n"
+        f"{bullet('🌐 Кабинет — ваш аккаунт на сайте')}\n"
+        f"{bullet('📦 Подписка — ссылка, оплата, срок')}\n"
+        f"{bullet('ℹ️ Инфо — правила и пригласить друга')}\n"
+        f"{bullet('💬 Помощь · 📱 Гайд — если что-то непонятно')}\n\n"
         f"{footer_hint()}"
     )
 
@@ -114,7 +115,8 @@ def format_tariff_menu(catalog: Catalog | None, settings: Settings, *, renew: bo
     if not catalog or not catalog.offers():
         return (
             f"{header('💎', 'Тарифы')}\n\n"
-            f"Список тарифов и цены — в кабинете, открою уже авторизованным.\n\n"
+            f"Список тарифов и цены — на сайте в личном кабинете. "
+            f"Открою его для вас — регистрация не нужна.\n\n"
             f"{footer_hint('кнопка ниже')}"
         )
 
@@ -122,8 +124,8 @@ def format_tariff_menu(catalog: Catalog | None, settings: Settings, *, renew: bo
     lines = [
         header("💎", title),
         "",
-        "Безлимит трафика. Чем длиннее период — тем дешевле месяц. "
-        "Нажмите тариф под сообщением.",
+        "Интернет без ограничений. Чем дольше срок — тем дешевле месяц. "
+        "Нажмите нужный тариф под сообщением.",
         "",
     ]
     for offer in catalog.offers():
@@ -134,7 +136,8 @@ def format_tariff_menu(catalog: Catalog | None, settings: Settings, *, renew: bo
             f"{offer.period.price_label}{note} · {_devices_upto(t.device_limit)}"
         )
     lines.append("")
-    lines.append("Дальше — способ оплаты. Не хватает баланса → счёт, тариф активируется сам.")
+    lines.append("Дальше выберите способ оплаты. Если денег на счету не хватает — "
+                 "выставлю счёт, тариф включится сам после оплаты.")
     return "\n".join(lines)
 
 
@@ -144,11 +147,12 @@ def format_tariff_chosen(offer: Offer) -> str:
     return (
         f"{header('💳', f'{t.name} · {offer.period.label}')}\n\n"
         f"{kv('Цена', offer.period.price_label + note)}\n"
-        f"{kv('Трафик', t.traffic_label or '♾️ Безлимит')}\n"
+        f"{kv('Интернет', t.traffic_label or '♾️ Без ограничений')}\n"
         f"{kv('Устройства', _devices_upto(t.device_limit))}\n\n"
-        f"Способ оплаты: {method_label(PLATEGA_METHOD_SBP_QR)}, "
+        f"Как оплатить: {method_label(PLATEGA_METHOD_SBP_QR)}, "
         f"{method_label(PLATEGA_METHOD_CARD)} или {method_label(PLATEGA_METHOD_CRYPTO)}. "
-        f"Хватает баланса — тариф сразу, иначе выставлю счёт.\n\n"
+        f"Если на счету хватает денег — тариф включится сразу, "
+        f"если нет — пришлю ссылку на оплату.\n\n"
         f"{footer_hint()}"
     )
 
@@ -160,7 +164,7 @@ def format_tariff_activated(offer: Offer, settings: Settings) -> str:
         f"{kv('Тариф', t.name)}\n"
         f"{kv('Период', offer.period.label)}\n"
         f"{kv('Устройств', f'до {t.device_limit}')}\n\n"
-        f"Доступ работает. «🔑 Ключ» — ссылка-подписка, «📦 Подписка» — срок и трафик."
+        f"Готово — VPN работает. «🔑 Ключ» — ваша ссылка, «📦 Подписка» — срок и оплата."
     )
 
 
@@ -168,10 +172,11 @@ def format_tariff_needs_topup(offer: Offer, missing_rubles: str, *, method_code:
     copy = method_copy(method_code)
     label = method_label(method_code)
     return (
-        f"{header('💳', 'Пополните баланс')}\n\n"
-        f"«{offer.tariff.name} · {offer.period.label}» — {offer.period.price_label}, "
-        f"не хватает {missing_rubles}. Счёт через {label}.\n\n"
-        f"{copy['how']} {copy['timing']} Тариф активируется сам после оплаты."
+        f"{header('💳', 'Нужно пополнить счёт')}\n\n"
+        f"Тариф «{offer.tariff.name} · {offer.period.label}» стоит "
+        f"{offer.period.price_label}, не хватает {missing_rubles}. "
+        f"Сейчас выставлю счёт: {label}.\n\n"
+        f"{copy['how']} {copy['timing']} После оплаты тариф включится сам."
     )
 
 
@@ -180,16 +185,16 @@ def format_tariffs(catalog: Catalog | None, settings: Settings) -> str:
     if not catalog or not catalog.tariffs:
         return (
             f"{header('💎', 'Тарифы')}\n\n"
-            f"Актуальный список тарифов и цены — в кабинете. "
-            f"Открою его уже авторизованным: регистрация не нужна.\n\n"
+            f"Актуальные тарифы и цены — в личном кабинете на сайте. "
+            f"Открою его для вас, регистрация не нужна.\n\n"
             f"{footer_hint('кнопка ниже')}"
         )
 
     lines = [
         header("💎", "Тарифы"),
         "",
-        "Все тарифы — с безлимитным трафиком, отличаются числом устройств "
-        "и сроком. Чем дольше период, тем ниже цена месяца.",
+        "Все тарифы — с безлимитным интернетом. Отличаются сроком "
+        "и числом устройств. Чем дольше срок, тем дешевле месяц.",
         "",
     ]
 
@@ -214,9 +219,8 @@ def format_tariffs(catalog: Catalog | None, settings: Settings) -> str:
 
     lines.append(soft_rule())
     lines.append(
-        f"Оплата тарифа списывается с баланса — пополнить можно кнопкой "
-        f"«💳 Оплатить», от {catalog.min_topup_kopeks // 100} ₽. "
-        f"Выбор тарифа и активация — в кабинете."
+        f"Оплата списывается со счёта в кабинете. Пополнить можно кнопкой "
+        f"«💳 Оплатить», от {catalog.min_topup_kopeks // 100} ₽."
     )
     lines.append("")
     lines.append(footer_hint("открыть кабинет кнопкой ниже"))
@@ -236,15 +240,15 @@ def format_subscription_card(
     else:
         status = "⛔️ не активна"
 
-    trial = "уже использован" if user.is_trial_used else "🎁 доступен"
-    key_preview = mask_key(user.vpn_key) if user.vpn_key else "ещё не выдан"
+    trial = "уже был" if user.is_trial_used else "🎁 можно попробовать"
+    key_preview = mask_key(user.vpn_key) if user.vpn_key else "ещё нет"
 
     lines = [
         header("📦", "Подписка"),
         "",
         kv("Статус", status),
-        kv("Триал", trial),
-        kv("Ключ", key_preview),
+        kv("Пробный период", trial),
+        kv("Ссылка", key_preview),
     ]
 
     time_left = ""
@@ -258,15 +262,15 @@ def format_subscription_card(
             if sub.get("tariff_name"):
                 lines.append(kv("Тариф", str(sub.get("tariff_name"))))
             elif sub.get("is_trial"):
-                lines.append(kv("Тариф", "триал"))
+                lines.append(kv("Тариф", "пробный"))
             if sub.get("traffic_limit_gb"):
                 used = sub.get("traffic_used_gb", 0)
                 limit = sub.get("traffic_limit_gb")
                 percent = sub.get("traffic_used_percent")
                 extra = f" ({percent}%)" if percent not in (None, 0) else ""
-                lines.append(kv("Трафик", f"{used} / {limit} ГБ{extra}"))
+                lines.append(kv("Интернет", f"{used} / {limit} ГБ{extra}"))
             elif sub.get("traffic_limit_gb") == 0:
-                lines.append(kv("Трафик", "♾️ безлимит"))
+                lines.append(kv("Интернет", "♾️ без ограничений"))
             if sub.get("device_limit") is not None:
                 lines.append(kv("Устройства", f"до {sub.get('device_limit')}"))
             if sub.get("time_left_display") and sub.get("is_active"):
@@ -285,14 +289,14 @@ def format_subscription_card(
 
     lines.append("")
     if active:
-        lines.append("«🔑 Ключ» — ссылка. «♻️ Продлить» — продление.")
+        lines.append("«🔑 Ключ» — ваша ссылка. «♻️ Продлить» — продлить доступ.")
     elif not user.is_trial_used:
         lines.append(
-            f"Триал: {settings.trial_days} дн., {settings.trial_traffic_gb} ГБ. "
-            f"«🎁 Триал» или «🚀 Подключить»."
+            f"Можно попробовать бесплатно: {settings.trial_days} дн., "
+            f"{settings.trial_traffic_gb} ГБ. Нажмите «🎁 Триал»."
         )
     else:
-        lines.append("Неактивна. «💎 Тарифы» или «💳 Оплатить».")
+        lines.append("Сейчас VPN выключен. Нажмите «💎 Тарифы» или «💳 Оплатить».")
 
     lines.append("")
     lines.append(f"🌐  {settings.cabinet_url}/subscription")
@@ -309,16 +313,17 @@ def format_connect_screen(
     if user.is_subscription_active():
         return (
             f"{header('🚀', 'Подключение')}\n\n"
-            f"{success_banner('Подписка активна')}\n\n"
-            f"«🔑 Ключ» — ссылка для Happ. Клиент сам обновляет серверы.\n\n"
+            f"{success_banner('VPN включён')}\n\n"
+            f"Нажмите «🔑 Ключ» — там ссылка для приложения Happ.\n\n"
             f"{footer_hint()}"
         )
     if not user.is_trial_used:
         return (
             f"{header('🚀', 'Подключение')}\n\n"
-            f"{success_banner('Триал доступен')}\n\n"
+            f"{success_banner('Можно попробовать бесплатно')}\n\n"
             f"{settings.trial_days} дн., {settings.trial_traffic_gb} ГБ, "
-            f"{_plural_devices(settings.trial_devices)}. Без карты — «🎁 Триал».\n\n"
+            f"{_plural_devices(settings.trial_devices)}. Карта не нужна — "
+            f"нажмите «🎁 Триал».\n\n"
             f"{footer_hint()}"
         )
 
@@ -326,7 +331,7 @@ def format_connect_screen(
     tail = f"Тарифы от {price}. " if price else ""
     return (
         f"{header('🚀', 'Подключение')}\n\n"
-        f"{warn_banner('Триал использован')}\n\n"
+        f"{warn_banner('Пробный период уже был')}\n\n"
         f"{tail}"
         f"«💎 Тарифы» или «💳 Оплатить».\n\n"
         f"{footer_hint()}"
@@ -343,28 +348,26 @@ def format_key_message(
 ) -> str:
     _ = source
     if is_trial:
-        head = header("🎁", f"Триал на {settings.trial_days} дня активирован")
-        intro = f"Доступ открыт на {settings.trial_days} дня и уже работает."
+        head = header("🎁", f"Пробный период на {settings.trial_days} дня")
+        intro = f"VPN включён на {settings.trial_days} дня — можно пользоваться."
     else:
-        head = header("🔑", "Ваша ссылка подключения")
-        intro = "Эту ссылку нужно один раз добавить в VPN-клиент."
+        head = header("🔑", "Ваша ссылка")
+        intro = "Скопируйте ссылку ниже и вставьте в приложение Happ."
 
     facts: list[str] = []
     if limits:
         if limits.get("traffic_limit_gb"):
             used = limits.get("traffic_used_gb") or 0
-            facts.append(
-                kv("Трафик", f"{used} / {limits['traffic_limit_gb']} ГБ")
-            )
+            facts.append(kv("Интернет", f"{used} / {limits['traffic_limit_gb']} ГБ"))
         elif limits.get("unlimited"):
-            facts.append(kv("Трафик", "♾️ безлимит"))
+            facts.append(kv("Интернет", "♾️ без ограничений"))
         if limits.get("device_limit"):
             facts.append(kv("Устройств", f"до {limits['device_limit']}"))
         if limits.get("end_date"):
             facts.append(kv("Действует до", str(limits["end_date"])))
     elif is_trial:
         facts = [
-            kv("Трафик", f"{settings.trial_traffic_gb} ГБ"),
+            kv("Интернет", f"{settings.trial_traffic_gb} ГБ"),
             kv("Устройств", f"до {settings.trial_devices}"),
         ]
 
@@ -375,23 +378,21 @@ def format_key_message(
         f"{intro}\n\n"
         f"{facts_block}"
         f"{key}\n\n"
-        f"{subhead('📋', 'Подключение')}\n"
+        f"{subhead('📋', 'Что делать')}\n"
         f"{step(1, 'Скопируйте ссылку целиком')}\n"
-        f"{step(2, 'Happ → «+» → из буфера')}\n"
-        f"{step(3, 'Включите VPN, разрешите в системе')}\n\n"
-        f"Подписка обновляет серверы сама. Проверка — 2ip.ru. "
-        f"Гайд — «📱 Гайд»."
+        f"{step(2, 'Откройте Happ → нажмите «+» → вставьте ссылку')}\n"
+        f"{step(3, 'Включите VPN')}\n\n"
+        f"Подробная инструкция — в «📱 Гайд». "
+        f"Проверить можно на сайте 2ip.ru."
     )
 
 
 def format_buy(settings: Settings) -> str:
     _ = settings
     return (
-        f"{header('💎', 'Покупка подписки')}\n\n"
-        f"Открою кабинет уже авторизованным — регистрация не потребуется. "
-        f"Там вы увидите доступные тарифы с ценами, сроком и лимитом "
-        f"устройств. После оплаты доступ активируется автоматически, "
-        f"а ключ обновится в разделе «📦 Подписка».\n\n"
+        f"{header('💎', 'Покупка')}\n\n"
+        f"Открою личный кабинет на сайте — там все тарифы и цены. "
+        f"После оплаты VPN включится сам, ссылка появится в «📦 Подписка».\n\n"
         f"{footer_hint('кнопка ниже')}"
     )
 
@@ -418,11 +419,11 @@ def format_pay_intro(catalog: Catalog | None = None) -> str:
     crypto = method_copy(PLATEGA_METHOD_CRYPTO)
     return (
         f"{header('💳', 'Оплата')}\n\n"
-        f"Пополнение баланса (Platega). Тариф списывается с баланса.\n\n"
+        f"Сначала пополняете счёт, потом с него списывается тариф.\n\n"
         f"{bullet(f'{method_label(PLATEGA_METHOD_SBP_QR)} — {sbp['summary']}')}\n"
         f"{bullet(f'{method_label(PLATEGA_METHOD_CARD)} — {card['summary']}')}\n"
         f"{bullet(f'{method_label(PLATEGA_METHOD_CRYPTO)} — {crypto['summary']}')}\n\n"
-        f"Способ → сумма ({amounts}, от {minimum} ₽).\n\n"
+        f"Выберите способ, потом сумму ({amounts}, от {minimum} ₽).\n\n"
         f"{footer_hint()}"
     )
 
@@ -436,7 +437,7 @@ def format_pay_amount_prompt(
     return (
         f"{header('💵', label)}\n\n"
         f"{copy['summary']} {copy['how']}\n\n"
-        f"Сумма: кнопка или число (от {minimum} ₽). {copy['timing']}\n\n"
+        f"Сумма: нажмите кнопку или напишите число (от {minimum} ₽). {copy['timing']}\n\n"
         f"{footer_hint()}"
     )
 
@@ -458,8 +459,8 @@ def format_payment_created(
         f"{header('✅', 'Счёт готов')}\n\n"
         f"{kv('Способ', label)}\n"
         f"{kv('Сумма', amount)}\n\n"
-        f"«✨ Оплатить» → Platega. {copy['how']} {copy['timing']}\n"
-        f"Не зачислилось за 15 мин — «📖 Помощь» → «✍️ Вопрос».\n\n"
+        f"Нажмите «✨ Оплатить» и следуйте подсказкам на странице. {copy['how']} {copy['timing']}\n"
+        f"Деньги не пришли за 15 минут? Напишите в «💬 Помощь» → «✍️ Вопрос».\n\n"
         f"{payment_url}"
     )
 
@@ -482,27 +483,26 @@ def format_referral(
         else ""
     )
     commission_line = (
-        f"{bullet(f'💰 {percent}% с оплат приглашённых')}\n"
+        f"{bullet(f'💰 {percent}% с оплат друзей')}\n"
         if percent
-        else f"{bullet('💰 процент с оплат приглашённых')}\n"
+        else ""
     )
 
     body = (
-        f"{header('👥', 'Рефералка')}\n\n"
-        f"Приглашайте друзей — получайте бонусы.\n\n"
+        f"{header('👥', 'Пригласить друга')}\n\n"
+        f"Отправьте другу свою ссылку — получите бонус.\n\n"
         f"{bonus_line}"
         f"{commission_line}\n"
     )
 
     if stats and stats.referral_code:
         body += (
-            f"{subhead('🔗', 'Ссылка')}\n"
+            f"{subhead('🔗', 'Ваша ссылка')}\n"
             f"{stats.vk_link}\n\n"
-            f"{kv('Код', stats.referral_code)}\n"
             f"{kv('Приглашено', stats.total_referrals)}\n"
-            f"{kv('Активных', stats.active_referrals)}\n"
+            f"{kv('Оплатили', stats.active_referrals)}\n"
             f"{kv('Заработано', f'{stats.total_earnings_rubles:.0f} ₽')}\n\n"
-            f"Отправьте ссылку другу — он должен открыть бот по ней.\n\n"
+            f"Друг должен открыть бот именно по этой ссылке.\n\n"
         )
     else:
         body += "Ссылка появится после входа в кабинет.\n\n"
@@ -515,9 +515,9 @@ def format_referral_inviter_bonus(settings: Settings) -> str:
     if days <= 0:
         return ""
     return (
-        f"{success_banner('Реферал засчитан!')}\n\n"
-        f"Спасибо, что пришли по приглашению. "
-        f"Ваш друг получит +{days} дн. к подписке."
+        f"{success_banner('Спасибо!')}\n\n"
+        f"Вы пришли по приглашению друга. "
+        f"Ему добавим +{days} дн. к подписке."
     )
 
 
@@ -525,13 +525,13 @@ def format_referral_bonus_notify(settings: Settings) -> str:
     days = settings.referral_inviter_bonus_days
     if days <= 0:
         return (
-            f"{success_banner('Новый реферал!')}\n\n"
-            f"По вашей ссылке зарегистрировался новый пользователь."
+            f"{success_banner('Новый друг!')}\n\n"
+            f"Кто-то зарегистрировался по вашей ссылке."
         )
     return (
-        f"{success_banner('Новый реферал!')}\n\n"
-        f"По вашей ссылке зарегистрировался друг — "
-        f"мы добавили +{days} дн. к вашей подписке."
+        f"{success_banner('Новый друг!')}\n\n"
+        f"По вашей ссылке пришёл друг — "
+        f"добавили +{days} дн. к вашей подписке."
     )
 
 
@@ -539,8 +539,8 @@ def format_promo_prompt(settings: Settings) -> str:
     _ = settings
     return (
         f"{header('🎟', 'Промокод')}\n\n"
-        f"Отправьте код одним сообщением. Регистр не важен.\n"
-        f"Скидка, баланс или дни — видно при активации в кабинете.\n\n"
+        f"Напишите код одним сообщением — большие или маленькие буквы не важны.\n"
+        f"Что даст код — увидите при активации.\n\n"
         f"{footer_hint('ждём код')}"
     )
 
@@ -548,22 +548,14 @@ def format_promo_prompt(settings: Settings) -> str:
 def format_apps(settings: Settings) -> str:
     _ = settings
     return (
-        f"{header('📱', 'Приложения')}\n\n"
-        f"Ключ выдаётся по протоколу VLESS в виде ссылки-подписки, "
-        f"поэтому нужен клиент, который её понимает. Рекомендуем Happ: "
-        f"он есть на всех платформах и сам обновляет список серверов.\n\n"
-        f"{subhead('✅', 'Где взять Happ')}\n"
-        f"{bullet('iOS и macOS — App Store, поиск «Happ»')}\n"
-        f"{bullet('Android — Google Play или APK с happ.su')}\n"
-        f"{bullet('Windows — установщик с happ.su')}\n\n"
-        f"{subhead('🔁', 'Альтернативы, если Happ не подошёл')}\n"
-        f"{bullet('Android — v2rayNG, Hiddify')}\n"
-        f"{bullet('iOS — Streisand, V2Box, Shadowrocket')}\n"
-        f"{bullet('Windows — Hiddify, v2rayN, Nekoray')}\n"
-        f"{bullet('macOS — Hiddify, Streisand, V2Box')}\n\n"
-        f"Ссылка одинаково работает в любом из них: везде нужно добавить "
-        f"её как подписку, а не как отдельный сервер. "
-        f"Пошагово по вашей системе — в «📖 Гайд»."
+        f"{header('📱', 'Приложение')}\n\n"
+        f"Для подключения нужно приложение Happ — оно бесплатное.\n\n"
+        f"{subhead('✅', 'Где скачать')}\n"
+        f"{bullet('iPhone и iPad — App Store, ищите «Happ»')}\n"
+        f"{bullet('Android — Google Play или happ.su')}\n"
+        f"{bullet('Компьютер — happ.su')}\n\n"
+        f"Ссылку из бота вставляете в Happ — и всё. "
+        f"Пошагово: «📱 Гайд»."
     )
 
 
@@ -579,20 +571,15 @@ def format_renew_stub(settings: Settings, catalog: Catalog | None = None) -> str
     if settings.bedolaga_api_key:
         return (
             f"{header('♻️', 'Продление')}\n\n"
-            f"Быстрый вариант: напишите «продлить сейчас» — продлю доступ "
-            f"на {settings.renew_days} дней и пришлю обновлённый ключ.\n\n"
-            f"Если хотите сменить тариф или взять период подольше, "
-            f"выберите его в кабинете. {prices}{long_hint} "
-            f"Ссылка-подписка при продлении не меняется, так что "
-            f"перенастраивать приложение не нужно.\n\n"
+            f"Напишите «продлить сейчас» — продлю на {settings.renew_days} дней.\n\n"
+            f"Или выберите другой срок в кабинете. {prices}{long_hint} "
+            f"Ссылку в приложении менять не нужно.\n\n"
             f"{footer_hint()}"
         )
     return (
         f"{header('♻️', 'Продление')}\n\n"
-        f"Продление оформляется в кабинете: пополняете баланс, выбираете "
-        f"тариф и период. {prices}{long_hint}\n\n"
-        f"Ключ при этом остаётся прежним — приложение подтянет доступ само, "
-        f"заново добавлять подписку не придётся.\n\n"
+        f"Пополните счёт в кабинете и выберите срок. {prices}{long_hint}\n\n"
+        f"Ссылку в приложении менять не нужно.\n\n"
         f"{footer_hint()}"
     )
 
@@ -602,8 +589,8 @@ def format_help_menu(settings: Settings) -> str:
     return (
         f"{header('💬', 'Помощь')}\n\n"
         f"{settings.support_text}\n\n"
-        f"{bullet('✍️ Вопрос — напишите в чат')}\n"
-        f"{bullet('🎟 Промо — активация кода')}\n\n"
+        f"{bullet('✍️ Вопрос — напишите, поможем')}\n"
+        f"{bullet('🎟 Промо — введите промокод')}\n\n"
         f"{footer_hint()}"
     )
 
@@ -615,7 +602,7 @@ def format_support(settings: Settings) -> str:
 def format_support_prompt() -> str:
     return (
         f"{header('✍️', 'Вопрос')}\n\n"
-        f"Опишите проблему одним сообщением. «◀️ Назад» — отмена."
+        f"Расскажите, что не получается. «◀️ Назад» — отмена."
     )
 
 
@@ -623,7 +610,7 @@ def format_support_received(delivered: bool) -> str:
     tail = "Уведомление отправлено." if delivered else "Сообщение в диалоге."
     return (
         f"{header('✅', 'Принято')}\n\n"
-        f"{tail} Ответ придёт сюда. FAQ — «ℹ️ Инфо»."
+        f"{tail} Ответ придёт сюда. Частые вопросы — в «ℹ️ Инфо»."
     )
 
 
@@ -647,8 +634,8 @@ def format_info_menu(settings: Settings) -> str:
     _ = settings
     return (
         f"{header('ℹ️', 'Инфо')}\n\n"
-        f"Документы и рефералка — кнопки ниже. "
-        f"Длинные тексты листаются «⬅️» / «➡️».\n\n"
+        f"Документы и «пригласить друга» — кнопки ниже. "
+        f"Длинный текст листайте стрелками.\n\n"
         f"{footer_hint()}"
     )
 
@@ -657,8 +644,8 @@ def format_cabinet_plain(settings: Settings, redirect: str = "/") -> str:
     """Кабинет без автологина — когда не настроен CABINET_JWT_SECRET."""
     return (
         f"{header('🌐', 'Личный кабинет')}\n\n"
-        f"Автоматический вход сейчас недоступен, поэтому откройте кабинет "
-        f"по ссылке и войдите обычным способом.\n\n"
+        f"Сейчас не могу открыть кабинет автоматически. "
+        f"Зайдите на сайт по ссылке и войдите как обычно.\n\n"
         f"{settings.cabinet_url}{redirect}"
     )
 
@@ -666,32 +653,31 @@ def format_cabinet_plain(settings: Settings, redirect: str = "/") -> str:
 def format_doc_not_found() -> str:
     return (
         f"{header('📄', 'Документ не найден')}\n\n"
-        f"Похоже, этот раздел уже переименован или пока не заполнен. "
-        f"Выберите документ из списка ниже — там актуальные версии."
+        f"Такого документа нет. Выберите другой из списка ниже."
     )
 
 
 def format_min_amount(current: str, minimum: str = "50 ₽") -> str:
     return (
         f"{header('⚠️', 'Сумма слишком маленькая')}\n\n"
-        f"Минимальная сумма пополнения — {minimum}, а вы указали {current}. "
-        f"Выберите готовую сумму кнопкой ниже или отправьте другое число."
+        f"Минимум — {minimum}, а вы написали {current}. "
+        f"Выберите сумму кнопкой или напишите больше."
     )
 
 
 def format_pay_method_first() -> str:
-    return f"{header('💳', 'Сначала способ')}\n\n🏦 СБП · 💳 Карта · 🪙 Крипта — выберите кнопкой."
+    return f"{header('💳', 'Сначала способ')}\n\nВыберите: 🏦 СБП, 💳 Карта или 🪙 Крипта."
 
 
 def format_amount_invalid() -> str:
-    return f"{header('💵', 'Не понял')}\n\nЧисло сообщением или кнопка ниже."
+    return f"{header('💵', 'Не понял')}\n\nНапишите сумму числом или нажмите кнопку ниже."
 
 
 def format_promo_accepted(code: str) -> str:
     return (
         f"{header('🎟', 'Промокод')}\n\n"
         f"{brand(code) if code.isascii() else code}\n\n"
-        f"Активация в кабинете — открою по кнопке."
+        f"Открою кабинет, чтобы активировать код.\n\n"
     )
 
 
@@ -702,15 +688,16 @@ def format_guide_outro() -> str:
 def format_fallback() -> str:
     return (
         f"{header('🤔', 'Не понял')}\n\n"
-        f"Кнопки внизу или /start. Вопрос — «💬 Помощь».\n\n"
+        f"Нажмите кнопку внизу или напишите /start. "
+        f"Нужна помощь — «💬 Помощь».\n\n"
         f"{footer_hint()}"
     )
 
 
 def format_trial_used() -> str:
     return (
-        f"{header('🎁', 'Триал использован')}\n\n"
-        f"«💎 Тарифы» или «💳 Оплатить» — ключ сохранится.\n\n"
+        f"{header('🎁', 'Пробный период уже был')}\n\n"
+        f"Оплатите тариф — «💎 Тарифы» или «💳 Оплатить». Ссылку менять не нужно.\n\n"
         f"{footer_hint()}"
     )
 

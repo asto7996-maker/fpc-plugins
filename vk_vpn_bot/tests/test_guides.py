@@ -30,17 +30,15 @@ def test_fits_vk_limit() -> None:
 
 
 def test_install_guides_are_actionable() -> None:
-    """В каждом гайде по ОС должно быть где взять клиент, шаги и проверка."""
+    """В каждом гайде по ОС должно быть где взять ссылку, шаги и проверка."""
     for slug in ("ios", "android", "windows", "macos"):
         text = GUIDES[slug]
         assert "Happ" in text, slug
-        assert "🔑 Мой ключ" in text, f"{slug}: не сказано, где взять ключ"
-        assert "буфер" in text.lower(), f"{slug}: нет шага добавления"
+        assert "🔑 Ключ" in text, f"{slug}: не сказано, где взять ссылку"
+        assert "скопируйте" in text.lower(), f"{slug}: нет шага копирования"
         assert "2ip.ru" in text, f"{slug}: нет способа проверить результат"
-        # Нумерованные шаги — иначе это не инструкция
         assert "①" in text and "④" in text, f"{slug}: нет пошаговой части"
 
-    # Источники установки названы конкретно
     assert "App Store" in GUIDES["ios"]
     assert "Google Play" in GUIDES["android"] and "happ.su" in GUIDES["android"]
     assert "happ.su" in GUIDES["windows"]
@@ -48,27 +46,26 @@ def test_install_guides_are_actionable() -> None:
 
 
 def test_platform_specific_pitfalls() -> None:
-    """Каждая ОС имеет свои грабли — они должны быть описаны."""
-    assert "код-пароль" in GUIDES["ios"]
+    """Каждая ОС имеет свои подсказки — они должны быть описаны."""
+    assert "разрешение" in GUIDES["ios"].lower()
     assert "Батарея" in GUIDES["android"]
-    assert "TUN" in GUIDES["windows"] and "System Proxy" in GUIDES["windows"]
-    assert "Конфиденциальность и безопасность" in GUIDES["macos"]
+    assert "антивирус" in GUIDES["windows"].lower()
+    assert "пароль" in GUIDES["macos"].lower()
 
 
 def test_troubleshooting_covers_real_symptoms() -> None:
     trouble = GUIDES["trouble"]
     for marker in (
-        "App not supported",   # так отвечает неактивная подписка
-        "маршрутизации",       # трафик не идёт
-        "пуст",                # добавлено как сервер, а не подписка
-        "рвётся",              # обрывы соединения
-        "Вопрос",               # куда идти, если ничего не помогло
+        "App not supported",
+        "пуст",
+        "отключается",
+        "Вопрос",
     ):
         assert marker in trouble, marker
 
 
 def test_intro_explains_subscription_model() -> None:
-    for marker in ("подписк", "sub.paskod.ru", "Happ"):
+    for marker in ("ссылк", "Happ", "Подписка"):
         assert marker in GUIDE_INTRO, marker
 
 

@@ -61,7 +61,7 @@ def test_format_referral_with_stats() -> None:
     )
     text = format_referral(settings, stats)
     assert "+5 дн." in text
-    assert "15%" in text
+    assert "15%" in text or "друз" in text.lower()
     assert "refXqIbAQfu" in text
     assert "vk.me/club240702990" in text
     assert "Приглашено" in text

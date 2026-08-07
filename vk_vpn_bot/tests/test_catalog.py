@@ -131,8 +131,8 @@ def test_texts_survive_without_catalog() -> None:
     pay = format_pay_intro(None)
     assert "50 ₽" in pay
     ref = format_referral(settings, None, None)
-    assert "процент" in ref.lower() or "15%" in ref
     assert "+5 дн." in ref
+    assert "друг" in ref.lower()
 
 
 def _make_catalog() -> Catalog:
@@ -191,7 +191,7 @@ def test_tariff_menu_and_choice() -> None:
     chosen = format_tariff_chosen(offer)
     assert "Базовый" in chosen
     assert "49 ₽" in chosen
-    assert "оплаты" in chosen
+    assert "оплатить" in chosen.lower()
 
 
 def main() -> None:

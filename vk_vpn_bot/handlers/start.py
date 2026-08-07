@@ -382,9 +382,8 @@ async def _open_cabinet(
         logger.exception("cabinet open failed: %s", exc)
         await message.answer(
             format_error(
-                "Кабинет не отвечает — скорее всего, это временный сбой. "
-                "Попробуйте ещё раз через минуту, а если не поможет, "
-                "напишите в «💬 Помощь», и мы посмотрим со своей стороны."
+                "Сайт сейчас не открывается. Попробуйте через минуту. "
+                "Не помогло — напишите в «💬 Помощь»."
             ),
             keyboard=_main_kb(message.from_id),
         )
@@ -782,7 +781,7 @@ async def _pick_tariff(
     if offer is None:
         await api.messages.send(
             peer_id=peer_id,
-            message=format_error("Тариф недоступен — выберите другой."),
+            message=format_error("Этот тариф сейчас недоступен. Выберите другой."),
             random_id=0,
             keyboard=_main_kb(user_id),
         )
@@ -814,7 +813,7 @@ async def _purchase_with_method(
     if offer is None:
         _pending_tariff.pop(message.from_id, None)
         await message.answer(
-            format_error("Тариф больше недоступен. Выберите другой."),
+            format_error("Тариф больше нельзя купить. Выберите другой."),
             keyboard=_main_kb(message.from_id),
         )
         return
@@ -860,8 +859,8 @@ async def _purchase_with_method(
         logger.exception("tariff purchase failed: %s", exc)
         await message.answer(
             format_error(
-                "Не получилось оформить тариф. Попробуйте другой способ "
-                "оплаты или откройте покупку в кабинете."
+                "Не получилось купить тариф. Попробуйте другой способ оплаты "
+                "или зайдите в кабинет на сайте."
             ),
             keyboard=pay_methods_keyboard(),
         )
@@ -869,7 +868,7 @@ async def _purchase_with_method(
         logger.exception("tariff purchase unexpected: %s", exc)
         await message.answer(
             format_error(
-                "Что-то пошло не так, тариф не оформлен. Деньги не списывались. "
+                "Что-то пошло не так. Деньги не списались. "
                 "Попробуйте позже или напишите в «💬 Помощь»."
             ),
             keyboard=_main_kb(message.from_id),
@@ -927,10 +926,8 @@ async def _create_and_send_payment(
         logger.exception("platega topup failed: %s", exc)
         await message.answer(
             format_error(
-                "Счёт создать не удалось — платёжный сервис вернул ошибку. "
-                "Попробуйте выбрать другой способ оплаты или повторите "
-                "попытку чуть позже. Пополнить баланс также можно "
-                "напрямую в кабинете."
+                "Не удалось создать счёт на оплату. Попробуйте другой способ "
+                "или зайдите в кабинет на сайте."
             ),
             keyboard=pay_methods_keyboard(),
         )
@@ -938,9 +935,8 @@ async def _create_and_send_payment(
         logger.exception("platega topup unexpected: %s", exc)
         await message.answer(
             format_error(
-                "Что-то сломалось на нашей стороне, и счёт не сформировался. "
-                "Деньги при этом не списывались. Попробуйте ещё раз через "
-                "пару минут или напишите в «💬 Помощь»."
+                "Не получилось создать счёт. Деньги не списались. "
+                "Попробуйте через пару минут или напишите в «💬 Помощь»."
             ),
             keyboard=_main_kb(message.from_id),
         )
