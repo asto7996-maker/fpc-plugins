@@ -124,27 +124,22 @@ def format_tariff_menu(catalog: Catalog | None, settings: Settings, *, renew: bo
     lines = [
         header("💎", title),
         "",
-        "У каждого тарифа свой объём интернета и число устройств. "
-        "Цены как в кабинете — «от» за первый срок. "
-        "Другие периоды можно выбрать на сайте.",
+        "Цены как в мини-приложении — за месяц. "
+        "Другие сроки (3 и 6 мес.) дешевле в кабинете на сайте.",
         "",
     ]
     for offer in catalog.offers():
         t = offer.tariff
         whitelist = " · 📋 белые списки" if t.has_whitelist_server else ""
-        more_periods = (
-            " · другие сроки в кабинете"
-            if len(t.periods) > 1
-            else ""
-        )
         lines.append(
-            f"{t.emoji}  {t.name} — {t.price_from_label}\n"
-            f"     {t.traffic_display} · {_devices_upto(t.device_limit)}"
-            f"{whitelist}{more_periods}"
+            f"{t.emoji}  {t.name} — {t.price_from_label}/мес\n"
+            f"     {t.traffic_display} · {_devices_upto(t.device_limit)}{whitelist}"
         )
     lines.append("")
-    lines.append("Дальше выберите способ оплаты. Если денег на счету не хватает — "
-                 "выставлю счёт, тариф включится сам после оплаты.")
+    lines.append(
+        "Нажмите тариф под сообщением. Если денег на счету не хватает — "
+        "выставлю счёт, тариф включится сам после оплаты."
+    )
     return "\n".join(lines)
 
 
@@ -213,8 +208,8 @@ def format_tariffs(catalog: Catalog | None, settings: Settings) -> str:
     lines = [
         header("💎", "Тарифы"),
         "",
-        "Тарифы отличаются объёмом интернета, числом устройств и доступными "
-        "серверами. Цены — как в кабинете, «от» за первый срок.",
+        "Цены как в мини-приложении. Три тарифа — отличаются интернетом, "
+        "устройствами и серверами.",
         "",
     ]
 
@@ -226,11 +221,12 @@ def format_tariffs(catalog: Catalog | None, settings: Settings) -> str:
         if tariff.has_whitelist_server:
             lines.append("     📋 Есть сервер с белыми списками")
         if tariff.price_from_label:
-            period = tariff.primary_period
-            suffix = f" ({period.label})" if period and period.label else ""
-            lines.append(f"     Цена: {tariff.price_from_label}{suffix}")
+            lines.append(f"     Цена: {tariff.price_from_label}/мес")
         if len(tariff.periods) > 1:
-            lines.append("     Другие сроки — в кабинете на сайте")
+            extras = ", ".join(
+                f"{p.label} — {p.price_label}" for p in tariff.periods[1:3]
+            )
+            lines.append(f"     Длиннее: {extras}")
         if tariff.extra_device_kopeks:
             lines.append(
                 f"     Доп. устройство: {tariff.extra_device_kopeks // 100} ₽"
