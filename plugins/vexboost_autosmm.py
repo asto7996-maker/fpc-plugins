@@ -2,7 +2,7 @@ from __future__ import annotations
 
 # === ОБЯЗАТЕЛЬНЫЕ ПОЛЯ FunPay Cardinal (НЕ УДАЛЯТЬ) ===
 NAME = "VexBoost AutoSMM"
-VERSION = "2.4.11"
+VERSION = "2.4.12"
 DESCRIPTION = "Автонакрутка SMM-услуг для FunPay Cardinal"
 CREDITS = "@xei1y"
 UUID = "a3f8c2e1-7b4d-4a9f-9e2c-1d5b8f6a0c3e"
@@ -2165,6 +2165,129 @@ def _cmd_refill(c: "Cardinal", chat_id: Any, message_text: str) -> None:
 # Фоновая проверка статусов заказов VexBoost
 # ─────────────────────────────────────────────────────────────────────────────
 
+CATCHUP_MARKER_FILE = f"{STORAGE_DIR}/catchup_v2412.done"
+CATCHUP_BUYER_MESSAGE_NO_LINK = (
+    "⚠️ Бот был временно недоступен и мог пропустить ваше сообщение.\n\n"
+    "Ваш заказ FunPay #{order_id} ещё ожидает ссылку для накрутки.\n"
+    "Пожалуйста, отправьте ссылку на аккаунт или пост ещё раз."
+)
+CATCHUP_BUYER_MESSAGE_WITH_LINK = (
+    "⚠️ Бот был временно недоступен.\n\n"
+    "Ваш заказ FunPay #{order_id} готов к запуску.\n"
+    "Подтвердите ссылку ответом + или отправьте новую ссылку.\n"
+    "Для отмены и возврата отправьте -."
+)
+
+
+def _resolve_order_chat_id(c: "Cardinal", order: Dict[str, Any]) -> Any:
+    """Актуальный chat_id заказа: из записи или через get_chat_by_name."""
+    chat_id = order.get("chat_id")
+    if chat_id not in (None, "", 0, -1):
+        return _normalize_chat_id(chat_id)
+    buyer = order.get("buyer") or ""
+    if not buyer:
+        return None
+    try:
+        chat = c.account.get_chat_by_name(buyer)
+        if chat and getattr(chat, "id", None):
+            return _normalize_chat_id(chat.id)
+    except Exception as exc:
+        logger.warning("%s: get_chat_by_name(%s): %s", LOGGER_PREFIX, buyer, exc)
+    return None
+
+
+def catchup_unfinished_orders(c: "Cardinal") -> None:
+    """После рестарта: ответить покупателям с незавершёнными AutoSMM-заказами.
+
+    - payorders без ссылки → просьба прислать ссылку снова
+    - payorders со ссылкой → повторный запрос подтверждения +/-
+    - active Completed/Canceled → догнать уведомление покупателю
+    Запускается один раз на версию (маркер-файл), чтобы не спамить.
+    """
+    try:
+        _ensure_storage()
+        if os.path.exists(CATCHUP_MARKER_FILE):
+            logger.info("%s: catchup уже выполнен (%s)", LOGGER_PREFIX, CATCHUP_MARKER_FILE)
+            return
+        # Дать Cardinal полностью подняться
+        time.sleep(8)
+
+        contacted = 0
+        pay_orders = load_payorders()
+        changed = False
+        for order in pay_orders:
+            if order.get("catchup_sent"):
+                continue
+            chat_id = _resolve_order_chat_id(c, order)
+            if not chat_id:
+                logger.warning(
+                    "%s: catchup — нет chat_id для FP#%s buyer=%s",
+                    LOGGER_PREFIX, order.get("OrderID"), order.get("buyer"),
+                )
+                continue
+            order["chat_id"] = chat_id
+            fp_id = str(order.get("OrderID", ""))
+            link = (order.get("url") or "").strip()
+            try:
+                if link:
+                    send_fp(
+                        c, chat_id,
+                        CATCHUP_BUYER_MESSAGE_WITH_LINK.format(order_id=fp_id),
+                    )
+                    # Восстановить pending и показать детали
+                    request_confirmation(c, order, link)
+                else:
+                    send_fp(
+                        c, chat_id,
+                        CATCHUP_BUYER_MESSAGE_NO_LINK.format(order_id=fp_id),
+                    )
+                order["catchup_sent"] = True
+                changed = True
+                contacted += 1
+                time.sleep(1.2)  # не упираться в FunPay rate-limit
+            except Exception as exc:
+                logger.error(
+                    "%s: catchup FP#%s: %s", LOGGER_PREFIX, fp_id, exc,
+                )
+
+        if changed:
+            save_payorders(pay_orders)
+
+        # Догон active: Completed/Canceled могли не уйти покупателю из‑за зависания
+        if is_api_configured():
+            active = load_active_orders()
+            updated = dict(active)
+            for smm_id, info in list(active.items()):
+                try:
+                    status_data = VexBoostAPI.get_order_status(int(smm_id))
+                    if not status_data:
+                        continue
+                    status = status_data.get("status", "")
+                    if status == "Completed":
+                        _handle_completed_order(c, smm_id, updated.pop(smm_id, info))
+                        contacted += 1
+                    elif status == "Canceled":
+                        _handle_canceled_order(c, smm_id, updated.pop(smm_id, info))
+                        contacted += 1
+                    time.sleep(0.8)
+                except Exception as exc:
+                    logger.error("%s: catchup active VB#%s: %s", LOGGER_PREFIX, smm_id, exc)
+            save_active_orders(updated)
+
+        with open(CATCHUP_MARKER_FILE, "w", encoding="utf-8") as fh:
+            fh.write(datetime.now().isoformat())
+        logger.info("%s: catchup завершён, сообщений: %s", LOGGER_PREFIX, contacted)
+        if contacted:
+            _send_tg_to_admins(
+                c,
+                f"♻️ <b>{NAME}</b>: догон незавершённых заказов\n"
+                f"Сообщений покупателям: <b>{contacted}</b>",
+            )
+    except Exception as exc:
+        logger.error("%s: catchup_unfinished_orders: %s", LOGGER_PREFIX, exc)
+        logger.debug(traceback.format_exc())
+
+
 def start_status_checker(c: "Cardinal") -> None:
     global _status_thread_started
     if _status_thread_started:
@@ -2175,6 +2298,8 @@ def start_status_checker(c: "Cardinal") -> None:
         name="VexBoostStatusChecker", daemon=True,
     ).start()
     logger.info("%s: фоновая проверка статусов запущена", LOGGER_PREFIX)
+    # Догон покупателей с незавершёнными заказами (после зависания плагина)
+    _run_bg("catchup-unfinished", catchup_unfinished_orders, c)
 
 
 def _status_checker_loop(c: "Cardinal") -> None:
@@ -2807,6 +2932,25 @@ def init_commands(cardinal: "Cardinal", *args) -> None:
         # API VexBoost не должен блокировать остальные TG-команды.
         _run_bg("tg-vb-balance", _worker)
 
+    def send_catchup_cmd(message):
+        try:
+            logger.info("%s: команда /vb_catchup от user %s", LOGGER_PREFIX, message.from_user.id)
+            if os.path.exists(CATCHUP_MARKER_FILE):
+                try:
+                    os.remove(CATCHUP_MARKER_FILE)
+                except OSError:
+                    pass
+            # Сбросить флаги catchup_sent, чтобы повторно уведомить ожидающих
+            orders = load_payorders()
+            for order in orders:
+                order.pop("catchup_sent", None)
+            save_payorders(orders)
+            bot.reply_to(message, "♻️ Запускаю догон незавершённых заказов AutoSMM…")
+            _run_bg("tg-vb-catchup", catchup_unfinished_orders, cardinal)
+        except Exception as exc:
+            logger.error("%s: ошибка /vb_catchup: %s", LOGGER_PREFIX, exc)
+            bot.reply_to(message, f"⚠️ Ошибка catchup: {exc}")
+
     def open_plugin_settings(call):
         try:
             settings = load_settings()
@@ -3208,6 +3352,7 @@ def init_commands(cardinal: "Cardinal", *args) -> None:
     tg.msg_handler(send_main_panel, func=lambda m: _tg_matches_command(m, "vexboost"))
     tg.msg_handler(send_stats_cmd, func=lambda m: _tg_matches_command(m, "vb_stats"))
     tg.msg_handler(send_balance_cmd, func=lambda m: _tg_matches_command(m, "vb_balance"))
+    tg.msg_handler(send_catchup_cmd, func=lambda m: _tg_matches_command(m, "vb_catchup"))
     tg.cbq_handler(open_plugin_settings, lambda c: c.data.startswith(f"{CBT.PLUGIN_SETTINGS}:{UUID}:"))
     tg.cbq_handler(handle_callback, lambda c: c.data.startswith("vb_"))
     tg.msg_handler(handle_text_input, func=_has_text_input_state)
@@ -3217,13 +3362,14 @@ def init_commands(cardinal: "Cardinal", *args) -> None:
             ("vexboost", f"панель {NAME}", True),
             ("vb_stats", f"статистика {NAME}", True),
             ("vb_balance", f"баланс {NAME}", True),
+            ("vb_catchup", f"догон незавершённых заказов {NAME}", True),
         ])
     except Exception as exc:
         logger.error("%s: add_telegram_commands: %s", LOGGER_PREFIX, exc)
 
     _tg_bot_instance_id = bot_instance_id
     logger.info(
-        "%s: Telegram-команды зарегистрированы (/vexboost /vb_stats /vb_balance)",
+        "%s: Telegram-команды зарегистрированы (/vexboost /vb_stats /vb_balance /vb_catchup)",
         LOGGER_PREFIX,
     )
 
