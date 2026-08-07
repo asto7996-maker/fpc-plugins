@@ -32,10 +32,48 @@ PLATEGA_METHOD_CARD = 11
 PLATEGA_METHOD_CRYPTO = 13
 
 METHOD_LABELS: dict[int, str] = {
-    PLATEGA_METHOD_SBP_QR: "СБП · QR",
-    PLATEGA_METHOD_CARD: "Карта",
-    PLATEGA_METHOD_CRYPTO: "Крипта",
+    PLATEGA_METHOD_SBP_QR: "🏦 СБП",
+    PLATEGA_METHOD_CARD: "💳 Карта",
+    PLATEGA_METHOD_CRYPTO: "🪙 Крипта",
 }
+
+METHOD_COPY: dict[int, dict[str, str]] = {
+    PLATEGA_METHOD_SBP_QR: {
+        "title": "СБП · QR",
+        "summary": "Оплата через QR-код в приложении банка.",
+        "how": "На странице оплаты отсканируйте QR-код в банковском приложении.",
+        "timing": "Обычно приходит за 1–2 минуты.",
+        "note": "Подходит для Сбера, Т‑Банка, ВТБ, Альфы и других.",
+    },
+    PLATEGA_METHOD_CARD: {
+        "title": "Карта",
+        "summary": "Оплата картой на защищённой странице.",
+        "how": "Введите номер карты. Банк может прислать код из SMS.",
+        "timing": "Сразу после подтверждения в банке.",
+        "note": "МИР, Visa, Mastercard.",
+    },
+    PLATEGA_METHOD_CRYPTO: {
+        "title": "Крипта",
+        "summary": "Оплата криптовалютой, если нет карты РФ.",
+        "how": "На странице выберите монету и переведите указанную сумму.",
+        "timing": "От нескольких минут до часа.",
+        "note": "Сумма фиксируется при создании счёта.",
+    },
+}
+
+
+def method_label(code: int) -> str:
+    return METHOD_LABELS.get(code, f"Platega {code}")
+
+
+def method_copy(code: int) -> dict[str, str]:
+    return METHOD_COPY.get(code, {
+        "title": method_label(code),
+        "summary": "Оплата на защищённой странице.",
+        "how": "Следуйте подсказкам на странице оплаты.",
+        "timing": "Обычно деньги приходят за несколько минут.",
+        "note": "",
+    })
 
 # Быстрые суммы из payment_method_configs.platega.quick_amounts
 DEFAULT_QUICK_AMOUNTS_KOPEKS = (5000, 10000, 15000, 50000)
@@ -141,6 +179,11 @@ class CabinetPaymentClient:
                     return {}
                 return await resp.json(content_type=None)
 
+    async def get_cabinet_json(self, bedolaga_user_id: int, path: str) -> Any:
+        """GET любого кабинетного эндпоинта от имени пользователя."""
+        token = await self._cabinet_access_token(bedolaga_user_id)
+        return await self._request("GET", path, access_token=token)
+
     async def get_payment_methods(
         self, bedolaga_user_id: int
     ) -> list[PaymentMethodInfo]:
@@ -174,6 +217,55 @@ class CabinetPaymentClient:
                 )
             )
         return methods
+
+    async def purchase_tariff(
+        self,
+        bedolaga_user_id: int,
+        *,
+        tariff_id: int,
+        period_days: int,
+    ) -> dict[str, Any]:
+        """
+        Покупает тариф за счёт баланса кабинета.
+
+        Возвращает:
+          {"status": "activated", "raw": ...}          — подписка активирована
+          {"status": "insufficient", "missing_kopeks"} — не хватает на балансе
+                                                          (корзина сохранена)
+          {"status": "error", "raw": ...}              — иная ошибка
+        """
+        token = await self._cabinet_access_token(bedolaga_user_id)
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        }
+        body = {"tariff_id": int(tariff_id), "period_days": int(period_days)}
+        async with aiohttp.ClientSession(timeout=self._timeout) as session:
+            async with session.post(
+                f"{self.base}/cabinet/subscription/purchase-tariff",
+                json=body,
+                headers=headers,
+            ) as resp:
+                status = resp.status
+                try:
+                    data = await resp.json(content_type=None)
+                except Exception:  # noqa: BLE001
+                    data = {}
+        if status < 400:
+            return {"status": "activated", "raw": data}
+        detail = data.get("detail") if isinstance(data, dict) else None
+        if (
+            status == 402
+            and isinstance(detail, dict)
+            and detail.get("code") == "insufficient_funds"
+        ):
+            return {
+                "status": "insufficient",
+                "missing_kopeks": int(detail.get("missing_amount") or 0),
+            }
+        logger.error("purchase-tariff %s: %s", status, str(data)[:300])
+        return {"status": "error", "raw": data}
 
     async def create_platega_topup(
         self,

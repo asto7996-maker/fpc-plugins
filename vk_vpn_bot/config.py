@@ -44,9 +44,14 @@ class Settings:
     group_id: int
     database_url: str
     trial_days: int
+    trial_traffic_gb: int
+    trial_devices: int
     vpn_key_type: str
     support_url: str
     support_text: str
+    support_admin_ids: tuple[int, ...]
+    main_admin_vk_id: int
+    main_admin_username: str
     vless_template: str
     outline_keys: tuple[str, ...]
     bot_name: str
@@ -57,6 +62,7 @@ class Settings:
     cabinet_url: str
     cabinet_jwt_secret: str
     renew_days: int
+    referral_inviter_bonus_days: int
 
 
 def load_settings() -> Settings:
@@ -75,14 +81,49 @@ def load_settings() -> Settings:
     except ValueError as exc:
         raise RuntimeError("TRIAL_DAYS должен быть целым числом") from exc
 
+    # Лимиты триала задаются в админке Bedolaga; здесь — чтобы честно
+    # называть их до активации, когда подписки ещё нет.
+    try:
+        trial_traffic_gb = max(1, int(_optional("TRIAL_TRAFFIC_GB", "10")))
+    except ValueError as exc:
+        raise RuntimeError("TRIAL_TRAFFIC_GB должен быть целым числом") from exc
+    try:
+        trial_devices = max(1, int(_optional("TRIAL_DEVICES", "1")))
+    except ValueError as exc:
+        raise RuntimeError("TRIAL_DEVICES должен быть целым числом") from exc
+
     renew_raw = _optional("RENEW_DAYS", "30")
     try:
         renew_days = max(1, int(renew_raw))
     except ValueError as exc:
         raise RuntimeError("RENEW_DAYS должен быть целым числом") from exc
 
+    referral_bonus_raw = _optional("REFERRAL_INVITER_BONUS_DAYS", "5")
+    try:
+        referral_inviter_bonus_days = max(0, int(referral_bonus_raw))
+    except ValueError as exc:
+        raise RuntimeError(
+            "REFERRAL_INVITER_BONUS_DAYS должен быть целым числом"
+        ) from exc
+
     outline_raw = _optional("OUTLINE_KEYS", "")
     outline_keys = tuple(k.strip() for k in outline_raw.split(",") if k.strip())
+
+    # Кому пересылать вопросы из «Помощи». Пусто — спросим управляющих у VK.
+    admins_raw = _optional("SUPPORT_ADMIN_IDS", "")
+    support_admin_ids: tuple[int, ...] = tuple(
+        int(part.strip())
+        for part in admins_raw.replace(";", ",").split(",")
+        if part.strip().lstrip("-").isdigit()
+    )
+
+    # Главный админ: все тикеты идут только ему; в боте видит раздел «Админ».
+    main_admin_username = _optional("MAIN_ADMIN_USERNAME", "xylophaze").lstrip("@")
+    main_admin_raw = _optional("MAIN_ADMIN_VK_ID", "634094665")
+    try:
+        main_admin_vk_id = int(main_admin_raw) if main_admin_raw else 0
+    except ValueError as exc:
+        raise RuntimeError("MAIN_ADMIN_VK_ID должен быть целым числом") from exc
 
     vpn_key_type = _optional("VPN_KEY_TYPE", "vless").lower()
     if vpn_key_type not in {"vless", "outline", "wireguard"}:
@@ -98,12 +139,17 @@ def load_settings() -> Settings:
         group_id=group_id,
         database_url=database_url,
         trial_days=trial_days,
+        trial_traffic_gb=trial_traffic_gb,
+        trial_devices=trial_devices,
         vpn_key_type=vpn_key_type,
-        support_url=_optional("SUPPORT_URL", "https://vk.com"),
+        support_url=_optional("SUPPORT_URL", ""),
         support_text=_optional(
             "SUPPORT_TEXT",
             "Напишите в поддержку сообщества — поможем с подключением.",
         ),
+        support_admin_ids=support_admin_ids,
+        main_admin_vk_id=main_admin_vk_id,
+        main_admin_username=main_admin_username,
         vless_template=_optional(
             "VLESS_TEMPLATE",
             "vless://{uuid}@vpn.example.com:443?encryption=none&security=reality"
@@ -123,6 +169,7 @@ def load_settings() -> Settings:
         cabinet_url=_optional("CABINET_URL", "https://cabinet.paskod.ru"),
         cabinet_jwt_secret=_optional("CABINET_JWT_SECRET", ""),
         renew_days=renew_days,
+        referral_inviter_bonus_days=referral_inviter_bonus_days,
     )
 
 
