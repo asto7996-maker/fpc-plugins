@@ -37,6 +37,7 @@ def _offer() -> Offer:
     tariff = Tariff(
         id=4,
         name="Базовый",
+        description="",
         tier=1,
         traffic_label="♾️ Безлимит",
         unlimited_traffic=True,

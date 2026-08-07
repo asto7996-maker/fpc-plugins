@@ -100,7 +100,7 @@ def format_welcome(
         f"{bot} — быстрый VPN для телефона и компьютера.\n"
         f"Можно попробовать бесплатно: {trial}.\n"
         f"Платные тарифы"
-        f"{f' от {price}/мес' if price else ''}. "
+        f"{f' {price}' if price else ''}. "
         f"Оплата картой, по QR или криптой от {(catalog.min_topup_kopeks // 100) if catalog else 50} ₽.\n\n"
         f"{bullet('🌐 Кабинет — ваш аккаунт на сайте')}\n"
         f"{bullet('📦 Подписка — ссылка, оплата, срок')}\n"
@@ -125,17 +125,22 @@ def format_tariff_menu(catalog: Catalog | None, settings: Settings, *, renew: bo
         header("💎", title),
         "",
         "У каждого тарифа свой объём интернета и число устройств. "
-        "Чем дольше срок — тем дешевле месяц. Нажмите нужный вариант под сообщением.",
+        "Цены как в кабинете — «от» за первый срок. "
+        "Другие периоды можно выбрать на сайте.",
         "",
     ]
     for offer in catalog.offers():
         t = offer.tariff
-        note = f" · {offer.per_month_note}" if offer.per_month_note else ""
         whitelist = " · 📋 белые списки" if t.has_whitelist_server else ""
+        more_periods = (
+            " · другие сроки в кабинете"
+            if len(t.periods) > 1
+            else ""
+        )
         lines.append(
-            f"{t.emoji}  {t.name} · {offer.period.label} — "
-            f"{offer.period.price_label}{note}\n"
-            f"     {t.traffic_display} · {_devices_upto(t.device_limit)}{whitelist}"
+            f"{t.emoji}  {t.name} — {offer.period.price_label}\n"
+            f"     {t.traffic_display} · {_devices_upto(t.device_limit)}"
+            f"{whitelist}{more_periods}"
         )
     lines.append("")
     lines.append("Дальше выберите способ оплаты. Если денег на счету не хватает — "
@@ -151,13 +156,19 @@ def format_tariff_chosen(offer: Offer) -> str:
         if t.has_whitelist_server
         else ""
     )
+    more_periods = (
+        f"\n\nДругие сроки ({', '.join(p.label for p in t.periods[1:3])}) — "
+        f"в кабинете на сайте."
+        if len(t.periods) > 1
+        else ""
+    )
     return (
         f"{header('💳', f'{t.name} · {offer.period.label}')}\n\n"
         f"{t.short_description}\n\n"
         f"{kv('Цена', offer.period.price_label + note)}\n"
         f"{kv('Интернет', t.traffic_display)}\n"
         f"{kv('Устройства', _devices_upto(t.device_limit))}"
-        f"{whitelist}\n\n"
+        f"{whitelist}{more_periods}\n\n"
         f"Как оплатить: {method_label(PLATEGA_METHOD_SBP_QR)}, "
         f"{method_label(PLATEGA_METHOD_CARD)} или {method_label(PLATEGA_METHOD_CRYPTO)}. "
         f"Если на счету хватает денег — тариф включится сразу, "
@@ -203,7 +214,7 @@ def format_tariffs(catalog: Catalog | None, settings: Settings) -> str:
         header("💎", "Тарифы"),
         "",
         "Тарифы отличаются объёмом интернета, числом устройств и доступными "
-        "серверами. Чем дольше срок, тем дешевле месяц.",
+        "серверами. Цены — как в кабинете, «от» за первый срок.",
         "",
     ]
 
@@ -214,14 +225,12 @@ def format_tariffs(catalog: Catalog | None, settings: Settings) -> str:
         lines.append(f"     Устройств: до {tariff.device_limit}")
         if tariff.has_whitelist_server:
             lines.append("     📋 Есть сервер с белыми списками")
-        for period in tariff.periods:
-            per_month = (
-                f"  ({period.per_month_label}/мес)"
-                if period.per_month_label
-                and period.per_month_label != period.price_label
-                else ""
-            )
-            lines.append(f"     {period.label}: {period.price_label}{per_month}")
+        if tariff.price_from_label:
+            period = tariff.primary_period
+            suffix = f" ({period.label})" if period and period.label else ""
+            lines.append(f"     Цена: {tariff.price_from_label}{suffix}")
+        if len(tariff.periods) > 1:
+            lines.append("     Другие сроки — в кабинете на сайте")
         if tariff.extra_device_kopeks:
             lines.append(
                 f"     Доп. устройство: {tariff.extra_device_kopeks // 100} ₽"
@@ -339,7 +348,7 @@ def format_connect_screen(
         )
 
     price = catalog.entry_price_label if catalog else ""
-    tail = f"Тарифы от {price}. " if price else ""
+    tail = f"Тарифы {price}. " if price else ""
     return (
         f"{header('🚀', 'Подключение')}\n\n"
         f"{warn_banner('Пробный период уже был')}\n\n"
@@ -572,7 +581,7 @@ def format_apps(settings: Settings) -> str:
 
 def format_renew_stub(settings: Settings, catalog: Catalog | None = None) -> str:
     price = catalog.entry_price_label if catalog else ""
-    prices = f"Тарифы начинаются от {price} за месяц; " if price else ""
+    prices = f"Тарифы {price}; " if price else ""
     long_hint = (
         "на трёх и шести месяцах месяц выходит дешевле."
         if catalog and catalog.tariffs

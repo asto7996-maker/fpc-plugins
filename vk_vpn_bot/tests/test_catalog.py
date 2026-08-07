@@ -83,6 +83,7 @@ def test_catalog_aggregates() -> None:
     premium = Tariff(
         id=2,
         name="Премиум",
+        description="",
         tier=3,
         traffic_label="♾️ Безлимит",
         unlimited_traffic=True,
@@ -100,7 +101,7 @@ def test_catalog_aggregates() -> None:
         quick_amounts_kopeks=(5000, 10000, 15000, 50000),
         referral_percent=15,
     )
-    assert catalog.entry_price_label == "49 ₽"
+    assert catalog.entry_price_label == "от 49 ₽"
     assert catalog.max_devices == 5
 
 
@@ -117,8 +118,8 @@ def test_texts_use_real_numbers() -> None:
     assert "Базовый" in tariffs
     assert "100 ГБ" in tariffs
     assert "49 ₽" in tariffs
-    assert "229 ₽" in tariffs
-    assert "38 ₽" in tariffs, "нужна цена за месяц на длинном периоде"
+    assert "от 49" in tariffs
+    assert "кабинете" in tariffs.lower()
     assert "до 1" in tariffs
 
     pay = format_pay_intro(catalog)
@@ -146,6 +147,7 @@ def _make_catalog() -> Catalog:
     premium = Tariff(
         id=2,
         name="Премиум",
+        description="",
         tier=3,
         traffic_label="♾️ Безлимит",
         unlimited_traffic=True,
@@ -169,6 +171,7 @@ def _make_catalog() -> Catalog:
 def test_offers_sorted_and_labeled() -> None:
     cat = _make_catalog()
     offers = cat.offers()
+    assert len(offers) == 2, "в боте один вариант на тариф, как в мини-приложении"
     prices = [o.period.price_kopeks for o in offers]
     assert prices == sorted(prices), "офферы должны идти от дешёвых к дорогим"
     # Самый дешёвый — базовый на месяц
@@ -177,7 +180,9 @@ def test_offers_sorted_and_labeled() -> None:
     label = offers[0].label
     assert "🥉" in label and "49 ₽" in label and "1 мес" in label
     assert cat.find_offer(label) == offers[0]
+    assert cat.find_offer(offers[0].button_label) == offers[0]
     assert cat.find_offer("несуществующий · 1 мес · 1 ₽") is None
+    assert cat.find_offer_by_tariff(4, 180) is not None
 
 
 def test_short_period() -> None:
@@ -192,7 +197,7 @@ def test_tariff_menu_and_choice() -> None:
     menu = format_tariff_menu(cat, settings, renew=True)
     assert "Продление" in menu
     assert "49 ₽" in menu
-    assert "38 ₽" in menu  # цена за месяц на длинном периоде
+    assert "кабинете" in menu.lower()
 
     offer = cat.offers()[0]
     chosen = format_tariff_chosen(offer)

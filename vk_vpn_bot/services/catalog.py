@@ -62,6 +62,7 @@ class Period:
 class Tariff:
     id: int
     name: str
+    description: str
     tier: int
     traffic_label: str
     unlimited_traffic: bool
@@ -101,8 +102,17 @@ class Tariff:
         return f"{gb} ГБ"
 
     @property
+    def primary_period(self) -> Period | None:
+        """Первый период из панели — как в мини-приложении (цена «от …»)."""
+        if self.periods:
+            return self.periods[0]
+        return None
+
+    @property
     def short_description(self) -> str:
-        if self.is_premium:
+        if self.description.strip():
+            base = self.description.strip()
+        elif self.is_premium:
             base = (
                 "Максимум устройств и трафик без ограничений — "
                 "для активного пользования на всех гаджетах."
@@ -113,9 +123,16 @@ class Tariff:
             )
         else:
             base = "Для одного устройства — телефона или ноутбука."
-        if self.has_whitelist_server:
+        if self.has_whitelist_server and "бел" not in base.lower():
             return f"{base} Есть сервер с белыми списками."
         return base
+
+    @property
+    def price_from_label(self) -> str:
+        period = self.primary_period
+        if not period or not period.price_label:
+            return ""
+        return f"от {period.price_label}"
 
     @property
     def cheapest(self) -> Period | None:
@@ -133,11 +150,16 @@ class Offer:
 
     @property
     def label(self) -> str:
-        """Подпись кнопки. Должна воспроизводиться детерминированно."""
+        """Подпись reply-кнопки (fallback)."""
         return (
             f"{self.tariff.emoji} {self.tariff.name} · "
             f"{short_period(self.period.days)} · {self.period.price_label}"
         )
+
+    @property
+    def button_label(self) -> str:
+        """Короткая подпись inline-кнопки — как карточка в мини-приложении."""
+        return f"{self.tariff.emoji} {self.tariff.name} · от {self.period.price_label}"
 
     @property
     def per_month_note(self) -> str:
@@ -156,31 +178,45 @@ class Catalog:
 
     @property
     def entry_price_label(self) -> str:
-        """Самая низкая цена в каталоге — «от N ₽»."""
+        """Самая низкая цена среди карточек тарифов — «от N ₽»."""
         prices = [
-            p.price_kopeks
-            for t in self.tariffs
-            for p in t.periods
-            if p.price_kopeks
+            o.period.price_kopeks
+            for o in self.offers()
+            if o.period.price_kopeks
         ]
         if not prices:
             return ""
-        return f"{min(prices) // 100} ₽"
+        return f"от {min(prices) // 100} ₽"
 
     @property
     def max_devices(self) -> int:
         return max((t.device_limit for t in self.tariffs), default=0)
 
     def offers(self, limit: int = 9) -> list[Offer]:
-        """Все покупки (тариф × период), от дешёвых к дорогим."""
-        res = [Offer(t, p) for t in self.tariffs for p in t.periods]
+        """По одному варианту на тариф (первый период), как в мини-приложении."""
+        res: list[Offer] = []
+        for tariff in self.tariffs:
+            period = tariff.primary_period
+            if period:
+                res.append(Offer(tariff, period))
         res.sort(key=lambda o: o.period.price_kopeks or 10**9)
         return res[:limit]
 
     def find_offer(self, label: str) -> Offer | None:
         for offer in self.offers(limit=99):
-            if offer.label == label:
+            if offer.label == label or offer.button_label == label:
                 return offer
+        return None
+
+    def find_offer_by_tariff(self, tariff_id: int, days: int) -> Offer | None:
+        for tariff in self.tariffs:
+            if tariff.id != tariff_id:
+                continue
+            for period in tariff.periods:
+                if period.days == days:
+                    return Offer(tariff, period)
+            if tariff.primary_period:
+                return Offer(tariff, tariff.primary_period)
         return None
 
 
@@ -201,6 +237,7 @@ def _parse_tariff(raw: dict) -> Tariff:
     return Tariff(
         id=int(raw.get("id") or 0),
         name=str(raw.get("name") or "Тариф"),
+        description=str(raw.get("description") or "").strip(),
         tier=int(raw.get("tier_level") or 0),
         traffic_label=str(raw.get("traffic_limit_label") or ""),
         unlimited_traffic=bool(raw.get("is_unlimited_traffic")),

@@ -774,10 +774,7 @@ async def _pick_tariff(
 
     offer = None
     if catalog:
-        for o in catalog.offers(limit=99):
-            if o.tariff.id == tid and o.period.days == days:
-                offer = o
-                break
+        offer = catalog.find_offer_by_tariff(tid, days)
     if offer is None:
         await api.messages.send(
             peer_id=peer_id,
@@ -806,10 +803,7 @@ async def _purchase_with_method(
     catalog = await _catalog(message)
     offer = None
     if catalog:
-        for o in catalog.offers(limit=99):
-            if o.tariff.id == sel["tid"] and o.period.days == sel["days"]:
-                offer = o
-                break
+        offer = catalog.find_offer_by_tariff(sel["tid"], sel["days"])
     if offer is None:
         _pending_tariff.pop(message.from_id, None)
         await message.answer(

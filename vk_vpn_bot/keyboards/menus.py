@@ -171,7 +171,7 @@ def tariffs_inline_keyboard(offers: list[Offer]) -> str:
     for i, offer in enumerate(offers[:10]):
         if i > 0 and i % 2 == 0:
             kb.row()
-        short = f"{offer.tariff.emoji} {offer.period.price_label}"
+        short = offer.button_label
         kb.add(
             Callback(
                 short,
