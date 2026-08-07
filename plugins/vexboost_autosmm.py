@@ -2,7 +2,7 @@ from __future__ import annotations
 
 # === ОБЯЗАТЕЛЬНЫЕ ПОЛЯ FunPay Cardinal (НЕ УДАЛЯТЬ) ===
 NAME = "VexBoost AutoSMM"
-VERSION = "2.4.10"
+VERSION = "2.4.11"
 DESCRIPTION = "Автонакрутка SMM-услуг для FunPay Cardinal"
 CREDITS = "@xei1y"
 UUID = "a3f8c2e1-7b4d-4a9f-9e2c-1d5b8f6a0c3e"
@@ -244,8 +244,18 @@ _tg_bot_instance_id: Optional[int] = None
 URL_PATTERN = re.compile(
     r"https?://(?:[a-zA-Z0-9]|[$-_@.&+]|(?:%[0-9a-fA-F][0-9a-fA-F]))+"
 )
-SERVICE_ID_PATTERN = re.compile(r"ID:\s*(\d+)", re.IGNORECASE)
-QUANTITY_MULT_PATTERN = re.compile(r"#Quan:\s*(\d+)", re.IGNORECASE)
+BARE_URL_PATTERN = re.compile(
+    r"(?:(?:www\.)?(?:t\.me|telegram\.me|telegram\.dog|vk\.com|vk\.ru|"
+    r"instagram\.com|instagr\.am|tiktok\.com|vm\.tiktok\.com|"
+    r"youtube\.com|youtu\.be|twitter\.com|x\.com|"
+    r"facebook\.com|fb\.com|fb\.watch|ok\.ru|odnoklassniki\.ru|"
+    r"discord\.gg|discord\.com|twitch\.tv|rutube\.ru|dzen\.ru|"
+    r"zen\.yandex\.ru)/[^\s<>\"']+)",
+    re.IGNORECASE,
+)
+TG_AT_PATTERN = re.compile(r"@([a-zA-Z0-9_]{4,32})\b")
+SERVICE_ID_PATTERN = re.compile(r"ID\s*[:=\-]\s*(\d+)", re.IGNORECASE)
+QUANTITY_MULT_PATTERN = re.compile(r"#?\s*Quan\s*[:=\-]\s*(\d+)", re.IGNORECASE)
 HTML_TAG_PATTERN = re.compile(r"<[^>]+>")
 
 FUNPAY_ORDER_URL = "https://funpay.com/orders/{order_id}/"
@@ -317,6 +327,19 @@ def _is_confirm_message(text: str) -> Optional[str]:
     return None
 
 
+def _run_bg(name: str, target: Callable, *args: Any, **kwargs: Any) -> None:
+    """Запуск тяжёлой работы в daemon-потоке, чтобы не блокировать Cardinal/Telegram."""
+
+    def _wrapper() -> None:
+        try:
+            target(*args, **kwargs)
+        except Exception as exc:
+            logger.error("%s: фоновая задача %s: %s", LOGGER_PREFIX, name, exc)
+            logger.debug(traceback.format_exc())
+
+    threading.Thread(target=_wrapper, name=f"VexBoost-{name}", daemon=True).start()
+
+
 def set_pending(order: Dict[str, Any]) -> None:
     chat_id = _normalize_chat_id(order.get("chat_id"))
     order["chat_id"] = chat_id
@@ -331,14 +354,23 @@ def get_pending_for_chat(chat_id: Any) -> Optional[Dict[str, Any]]:
 
 
 def get_pending(chat_id: Any, buyer: str = "") -> Optional[Dict[str, Any]]:
-    order = get_pending_for_chat(chat_id)
+    """Найти pending по chat_id; при расхождении chat_id — по нику покупателя с перепривязкой."""
+    cid = _normalize_chat_id(chat_id)
+    order = pending_confirmations.get(cid)
     if order is not None:
         return order
-    if buyer and buyer in pending_by_buyer:
-        order = pending_by_buyer[buyer]
-        if _normalize_chat_id(order.get("chat_id")) == _normalize_chat_id(chat_id):
-            return order
-    return None
+    if not buyer:
+        return None
+    order = pending_by_buyer.get(buyer)
+    if not order:
+        return None
+    old_cid = _normalize_chat_id(order.get("chat_id"))
+    if old_cid != cid:
+        if old_cid in pending_confirmations and pending_confirmations.get(old_cid) is order:
+            pending_confirmations.pop(old_cid, None)
+        order["chat_id"] = cid
+        pending_confirmations[cid] = order
+    return order
 
 
 def pop_pending_for_chat(chat_id: Any) -> Optional[Dict[str, Any]]:
@@ -346,23 +378,28 @@ def pop_pending_for_chat(chat_id: Any) -> Optional[Dict[str, Any]]:
     order = pending_confirmations.pop(cid, None)
     if order and order.get("buyer"):
         stored = pending_by_buyer.get(order["buyer"])
-        if stored and _normalize_chat_id(stored.get("chat_id")) == cid:
+        if stored is order or (
+            stored and _normalize_chat_id(stored.get("chat_id")) == cid
+        ):
             pending_by_buyer.pop(order["buyer"], None)
     return order
 
 
 def pop_pending(chat_id: Any, buyer: str = "") -> Optional[Dict[str, Any]]:
-    order = pop_pending_for_chat(chat_id)
-    if order:
-        return order
-    pending = get_pending(chat_id, buyer)
-    if not pending:
+    order = get_pending(chat_id, buyer)
+    if not order:
         return None
-    return pop_pending_for_chat(pending.get("chat_id", chat_id))
+    return pop_pending_for_chat(order.get("chat_id", chat_id))
 
 
 def clear_pending(chat_id: Any, buyer: str = "") -> None:
-    pop_pending_for_chat(chat_id)
+    order = get_pending(chat_id, buyer)
+    if order:
+        pop_pending_for_chat(order.get("chat_id", chat_id))
+    else:
+        pop_pending_for_chat(chat_id)
+    if buyer:
+        pending_by_buyer.pop(buyer, None)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Утилиты хранения (потокобезопасные)
@@ -588,7 +625,24 @@ def save_stats(stats: Dict[str, Any]) -> None:
 
 
 def extract_links(text: str) -> List[str]:
-    return URL_PATTERN.findall(text)
+    """Извлечь ссылки: полный URL, bare-домены соцсетей, @telegram-хэндлы."""
+    raw = (text or "").strip()
+    if not raw:
+        return []
+    links = URL_PATTERN.findall(raw)
+    if links:
+        return links
+    result: List[str] = []
+    for item in BARE_URL_PATTERN.findall(raw):
+        link = item.strip().rstrip(".,;)>]}")
+        if not link.startswith(("http://", "https://")):
+            link = f"https://{link}"
+        result.append(link)
+    if result:
+        return result
+    for handle in TG_AT_PATTERN.findall(raw):
+        result.append(f"https://t.me/{handle}")
+    return result
 
 
 def find_order_by_buyer(orders: List[Dict[str, Any]], buyer: str) -> Optional[Dict[str, Any]]:
@@ -1769,11 +1823,12 @@ def bind_to_new_order(c: "Cardinal", e: NewOrderEvent) -> None:
         StatisticsManager.record_created(service_id, safe_float(e.order.price))
 
         settings = load_settings()
-        if settings.get("set_alert_smmbalance_new"):
-            send_balance_notification(c)
-
         if chat_id:
             send_fp(c, chat_id, _format_buyer_template("welcome_message", order_id=order_id))
+
+        # Баланс VexBoost — в фоне: иначе новый заказ блокирует весь updater Cardinal.
+        if settings.get("set_alert_smmbalance_new"):
+            _run_bg(f"balance-new-{order_id}", send_balance_notification, c)
 
         logger.info(
             "%s: новый заказ FP#%s service=%s qty=%s buyer=%s",
@@ -1815,7 +1870,7 @@ def request_confirmation(c: "Cardinal", order: Dict[str, Any], link: str) -> Non
 
 
 def confirm_order(c: "Cardinal", chat_id: Any, text: str, buyer: str = "") -> None:
-    order = pop_pending_for_chat(chat_id)
+    order = pop_pending(chat_id, buyer)
     if not order:
         logger.warning(
             "%s: подтверждение без заказа chat=%s buyer=%s text=%r",
@@ -1833,15 +1888,38 @@ def confirm_order(c: "Cardinal", chat_id: Any, text: str, buyer: str = "") -> No
             )
             return
         send_fp(c, order["chat_id"], _format_buyer_template("creating_order_message"))
-        try:
-            _create_vexboost_order(c, order)
-        except Exception:
-            _unlock_fp_order(fp_id)
-            raise
+        # Создание SMM-заказа в фоне: API/логин могут занимать десятки секунд
+        # и иначе «замораживают» ответы другим покупателям и TG-команды.
+        _run_bg(f"create-{fp_id}", _create_vexboost_order_safe, c, order)
     elif action == "-":
         send_fp(c, chat_id, _format_buyer_template("order_cancelled_message"))
         _remove_pay_order(order["buyer"])
-        _refund_order(c, order["OrderID"])
+        oid = str(order.get("OrderID", ""))
+        _run_bg(f"refund-{oid}", _refund_order, c, oid)
+
+
+def _create_vexboost_order_safe(c: "Cardinal", order: Dict[str, Any]) -> None:
+    """Обёртка создания заказа с гарантированным unlock при необработанном сбое."""
+    fp_id = str(order.get("OrderID", ""))
+    try:
+        _create_vexboost_order(c, order)
+    except Exception as exc:
+        _unlock_fp_order(fp_id)
+        logger.error("%s: сбой создания VB для FP#%s: %s", LOGGER_PREFIX, fp_id, exc)
+        logger.debug(traceback.format_exc())
+        try:
+            send_fp(
+                c,
+                order.get("chat_id"),
+                _format_buyer_template("error_message", error=_buyer_error_message(str(exc))),
+            )
+        except Exception:
+            pass
+        try:
+            send_order_error_notification(c, str(exc), order)
+        except Exception:
+            pass
+        StatisticsManager.record_failed()
 
 
 def _create_vexboost_order(c: "Cardinal", order: Dict[str, Any]) -> None:
@@ -1948,7 +2026,7 @@ def _process_buyer_message(
         return
 
     confirm_action = _is_confirm_message(message_text)
-    pending = get_pending_for_chat(cid)
+    pending = get_pending(cid, msgname)
 
     if confirm_action:
         if not _chat_has_vexboost_order(cid, msgname):
@@ -1973,11 +2051,11 @@ def _process_buyer_message(
         return
 
     if message_text.startswith("#статус"):
-        _cmd_status(c, cid, message_text)
+        _run_bg(f"status-{cid}", _cmd_status, c, cid, message_text)
         return
 
     if message_text.startswith("#рефилл"):
-        _cmd_refill(c, cid, message_text)
+        _run_bg(f"refill-{cid}", _cmd_refill, c, cid, message_text)
         return
 
     pay_orders = load_payorders()
@@ -2035,10 +2113,10 @@ def last_chat_msg_hook(c: "Cardinal", e: Any) -> None:
 def _handle_pending_message(
     c: "Cardinal", chat_id: Any, message_text: str, buyer: str = "",
 ) -> None:
-    order = get_pending_for_chat(chat_id)
+    order = get_pending(chat_id, buyer)
     if not order:
         return
-    if "http" in message_text:
+    if "http" in message_text.lower() or extract_links(message_text):
         order["chat_id"] = _normalize_chat_id(chat_id)
         links = extract_links(message_text)
         if links:
@@ -2704,23 +2782,30 @@ def init_commands(cardinal: "Cardinal", *args) -> None:
             bot.reply_to(message, f"⚠️ Ошибка статистики: {exc}")
 
     def send_balance_cmd(message):
-        try:
-            logger.info("%s: команда /vb_balance от user %s", LOGGER_PREFIX, message.from_user.id)
-            balance = VexBoostAPI.get_balance()
-            if balance:
-                text = f"💰 <b>Баланс VexBoost:</b> {balance[0]:.2f} {balance[1]}"
-            else:
-                err = VexBoostAPI.get_balance_error()
-                text = f"🔴 <b>VexBoost:</b> {err or 'Проверьте настройки в /vexboost'}"
+        def _worker() -> None:
             try:
-                fp = cardinal.get_balance()
-                text += f"\n💰 <b>FunPay:</b> {fp.total_rub}₽, {fp.available_usd}$, {fp.total_eur}€"
-            except Exception:
-                pass
-            bot.reply_to(message, text, parse_mode="HTML")
-        except Exception as exc:
-            logger.error("%s: ошибка /vb_balance: %s", LOGGER_PREFIX, exc)
-            bot.reply_to(message, f"⚠️ Ошибка баланса: {exc}")
+                logger.info("%s: команда /vb_balance от user %s", LOGGER_PREFIX, message.from_user.id)
+                balance = VexBoostAPI.get_balance()
+                if balance:
+                    text = f"💰 <b>Баланс VexBoost:</b> {balance[0]:.2f} {balance[1]}"
+                else:
+                    err = VexBoostAPI.get_balance_error()
+                    text = f"🔴 <b>VexBoost:</b> {err or 'Проверьте настройки в /vexboost'}"
+                try:
+                    fp = cardinal.get_balance()
+                    text += f"\n💰 <b>FunPay:</b> {fp.total_rub}₽, {fp.available_usd}$, {fp.total_eur}€"
+                except Exception:
+                    pass
+                bot.reply_to(message, text, parse_mode="HTML")
+            except Exception as exc:
+                logger.error("%s: ошибка /vb_balance: %s", LOGGER_PREFIX, exc)
+                try:
+                    bot.reply_to(message, f"⚠️ Ошибка баланса: {exc}")
+                except Exception:
+                    pass
+
+        # API VexBoost не должен блокировать остальные TG-команды.
+        _run_bg("tg-vb-balance", _worker)
 
     def open_plugin_settings(call):
         try:
@@ -2848,14 +2933,24 @@ def init_commands(cardinal: "Cardinal", *args) -> None:
                 bot.answer_callback_query(call.id)
 
             elif call.data == "vb_balance_btn":
-                balance = VexBoostAPI.get_balance()
-                if balance:
-                    bot.answer_callback_query(
-                        call.id, f"Баланс: {balance[0]:.2f} {balance[1]}", show_alert=True,
-                    )
-                else:
-                    err = VexBoostAPI.get_balance_error() or "Ошибка API"
-                    bot.answer_callback_query(call.id, err[:200], show_alert=True)
+                bot.answer_callback_query(call.id, "⏳ Запрос баланса…")
+
+                def _balance_worker() -> None:
+                    try:
+                        balance = VexBoostAPI.get_balance()
+                        if balance:
+                            text = f"💰 Баланс VexBoost: {balance[0]:.2f} {balance[1]}"
+                        else:
+                            text = VexBoostAPI.get_balance_error() or "Ошибка API"
+                        bot.send_message(chat_id, text)
+                    except Exception as exc:
+                        logger.error("%s: vb_balance_btn: %s", LOGGER_PREFIX, exc)
+                        try:
+                            bot.send_message(chat_id, f"⚠️ Ошибка баланса: {exc}")
+                        except Exception:
+                            pass
+
+                _run_bg("tg-balance-btn", _balance_worker)
 
             elif call.data == "vb_stats_menu":
                 bot.edit_message_text(
@@ -2977,7 +3072,13 @@ def init_commands(cardinal: "Cardinal", *args) -> None:
                     bot.answer_callback_query(call.id)
 
             elif call.data in VB_EXTRA_CALLBACKS:
-                VB_EXTRA_CALLBACKS[call.data](cardinal, bot, chat_id, msg_id)
+                bot.answer_callback_query(call.id)
+                cb_key = call.data
+                _run_bg(
+                    f"tg-{cb_key}",
+                    VB_EXTRA_CALLBACKS[cb_key],
+                    cardinal, bot, chat_id, msg_id,
+                )
 
             elif call.data == "vb_guide":
                 bot.edit_message_text(
@@ -3458,10 +3559,15 @@ class RateLimiter:
 
     @classmethod
     def wait(cls) -> None:
+        # Считаем задержку под lock, спим БЕЗ lock — иначе блокируем другие потоки.
         with cls._lock:
             elapsed = time.time() - cls._last_request
-            if elapsed < cls._min_interval:
-                time.sleep(cls._min_interval - elapsed)
+            sleep_for = cls._min_interval - elapsed if elapsed < cls._min_interval else 0.0
+            if sleep_for <= 0:
+                cls._last_request = time.time()
+                return
+        time.sleep(sleep_for)
+        with cls._lock:
             cls._last_request = time.time()
 
 
