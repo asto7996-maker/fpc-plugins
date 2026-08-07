@@ -44,27 +44,39 @@ def run(client: paramiko.SSHClient, cmd: str, timeout: int = 120) -> tuple[int, 
 
 
 def detect_fpc(client: paramiko.SSHClient) -> str | None:
+    """Prefer live FunPayCardinal over Starvell copies."""
+    preferred = [
+        "/home/fpc/FunPayCardinal",
+        "/opt/FunPayCardinal",
+        "/root/FunPayCardinal",
+    ]
+    for path in preferred:
+        code, out, _ = run(client, f"test -f '{path}/plugins/vexboost_autosmm.py' && echo OK")
+        if "OK" in out:
+            return path
+
     code, out, _ = run(
         client,
-        "find /root /home /opt /var /srv -maxdepth 5 -type f -name vexboost_autosmm.py 2>/dev/null | head -10",
+        "find /home /opt /root /var /srv -maxdepth 5 -type f -name vexboost_autosmm.py 2>/dev/null | head -20",
     )
+    ranked: list[tuple[int, str]] = []
     for path in (line.strip() for line in out.splitlines() if line.strip()):
-        if path.endswith("/plugins/vexboost_autosmm.py"):
-            return path[: -len("/plugins/vexboost_autosmm.py")]
-    code, out, _ = run(
-        client,
-        "find /root /home /opt /var /srv -maxdepth 5 -type d -name plugins 2>/dev/null | head -30",
-    )
-    for plugins_dir in (line.strip() for line in out.splitlines() if line.strip()):
-        parent = os.path.dirname(plugins_dir)
-        code, out2, _ = run(
-            client,
-            f"test -d '{parent}/storage' && echo YES; "
-            f"test -f '{parent}/main.py' && echo MAIN; "
-            f"test -f '{parent}/cardinal.py' && echo CARD",
-        )
-        if "YES" in out2 or "MAIN" in out2 or "CARD" in out2:
-            return parent
+        if not path.endswith("/plugins/vexboost_autosmm.py"):
+            continue
+        root = path[: -len("/plugins/vexboost_autosmm.py")]
+        # FunPay Cardinal first, Starvell last
+        score = 0
+        low = root.lower()
+        if "funpay" in low:
+            score += 10
+        if "starvell" in low:
+            score -= 5
+        if "/home/fpc/" in root:
+            score += 20
+        ranked.append((score, root))
+    ranked.sort(reverse=True)
+    if ranked:
+        return ranked[0][1]
     return None
 
 
