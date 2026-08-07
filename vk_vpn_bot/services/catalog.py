@@ -40,6 +40,25 @@ def _server_has_whitelist(name: str) -> bool:
     return any(marker in low for marker in WHITELIST_SERVER_MARKERS)
 
 
+PREFERRED_PERIOD_DAYS = (30, 90, 180, 365)
+
+
+def _pick_primary_period(periods: tuple[Period, ...]) -> Period | None:
+    """Месячный срок для цены «от …» — как карточка в мини-приложении."""
+    if not periods:
+        return None
+    by_days = {p.days: p for p in periods}
+    for days in PREFERRED_PERIOD_DAYS:
+        if days in by_days:
+            return by_days[days]
+    return periods[0]
+
+
+def _sort_periods(periods: tuple[Period, ...]) -> tuple[Period, ...]:
+    order = {days: idx for idx, days in enumerate(PREFERRED_PERIOD_DAYS)}
+    return tuple(sorted(periods, key=lambda p: (order.get(p.days, 99), p.days)))
+
+
 def short_period(days: int) -> str:
     table = {30: "1 мес", 90: "3 мес", 180: "6 мес", 365: "1 год", 360: "1 год"}
     if days in table:
@@ -103,10 +122,7 @@ class Tariff:
 
     @property
     def primary_period(self) -> Period | None:
-        """Первый период из панели — как в мини-приложении (цена «от …»)."""
-        if self.periods:
-            return self.periods[0]
-        return None
+        return _pick_primary_period(self.periods)
 
     @property
     def short_description(self) -> str:
@@ -193,13 +209,13 @@ class Catalog:
         return max((t.device_limit for t in self.tariffs), default=0)
 
     def offers(self, limit: int = 9) -> list[Offer]:
-        """По одному варианту на тариф (первый период), как в мини-приложении."""
+        """По одному варианту на тариф (месячный срок), как в мини-приложении."""
         res: list[Offer] = []
         for tariff in self.tariffs:
             period = tariff.primary_period
             if period:
                 res.append(Offer(tariff, period))
-        res.sort(key=lambda o: o.period.price_kopeks or 10**9)
+        res.sort(key=lambda o: (o.tariff.tier, o.period.price_kopeks or 10**9))
         return res[:limit]
 
     def find_offer(self, label: str) -> Offer | None:
@@ -224,15 +240,17 @@ _cache: tuple[float, Catalog] | None = None
 
 
 def _parse_tariff(raw: dict) -> Tariff:
-    periods = tuple(
-        Period(
-            days=int(p.get("days") or 0),
-            label=str(p.get("label") or ""),
-            price_label=str(p.get("price_label") or ""),
-            per_month_label=str(p.get("price_per_month_label") or ""),
-            price_kopeks=int(p.get("price_kopeks") or 0),
+    periods = _sort_periods(
+        tuple(
+            Period(
+                days=int(p.get("days") or 0),
+                label=str(p.get("label") or ""),
+                price_label=str(p.get("price_label") or ""),
+                per_month_label=str(p.get("price_per_month_label") or ""),
+                price_kopeks=int(p.get("price_kopeks") or 0),
+            )
+            for p in (raw.get("periods") or [])
         )
-        for p in (raw.get("periods") or [])
     )
     return Tariff(
         id=int(raw.get("id") or 0),

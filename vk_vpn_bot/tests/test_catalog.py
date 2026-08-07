@@ -168,12 +168,22 @@ def _make_catalog() -> Catalog:
     )
 
 
+def test_primary_period_prefers_month() -> None:
+  raw = dict(RAW_TARIFF)
+  raw["periods"] = list(reversed(raw["periods"]))
+  t = _parse_tariff(raw)
+  assert t.periods[0].days == 30
+  assert t.primary_period is not None
+  assert t.primary_period.days == 30
+  assert t.primary_period.price_label == "49 ₽"
+  assert t.price_from_label == "от 49 ₽"
+
+
 def test_offers_sorted_and_labeled() -> None:
     cat = _make_catalog()
     offers = cat.offers()
     assert len(offers) == 2, "в боте один вариант на тариф, как в мини-приложении"
-    prices = [o.period.price_kopeks for o in offers]
-    assert prices == sorted(prices), "офферы должны идти от дешёвых к дорогим"
+    assert [o.tariff.tier for o in offers] == sorted(o.tariff.tier for o in offers)
     # Самый дешёвый — базовый на месяц
     assert offers[0].tariff.id == 4 and offers[0].period.days == 30
     # Ярлык узнаётся обратно
@@ -225,6 +235,7 @@ def main() -> None:
     test_texts_survive_without_catalog()
     test_offers_sorted_and_labeled()
     test_short_period()
+    test_primary_period_prefers_month()
     test_tariff_menu_and_choice()
     test_premium_unlimited_and_whitelist()
     print("test_catalog: OK")

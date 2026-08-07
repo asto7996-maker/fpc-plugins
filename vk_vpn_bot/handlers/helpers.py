@@ -138,7 +138,7 @@ def format_tariff_menu(catalog: Catalog | None, settings: Settings, *, renew: bo
             else ""
         )
         lines.append(
-            f"{t.emoji}  {t.name} — {offer.period.price_label}\n"
+            f"{t.emoji}  {t.name} — {t.price_from_label}\n"
             f"     {t.traffic_display} · {_devices_upto(t.device_limit)}"
             f"{whitelist}{more_periods}"
         )
