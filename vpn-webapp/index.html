@@ -1,0 +1,221 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+  <meta name="theme-color" content="#0a0a1a" />
+  <title>AuroraVPN — быстрый и безопасный VPN</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <!-- ==================== ФОНОВЫЕ ЭФФЕКТЫ ==================== -->
+  <div class="bg">
+    <canvas id="stars" class="bg__stars"></canvas>
+    <div class="bg__aurora">
+      <span class="aurora aurora--1"></span>
+      <span class="aurora aurora--2"></span>
+      <span class="aurora aurora--3"></span>
+      <span class="aurora aurora--4"></span>
+    </div>
+    <div class="bg__grid"></div>
+    <div class="bg__noise"></div>
+    <div class="bg__vignette"></div>
+  </div>
+
+  <!-- ==================== ПРИЛОЖЕНИЕ ==================== -->
+  <main class="app" id="app">
+
+    <!-- Шапка -->
+    <header class="topbar reveal">
+      <div class="brand">
+        <div class="brand__logo">
+          <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+            <path d="M12 2.5 4 6v5.2c0 4.8 3.3 8.6 8 10.3 4.7-1.7 8-5.5 8-10.3V6l-8-3.5Z" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/>
+            <path d="m8.6 12 2.2 2.3L15.6 9.6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+        </div>
+        <div class="brand__text">
+          <span class="brand__name">Aurora<b>VPN</b></span>
+          <span class="brand__tag">безопасное соединение</span>
+        </div>
+      </div>
+      <button class="icon-btn" id="profileBtn" aria-label="Профиль">
+        <img id="avatar" alt="" class="avatar" />
+        <span class="icon-btn__fallback" id="avatarFallback">A</span>
+      </button>
+    </header>
+
+    <!-- ============ ВКЛАДКА: ГЛАВНАЯ ============ -->
+    <section class="page page--active" id="page-home">
+
+      <!-- Кольцо подключения -->
+      <div class="connect reveal" style="--d:.05s">
+        <div class="connect__ring" id="connectRing" role="button" tabindex="0" aria-label="Подключить VPN">
+          <span class="connect__pulse"></span>
+          <span class="connect__pulse connect__pulse--2"></span>
+          <span class="connect__glow"></span>
+          <div class="connect__core">
+            <svg class="connect__power" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+              <path d="M12 3v9" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/>
+              <path d="M6.3 6.8a8 8 0 1 0 11.4 0" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/>
+            </svg>
+          </div>
+        </div>
+        <div class="connect__status">
+          <span class="dot" id="statusDot"></span>
+          <span id="statusText">Отключено</span>
+        </div>
+        <div class="connect__timer" id="timer">00:00:00</div>
+      </div>
+
+      <!-- Метрики скорости -->
+      <div class="stats reveal" style="--d:.12s">
+        <div class="stat glass">
+          <div class="stat__icon down">
+            <svg viewBox="0 0 24 24" fill="none"><path d="M12 4v13m0 0-5-5m5 5 5-5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </div>
+          <div class="stat__body">
+            <span class="stat__value" id="dlValue">0.0</span>
+            <span class="stat__unit">Мбит/с · загрузка</span>
+          </div>
+        </div>
+        <div class="stat glass">
+          <div class="stat__icon up">
+            <svg viewBox="0 0 24 24" fill="none"><path d="M12 20V7m0 0-5 5m5-5 5 5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </div>
+          <div class="stat__body">
+            <span class="stat__value" id="ulValue">0.0</span>
+            <span class="stat__unit">Мбит/с · отдача</span>
+          </div>
+        </div>
+        <div class="stat glass">
+          <div class="stat__icon ping">
+            <svg viewBox="0 0 24 24" fill="none"><path d="M3 12h4l2 5 4-12 2 7h6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </div>
+          <div class="stat__body">
+            <span class="stat__value" id="pingValue">—</span>
+            <span class="stat__unit">мс · пинг</span>
+          </div>
+        </div>
+        <div class="stat glass">
+          <div class="stat__icon shield">
+            <svg viewBox="0 0 24 24" fill="none"><path d="M12 3 5 5.5v5c0 4 2.8 7.3 7 8.5 4.2-1.2 7-4.5 7-8.5v-5L12 3Z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/></svg>
+          </div>
+          <div class="stat__body">
+            <span class="stat__value" id="protValue">AES-256</span>
+            <span class="stat__unit">шифрование</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Текущий сервер -->
+      <button class="server-card glass reveal" id="serverCard" style="--d:.18s">
+        <span class="server-card__flag" id="curFlag">🇳🇱</span>
+        <span class="server-card__info">
+          <span class="server-card__label">Текущий сервер</span>
+          <span class="server-card__name" id="curName">Нидерланды · Амстердам</span>
+        </span>
+        <span class="server-card__ping"><i class="bar b1"></i><i class="bar b2"></i><i class="bar b3"></i><i class="bar b4"></i></span>
+        <svg class="server-card__chev" viewBox="0 0 24 24" fill="none"><path d="m9 6 6 6-6 6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </button>
+
+      <!-- Использовано трафика -->
+      <div class="quota glass reveal" style="--d:.24s">
+        <div class="quota__head">
+          <span>Трафик за месяц</span>
+          <span class="quota__val"><b id="usedGb">32.4</b> / <span id="totalGb">∞</span> ГБ</span>
+        </div>
+        <div class="quota__track"><span class="quota__fill" id="quotaFill" style="width:34%"></span></div>
+        <div class="quota__foot">Подписка активна до <b id="expireDate">14 сентября</b></div>
+      </div>
+    </section>
+
+    <!-- ============ ВКЛАДКА: СЕРВЕРЫ ============ -->
+    <section class="page" id="page-servers">
+      <h2 class="page__title">Выбор локации</h2>
+      <div class="search glass">
+        <svg viewBox="0 0 24 24" fill="none"><circle cx="11" cy="11" r="6.5" stroke="currentColor" stroke-width="1.8"/><path d="m20 20-3.2-3.2" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+        <input id="serverSearch" type="text" placeholder="Поиск страны или города…" />
+      </div>
+      <div class="server-list" id="serverList"><!-- рендерится в app.js --></div>
+    </section>
+
+    <!-- ============ ВКЛАДКА: ТАРИФЫ ============ -->
+    <section class="page" id="page-plans">
+      <h2 class="page__title">Тарифные планы</h2>
+      <p class="page__sub">Отмена в любой момент. Первые 7 дней — бесплатно.</p>
+      <div class="plans" id="planList"><!-- рендерится в app.js --></div>
+      <ul class="perks">
+        <li class="glass"><span class="perks__ic">⚡</span> До 1 Гбит/с без ограничений скорости</li>
+        <li class="glass"><span class="perks__ic">🖥️</span> До 5 устройств одновременно</li>
+        <li class="glass"><span class="perks__ic">🛡️</span> Без логов, kill-switch, WireGuard</li>
+      </ul>
+    </section>
+
+    <!-- ============ ВКЛАДКА: ПРОФИЛЬ ============ -->
+    <section class="page" id="page-profile">
+      <div class="profile-hero glass reveal">
+        <div class="profile-hero__avatar" id="profAvatar">A</div>
+        <div class="profile-hero__name" id="profName">Гость</div>
+        <div class="profile-hero__badge" id="profBadge">Free план</div>
+      </div>
+      <div class="profile-grid">
+        <div class="glass mini-stat"><span class="mini-stat__v" id="daysLeft">7</span><span class="mini-stat__l">дней осталось</span></div>
+        <div class="glass mini-stat"><span class="mini-stat__v" id="devCount">1</span><span class="mini-stat__l">устройства</span></div>
+      </div>
+      <div class="referral glass reveal">
+        <div class="referral__top">
+          <span class="referral__title">Пригласи друга 🎁</span>
+          <span class="referral__hint">+30 дней вам обоим</span>
+        </div>
+        <div class="referral__code">
+          <code id="refCode">AURORA-7X4K</code>
+          <button class="btn btn--ghost" id="copyRef">Копировать</button>
+        </div>
+      </div>
+      <div class="settings">
+        <button class="setting glass" data-toggle="kill"><span>Kill-switch</span><span class="switch on" id="swKill"></span></button>
+        <button class="setting glass" data-toggle="auto"><span>Автоподключение</span><span class="switch" id="swAuto"></span></button>
+        <button class="setting glass" id="supportBtn"><span>Поддержка</span><span class="setting__arrow">›</span></button>
+      </div>
+    </section>
+
+    <!-- Главная кнопка действия -->
+    <div class="cta">
+      <button class="btn btn--primary" id="mainAction">
+        <span class="btn__shine"></span>
+        <span id="mainActionText">Подключиться</span>
+      </button>
+    </div>
+
+    <!-- Нижняя навигация -->
+    <nav class="tabbar glass">
+      <button class="tab tab--active" data-tab="home">
+        <svg viewBox="0 0 24 24" fill="none"><path d="M4 11 12 4l8 7" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/><path d="M6 10v9h12v-9" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        <span>Главная</span>
+      </button>
+      <button class="tab" data-tab="servers">
+        <svg viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="8.5" stroke="currentColor" stroke-width="1.6"/><path d="M3.5 12h17M12 3.5c2.5 2.3 2.5 14.7 0 17M12 3.5c-2.5 2.3-2.5 14.7 0 17" stroke="currentColor" stroke-width="1.4"/></svg>
+        <span>Серверы</span>
+      </button>
+      <button class="tab" data-tab="plans">
+        <svg viewBox="0 0 24 24" fill="none"><path d="M12 3 3 8v8l9 5 9-5V8l-9-5Z" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/><path d="m3 8 9 5 9-5M12 21v-8" stroke="currentColor" stroke-width="1.4"/></svg>
+        <span>Тарифы</span>
+      </button>
+      <button class="tab" data-tab="profile">
+        <svg viewBox="0 0 24 24" fill="none"><circle cx="12" cy="8" r="4" stroke="currentColor" stroke-width="1.7"/><path d="M4.5 20a7.5 7.5 0 0 1 15 0" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
+        <span>Профиль</span>
+      </button>
+    </nav>
+  </main>
+
+  <!-- Всплывающее уведомление -->
+  <div class="toast" id="toast"></div>
+
+  <script src="app.js"></script>
+</body>
+</html>
