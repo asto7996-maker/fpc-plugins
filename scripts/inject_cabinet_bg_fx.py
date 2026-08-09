@@ -95,7 +95,7 @@ BOOT = r"""
 """
 
 FX_CSS = r"""
-      <!-- pk-build:20260809-perf120 -->
+      <!-- pk-build:20260809-smooth -->
       <style id="paskod-bg-fx">
       html{background-color:#070b1c!important}
       body,.dark body,.light body{background-color:transparent!important}
@@ -106,7 +106,14 @@ FX_CSS = r"""
       html.dark #root div[class*="bg-dark-950"],
       html.dark #root div[class*="bg-[#0"]{background-color:rgba(8,12,28,.48)!important}
 
-      /* Glass only when idle — blur off during scroll */
+      /* Surfaces: stable fill so glass on/off doesn’t pop */
+      html.dark #root div[class*="rounded-3xl"],
+      html.dark #root div[class*="rounded-2xl"],
+      html.dark #root section[class*="rounded-3xl"],
+      html.dark #root article[class*="rounded-3xl"]{
+        background-color:rgba(10,14,32,.58)!important;
+        transition:background-color .32s ease,box-shadow .32s ease,border-color .32s ease,opacity .28s ease,transform .28s ease!important;
+      }
       html.dark:not(.pk-scrolling) #root div[class*="rounded-3xl"],
       html.dark:not(.pk-scrolling) #root div[class*="rounded-2xl"],
       html.dark:not(.pk-scrolling) #root section[class*="rounded-3xl"],
@@ -121,9 +128,12 @@ FX_CSS = r"""
         -webkit-backdrop-filter:none!important;
       }
 
-      /* Interaction surface */
+      /* Interaction surface + chrome easing */
       html,body{overscroll-behavior:none;-webkit-text-size-adjust:100%}
-      #root{overscroll-behavior:contain;-webkit-overflow-scrolling:touch}
+      #root{
+        overscroll-behavior:contain;-webkit-overflow-scrolling:touch;
+        transition:opacity .36s cubic-bezier(.22,.61,.36,1);
+      }
       #root main,
       #root [class*="overflow-y-auto"],
       #root [class*="overflow-auto"],
@@ -141,15 +151,23 @@ FX_CSS = r"""
       #root label{
         touch-action:manipulation;
         -webkit-tap-highlight-color:transparent;
+        transition:background-color .2s ease,color .2s ease,border-color .2s ease,opacity .2s ease,box-shadow .2s ease,transform .12s ease!important;
       }
       @media (hover:none){
         #root button:active,
         #root a:active,
         #root [role="button"]:active{
           transform:translateZ(0) scale(.985);
-          transition:transform .07s linear;
         }
       }
+
+      /* Theme / boot crossfade */
+      html.pk-theme-swap #root{opacity:.88}
+      html.pk-theme-swap #pk-fx{opacity:0}
+      #boot{transition:opacity .35s ease!important}
+      @keyframes pkFxIn{from{opacity:0}to{opacity:1}}
+      @keyframes pkSoftIn{from{opacity:0;transform:translate3d(0,8px,0)}to{opacity:1;transform:translate3d(0,0,0)}}
+      html.pk-booted #root > *:not(#pk-fx){animation:pkSoftIn .38s cubic-bezier(.22,.61,.36,1) both}
 
       /* Ambient FX — compositor-friendly (transform/opacity only) */
       #pk-fx{
@@ -157,6 +175,18 @@ FX_CSS = r"""
         contain:strict;isolation:isolate;
         transform:translateZ(0);backface-visibility:hidden;
         background:radial-gradient(120% 90% at 50% -18%, #1a2458 0%, #0d1434 42%, #070b1c 78%, #050712 100%);
+        animation:pkFxIn .55s cubic-bezier(.22,.61,.36,1) both;
+        transition:opacity .38s cubic-bezier(.22,.61,.36,1);
+      }
+      #pk-fx .orb,
+      #pk-fx .aurora,
+      #pk-fx .beam,
+      #pk-fx .grid,
+      #pk-fx .ring,
+      #pk-fx .stars,
+      #pk-fx .stars.s2,
+      #pk-fx .veil{
+        transition:opacity .34s cubic-bezier(.22,.61,.36,1);
       }
       #pk-fx .orb{
         position:absolute;border-radius:50%;
@@ -255,16 +285,32 @@ FX_CSS = r"""
         radial-gradient(120% 90% at 50% 35%,transparent 55%,rgba(2,4,12,.28) 100%),
         linear-gradient(180deg,rgba(7,11,28,.15) 0%,transparent 28%,transparent 70%,rgba(5,7,18,.35) 100%)}
 
+      /* Scroll: pause motion + soft opacity fade (no visibility snap) */
       html.pk-scrolling #pk-fx .orb,
       html.pk-scrolling #pk-fx .aurora,
       html.pk-scrolling #pk-fx .beam,
       html.pk-scrolling #pk-fx .spark{animation-play-state:paused!important;will-change:auto!important}
+      html.pk-scrolling #pk-fx .o1{opacity:.28!important}
+      html.pk-scrolling #pk-fx .o2{opacity:.2!important}
+      html.pk-scrolling #pk-fx .o3{opacity:.22!important}
+      html.pk-scrolling #pk-fx .o4{opacity:.16!important}
+      html.pk-scrolling #pk-fx .o5{opacity:.1!important}
+      html.pk-scrolling #pk-fx .o6{opacity:.08!important}
       html.pk-scrolling #pk-fx .aurora,
       html.pk-scrolling #pk-fx .beam,
       html.pk-scrolling #pk-fx .grid,
       html.pk-scrolling #pk-fx .ring,
-      html.pk-scrolling #pk-fx .stars.s2,
-      html.pk-scrolling #pk-fx .spark{visibility:hidden}
+      html.pk-scrolling #pk-fx .stars.s2{opacity:0!important}
+      html.pk-scrolling #pk-fx .spark{opacity:0!important;animation:none!important}
+      html.pk-scroll-settle #pk-fx .orb,
+      html.pk-scroll-settle #pk-fx .aurora,
+      html.pk-scroll-settle #pk-fx .beam,
+      html.pk-scroll-settle #pk-fx .grid,
+      html.pk-scroll-settle #pk-fx .ring,
+      html.pk-scroll-settle #pk-fx .stars,
+      html.pk-scroll-settle #pk-fx .stars.s2{
+        transition-duration:.45s;
+      }
 
       html.light{background-color:#dceaf8!important}
       html.light #pk-fx{
@@ -312,6 +358,7 @@ FX_CSS = r"""
 
       @media (prefers-reduced-motion:reduce){
         #pk-fx .orb,#pk-fx .aurora,#pk-fx .beam,#pk-fx .spark{animation:none!important}
+        #pk-fx,#pk-fx *,#root,#root *{transition:none!important;animation:none!important}
       }
       /* AVERAGE Android class — keep orbs, drop secondary motion */
       html.paskod-avg #pk-fx .spark,
@@ -356,26 +403,33 @@ FX_BODY = r"""
       var root = document.documentElement;
       var scrolling = false;
       var timer = 0;
+      var settleTimer = 0;
+      var themeTimer = 0;
+      var prevLight = root.classList.contains('light');
 
       function setScrolling(on){
-        if (on) {
-          if (!scrolling) {
-            scrolling = true;
-            root.classList.add('pk-scrolling');
-            try { window.__paskodPauseAnim = true; } catch (e) {}
-          }
-          clearTimeout(timer);
-          timer = setTimeout(function(){
-            scrolling = false;
-            root.classList.remove('pk-scrolling');
-            try {
-              if (!(location.pathname || '').includes('subscription')) {
-                window.__paskodPauseAnim = false;
-              }
-            } catch (e2) {}
-          }, 120);
-          return;
+        if (!on) return;
+        if (!scrolling) {
+          scrolling = true;
+          root.classList.add('pk-scrolling');
+          root.classList.remove('pk-scroll-settle');
+          try { window.__paskodPauseAnim = true; } catch (e) {}
         }
+        clearTimeout(timer);
+        clearTimeout(settleTimer);
+        timer = setTimeout(function(){
+          scrolling = false;
+          root.classList.remove('pk-scrolling');
+          root.classList.add('pk-scroll-settle');
+          try {
+            if (!(location.pathname || '').includes('subscription')) {
+              window.__paskodPauseAnim = false;
+            }
+          } catch (e2) {}
+          settleTimer = setTimeout(function(){
+            root.classList.remove('pk-scroll-settle');
+          }, 420);
+        }, 140);
       }
 
       var opts = {passive:true, capture:true};
@@ -389,16 +443,35 @@ FX_BODY = r"""
         else root.classList.remove('pk-hidden');
       }, false);
 
-      /* Long-press / drag on buttons should feel instant */
+      /* Smooth theme (light/dark) crossfade */
       try {
-        document.addEventListener('pointerdown', function(ev){
-          var t = ev.target;
-          if (!t || !t.closest) return;
-          if (t.closest('button, a, [role="button"], [class*="cursor-pointer"]')) {
-            /* no-op: touch-action:manipulation handles 300ms; keep listener light */
-          }
-        }, {passive:true});
+        new MutationObserver(function(){
+          var light = root.classList.contains('light');
+          if (light === prevLight) return;
+          prevLight = light;
+          root.classList.add('pk-theme-swap');
+          clearTimeout(themeTimer);
+          themeTimer = setTimeout(function(){
+            root.classList.remove('pk-theme-swap');
+          }, 380);
+        }).observe(root, {attributes:true, attributeFilter:['class']});
       } catch (e3) {}
+
+      /* Soft enter after boot node leaves */
+      try {
+        var boot = document.getElementById('boot');
+        if (!boot) root.classList.add('pk-booted');
+        else {
+          new MutationObserver(function(){
+            if (!document.getElementById('boot') || (boot.classList && boot.classList.contains('hide'))) {
+              root.classList.add('pk-booted');
+            }
+          }).observe(boot, {attributes:true, attributeFilter:['class']});
+          setTimeout(function(){ root.classList.add('pk-booted'); }, 1200);
+        }
+      } catch (e4) {
+        root.classList.add('pk-booted');
+      }
     })();
     </script>
 """
@@ -416,11 +489,11 @@ else:
     t = t.replace("<body>", "<body>\n" + FX_BODY, 1)
 
 p.write_text(t, encoding="utf-8")
-assert "pk-build:20260809-perf120" in t
+assert "pk-build:20260809-smooth" in t
 assert 'id="pk-fx"' in t
 assert "paskod-perf-runtime" in t
 assert "pk-header-total" not in t
 assert t.count('id="paskod-perf-boot"') == 1
 assert t.count('id="paskod-bg-fx"') == 1
-print("OK perf120", len(t))
+print("OK smooth", len(t))
 print("stock_patched", STOCK_NEW[:40] in t or "if (cls) window.__paskodPerfClass" in t)

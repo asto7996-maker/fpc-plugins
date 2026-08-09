@@ -193,15 +193,24 @@
   setInterval(tickCd, 1000);
 
   document.getElementById("btnTheme")?.addEventListener("click", () => {
+    root.classList.add("pk-theme-swap");
     document.body.classList.toggle("theme-flip");
+    setTimeout(() => root.classList.remove("pk-theme-swap"), 380);
   });
 
-  /* ---------- 120fps: pause FX while scrolling ---------- */
+  /* ---------- 120fps: pause FX while scrolling (soft settle) ---------- */
   let scrollTimer = 0;
+  let settleTimer = 0;
   function markScrolling() {
     root.classList.add("pk-scrolling");
+    root.classList.remove("pk-scroll-settle");
     clearTimeout(scrollTimer);
-    scrollTimer = setTimeout(() => root.classList.remove("pk-scrolling"), 120);
+    clearTimeout(settleTimer);
+    scrollTimer = setTimeout(() => {
+      root.classList.remove("pk-scrolling");
+      root.classList.add("pk-scroll-settle");
+      settleTimer = setTimeout(() => root.classList.remove("pk-scroll-settle"), 420);
+    }, 140);
   }
   const scrollOpts = { passive: true, capture: true };
   if (main) main.addEventListener("scroll", markScrolling, scrollOpts);

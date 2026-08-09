@@ -207,26 +207,59 @@ a { text-decoration: none; }
     radial-gradient(120% 90% at 50% 30%, transparent 55%, rgba(2,4,12,.42)),
     linear-gradient(180deg, rgba(7,11,28,.15), transparent 28%, rgba(5,7,18,.45));
 }
+.fx,
+.fx__orb,
+.fx__aurora,
+.fx__beam,
+.fx__grid,
+.fx__ring,
+.fx__stars,
+.fx__stars--2,
+.fx__veil {
+  transition: opacity .34s cubic-bezier(.22, .61, .36, 1);
+}
 html.pk-scrolling .fx__orb,
 html.pk-scrolling .fx__aurora,
 html.pk-scrolling .fx__beam,
 html.pk-scrolling .fx__spark { animation-play-state: paused !important; will-change: auto !important; }
+html.pk-scrolling .fx__orb--1 { opacity: .28 !important; }
+html.pk-scrolling .fx__orb--2 { opacity: .2 !important; }
+html.pk-scrolling .fx__orb--3 { opacity: .22 !important; }
+html.pk-scrolling .fx__orb--4 { opacity: .16 !important; }
+html.pk-scrolling .fx__orb--5 { opacity: .1 !important; }
+html.pk-scrolling .fx__orb--6 { opacity: .08 !important; }
 html.pk-scrolling .fx__aurora,
 html.pk-scrolling .fx__beam,
 html.pk-scrolling .fx__grid,
 html.pk-scrolling .fx__ring,
 html.pk-scrolling .fx__stars--2,
-html.pk-scrolling .fx__spark { visibility: hidden; }
+html.pk-scrolling .fx__spark { opacity: 0 !important; }
+html.pk-scrolling .fx__spark { animation: none !important; }
 html.pk-scrolling .card,
 html.pk-scrolling .app-header,
 html.pk-scrolling .app-dock {
   backdrop-filter: none !important;
   -webkit-backdrop-filter: none !important;
 }
+html.pk-scroll-settle .fx__orb,
+html.pk-scroll-settle .fx__aurora,
+html.pk-scroll-settle .fx__beam {
+  transition-duration: .45s;
+}
+html.pk-theme-swap .fx { opacity: 0; }
+html.pk-theme-swap .app { opacity: .9; }
+.app { transition: opacity .36s cubic-bezier(.22, .61, .36, 1); }
+.card {
+  transition: background-color .32s ease, box-shadow .32s ease, border-color .32s ease, transform .2s ease;
+}
 button, a, [role="button"] {
   touch-action: manipulation;
   -webkit-tap-highlight-color: transparent;
+  transition: background-color .2s ease, color .2s ease, border-color .2s ease, opacity .2s ease, transform .12s ease, box-shadow .2s ease;
 }
+body.theme-flip .fx { filter: hue-rotate(18deg) saturate(1.05); }
+.fx { transition: opacity .38s cubic-bezier(.22, .61, .36, 1), filter .4s ease; }
+
 @keyframes driftA {
   0%, 100% { transform: translate3d(0, 0, 0) scale(1); }
   50% { transform: translate3d(5dvw, 4dvh, 0) scale(1.06); }
