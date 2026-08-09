@@ -1,5 +1,5 @@
 /**
- * Paskod Mini App — gold-standard TMA safe areas + navigation
+ * Paskod TMA — gold-standard viewport + safe areas + shell sync
  */
 (function () {
   "use strict";
@@ -26,18 +26,18 @@
   }
 
   /**
-   * Official TMA model:
-   * - safeAreaInset = system (notch / status bar)
-   * - contentSafeAreaInset = Telegram UI within the safe area
-   * - When fullscreen, Close/••• overlay the WebView → add TG chrome height
-   * - When expanded normally, Close is outside the WebView → light breath only
+   * Telegram WebApp viewport + safe areas
+   * - expand() → use full available height (pair with 100dvh, never 100vh)
+   * - safeAreaInset → system notch / home indicator
+   * - contentSafeAreaInset → Telegram UI (Close / •••) inside the WebView
+   * - fullscreen → Close overlays content → reserve --tg-chrome-top
    */
   function applySafeArea() {
     let top = 0;
     let bottom = 0;
     let left = 0;
     let right = 0;
-    let tgBar = 0;
+    let chromeTop = 0;
 
     const envTop = readCssEnv("safe-area-inset-top");
     const envBottom = readCssEnv("safe-area-inset-bottom");
@@ -47,24 +47,59 @@
     if (tg) {
       try { tg.ready(); } catch (_) {}
       try { if (tg.expand) tg.expand(); } catch (_) {}
+      try {
+        if (tg.disableVerticalSwipes) tg.disableVerticalSwipes();
+      } catch (_) {}
 
       const sa = tg.safeAreaInset || {};
       const csa = tg.contentSafeAreaInset || {};
       const platform = String(tg.platform || "").toLowerCase();
       const fs = !!tg.isFullscreen;
-      const insetTop = Math.max(num(sa.top), num(csa.top), envTop);
+
+      // Prefer content-safe inset (Telegram chrome already accounted for)
+      const contentTop = Math.max(num(csa.top), 0);
+      const systemTop = Math.max(num(sa.top), envTop);
 
       if (fs) {
-        // Content draws under system UI + Telegram Close bar
-        top = insetTop;
-        tgBar = platform === "ios" ? 46 : 50;
-      } else if (insetTop > 0) {
-        top = insetTop;
+        // Fullscreen: Close / ••• sit ON TOP of the WebView
+        top = Math.max(systemTop, contentTop);
+        // If content inset is tiny, add explicit TG chrome bar height
+        if (contentTop < 40) {
+          chromeTop = platform === "ios" ? 48 : 52;
+        }
+      } else if (contentTop > 0 || systemTop > 0) {
+        // Partial overlay / reported insets
+        top = Math.max(contentTop, systemTop);
+        if (contentTop === 0 && systemTop >= 20 && fs === false) {
+          // System notch only — Close usually outside WebView
+          chromeTop = 0;
+        }
       } else {
-        // Close is outside the WebView
+        // Classic expanded: iOS Close is usually outside WebView.
+        // Android often still paints «Закрыть» over the top edge — reserve chrome.
         top = 0;
-        tgBar = 0;
+        chromeTop = 0;
+        if (platform === "android" || platform === "android_x") chromeTop = 46;
+        else if (
+          platform &&
+          !["tdesktop", "web", "weba", "macos", "windows", "linux", "ios"].includes(platform)
+        ) {
+          chromeTop = 40;
+        }
       }
+
+      // Prefer Telegram-injected CSS variables when the client provides them
+      try {
+        const cs = getComputedStyle(root);
+        const tgCssTop = parseFloat(cs.getPropertyValue("--tg-content-safe-area-inset-top")) || 0;
+        const tgCssSafe = parseFloat(cs.getPropertyValue("--tg-safe-area-inset-top")) || 0;
+        if (tgCssTop > top) {
+          top = tgCssTop;
+          if (tgCssTop >= 40) chromeTop = 0;
+        } else if (tgCssSafe > top) {
+          top = tgCssSafe;
+        }
+      } catch (_) {}
 
       bottom = Math.max(num(sa.bottom), num(csa.bottom), envBottom);
       left = Math.max(num(sa.left), num(csa.left), envLeft);
@@ -72,6 +107,7 @@
 
       root.classList.add("is-tma");
       root.classList.toggle("is-tma-fs", fs);
+
       try {
         tg.setHeaderColor("#0b1736");
         tg.setBackgroundColor("#070b1c");
@@ -85,25 +121,34 @@
     }
 
     // Soft ceilings — avoid pathological empty bands
-    top = Math.min(top, 80);
-    tgBar = Math.min(tgBar, 56);
+    top = Math.min(top, 72);
+    chromeTop = Math.min(chromeTop, 56);
     bottom = Math.min(bottom, 40);
 
-    // Non-overlay TMA: tiny breath under Close
-    if (tg && !tg.isFullscreen && top === 0 && tgBar === 0) {
-      top = 12;
-    }
+    root.style.setProperty("--tg-content-safe-area-top", `${top}px`);
+    root.style.setProperty("--tg-chrome-top", `${chromeTop}px`);
+    root.style.setProperty("--tg-content-safe-area-bottom", `${bottom}px`);
+    root.style.setProperty("--tg-content-safe-area-left", `${left}px`);
+    root.style.setProperty("--tg-content-safe-area-right", `${right}px`);
 
-    root.style.setProperty("--tg-safe-top", `${top}px`);
-    root.style.setProperty("--tg-bar", `${tgBar}px`);
-    root.style.setProperty("--tg-safe-bottom", `${bottom}px`);
-    root.style.setProperty("--tg-safe-left", `${left}px`);
-    root.style.setProperty("--tg-safe-right", `${right}px`);
+    syncDockClearance();
   }
 
-  /* ---------- Navigation ---------- */
+  /** Measure painted dock → keep spacer = dock height + 20px */
+  function syncDockClearance() {
+    const dock = document.getElementById("appDock");
+    if (!dock) return;
+    const h = Math.ceil(dock.getBoundingClientRect().height);
+    if (h > 40) {
+      root.style.setProperty("--dock-h", `${h}px`);
+      root.style.setProperty("--dock-clearance", `${h + 20}px`);
+    }
+  }
+
+  /* ---------- Navigation (scroll only .app-main) ---------- */
   const pages = [...document.querySelectorAll(".page")];
-  const dockItems = [...document.querySelectorAll(".dock__item")];
+  const dockItems = [...document.querySelectorAll(".app-dock__item")];
+  const main = document.getElementById("appMain");
 
   function go(name) {
     pages.forEach((p) => {
@@ -113,7 +158,7 @@
     });
     dockItems.forEach((b) => b.classList.toggle("is-active", b.dataset.nav === name));
     history.replaceState(null, "", `#${name}`);
-    window.scrollTo({ top: 0, behavior: "instant" in window ? "instant" : "auto" });
+    if (main) main.scrollTop = 0;
   }
 
   document.addEventListener("click", (e) => {
@@ -130,7 +175,7 @@
   const nameEl = document.getElementById("userName");
   if (tg && tg.initDataUnsafe && tg.initDataUnsafe.user) {
     const u = tg.initDataUnsafe.user;
-    nameEl.textContent = u.first_name || u.username || "друг";
+    if (nameEl) nameEl.textContent = u.first_name || u.username || "друг";
   }
 
   let sec = 18;
@@ -159,10 +204,13 @@
     document.body.classList.toggle("theme-flip");
   });
 
-  /* ---------- Boot safe areas ---------- */
+  /* ---------- Boot ---------- */
   applySafeArea();
   [50, 200, 600, 1200, 2500].forEach((ms) => setTimeout(applySafeArea, ms));
   window.addEventListener("resize", applySafeArea);
+  if (window.visualViewport) {
+    window.visualViewport.addEventListener("resize", applySafeArea);
+  }
   if (tg && tg.onEvent) {
     ["safeAreaChanged", "contentSafeAreaChanged", "viewportChanged", "fullscreenChanged"].forEach((ev) => {
       try { tg.onEvent(ev, applySafeArea); } catch (_) {}

@@ -1,31 +1,30 @@
-# Paskod Mini App — Gold-standard TMA layout
+# Paskod Mini App — TMA gold-standard shell
 
-Adaptive Telegram Mini App shell with production-safe area handling.
+Flexbox column architecture with Telegram safe areas, `100dvh` viewport, and a fixed bottom dock that never clips content.
 
-## What’s included
+## Architecture
 
-- **Safe areas**: `env(safe-area-inset-*)` + Telegram `safeAreaInset` / `contentSafeAreaInset`
-- **TMA detection**: expands WebApp, clears Close/••• when they overlay (fullscreen)
-- **Layout**: Flex + Grid, `clamp()` type, no absolute main layout
-- **Screens**: Home, Subscription, Balance, Referrals, Support
-- **Dock**: fixed bottom nav with `safe-area-inset-bottom`
+```
+.app (flex column, height: 100dvh, overflow: hidden)
+├── .app-header   flex: 0 0 auto   ← below Telegram Close via safe-area + chrome
+├── .app-main     flex: 1 1 auto   ← ONLY scroll container (overflow-y: auto)
+│   ├── .app-main__inner          ← 16px under header, card gap 12px
+│   └── .dock-spacer              ← dock height + 20px
+└── .app-dock     position: fixed; z-index: 100
+```
+
+## Rules
+
+- **Never** `100vh` — use `100dvh` / `min-height: 100dvh`
+- Call `Telegram.WebApp.expand()` on boot
+- Safe areas: `env(safe-area-inset-*)` + `safeAreaInset` / `contentSafeAreaInset`
+- Fullscreen overlay: add `--tg-chrome-top` (~48–52px) when Close sits on the WebView
+- Spacing tokens: `8 / 14 / 16 / 20` px · card gap `12px` · radius `16px`
+- Header → welcome title: **exactly 16px**
+- Countdown / money: `tabular-nums` + `nowrap`
 
 ## Run
-
-Open `index.html` in a browser, or serve statically:
 
 ```bash
 python3 -m http.server 5173 --directory .
 ```
-
-Then open in Telegram via a Mini App URL, or use [Telegram Web App](https://core.telegram.org/bots/webapps) tooling.
-
-## Safe-area rules (summary)
-
-| Mode | Top inset |
-|------|-----------|
-| Expanded (Close outside WebView) | ~12px breath |
-| Fullscreen / overlay | `max(system, content)` + TG chrome (~48–50px) |
-| Bottom dock | `env(safe-area-inset-bottom)` always |
-
-Background paints edge-to-edge; padding lives on the sticky header and dock so notches stay filled with the theme color.
