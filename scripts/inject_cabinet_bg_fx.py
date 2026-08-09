@@ -163,11 +163,11 @@ FX_CSS = r"""
 
       /* Theme / boot crossfade */
       html.pk-theme-swap #root{opacity:.88}
-      html.pk-theme-swap #pk-fx{opacity:0}
+      html.pk-theme-swap #pk-fx{opacity:0!important}
       #boot{transition:opacity .35s ease!important}
       @keyframes pkFxIn{from{opacity:0}to{opacity:1}}
       @keyframes pkSoftIn{from{opacity:0;transform:translate3d(0,8px,0)}to{opacity:1;transform:translate3d(0,0,0)}}
-      html.pk-booted #root > *:not(#pk-fx){animation:pkSoftIn .38s cubic-bezier(.22,.61,.36,1) both}
+      html.pk-booted:not(.pk-theme-swap) #root{animation:pkSoftIn .38s cubic-bezier(.22,.61,.36,1)}
 
       /* Ambient FX — compositor-friendly (transform/opacity only) */
       #pk-fx{
@@ -175,7 +175,7 @@ FX_CSS = r"""
         contain:strict;isolation:isolate;
         transform:translateZ(0);backface-visibility:hidden;
         background:radial-gradient(120% 90% at 50% -18%, #1a2458 0%, #0d1434 42%, #070b1c 78%, #050712 100%);
-        animation:pkFxIn .55s cubic-bezier(.22,.61,.36,1) both;
+        animation:pkFxIn .55s cubic-bezier(.22,.61,.36,1);
         transition:opacity .38s cubic-bezier(.22,.61,.36,1);
       }
       #pk-fx .orb,
