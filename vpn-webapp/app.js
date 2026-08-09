@@ -200,17 +200,15 @@
 
   /* ---------- 120fps: pause FX while scrolling (soft settle) ---------- */
   let scrollTimer = 0;
-  let settleTimer = 0;
+  let raf = 0;
   function markScrolling() {
-    root.classList.add("pk-scrolling");
-    root.classList.remove("pk-scroll-settle");
-    clearTimeout(scrollTimer);
-    clearTimeout(settleTimer);
-    scrollTimer = setTimeout(() => {
-      root.classList.remove("pk-scrolling");
-      root.classList.add("pk-scroll-settle");
-      settleTimer = setTimeout(() => root.classList.remove("pk-scroll-settle"), 420);
-    }, 140);
+    if (raf) return;
+    raf = requestAnimationFrame(() => {
+      raf = 0;
+      root.classList.add("pk-scrolling");
+      clearTimeout(scrollTimer);
+      scrollTimer = setTimeout(() => root.classList.remove("pk-scrolling"), 180);
+    });
   }
   const scrollOpts = { passive: true, capture: true };
   if (main) main.addEventListener("scroll", markScrolling, scrollOpts);
