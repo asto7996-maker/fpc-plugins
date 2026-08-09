@@ -75,17 +75,9 @@
           chromeTop = 0;
         }
       } else {
-        // Classic expanded: iOS Close is usually outside WebView.
-        // Android often still paints «Закрыть» over the top edge — reserve chrome.
+        // Classic expanded: Close lives outside the WebView — no chrome band.
         top = 0;
         chromeTop = 0;
-        if (platform === "android" || platform === "android_x") chromeTop = 46;
-        else if (
-          platform &&
-          !["tdesktop", "web", "weba", "macos", "windows", "linux", "ios"].includes(platform)
-        ) {
-          chromeTop = 40;
-        }
       }
 
       // Prefer Telegram-injected CSS variables when the client provides them
