@@ -23,9 +23,10 @@ Flexbox column architecture with Telegram safe areas, `100dvh` viewport, and a f
 - Header → welcome title: **exactly 16px**
 - Countdown / money: `tabular-nums` + `nowrap`
 
-## Ambient FX
+## Ambient FX + perf
 
-Background-only stack (layout untouched): 6 gradient orbs, aurora conic, dual light beams, perspective grid, soft rings, dual starfields, sparkles, vignette veil. Matches live injection `pk-build:20260809-fx-rich` on `cabinet.paskod.ru`.
+Background-only GPU stack (layout untouched): orbs / aurora / beams / grid / rings / stars / sparks.
+Live build `pk-build:20260809-perf120`: no `mix-blend` / `filter:blur` on FX, glass blur only when idle, FX paused while scrolling, `touch-action: manipulation`, duplicate React portal backgrounds disabled via `__paskodDisableBg`.
 
 ## Run
 

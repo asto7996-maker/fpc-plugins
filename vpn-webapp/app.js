@@ -196,6 +196,21 @@
     document.body.classList.toggle("theme-flip");
   });
 
+  /* ---------- 120fps: pause FX while scrolling ---------- */
+  let scrollTimer = 0;
+  function markScrolling() {
+    root.classList.add("pk-scrolling");
+    clearTimeout(scrollTimer);
+    scrollTimer = setTimeout(() => root.classList.remove("pk-scrolling"), 120);
+  }
+  const scrollOpts = { passive: true, capture: true };
+  if (main) main.addEventListener("scroll", markScrolling, scrollOpts);
+  window.addEventListener("touchmove", markScrolling, scrollOpts);
+  window.addEventListener("wheel", markScrolling, scrollOpts);
+  document.addEventListener("visibilitychange", () => {
+    root.classList.toggle("pk-hidden", document.hidden);
+  });
+
   /* ---------- Boot ---------- */
   applySafeArea();
   [50, 200, 600, 1200, 2500].forEach((ms) => setTimeout(applySafeArea, ms));
