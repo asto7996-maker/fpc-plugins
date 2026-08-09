@@ -13,9 +13,9 @@
   --tg-chrome-top: 0px;
 
   /* Strict spacing tokens */
-  --space-xs: 0.5rem;     /* 8px */
+  --space-xs: 0.5rem;     /* 8px — header → welcome */
   --space-sm: 0.875rem;   /* 14px */
-  --space-md: 1rem;       /* 16px — header → welcome */
+  --space-md: 1rem;       /* 16px */
   --space-lg: 1.25rem;    /* 20px */
   --card-gap: 12px;
 
@@ -151,7 +151,7 @@ a { text-decoration: none; }
     var(--tg-chrome-top) +
     var(--header-pad-y)
   );
-  padding-bottom: var(--header-pad-y);
+  padding-bottom: 6px;
   padding-left: var(--page-x);
   padding-right: var(--page-x);
   background: linear-gradient(180deg, #0b1736 0%, #09132e 100%);
@@ -240,7 +240,7 @@ a { text-decoration: none; }
 .app-main__inner {
   width: min(100%, 44rem);
   margin: 0 auto;
-  padding: var(--space-md) var(--page-x) 0; /* EXACTLY 16px under header */
+  padding: var(--space-xs) var(--page-x) 0; /* 8px under header — tight to nav */
   display: flex;
   flex-direction: column;
 }
