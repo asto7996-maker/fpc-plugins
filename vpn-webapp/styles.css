@@ -198,16 +198,16 @@ a { text-decoration: none; }
   width: min(100%, 44rem);
   margin: 0 auto;
   padding:
-    clamp(0.7rem, 2.2vw, 1rem)
+    0.45rem
     var(--page-x)
     calc(var(--dock-h) + 0.85rem);
   display: flex;
   flex-direction: column;
-  gap: var(--gap);
+  gap: 0.7rem;
 }
 
 .page[hidden] { display: none !important; }
-.page { display: flex; flex-direction: column; gap: var(--gap); animation: fade .22s ease; }
+.page { display: flex; flex-direction: column; gap: 0.7rem; animation: fade .22s ease; }
 @keyframes fade { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
 
 .greet__title {
@@ -242,6 +242,8 @@ a { text-decoration: none; }
   display: flex;
   align-items: center;
   gap: 0.65rem;
+  margin: 0;
+  padding: 0;
 }
 .page-head__title {
   margin: 0;
@@ -390,7 +392,7 @@ a { text-decoration: none; }
 .earn { display: block; color: #c4b5fd; font-size: 0.78rem; margin-top: 0.15rem; }
 
 .countdown { display: flex; flex-direction: column; gap: 0.25rem; }
-.countdown strong { font-size: clamp(1.15rem, 4.2vw, 1.45rem); font-weight: 800; }
+.countdown strong { font-size: clamp(1.2rem, 4.5vw, 1.55rem); font-weight: 800; font-variant-numeric: tabular-nums; letter-spacing: 0.02em; }
 .locations { display: flex; align-items: center; gap: 0.5rem; }
 .tag {
   padding: 0.2rem 0.5rem; border-radius: 0.45rem;
@@ -506,7 +508,7 @@ a { text-decoration: none; }
 @media (min-width: 768px) {
   .shell {
     width: min(100%, 48rem);
-    padding-top: 1.15rem;
+    padding-top: 0.55rem;
   }
   .pair-grid {
     grid-template-columns: repeat(2, minmax(12rem, 1fr));
