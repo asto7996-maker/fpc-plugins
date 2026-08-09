@@ -23,6 +23,10 @@ Flexbox column architecture with Telegram safe areas, `100dvh` viewport, and a f
 - Header → welcome title: **exactly 16px**
 - Countdown / money: `tabular-nums` + `nowrap`
 
+## Ambient FX
+
+Background-only stack (layout untouched): 6 gradient orbs, aurora conic, dual light beams, perspective grid, soft rings, dual starfields, sparkles, vignette veil. Matches live injection `pk-build:20260809-fx-rich` on `cabinet.paskod.ru`.
+
 ## Run
 
 ```bash

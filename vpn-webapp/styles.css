@@ -75,55 +75,179 @@ button, a { color: inherit; font: inherit; }
 button { border: 0; background: none; cursor: pointer; }
 a { text-decoration: none; }
 
-/* ---------- Ambient FX ---------- */
+/* ---------- Ambient FX (rich nebula stack) ---------- */
 .fx {
   position: fixed;
   inset: 0;
   z-index: -1;
   pointer-events: none;
   overflow: hidden;
+  contain: strict;
+  background:
+    radial-gradient(120% 90% at 50% -18%, #1a2458 0%, #0d1434 42%, #070b1c 78%, #050712 100%);
 }
 .fx__orb {
   position: absolute;
   border-radius: 50%;
-  filter: blur(8px);
+  filter: blur(2px);
   mix-blend-mode: screen;
-  will-change: transform;
+  will-change: transform, opacity;
 }
 .fx__orb--1 {
-  width: 90dvw; height: 90dvw; left: -22dvw; top: -18dvh; opacity: .45;
-  background: radial-gradient(circle, rgba(139,92,246,.95), transparent 60%);
-  animation: drift 28s ease-in-out infinite;
+  width: 95dvw; height: 95dvw; left: -24dvw; top: -20dvh; opacity: .55;
+  background: radial-gradient(circle, rgba(139,92,246,.95) 0%, transparent 62%);
+  animation: driftA 26s ease-in-out infinite;
 }
 .fx__orb--2 {
-  width: 75dvw; height: 75dvw; right: -18dvw; top: 0; opacity: .35;
-  background: radial-gradient(circle, rgba(56,189,248,.9), transparent 60%);
-  animation: drift 34s ease-in-out infinite reverse;
+  width: 80dvw; height: 80dvw; right: -18dvw; top: -6dvh; opacity: .42;
+  background: radial-gradient(circle, rgba(56,189,248,.92) 0%, transparent 62%);
+  animation: driftB 32s ease-in-out infinite;
 }
 .fx__orb--3 {
-  width: 100dvw; height: 100dvw; left: -10dvw; bottom: -40dvh; opacity: .4;
-  background: radial-gradient(circle, rgba(99,102,241,.95), transparent 58%);
-  animation: drift 40s ease-in-out infinite;
+  width: 110dvw; height: 110dvw; left: -14dvw; bottom: -38dvh; opacity: .48;
+  background: radial-gradient(circle, rgba(99,102,241,.95) 0%, transparent 58%);
+  animation: driftC 38s ease-in-out infinite;
+}
+.fx__orb--4 {
+  width: 72dvw; height: 72dvw; right: -12dvw; bottom: -14dvh; opacity: .34;
+  background: radial-gradient(circle, rgba(45,212,191,.9) 0%, transparent 60%);
+  animation: driftB 28s ease-in-out infinite reverse;
+}
+.fx__orb--5 {
+  width: 58dvw; height: 58dvw; left: 22dvw; top: 28dvh; opacity: .22;
+  background: radial-gradient(circle, rgba(236,72,153,.85) 0%, transparent 62%);
+  animation: driftA 42s ease-in-out infinite reverse;
+}
+.fx__orb--6 {
+  width: 50dvw; height: 50dvw; right: 10dvw; top: 42dvh; opacity: .18;
+  background: radial-gradient(circle, rgba(250,204,21,.75) 0%, transparent 65%);
+  animation: driftC 46s ease-in-out infinite;
+}
+.fx__aurora {
+  position: absolute; inset: -20% -10%; opacity: .35; mix-blend-mode: screen;
+  filter: blur(28px);
+  background: conic-gradient(
+    from 180deg at 50% 40%,
+    rgba(139,92,246,0),
+    rgba(56,189,248,.35),
+    rgba(167,139,250,0),
+    rgba(236,72,153,.28),
+    rgba(45,212,191,.22),
+    rgba(139,92,246,0)
+  );
+  animation: auroraSpin 48s linear infinite;
+}
+.fx__beam {
+  position: absolute; width: 140%; height: 42%; left: -20%; top: 8%;
+  background: linear-gradient(105deg, transparent 20%, rgba(96,165,250,.12) 45%, rgba(167,139,250,.16) 55%, transparent 78%);
+  transform: rotate(-8deg); opacity: .55; mix-blend-mode: screen;
+  animation: beamDrift 18s ease-in-out infinite alternate;
+}
+.fx__beam--2 {
+  top: auto; bottom: 5%; height: 36%;
+  background: linear-gradient(75deg, transparent 15%, rgba(45,212,191,.1) 48%, rgba(139,92,246,.14) 62%, transparent 85%);
+  transform: rotate(6deg); animation-duration: 22s; animation-direction: alternate-reverse;
+}
+.fx__grid {
+  position: absolute; inset: 0; opacity: .14;
+  background-image:
+    linear-gradient(rgba(148,163,255,.18) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(148,163,255,.14) 1px, transparent 1px);
+  background-size: 48px 48px;
+  transform: perspective(600px) rotateX(58deg) translateY(-12%) scale(1.35);
+  transform-origin: center top;
+  mask-image: linear-gradient(to bottom, rgba(0,0,0,.7), transparent 72%);
+  animation: gridPulse 16s ease-in-out infinite;
+}
+.fx__ring {
+  position: absolute; left: 50%; top: 38%; width: 70dvw; height: 70dvw;
+  margin: -35dvw 0 0 -35dvw; border-radius: 50%;
+  border: 1px solid rgba(167,139,250,.18);
+  box-shadow: 0 0 40px rgba(99,102,241,.12), inset 0 0 40px rgba(56,189,248,.08);
+  opacity: .35; animation: ringBreath 14s ease-in-out infinite;
+}
+.fx__ring--2 {
+  width: 46dvw; height: 46dvw; margin: -23dvw 0 0 -23dvw; top: 48%;
+  border-color: rgba(45,212,191,.16); animation-duration: 18s; animation-direction: reverse;
 }
 .fx__stars {
-  position: absolute; inset: 0; opacity: .5;
+  position: absolute; inset: 0; opacity: .55;
   background-image:
     radial-gradient(1.2px 1.2px at 12% 18%, #fff, transparent),
     radial-gradient(1px 1px at 40% 30%, #dbeafe, transparent),
     radial-gradient(1.3px 1.3px at 70% 22%, #fff, transparent),
     radial-gradient(1px 1px at 85% 60%, #c7d2fe, transparent),
-    radial-gradient(1.1px 1.1px at 28% 78%, #fff, transparent);
+    radial-gradient(1.1px 1.1px at 28% 78%, #fff, transparent),
+    radial-gradient(1px 1px at 58% 48%, #e0e7ff, transparent),
+    radial-gradient(1.4px 1.4px at 8% 54%, #fff, transparent),
+    radial-gradient(1px 1px at 92% 34%, #a5b4fc, transparent);
+  animation: starsDrift 60s linear infinite;
 }
+.fx__stars--2 {
+  opacity: .35; transform: scale(1.15);
+  animation-duration: 90s; animation-direction: reverse;
+  background-image:
+    radial-gradient(1px 1px at 18% 42%, #fff, transparent),
+    radial-gradient(1.2px 1.2px at 62% 14%, #c4b5fd, transparent),
+    radial-gradient(1px 1px at 76% 72%, #fff, transparent),
+    radial-gradient(1.3px 1.3px at 34% 66%, #67e8f9, transparent);
+}
+.fx__spark {
+  position: absolute; width: 6px; height: 6px; border-radius: 50%;
+  background: radial-gradient(circle, #fff 0%, rgba(167,139,250,.8) 40%, transparent 70%);
+  box-shadow: 0 0 12px rgba(196,181,253,.8);
+  opacity: 0; animation: sparkFlash 5.5s ease-in-out infinite;
+}
+.fx__spark--1 { left: 12%; top: 22%; animation-delay: .2s; }
+.fx__spark--2 { left: 72%; top: 18%; animation-delay: 1.1s; animation-duration: 6.2s; }
+.fx__spark--3 { left: 38%; top: 58%; animation-delay: 2.4s; animation-duration: 7s; }
+.fx__spark--4 { left: 84%; top: 64%; animation-delay: 3.3s; }
+.fx__spark--5 { left: 54%; top: 34%; animation-delay: 4.1s; animation-duration: 5.8s; }
+.fx__spark--6 { left: 22%; top: 72%; animation-delay: .8s; animation-duration: 6.6s; }
 .fx__veil {
   position: absolute; inset: 0;
-  background: radial-gradient(120% 90% at 50% 30%, transparent 55%, rgba(2,4,12,.35));
+  background:
+    radial-gradient(120% 90% at 50% 30%, transparent 55%, rgba(2,4,12,.42)),
+    linear-gradient(180deg, rgba(7,11,28,.15), transparent 28%, rgba(5,7,18,.45));
 }
-@keyframes drift {
+@keyframes driftA {
   0%, 100% { transform: translate3d(0, 0, 0) scale(1); }
-  50% { transform: translate3d(4dvw, 3dvh, 0) scale(1.08); }
+  50% { transform: translate3d(5dvw, 4dvh, 0) scale(1.1); }
+}
+@keyframes driftB {
+  0%, 100% { transform: translate3d(0, 0, 0) scale(1); }
+  50% { transform: translate3d(-4dvw, 3dvh, 0) scale(1.08); }
+}
+@keyframes driftC {
+  0%, 100% { transform: translate3d(0, 0, 0) scale(1.02); }
+  50% { transform: translate3d(3dvw, -3dvh, 0) scale(1.12); }
+}
+@keyframes auroraSpin { to { transform: rotate(360deg); } }
+@keyframes beamDrift {
+  from { transform: rotate(-8deg) translateX(-2%); }
+  to { transform: rotate(-6deg) translateX(3%); }
+}
+@keyframes gridPulse {
+  0%, 100% { opacity: .1; }
+  50% { opacity: .18; }
+}
+@keyframes ringBreath {
+  0%, 100% { transform: scale(1); opacity: .28; }
+  50% { transform: scale(1.08); opacity: .42; }
+}
+@keyframes starsDrift {
+  from { transform: translate3d(0, 0, 0); }
+  to { transform: translate3d(-2%, -3%, 0); }
+}
+@keyframes sparkFlash {
+  0%, 70%, 100% { opacity: 0; transform: scale(.4); }
+  78% { opacity: .95; transform: scale(1.15); }
+  86% { opacity: .35; transform: scale(.7); }
 }
 @media (prefers-reduced-motion: reduce) {
-  .fx__orb { animation: none !important; }
+  .fx__orb, .fx__aurora, .fx__beam, .fx__grid, .fx__stars, .fx__spark, .fx__ring {
+    animation: none !important;
+  }
 }
 
 /* ---------- App shell (flex column, no fixed heights on cards) ---------- */
