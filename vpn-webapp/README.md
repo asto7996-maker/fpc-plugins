@@ -1,65 +1,31 @@
-# AuroraVPN — мини-приложение (Telegram Mini App)
+# Paskod Mini App — Gold-standard TMA layout
 
-Красивый фронтенд для VPN-бота: анимированный фон (aurora-градиенты, звёздное
-поле на canvas, перспективная сетка, шум), glassmorphism-карточки и плавные
-переходы. Полностью автономно — без сборки и зависимостей, только три файла.
+Adaptive Telegram Mini App shell with production-safe area handling.
 
-## Состав
+## What’s included
 
-| Файл | Назначение |
-|------|-----------|
-| `index.html` | Разметка: кольцо подключения, метрики, серверы, тарифы, профиль |
-| `styles.css` | Все эффекты фона, glassmorphism, анимации, адаптив под Telegram |
-| `app.js` | Логика: Telegram WebApp SDK, подключение, выбор сервера/тарифа, haptics |
+- **Safe areas**: `env(safe-area-inset-*)` + Telegram `safeAreaInset` / `contentSafeAreaInset`
+- **TMA detection**: expands WebApp, clears Close/••• when they overlay (fullscreen)
+- **Layout**: Flex + Grid, `clamp()` type, no absolute main layout
+- **Screens**: Home, Subscription, Balance, Referrals, Support
+- **Dock**: fixed bottom nav with `safe-area-inset-bottom`
 
-## Возможности
+## Run
 
-- **Главная** — большая кнопка-кольцо подключения с состояниями
-  (отключено / подключение / защищено), таймер сессии, живые метрики
-  скорости и пинга, текущий сервер, индикатор трафика.
-- **Серверы** — список локаций с поиском, пингом, загрузкой и PRO-бейджами.
-- **Тарифы** — выбираемые планы с подсветкой и кнопкой оформления.
-- **Профиль** — данные пользователя из Telegram, реферальный код,
-  переключатели (kill-switch, автоподключение), поддержка.
-- Интеграция с Telegram: `ready/expand`, тема, `HapticFeedback`, `MainButton`,
-  данные пользователя (`initDataUnsafe`), отправка выбора тарифа через
-  `sendData`.
-
-## Локальный запуск
+Open `index.html` in a browser, or serve statically:
 
 ```bash
-cd vpn-webapp
-python3 -m http.server 8080
-# открыть http://localhost:8080
+python3 -m http.server 5173 --directory .
 ```
 
-Вне Telegram приложение работает как обычная веб-страница (SDK-вызовы
-безопасно пропускаются).
+Then open in Telegram via a Mini App URL, or use [Telegram Web App](https://core.telegram.org/bots/webapps) tooling.
 
-## Подключение к боту
+## Safe-area rules (summary)
 
-1. Разместите содержимое папки на любом HTTPS-хостинге
-   (GitHub Pages, Cloudflare Pages, Netlify, VPS с nginx и т.п.).
-2. В [@BotFather](https://t.me/BotFather) задайте URL мини-приложения:
-   `/setmenubutton` или создайте Web App и укажите ссылку.
-3. В коде бота открывайте кнопкой `web_app`:
+| Mode | Top inset |
+|------|-----------|
+| Expanded (Close outside WebView) | ~12px breath |
+| Fullscreen / overlay | `max(system, content)` + TG chrome (~48–50px) |
+| Bottom dock | `env(safe-area-inset-bottom)` always |
 
-```python
-from telegram import InlineKeyboardMarkup, InlineKeyboardButton, WebAppInfo
-
-kb = InlineKeyboardMarkup([[
-    InlineKeyboardButton("Открыть VPN", web_app=WebAppInfo(url="https://ваш-домен/"))
-]])
-```
-
-4. Данные о выбранном тарифе прилетают боту через `web_app_data`
-   (JSON вида `{"action":"subscribe","plan":"m12"}`) — обработайте и
-   выставьте счёт.
-
-## Кастомизация
-
-- Цвета и радиусы — CSS-переменные в начале `styles.css` (`:root`).
-- Список серверов и тарифов — массивы `SERVERS` и `PLANS` в `app.js`.
-- Интенсивность фона — плотность звёзд в `initStars()` и непрозрачность
-  `.bg__aurora` / `.bg__grid`.
-- Режим экономии анимаций уважает `prefers-reduced-motion`.
+Background paints edge-to-edge; padding lives on the sticky header and dock so notches stay filled with the theme color.
