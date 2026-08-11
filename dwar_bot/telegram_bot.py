@@ -254,6 +254,10 @@ def _autopilot_inline(s: BotSettings) -> dict:
          _btn(_toggle_label("Экипировка", f.auto_equip), "tg:farm:auto_equip")],
         [_btn(_toggle_label("Лечение", f.auto_heal), "tg:farm:auto_heal"),
          _btn(_toggle_label("Idle-паузы", f.idle_pauses), "tg:farm:idle_pauses")],
+        [_btn(
+            _toggle_label("Авто-возрождение", getattr(f, "auto_resurrect", True)),
+            "tg:farm:auto_resurrect",
+        )],
         [_btn(_toggle_label("Агрессивный режим", f.aggressive), "tg:farm:aggressive")],
         [_btn("✅ Всё ВКЛ", "farm_all_on"), _btn("⛔ Всё ВЫКЛ", "farm_all_off")],
         [_btn("🏠 Меню", "menu")],
@@ -1282,11 +1286,17 @@ class TelegramBotHandler:
         for key in (
             "auto_quests", "auto_combat", "farm_fronts", "farm_arena", "farm_area",
             "auto_travel", "auto_repair", "auto_equip", "auto_heal",
-            "auto_loot", "max_farm",
+            "auto_resurrect", "use_potions", "mid_fight_potions", "farm_achievements",
+            "aggressive", "max_farm", "auto_loot",
         ):
-            setattr(self._settings.farm, key, True)
+            if hasattr(self._settings.farm, key):
+                setattr(self._settings.farm, key, True)
+        # Max-farm: no idle pauses
+        self._settings.farm.idle_pauses = False
         self._settings.save()
-        await self._show_autopilot(chat_id, message_id, flash="Весь фарм включён")
+        await self._show_autopilot(
+            chat_id, message_id, flash="Весь фарм + авто-возрождение ВКЛ",
+        )
 
     async def _cmd_farm_all_off(self, chat_id: str, message_id: Optional[int] = None) -> None:
         for key in (

@@ -79,6 +79,7 @@ from dwar_bot.modules.leveling_engine import LevelingEngine
 from dwar_bot.modules.analytics_reporter import AnalyticsReporter
 from dwar_bot.modules.pure_farm import PureFarmEngine
 from dwar_bot.modules.achievement_farmer import AchievementFarmer
+from dwar_bot.modules.resurrection import ResurrectionEngine
 from dwar_bot.modules.money_format import (
     format_money,
     format_money_delta,
@@ -124,6 +125,7 @@ class DwarBot:
         self.owner_user_id = str(owner_user_id or "")
         self.stats = StatsParser(client)
         self.combat = CombatEngine(client, self.stats)
+        self.combat._resurrect_bot = self
         self.quests = QuestTracker(client)
         try:
             if self.quests.load_world_objective():
@@ -182,6 +184,7 @@ class DwarBot:
         except Exception:
             ach_path = None
         self.achievements = AchievementFarmer(ach_path)
+        self.resurrection = ResurrectionEngine()
         self._cookie_recovery = CookieRecovery(client)
         self._wire_telemetry_hooks()
 
@@ -979,8 +982,36 @@ class DwarBot:
             (self._client._session.get("sess_sid") or "")[:8],
         )
 
-        # HP≈0: try potion once, finish fight stub, then regen
+        # HP≈0: auto-resurrect (phoenix / altar / codes), then regen
         if self._char.hp_max and self._char.hp_percent <= 0.5:
+            if await self.combat.is_in_battle():
+                result = await self.combat.finish_fight(timeout=180.0)
+                logger.info("HP≈0 fight finish → %s", result.name)
+                await _sleep(1.0, 2.0)
+                return
+
+            if getattr(farm, "auto_resurrect", True):
+                try:
+                    rez = await self.resurrection.ensure_alive(self)
+                    if rez.ok and rez.method != "already_alive":
+                        logger.info("Auto-resurrect: %s", rez.summary)
+                        # Heal up after rez before farming
+                        if farm.auto_heal and self._char.hp_percent < float(farm.hp_heal or 55):
+                            try:
+                                await self.combat.heal_if_needed(self._profile)
+                            except Exception:
+                                pass
+                            try:
+                                await self.timers.wait_for_hp(
+                                    target_percent=max(50.0, float(farm.hp_heal or 55)),
+                                    max_wait=60,
+                                )
+                            except Exception:
+                                await _sleep(5.0, 10.0)
+                        return
+                except Exception as exc:
+                    logger.warning("auto-resurrect error: %s", exc)
+
             if farm.auto_heal and getattr(farm, "use_potions", True):
                 try:
                     drank = await self.combat.heal_if_needed(
@@ -992,11 +1023,7 @@ class DwarBot:
                         self._state = self._profile.state
                 except Exception as exc:
                     logger.debug("HP≈0 potion: %s", exc)
-            if await self.combat.is_in_battle():
-                result = await self.combat.finish_fight(timeout=180.0)
-                logger.info("HP≈0 fight finish → %s", result.name)
-                await _sleep(1.0, 2.0)
-                return
+
             if self._char.hp_percent <= 0.5:
                 logger.info("HP≈0 — wait regen (skip farm tick).")
                 if farm.auto_heal:

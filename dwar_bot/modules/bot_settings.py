@@ -58,6 +58,7 @@ class FarmSettings:
     use_potions: bool = True
     mid_fight_potions: bool = True
     farm_achievements: bool = True
+    auto_resurrect: bool = True
 
 
 @dataclass
@@ -212,6 +213,7 @@ class BotSettings:
             f"🧪 Лечение: {self.on_off(f.auto_heal)}",
             f"🍾 Зелья: {self.on_off(getattr(f, 'use_potions', True))}",
             f"⚔️ Зелья в бою: {self.on_off(getattr(f, 'mid_fight_potions', True))}",
+            f"✨ Авто-возрождение: {self.on_off(getattr(f, 'auto_resurrect', True))}",
             f"🏅 Ачивки: {self.on_off(getattr(f, 'farm_achievements', True))}",
             f"💤 Idle-паузы: {self.on_off(f.idle_pauses)}",
             f"🔥 Агрессивный: {self.on_off(f.aggressive)}",

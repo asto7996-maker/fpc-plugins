@@ -19,7 +19,7 @@ import re
 import time
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import Optional
+from typing import Any, Optional
 
 from dwar_bot.config import COMBAT, DELAY_COMBAT
 from dwar_bot.core.game_client import DwarGameClient, ApiResponse, STATUS_OK
@@ -95,6 +95,12 @@ class CombatEngine:
             self.potions = PotionManager()
         except Exception:
             self.potions = None  # type: ignore[assignment]
+        try:
+            from dwar_bot.modules.resurrection import ResurrectionEngine
+            self.resurrection = ResurrectionEngine()
+        except Exception:
+            self.resurrection = None  # type: ignore[assignment]
+        self._resurrect_bot: Any = None  # set by DwarBot to enable full auto-rez
         # SUIS session soft-limits (dwar.browsergamebots.com)
         self._suis_session_started: float = 0.0
         self._suis_session_kills: int = 0
@@ -1104,6 +1110,11 @@ class CombatEngine:
                     "Бой проигран (ударов=%d dmg=%d/%d).",
                     outcome.attacks, outcome.damage_dealt, outcome.damage_taken,
                 )
+                # Auto-resurrect immediately after death in fight
+                try:
+                    await self._auto_resurrect_after_loss()
+                except Exception as exc:
+                    logger.debug("post-loss resurrect: %s", exc)
                 if getattr(COMBAT, "post_battle_heal", True):
                     await self._post_battle_refresh()
                 return BattleResult.LOSE
@@ -1121,6 +1132,64 @@ class CombatEngine:
             return BattleResult.ERROR
         finally:
             self._fight_busy = False
+
+    async def _auto_resurrect_after_loss(self) -> bool:
+        """Try to bring the character back after a lost fight."""
+        bot = getattr(self, "_resurrect_bot", None)
+        eng = getattr(self, "resurrection", None)
+        if eng is None:
+            return False
+        if bot is not None:
+            try:
+                farm = getattr(getattr(bot, "settings", None), "farm", None)
+                if farm is not None and not getattr(farm, "auto_resurrect", True):
+                    return False
+            except Exception:
+                pass
+            # Prefer bot's shared engine (session counters / TG notify)
+            eng = getattr(bot, "resurrection", None) or eng
+            rez = await eng.ensure_alive(bot)
+            return bool(rez.ok and rez.method != "already_alive")
+
+        # Minimal shim when bot ref not set yet
+        class _Shim:
+            pass
+
+        shim = _Shim()
+        shim._client = self._client
+        shim.stats = self._stats
+        shim.combat = self
+        shim.timers = None
+        shim.settings = None
+        shim.notify = None
+        shim.achievements = None
+        try:
+            profile = self._stats.get_cached_profile()
+            if profile:
+                shim._profile = profile
+                shim._char = profile.char
+                shim._state = profile.state
+            else:
+                from dwar_bot.modules.stats_parser import CharStats
+                from dwar_bot.core.game_client import GameState
+                st = await self._client.get_state()
+                ch = await self._client.get_char_stats()
+                shim._char = ch
+                shim._state = st
+                shim._profile = None
+        except Exception as exc:
+            logger.debug("resurrect shim: %s", exc)
+            return False
+
+        # Attach a noop timer with wait_for_hp
+        class _T:
+            async def wait_for_hp(self, target_percent=40.0, max_wait=90):
+                import asyncio as _aio
+                await _aio.sleep(min(20.0, float(max_wait or 20)))
+
+        shim.timers = _T()
+        rez = await eng.ensure_alive(shim)
+        return bool(rez.ok)
 
     def _suis_note_kill(self) -> None:
         if not getattr(COMBAT, "suis_enabled", True):

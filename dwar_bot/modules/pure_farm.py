@@ -582,8 +582,18 @@ class PureFarmEngine:
             logger.info("PureFarm: combat/farm_area off — idle.")
             return True
 
-        # HP gate — drink potions BEFORE passive regen wait
+        # HP gate — resurrect if dead, else drink potions BEFORE regen wait
         hp_pct = float(getattr(char, "hp_percent", 100) or 100)
+        if hp_pct <= 0.5:
+            if getattr(farm, "auto_resurrect", True):
+                try:
+                    rez = await bot.resurrection.ensure_alive(bot)
+                    if rez.ok:
+                        logger.info("PureFarm resurrect: %s", rez.summary)
+                        char = bot._char
+                        hp_pct = float(getattr(char, "hp_percent", 0) or 0)
+                except Exception as exc:
+                    logger.debug("PureFarm resurrect: %s", exc)
         if hp_pct < float(farm.hp_retreat or 28):
             logger.info("PureFarm: HP %.0f%% — heal then wait.", hp_pct)
             if farm.auto_heal and getattr(farm, "use_potions", True):
