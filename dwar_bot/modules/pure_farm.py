@@ -83,17 +83,22 @@ class PureFarmStats:
         )
 
     def telegram_html(self) -> str:
+        from dwar_bot.modules.money_format import format_money, format_money_delta
+
         elapsed = max(1.0, time.time() - self.started_at)
         wph = self.wins / elapsed * 3600.0
         gold_delta = self.gold_delta
+        gph = gold_delta / elapsed * 3600.0
         lines = [
             "⚔️ <b>Pure Farm</b>",
             f"• Побед: <b>{self.wins}</b> · поражений: {self.losses} · skip: {self.skips}",
-            f"• Скорость: <b>{wph:.0f}</b> побед/час",
+            f"• Скорость: <b>{wph:.0f}</b> побед/час · "
+            f"<b>{gph:+.2f}</b> зол/час",
             f"• Последний моб: {self.last_mob or '—'}",
             f"• Уровень: {self.level_at_start} → <b>{self.level_now}</b>",
-            f"• Золото: {self.money_at_start:.2f} → <b>{self.money_now:.2f}</b> "
-            f"({gold_delta:+.2f})",
+            f"• Деньги: {format_money(self.money_at_start)} → "
+            f"<b>{format_money(self.money_now)}</b> "
+            f"({format_money_delta(gold_delta, short=True)})",
         ]
         if self.zero_reward or self.is_zero_reward():
             lines.append(
@@ -577,19 +582,48 @@ class PureFarmEngine:
             logger.info("PureFarm: combat/farm_area off — idle.")
             return True
 
-        # HP gate
+        # HP gate — drink potions BEFORE passive regen wait
         hp_pct = float(getattr(char, "hp_percent", 100) or 100)
-        if hp_pct < float(farm.hp_retreat or 15):
-            logger.info("PureFarm: HP %.0f%% — wait regen.", hp_pct)
-            if farm.auto_heal:
+        if hp_pct < float(farm.hp_retreat or 28):
+            logger.info("PureFarm: HP %.0f%% — heal then wait.", hp_pct)
+            if farm.auto_heal and getattr(farm, "use_potions", True):
                 try:
-                    await bot.timers.wait_for_hp(
-                        target_percent=max(40.0, float(farm.hp_heal or 40)),
-                        max_wait=120,
-                    )
-                except Exception:
-                    await asyncio.sleep(20)
-            return True
+                    profile = getattr(bot, "_profile", None)
+                    if profile is None:
+                        profile = await bot.stats.read_full_profile()
+                        bot._profile = profile
+                        bot._char = profile.char
+                    drank = await bot.combat.heal_if_needed(profile)
+                    if drank:
+                        logger.info("PureFarm: potion drunk at %.0f%% HP.", hp_pct)
+                        try:
+                            if getattr(bot, "achievements", None):
+                                bot.achievements.note_potion()
+                        except Exception:
+                            pass
+                        # Refresh HP after drink
+                        try:
+                            bot._profile = await bot.stats.read_full_profile()
+                            bot._char = bot._profile.char
+                            char = bot._char
+                            hp_pct = float(getattr(char, "hp_percent", hp_pct) or hp_pct)
+                        except Exception:
+                            pass
+                except Exception as exc:
+                    logger.debug("PureFarm heal_if_needed: %s", exc)
+            if hp_pct < float(farm.hp_heal or 55):
+                if farm.auto_heal:
+                    try:
+                        await bot.timers.wait_for_hp(
+                            target_percent=max(50.0, float(farm.hp_heal or 55)),
+                            max_wait=90,
+                        )
+                    except Exception:
+                        await asyncio.sleep(15)
+                return True
+            # Potion raised HP above heal threshold — continue farm
+            if hp_pct < float(farm.hp_retreat or 28):
+                return True
 
         # Finish active fight first
         if await bot.combat.is_in_battle():
@@ -639,13 +673,17 @@ class PureFarmEngine:
         try:
             if farm.aggressive or farm.max_farm:
                 from dwar_bot import config as _cfg
+                from dwar_bot.modules.farm_optimizer import max_farm_kill_limit
+                kill_lim = max_farm_kill_limit(
+                    level, aggressive=bool(farm.aggressive or farm.max_farm),
+                )
                 _cfg.COMBAT.suis_session_kill_limit = max(
                     int(getattr(_cfg.COMBAT, "suis_session_kill_limit", 0) or 0),
-                    80,
+                    int(kill_lim),
                 )
                 _cfg.COMBAT.max_consecutive_battles = max(
                     int(getattr(_cfg.COMBAT, "max_consecutive_battles", 0) or 0),
-                    int(farm.max_battles_row or 50),
+                    int(farm.max_battles_row or 80),
                 )
         except Exception:
             pass
@@ -705,16 +743,30 @@ class PureFarmEngine:
         if area in VILLAGE_AREAS:
             mob = "Крэтс"
         else:
-            # Prefer SUIS level pin (Зигред-воин at Lv3+) over leftover Cretas
+            # Prefer achievement goals → farm optimizer → SUIS level pin
             try:
-                from dwar_bot.modules.suis_knowledge import default_hunt_mob
-                mob = default_hunt_mob(level)
-                if mob.lower() == "крэтс" and level >= 3:
-                    mob = "Зигред"
+                ach = getattr(bot, "achievements", None)
+                if ach and getattr(farm, "farm_achievements", True):
+                    mob = ach.preferred_mob_for_level(level, area) or ""
             except Exception:
-                mob = str(getattr(bot.combat, "_last_map_hunt_name", "") or "")
-                if level >= 3 and (not mob or "рэтс" in mob.lower()):
-                    mob = "Зигред"
+                mob = ""
+            if not mob:
+                try:
+                    from dwar_bot.modules.farm_optimizer import preferred_mobs
+                    opts = preferred_mobs(level, area)
+                    mob = opts[0] if opts else ""
+                except Exception:
+                    mob = ""
+            if not mob:
+                try:
+                    from dwar_bot.modules.suis_knowledge import default_hunt_mob
+                    mob = default_hunt_mob(level)
+                    if mob.lower() == "крэтс" and level >= 3:
+                        mob = "Зигред"
+                except Exception:
+                    mob = str(getattr(bot.combat, "_last_map_hunt_name", "") or "")
+                    if level >= 3 and (not mob or "рэтс" in mob.lower()):
+                        mob = "Зигред"
 
         # Area 192 often still spawns only 0-reward Cretas — rotate to ущелье.
         if area == "192" and level >= 3:
@@ -766,12 +818,11 @@ class PureFarmEngine:
             await self._notify_zero_reward_once(bot)
             return True
 
-        # TG only when economy actually moves (no spam of 0-gold win counters)
+        # TG every N wins — always show money (even flat village) so display isn't "broken"
         if (
             self.stats.wins > 0
             and self.stats.wins % self.REPORT_EVERY_WINS == 0
             and self.stats.wins != self.stats.notified_wins
-            and (abs(self.stats.gold_delta) >= 0.01 or self.stats.leveled)
         ):
             self.stats.notified_wins = self.stats.wins
             try:
@@ -795,7 +846,8 @@ class PureFarmEngine:
                 bot._char = bot._profile.char
                 bot._state = bot._profile.state
                 self.stats.level_now = int(bot._char.level or self.stats.level_now)
-                self.stats.money_now = float(bot._state.money or self.stats.money_now)
+                from dwar_bot.modules.money_format import money_from_state
+                self.stats.money_now = money_from_state(bot._state)
             except Exception:
                 pass
             try:
@@ -803,6 +855,22 @@ class PureFarmEngine:
                 bot.quests.clear_exhausted(local_only=True)
             except Exception:
                 pass
+            try:
+                ach = getattr(bot, "achievements", None)
+                if ach:
+                    done = ach.note_kill(
+                        mob=mob,
+                        area_id=str(getattr(bot._state, "area_id", "") or ""),
+                        level=int(self.stats.level_now or 1),
+                    )
+                    ach.note_money_level(
+                        float(self.stats.money_now), int(self.stats.level_now or 1),
+                    )
+                    if done and bot.settings.notify.battles:
+                        titles = ", ".join(done[:3])
+                        await bot.notify(f"🏅 Ачивка: <b>{titles}</b>", "battles")
+            except Exception as exc:
+                logger.debug("PureFarm achievements: %s", exc)
             logger.info(
                 "PureFarm WIN #%d «%s» Lv%d gold=%.2f%s",
                 self.stats.wins,
@@ -813,6 +881,12 @@ class PureFarmEngine:
             )
         elif result == BattleResult.LOSE:
             self.stats.losses += 1
+            try:
+                ach = getattr(bot, "achievements", None)
+                if ach:
+                    ach.note_death()
+            except Exception:
+                pass
             logger.info("PureFarm LOSE «%s»", mob)
         elif result == BattleResult.NO_BATTLE:
             self.stats.skips += 1

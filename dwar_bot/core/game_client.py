@@ -408,9 +408,19 @@ class DwarGameClient:
             cookies = load_cookie_dict(path)
             if not cookies:
                 return False
+            old_sid = self._session.get("sess_sid")
             old_token = self._access_token
             self.apply_cookies(cookies, mark_fresh=True)
+            # mycom-only paste: keep OLD sess_sid until soft-check fails
             if cookies.get("mycom") and not cookies.get("sess_sid"):
+                if old_sid:
+                    self._session["sess_sid"] = old_sid
+                    soft = await self.soft_recheck_session()
+                    if soft:
+                        logger.info(
+                            "Cookie file mycom-only — kept working old sess_sid."
+                        )
+                        return True
                 self._session.pop("sess_sid", None)
                 self._session.pop("sess_uid", None)
                 self._session.pop("sess_crc", None)
@@ -597,8 +607,59 @@ class DwarGameClient:
             new_cookies = dict(r.cookies)
 
             if self._is_token_redirect(location) or not new_cookies.get("sess_sid"):
+                # Prefer keeping a still-valid old sess_sid over hard block
+                old_sid = self._session.get("sess_sid")
+                if old_sid:
+                    soft = await self.soft_recheck_session()
+                    if soft:
+                        logger.warning(
+                            "OAuth renew failed but OLD sess_sid still works — keeping it."
+                        )
+                        self._auth_blocked = False
+                        return
+                # Try Astrum refresh_token before declaring death
+                try:
+                    from dwar_bot.modules.cookie_recovery import CookieRecovery
+                    rec = CookieRecovery(self)
+                    if await rec.try_refresh_access_token():
+                        # Retry renew once with refreshed token
+                        r2 = await client.post(
+                            url,
+                            data={
+                                "soc_system_id": "18",
+                                "access_token": self._access_token,
+                            },
+                            headers={
+                                "User-Agent": _BASE_HEADERS["User-Agent"],
+                                "Content-Type": "application/x-www-form-urlencoded",
+                                "Referer": f"{self._world_url}/",
+                            },
+                        )
+                        loc2 = r2.headers.get("location", "")
+                        cookies2 = dict(r2.cookies)
+                        if cookies2.get("sess_sid") and not self._is_token_redirect(loc2):
+                            new_cookies = cookies2
+                            location = loc2
+                        else:
+                            raise TokenExpiredError("refresh+renew still failed")
+                    else:
+                        raise TokenExpiredError("no refresh")
+                except TokenExpiredError:
+                    self._auth_blocked = True
+                    # Do NOT pop sess_sid here — soft wait may still use it
+                    raise TokenExpiredError(
+                        f"OAuth access_token has expired. The bot needs fresh cookies.\n"
+                        f"Redirect destination: {location}"
+                    )
+                except Exception as exc:
+                    self._auth_blocked = True
+                    raise TokenExpiredError(
+                        f"OAuth access_token has expired. The bot needs fresh cookies.\n"
+                        f"Redirect destination: {location} ({exc})"
+                    ) from exc
+
+            if self._is_token_redirect(location) or not new_cookies.get("sess_sid"):
                 self._auth_blocked = True
-                self._session.pop("sess_sid", None)
                 raise TokenExpiredError(
                     f"OAuth access_token has expired. The bot needs fresh cookies.\n"
                     f"Redirect destination: {location}"
@@ -666,13 +727,23 @@ class DwarGameClient:
 
                 if allow_renew and self._is_auth_failure_response(resp):
                     logger.warning(
-                        "Auth failure on %s %s (status=%s loc=%s) — renewing.",
+                        "Auth failure on %s %s (status=%s loc=%s) — soft-check first.",
                         method, path, resp.status_code, resp.headers.get("location", ""),
                     )
+                    # Soft-recheck at most once per request chain
+                    soft_tried = getattr(self, "_soft_auth_tried", False)
+                    if not soft_tried:
+                        self._soft_auth_tried = True
+                        soft_ok = await self.soft_recheck_session()
+                        if soft_ok:
+                            logger.info("Auth glitch ignored — sess_sid still valid.")
+                            continue
+                    self._soft_auth_tried = False
                     await self.invalidate_session("auth failure response", force=True)
                     await self._renew_session()
                     continue
 
+                self._soft_auth_tried = False
                 return resp
 
             except TokenExpiredError:

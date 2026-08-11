@@ -19,7 +19,7 @@ import asyncio
 import json
 import logging
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 from dwar_bot.config import COMBAT
 from dwar_bot.core.game_client import DwarGameClient
@@ -34,6 +34,8 @@ from dwar_bot.modules.battle_strategy import (
 )
 
 logger = logging.getLogger(__name__)
+
+HealCallback = Callable[[int, int], Awaitable[bool]]
 
 # Param types
 PT_INT = 1
@@ -238,6 +240,7 @@ class FightClient:
             unblock_before_finisher=bool(
                 getattr(COMBAT, "unblock_before_finisher", True)
             ),
+            elixir_hp_percent=float(getattr(COMBAT, "hp_elixir_threshold", 55.0)),
             pers_id=int(pers_id or 0),
             want_magic_stance=want_magic,
             botmek_preset=botmek_name or suis_label,
@@ -256,6 +259,7 @@ class FightClient:
         hit_zone: Optional[int] = None,
         brain: Optional[FightBrain] = None,
         level: int = 1,
+        heal_callback: Optional[HealCallback] = None,
     ) -> FightOutcome:
         # FIGHT_WS_SERIAL_V1 — one reconnect if WS drops mid-fight
         st = await self._client.get_state()
@@ -309,6 +313,9 @@ class FightClient:
             brain.unblock_hp_percent = float(
                 getattr(COMBAT, "hp_unblock_threshold", brain.unblock_hp_percent)
             )
+            brain.elixir_hp_percent = float(
+                getattr(COMBAT, "hp_elixir_threshold", brain.elixir_hp_percent or 55.0)
+            )
 
         last = FightOutcome(error="fight not started")
         attempts = 2
@@ -320,6 +327,7 @@ class FightClient:
                 hit_zone=hit_zone,
                 brain=brain,
                 conf=conf,
+                heal_callback=heal_callback,
             )
             if last.finished:
                 return last
@@ -355,6 +363,7 @@ class FightClient:
         hit_zone: Optional[int] = None,
         brain: Optional[FightBrain] = None,
         conf: Optional[dict] = None,
+        heal_callback: Optional[HealCallback] = None,
     ) -> FightOutcome:
         try:
             import websockets
@@ -437,6 +446,20 @@ class FightClient:
 
         async def _do_turn(ws, *, now: float, reason: str) -> None:
             decision = brain.decide_turn(now=now)
+            if decision.drink_elixir and heal_callback is not None:
+                try:
+                    drank = await heal_callback(int(brain.hp), int(brain.hp_max))
+                    if drank:
+                        # Optimistic local HP bump so we don't spam drinks
+                        if brain.hp_max > 0:
+                            heal_amt = max(1, int(brain.hp_max * 0.25))
+                            brain.hp = min(brain.hp_max, brain.hp + heal_amt)
+                        logger.info(
+                            "Fight: mid-fight potion (hp≈%.0f%%) before %s",
+                            brain.hp_percent, reason,
+                        )
+                except Exception as exc:
+                    logger.debug("Fight mid-fight potion: %s", exc)
             if decision.set_magic_stance is not None:
                 await _set_magic_stance(ws, decision.set_magic_stance)
                 logger.info(

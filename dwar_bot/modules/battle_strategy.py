@@ -197,6 +197,8 @@ class TurnDecision:
     zone_name: str = ""
     # BotMek: switch to magic stance once at fight start
     set_magic_stance: Optional[bool] = None
+    # Drink HP potion via HTTP before this hit (FightClient heal_callback)
+    drink_elixir: bool = False
 
 
 @dataclass
@@ -213,6 +215,8 @@ class FightBrain:
     unblock_before_finisher: bool = True
     # Block toggle cooldown (canvas uses 5s)
     block_cooldown_s: float = 5.0
+    # Drink elixir when HP% below this (0 = disabled)
+    elixir_hp_percent: float = 55.0
     # BotMek: request magic stance on first turn
     want_magic_stance: bool = False
     botmek_preset: str = ""
@@ -221,6 +225,7 @@ class FightBrain:
     _step: int = 0
     block_active: bool = False
     _last_block_toggle_at: float = 0.0
+    _last_elixir_at: float = 0.0
     _magic_stance_sent: bool = False
     pers_id: int = 0
     pers_team: Optional[int] = None
@@ -230,6 +235,7 @@ class FightBrain:
     damage_taken: int = 0
     hits_sent: int = 0
     blocks_toggled: int = 0
+    elixirs_requested: int = 0
 
     @property
     def hp_percent(self) -> float:
@@ -264,6 +270,20 @@ class FightBrain:
     def _want_unblock_by_hp(self) -> bool:
         return self.hp_percent >= self.unblock_hp_percent
 
+    def _want_elixir(self, *, now: float) -> bool:
+        if self.elixir_hp_percent <= 0:
+            return False
+        if self.hp_max <= 0:
+            return False
+        if self.hp_percent >= self.elixir_hp_percent:
+            return False
+        if self.hp_percent <= 0:
+            return False
+        # Avoid spamming drink every turn
+        if now - self._last_elixir_at < 4.0:
+            return False
+        return True
+
     def decide_turn(self, *, now: float) -> TurnDecision:
         """
         Pick next hit zone and optional block change (DwarBOT fight loop).
@@ -271,6 +291,7 @@ class FightBrain:
         Finisher (last in cycle): force leave block so the combo lands hard.
         Other hits: enter/leave block from HP thresholds.
         BotMek: optional magic stance on the first turn.
+        Elixir: request mid-fight drink when HP critical.
         """
         n = len(self.hit_seq) or 1
         pos = self._step % n
@@ -296,12 +317,18 @@ class FightBrain:
             set_magic = True
             self._magic_stance_sent = True
 
+        drink = self._want_elixir(now=now)
+        if drink:
+            self._last_elixir_at = now
+            self.elixirs_requested += 1
+
         return TurnDecision(
             hit_zone=zone,
             set_block=set_block,
             is_finisher=is_finisher,
             zone_name=ZONE_NAME.get(zone, str(zone)),
             set_magic_stance=set_magic,
+            drink_elixir=drink,
         )
 
     def apply_block_result(self, enabled: bool, *, now: float) -> None:

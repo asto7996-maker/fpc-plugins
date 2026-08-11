@@ -51,9 +51,13 @@ class FarmSettings:
     max_farm: bool = True
     idle_pauses: bool = False  # max farm: no random idle breaks
     aggressive: bool = True
-    hp_retreat: float = 10.0
-    hp_heal: float = 30.0
-    max_battles_row: int = 50
+    # Safer defaults — legacy 10/30 caused frequent deaths before potion drank.
+    hp_retreat: float = 28.0
+    hp_heal: float = 55.0
+    max_battles_row: int = 80
+    use_potions: bool = True
+    mid_fight_potions: bool = True
+    farm_achievements: bool = True
 
 
 @dataclass
@@ -206,9 +210,13 @@ class BotSettings:
             f"🔧 Ремонт: {self.on_off(f.auto_repair)}",
             f"👕 Экипировка: {self.on_off(f.auto_equip)}",
             f"🧪 Лечение: {self.on_off(f.auto_heal)}",
+            f"🍾 Зелья: {self.on_off(getattr(f, 'use_potions', True))}",
+            f"⚔️ Зелья в бою: {self.on_off(getattr(f, 'mid_fight_potions', True))}",
+            f"🏅 Ачивки: {self.on_off(getattr(f, 'farm_achievements', True))}",
             f"💤 Idle-паузы: {self.on_off(f.idle_pauses)}",
             f"🔥 Агрессивный: {self.on_off(f.aggressive)}",
             f"❤️ Retreat HP: {f.hp_retreat:.0f}%  Heal: {f.hp_heal:.0f}%",
+            f"⚔️ Макс. боёв подряд: {f.max_battles_row}",
         ]
 
     def notify_summary_lines(self) -> list[str]:

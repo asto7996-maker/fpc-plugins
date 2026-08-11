@@ -78,6 +78,15 @@ from dwar_bot.core.rich_notifications import RichNotifications
 from dwar_bot.modules.leveling_engine import LevelingEngine
 from dwar_bot.modules.analytics_reporter import AnalyticsReporter
 from dwar_bot.modules.pure_farm import PureFarmEngine
+from dwar_bot.modules.achievement_farmer import AchievementFarmer
+from dwar_bot.modules.money_format import (
+    format_money,
+    format_money_delta,
+    format_money_from_state,
+    money_from_state,
+)
+from dwar_bot.modules.farm_optimizer import recommended_hp_thresholds, max_farm_kill_limit
+from dwar_bot.modules.cookie_recovery import CookieRecovery
 from dwar_bot.config import COMBAT, STATE_FILE
 
 logger = logging.getLogger("dwar_bot.main")
@@ -162,6 +171,18 @@ class DwarBot:
         self.rich = RichNotifications(self.telemetry)
         self.analytics = AnalyticsReporter(self)
         self.pure_farm = PureFarmEngine()
+        # Achievements persist next to bot settings
+        ach_path = None
+        try:
+            from pathlib import Path as _P
+            if getattr(self.settings, "_path", None):
+                ach_path = Path(self.settings._path)
+            else:
+                ach_path = _P(__file__).resolve().parent / "state.json"
+        except Exception:
+            ach_path = None
+        self.achievements = AchievementFarmer(ach_path)
+        self._cookie_recovery = CookieRecovery(client)
         self._wire_telemetry_hooks()
 
         self._iteration = 0
@@ -309,11 +330,34 @@ class DwarBot:
 
     def _apply_combat_thresholds(self) -> None:
         f = self.settings.farm
-        # Instance-local thresholds via combat engine settings if present;
-        # keep global COMBAT for backward compat but prefer farm settings on tick.
-        COMBAT.hp_retreat_threshold = float(f.hp_retreat)
-        COMBAT.hp_elixir_threshold = float(f.hp_heal)
-        COMBAT.max_consecutive_battles = int(f.max_battles_row)
+        # Prefer safer MaxFarm thresholds when user left legacy deadly 10/30
+        retreat, heal = float(f.hp_retreat), float(f.hp_heal)
+        if f.max_farm or f.aggressive:
+            rec_r, rec_h = recommended_hp_thresholds(
+                aggressive=bool(f.aggressive), max_farm=bool(f.max_farm),
+            )
+            # Only bump up — never lower a user-raised safe value
+            if retreat < rec_r:
+                retreat = rec_r
+                f.hp_retreat = rec_r
+            if heal < rec_h:
+                heal = rec_h
+                f.hp_heal = rec_h
+            COMBAT.suis_session_kill_limit = max(
+                int(getattr(COMBAT, "suis_session_kill_limit", 0) or 0),
+                max_farm_kill_limit(
+                    int(getattr(self._char, "level", 1) or 1),
+                    aggressive=bool(f.aggressive or f.max_farm),
+                ),
+            )
+        COMBAT.hp_retreat_threshold = float(retreat)
+        COMBAT.hp_elixir_threshold = float(heal)
+        COMBAT.max_consecutive_battles = int(f.max_battles_row or 80)
+        # Mid-fight potions follow farm.use_potions / mid_fight_potions
+        if not getattr(f, "use_potions", True):
+            COMBAT.post_battle_heal = False
+        else:
+            COMBAT.post_battle_heal = True
 
     async def notify(self, text: str, category: str = "") -> None:
         # Always deliver only to this account's owner — never broadcast to others.
@@ -341,7 +385,10 @@ class DwarBot:
             "hp_max":     self._char.hp_max,
             "mp":         self._char.mp,
             "mp_max":     self._char.mp_max,
-            "money":      self._state.money,
+            "money":      money_from_state(self._state),
+            "money_display": format_money_from_state(self._state),
+            "money_gold": getattr(self._state, "money_gold", 0),
+            "money_silver": getattr(self._state, "money_silver", 0),
             "area_id":    self._state.area_id,
             "area_title": self._area_title,
             "area_items": self._area_items,
@@ -719,15 +766,24 @@ class DwarBot:
                 logger.debug("startup farm adapt: %s", exc)
         self._prev_level = self._char.level or self._prev_level
 
-        # Money change (significant)
-        if self._prev_money >= 0 and abs(self._state.money - self._prev_money) >= 1.0:
-            delta = self._state.money - self._prev_money
-            sign = "+" if delta > 0 else ""
+        # Money change — notify on ≥0.01 (1 серебро), show зол./сер.
+        cur_money = money_from_state(self._state)
+        if self._prev_money >= 0 and abs(cur_money - self._prev_money) >= 0.01:
+            delta = cur_money - self._prev_money
             await self.notify(
-                f"💰 Деньги: {sign}{delta:.2f} → <b>{self._state.money:.2f}</b> зол.",
+                f"💰 Деньги: {format_money_delta(delta)} → "
+                f"<b>{format_money_from_state(self._state)}</b>",
                 "money",
             )
-        self._prev_money = self._state.money
+        self._prev_money = cur_money
+        try:
+            self.achievements.note_money_level(
+                cur_money, int(self._char.level or 0),
+            )
+            if self._state.area_id:
+                self.achievements.note_area(str(self._state.area_id))
+        except Exception:
+            pass
 
         # Area change
         if self._prev_area and self._state.area_id and self._state.area_id != self._prev_area:
@@ -913,32 +969,44 @@ class DwarBot:
             return
 
         logger.info(
-            "[%d] %s Lv%d | HP %d/%d (%.0f%%) | MP %d/%d | area=%s | %.2f зол | предметов=%d | sid=%s…",
+            "[%d] %s Lv%d | HP %d/%d (%.0f%%) | MP %d/%d | area=%s | %s | предметов=%d | sid=%s…",
             self._iteration,
             self._char.nick, self._char.level,
             self._char.hp, self._char.hp_max, self._char.hp_percent,
             self._char.mp, self._char.mp_max,
-            self._state.area_id, self._state.money,
+            self._state.area_id, format_money_from_state(self._state),
             len(self._profile.inventory),
             (self._client._session.get("sess_sid") or "")[:8],
         )
 
-        # HP≈0: finish any fight stub, then regen — don't farm/Расселина loop
+        # HP≈0: try potion once, finish fight stub, then regen
         if self._char.hp_max and self._char.hp_percent <= 0.5:
+            if farm.auto_heal and getattr(farm, "use_potions", True):
+                try:
+                    drank = await self.combat.heal_if_needed(
+                        self._profile, force_threshold=100.0,
+                    )
+                    if drank:
+                        self._profile = await self.stats.read_full_profile()
+                        self._char = self._profile.char
+                        self._state = self._profile.state
+                except Exception as exc:
+                    logger.debug("HP≈0 potion: %s", exc)
             if await self.combat.is_in_battle():
                 result = await self.combat.finish_fight(timeout=180.0)
                 logger.info("HP≈0 fight finish → %s", result.name)
                 await _sleep(1.0, 2.0)
                 return
-            logger.info("HP≈0 — wait regen (skip farm tick).")
-            if farm.auto_heal:
-                try:
-                    await self.timers.wait_for_hp(target_percent=40.0, max_wait=180)
-                except Exception:
+            if self._char.hp_percent <= 0.5:
+                logger.info("HP≈0 — wait regen (skip farm tick).")
+                if farm.auto_heal:
+                    try:
+                        await self.timers.wait_for_hp(target_percent=50.0, max_wait=180)
+                    except Exception:
+                        await _sleep(20.0, 40.0)
+                else:
                     await _sleep(20.0, 40.0)
-            else:
-                await _sleep(20.0, 40.0)
-            return
+                return
 
         await self.timers.update_regen(self._char.hp, self._char.mp)
         await self._emit_state_notifications()
@@ -1043,11 +1111,22 @@ class DwarBot:
                 )
             handled = await self.pure_farm.run_tick(self)
             if handled:
-                # Never invent Exp from empty Cretas wins — that made
-                # Level-Up / telemetry show nonsense (±0 / negative Exp/h).
+                # Real gold; Exp only from leveling engine (never invent Cretas Exp)
+                exp_proxy = 0.0
+                try:
+                    if not getattr(self.pure_farm.stats, "zero_reward", False):
+                        exp_proxy = float(
+                            self.leveling.progress.exp_per_hour
+                            * max(
+                                0.01,
+                                (time.time() - self.leveling._session_started) / 3600.0,
+                            )
+                        )
+                except Exception:
+                    exp_proxy = 0.0
                 self.telemetry.note_economy(
-                    gold=float(self._state.money or 0),
-                    exp_proxy=0.0,
+                    gold=money_from_state(self._state),
+                    exp_proxy=exp_proxy,
                     battles=self.combat.session.battles_joined,
                     wins=max(self.combat.session.wins, self.pure_farm.stats.wins),
                     potions_used=self.combat.session.potions_used,
@@ -1104,7 +1183,7 @@ class DwarBot:
 
         # Economy snapshot every tick (feeds Gold/hr Exp/hr)
         self.telemetry.note_economy(
-            gold=float(self._state.money or 0),
+            gold=money_from_state(self._state),
             exp_proxy=self.leveling.progress.exp_per_hour * max(
                 0.01, (time.time() - self.leveling._session_started) / 3600.0
             ),
@@ -2474,10 +2553,24 @@ class DwarBot:
             "1. Войди на https://w1.dwar.ru\n"
             "2. Cookie Editor → Export as JSON\n"
             "3. Пришли JSON сюда в этот чат\n\n"
+            "Бот сначала проверит старые sess_sid — если живы, рестарт не нужен.\n"
             "Бот подхватит автоматически (без рестарта)."
         )
         logger.critical("TOKEN EXPIRED: %s", detail)
         await self._send_telegram(msg)
+
+        # Immediate soft-keep attempt before waiting for paste
+        try:
+            if await self._cookie_recovery.try_keep_old_session("token_expired entry"):
+                self._token_ok = True
+                char = await self._client.get_char_stats()
+                if char.nick:
+                    await self._send_telegram(
+                        f"✅ Старые куки ещё работают — {char.nick} Lv{char.level}."
+                    )
+                    return
+        except Exception as exc:
+            logger.debug("soft keep on token expire: %s", exc)
 
         last_mtime = 0.0
         try:
@@ -2488,30 +2581,49 @@ class DwarBot:
 
         while not _shutdown_event.is_set():
             try:
-                # Pause background spam while blocked
-                reloaded = await self._client.maybe_reload_cookie_file()
-                if reloaded or (
-                    DEFAULT_COOKIE_FILE.exists()
-                    and DEFAULT_COOKIE_FILE.stat().st_mtime != last_mtime
-                ):
-                    last_mtime = DEFAULT_COOKIE_FILE.stat().st_mtime
-                    self._client.unblock_auth()
-                    # Drop dead sess, keep new mycom
-                    await self._client.invalidate_session("cookie file updated")
+                # Soft recheck periodically — sess may still be alive
+                if await self._cookie_recovery.try_keep_old_session("token wait loop"):
+                    self._token_ok = True
                     try:
-                        await self._client.ensure_session()
                         char = await self._client.get_char_stats()
                         if char.nick:
-                            logger.info("Fresh cookies OK — %s Lv%d", char.nick, char.level)
                             await self._send_telegram(
-                                f"✅ DwarBot: сессия восстановлена ({char.nick} Lv{char.level})."
+                                f"✅ Сессия снова жива ({char.nick} Lv{char.level})."
                             )
                             return
-                    except TokenExpiredError:
-                        logger.warning("Cookie file updated but token still invalid.")
+                    except Exception:
+                        self._token_ok = True
+                        return
+
+                reloaded = await self._client.maybe_reload_cookie_file()
+                file_changed = (
+                    DEFAULT_COOKIE_FILE.exists()
+                    and DEFAULT_COOKIE_FILE.stat().st_mtime != last_mtime
+                )
+                if reloaded or file_changed:
+                    last_mtime = DEFAULT_COOKIE_FILE.stat().st_mtime
+                    ok, human = await self._cookie_recovery.recover_after_cookie_file_update()
+                    if ok:
+                        try:
+                            char = await self._client.get_char_stats()
+                            if char.nick:
+                                self._token_ok = True
+                                logger.info(
+                                    "Fresh cookies OK — %s Lv%d (%s)",
+                                    char.nick, char.level, human,
+                                )
+                                await self._send_telegram(
+                                    f"✅ DwarBot: сессия восстановлена "
+                                    f"({char.nick} Lv{char.level}).\n{human}"
+                                )
+                                return
+                        except TokenExpiredError:
+                            pass
+                    else:
+                        logger.warning("Cookie recover failed: %s", human)
                         await self._send_telegram(
-                            "⚠️ Файл куков обновился, но токен всё ещё невалиден. "
-                            "Пришли свежий Export JSON."
+                            f"⚠️ Куки обновились, но сессия не поднялась: {human}\n"
+                            "Пришли свежий Export JSON (желательно с sess_sid)."
                         )
             except Exception as exc:
                 logger.debug("token wait loop: %s", exc)

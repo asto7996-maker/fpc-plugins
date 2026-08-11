@@ -126,7 +126,9 @@ def test_resources_geologist():
 
 def test_apply_suis_defaults():
     d = apply_suis_defaults_to_combat_dict()
-    assert d["hp_elixir_threshold"] == 20.0
+    # Floored above legacy 20% so MaxFarm doesn't die before drinking
+    assert d["hp_elixir_threshold"] >= 45.0
+    assert d["hp_retreat_threshold"] >= 25.0
     assert d["hp_block_threshold"] == 30.0
     assert d["hp_unblock_threshold"] == 60.0
 

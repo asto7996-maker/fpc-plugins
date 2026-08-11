@@ -14,6 +14,7 @@ from typing import Any, Optional
 from dwar_bot.core.bot_state import get_bot_state
 from dwar_bot.core.rich_notifications import RichNotifications, _esc, _fmt_duration, _fmt_num
 from dwar_bot.core.telemetry_engine import TelemetryEngine
+from dwar_bot.modules.money_format import format_money_from_state
 
 logger = logging.getLogger(__name__)
 
@@ -64,7 +65,7 @@ class AnalyticsReporter:
             f"❤️ {st.get('hp', '?')}/{st.get('hp_max', '?')} "
             f"({getattr(bot._char, 'hp_percent', 0):.0f}%) · "
             f"💙 {st.get('mp', '?')}/{st.get('mp_max', '?')}",
-            f"💰 <b>{_fmt_num(float(st.get('money') or 0), 2)}</b> зл. · "
+            f"💰 <b>{_esc(format_money_from_state(bot._state) if hasattr(bot, '_state') else _fmt_num(float(st.get('money') or 0), 2))}</b> · "
             f"📍 {_esc(st.get('area_title') or st.get('area_id') or '?')} "
             f"(id=<code>{_esc(st.get('area_id'))}</code>)",
             f"⏱ Аптайм <b>{_esc(st.get('uptime', '?'))}</b> · "

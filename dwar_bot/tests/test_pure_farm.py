@@ -132,7 +132,9 @@ def test_main_skips_fake_exp_proxy_and_levelup_spam():
     src = (ROOT / "main.py").read_text(encoding="utf-8")
     assert "wins) * 50" not in src
     assert "Skip Level-Up TG" in src
-    assert "exp_proxy=0.0" in src
+    # Cretas still zero Exp; open farm may use leveling engine proxy
+    assert "zero_reward" in src
+    assert "exp_proxy" in src
 
 
 def test_main_wires_story_first():

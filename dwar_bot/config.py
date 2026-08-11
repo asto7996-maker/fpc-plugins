@@ -236,15 +236,15 @@ SELECTORS: Selectors = Selectors()
 @dataclass
 class CombatConfig:
     # HP threshold (percent 0–100) below which the bot drinks an HP elixir
-    hp_elixir_threshold: float = 40.0
+    hp_elixir_threshold: float = 55.0
     # MP threshold (percent 0–100) below which the bot drinks an MP elixir
     mp_elixir_threshold: float = 30.0
     # If True, prefer special skills over basic attack when available
     prefer_skills: bool = True
     # Maximum consecutive battles before forcing a rest cycle
-    max_consecutive_battles: int = 20
+    max_consecutive_battles: int = 80
     # HP percent below which the bot retreats and does not fight
-    hp_retreat_threshold: float = 15.0
+    hp_retreat_threshold: float = 28.0
     # Whether to auto-loot after each battle
     auto_loot: bool = True
     # DwarBOT-adapted physical hit sequence (names or 1/2/3 zone ids).
@@ -274,7 +274,7 @@ class CombatConfig:
     suis_hunt_priority: bool = True
     # Session soft limits from SUIS (0 = disabled)
     suis_session_minutes: int = 60
-    suis_session_kill_limit: int = 50
+    suis_session_kill_limit: int = 80
     # Post-battle food ladder (Еда после боя)
     suis_post_battle_food: bool = True
     # Skip food when HP% above this (SUIS «Не употреблять еду, если HP > N%»)

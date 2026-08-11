@@ -428,13 +428,15 @@ def food_ladder_candidates(hp_percent: float, *, skip_above: float = 75.0) -> li
 def apply_suis_defaults_to_combat_dict() -> dict[str, Any]:
     """Values to merge into CombatConfig / FarmSettings."""
     d = SUIS_DEFAULTS
+    # Floor elixir/retreat higher than legacy SUIS 20/15 — deaths > micro-efficiency
+    elixir = max(float(d.hp_elixir_percent), 45.0)
     return {
-        "hp_elixir_threshold": d.hp_elixir_percent,
+        "hp_elixir_threshold": elixir,
         "hp_block_threshold": d.hp_block_enter,
         "hp_unblock_threshold": d.hp_block_exit,
         "post_battle_heal": True,
-        # keep retreat below elixir
-        "hp_retreat_threshold": max(10.0, d.hp_elixir_percent - 5.0),
+        # keep retreat below elixir but not deadly-low
+        "hp_retreat_threshold": max(25.0, elixir - 20.0),
     }
 
 

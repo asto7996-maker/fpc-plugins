@@ -799,7 +799,7 @@ class TelegramBotHandler:
             f"Слот: <code>{_esc(slot)}</code>\n"
             f"{icon} <b>{_esc(nick)}</b> Lv{st.get('level','?')}\n"
             f"❤️ {st.get('hp','?')}/{st.get('hp_max','?')} · "
-            f"💰 {st.get('money','?')} · "
+            f"💰 {_esc(st.get('money_display') or st.get('money','?'))} · "
             f"📍 {_esc(st.get('area_title') or st.get('area_id','?'))}\n\n"
             "Вы играете <b>только своим</b> аккаунтом dwar.ru.\n"
         )
@@ -952,10 +952,27 @@ class TelegramBotHandler:
             f"<b>🧙 {_esc(st.get('nick','?'))} — Ур. {st.get('level','?')}</b>\n\n"
             f"❤️ HP: {hp}/{hp_max}\n{_progress_bar(hp_pct)}\n\n"
             f"💧 MP: {mp}/{mp_max}\n{_progress_bar(mp_pct)}\n\n"
-            f"💰 {_esc(st.get('money','0'))} зол.\n"
+            f"💰 {_esc(st.get('money_display') or st.get('money','0'))}\n"
             f"📍 {_esc(st.get('area_title') or st.get('area_id','?'))}\n"
             f"🏁 flags: {st.get('flags',0)} / {st.get('flags2',0)} / {st.get('flags3',0)}"
         )
+        # Append achievement summary when available
+        try:
+            bot = self._bot if hasattr(self, "_bot") else None
+            get_bot = getattr(self, "_get_bot", None)
+            if callable(get_bot):
+                bot = get_bot()
+            # Account manager path: status already enough; try runtime
+            rt = None
+            if self._accounts and self._ctx_uid:
+                rt = self._accounts.get_runtime(self._ctx_uid)
+            ach = None
+            if rt and getattr(rt, "bot", None):
+                ach = getattr(rt.bot, "achievements", None)
+            if ach:
+                text += "\n\n" + ach.telegram_html(level=int(st.get("level") or 1))
+        except Exception:
+            pass
         await self._reply(chat_id, text, _menu_inline(), message_id)
 
     async def _cmd_inventory(self, chat_id: str, message_id: Optional[int] = None) -> None:

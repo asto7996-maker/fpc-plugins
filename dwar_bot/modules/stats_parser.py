@@ -317,9 +317,53 @@ class StatsParser:
         return None
 
     async def find_hp_potion(self) -> Optional[Artifact]:
-        return await self.find_potion(["здоров", "лечен", "хп", "жизн", "исцел"])
+        """
+        Find best HP consumable.
+
+        Matches title keywords AND potion kinds (отвар/эликсир/зелье),
+        preferring «отвар восстановления» / «зелье здоровья».
+        """
+        try:
+            from dwar_bot.modules.potion_manager import PotionManager
+            profile = self._last_profile or await self.read_full_profile()
+            pick = PotionManager().pick_hp_from_inventory(profile.inventory)
+            if pick:
+                for art in profile.inventory:
+                    if str(art.art_id) == pick.art_id:
+                        return art
+        except Exception:
+            pass
+        # Fallback: broad keyword search across potions + any inventory title
+        profile = self._last_profile or await self.read_full_profile()
+        keys = [
+            "восстанов", "здоров", "лечен", "хп", "жизн", "исцел",
+            "хил", "снадоб", "аптеч", "зелье здоровья", "эликсир жизни",
+        ]
+        potion = await self.find_potion(keys)
+        if potion:
+            return potion
+        for art in profile.inventory:
+            title = (art.title or "").lower()
+            kind = (art.kind or "").lower()
+            if any(k in title or k in kind for k in keys):
+                return art
+            if art.is_potion and not any(
+                x in title for x in ("гнев", "мощь", "мана", "магии", "опыт")
+            ):
+                return art
+        return None
 
     async def find_mp_potion(self) -> Optional[Artifact]:
+        try:
+            from dwar_bot.modules.potion_manager import PotionManager
+            profile = self._last_profile or await self.read_full_profile()
+            pick = PotionManager().pick_mp_from_inventory(profile.inventory)
+            if pick:
+                for art in profile.inventory:
+                    if str(art.art_id) == pick.art_id:
+                        return art
+        except Exception:
+            pass
         return await self.find_potion(["ман", "магии", "мп", "энерг"])
 
     async def find_food(self, keywords: list[str]) -> Optional[Artifact]:

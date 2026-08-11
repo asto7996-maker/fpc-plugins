@@ -90,6 +90,11 @@ class CombatEngine:
         self.last_fight_damage_dealt: int = 0
         self.last_fight_damage_taken: int = 0
         self.last_fight_hit_seq: str = ""
+        try:
+            from dwar_bot.modules.potion_manager import PotionManager
+            self.potions = PotionManager()
+        except Exception:
+            self.potions = None  # type: ignore[assignment]
         # SUIS session soft-limits (dwar.browsergamebots.com)
         self._suis_session_started: float = 0.0
         self._suis_session_kills: int = 0
@@ -302,38 +307,93 @@ class CombatEngine:
             logger.warning("use_potion error: %s", exc)
             return False
 
-    async def heal_if_needed(self, profile: FullProfile) -> bool:
+    async def heal_if_needed(
+        self,
+        profile: FullProfile,
+        *,
+        mid_fight: bool = False,
+        force_threshold: Optional[float] = None,
+    ) -> bool:
         """
         Drink an HP potion when HP falls below the configured threshold.
         Returns True if a potion was consumed.
+
+        ``mid_fight=True`` allows drinks during an active WS fight (HTTP DRINK
+        while the fight socket stays open) — critical to stop deaths.
         """
         hp_pct = profile.char.hp_percent
-        if hp_pct >= COMBAT.hp_elixir_threshold:
-            return False
-
-        # HP≈0: often fight-lock stub / death — potion spam doesn't help.
-        if hp_pct <= 0.5:
-            now = time.time()
-            last = float(getattr(self, "_hp0_warn_at", 0.0) or 0.0)
-            if now - last >= 120.0:
-                self._hp0_warn_at = now
-                logger.warning(
-                    "HP at %.0f%% — wait regen / finish fight (no potion spam).",
-                    hp_pct,
-                )
-            return False
+        threshold = float(
+            force_threshold
+            if force_threshold is not None
+            else getattr(COMBAT, "hp_elixir_threshold", 55.0)
+        )
+        pm = getattr(self, "potions", None)
+        if pm is not None:
+            ok_gate = (
+                pm.should_drink_mid_fight(hp_pct, threshold)
+                if mid_fight
+                else pm.should_drink_out_of_fight(hp_pct, threshold)
+            )
+            if not ok_gate:
+                return False
+        else:
+            if hp_pct >= threshold:
+                return False
+            # Only skip true 0 HP (dead / empty stub) — 0.5% used to refuse
+            # near-death drinks and the character died waiting for regen.
+            if hp_pct <= 0:
+                return False
 
         potion = await self._stats.find_hp_potion()
         if potion is None:
+            # Last resort: bag ADD_HP actions (food/kits) outside fight
+            if not mid_fight:
+                try:
+                    n = await self.open_bag_actions(max_actions=2, include_food=True)
+                    if n:
+                        logger.info("heal_if_needed: bag ADD_HP/food actions=%d", n)
+                        if pm is not None:
+                            pm.note_drink(mid_fight=False, ok=True)
+                        return True
+                except Exception as exc:
+                    logger.debug("heal bag food: %s", exc)
             now = time.time()
             last = float(getattr(self, "_no_potion_warn_at", 0.0) or 0.0)
             if now - last >= 90.0:
                 self._no_potion_warn_at = now
                 logger.warning("HP at %.0f%% but no healing potion in backpack!", hp_pct)
+            if pm is not None:
+                pm.note_drink(mid_fight=mid_fight, ok=False)
             return False
 
-        logger.info("HP %.0f%% below threshold — drinking '%s'.", hp_pct, potion.title)
-        return await self.use_potion(potion)
+        logger.info(
+            "HP %.0f%% < %.0f%% — drinking '%s'%s.",
+            hp_pct, threshold, potion.title,
+            " (mid-fight)" if mid_fight else "",
+        )
+        ok = await self.use_potion(potion)
+        if pm is not None:
+            pm.note_drink(mid_fight=mid_fight, ok=ok)
+        return ok
+
+    async def drink_mid_fight(self, hp: int, hp_max: int) -> bool:
+        """Called from FightClient between turns when HP is critical."""
+        if hp_max <= 0:
+            return False
+        hp_pct = 100.0 * max(0, int(hp)) / int(hp_max)
+        threshold = float(getattr(COMBAT, "hp_elixir_threshold", 55.0))
+        # Drink earlier mid-fight than out-of-fight wait
+        mid_threshold = max(threshold, float(getattr(COMBAT, "hp_block_threshold", 45.0)))
+        profile = self._stats.get_cached_profile()
+        if profile is None:
+            from dwar_bot.modules.stats_parser import CharStats, FullProfile as FP
+            profile = FP(char=CharStats(hp=int(hp), hp_max=int(hp_max)))
+        else:
+            profile.char.hp = int(hp)
+            profile.char.hp_max = int(hp_max)
+        return await self.heal_if_needed(
+            profile, mid_fight=True, force_threshold=mid_threshold,
+        )
 
     async def restore_mana_if_needed(self, profile: FullProfile) -> bool:
         """Drink an MP potion when mana falls below the threshold."""
@@ -998,6 +1058,7 @@ class CombatEngine:
                     unblock_before_finisher=bool(
                         getattr(COMBAT, "unblock_before_finisher", True)
                     ),
+                    elixir_hp_percent=float(getattr(COMBAT, "hp_elixir_threshold", 55.0)),
                     want_magic_stance=want_magic,
                     botmek_preset=botmek_name or suis_label,
                 )
@@ -1007,10 +1068,15 @@ class CombatEngine:
                 logger.debug("fight brain seed: %s", exc)
                 brain = None
 
+            heal_cb = None
+            if getattr(COMBAT, "post_battle_heal", True):
+                heal_cb = self.drink_mid_fight
+
             outcome: FightOutcome = await self._fight.complete_current_fight(
                 timeout=timeout,
                 brain=brain,
                 level=level,
+                heal_callback=heal_cb,
             )
             self.last_fight_attacks = int(outcome.attacks or 0)
             self.last_fight_damage_dealt = int(outcome.damage_dealt or 0)
