@@ -109,8 +109,7 @@ async def notify_admins(
 
     who = (first_name or "пользователь").strip()
     text = (
-        f"🆘 Новый вопрос в поддержку\n"
-        f"━━━━━━━━━━━━━━━━\n\n"
+        f"🆘 Новый вопрос в поддержку\n\n"
         f"От: {who} (vk.com/id{vk_user_id})\n\n"
         f"{question.strip()[:3000]}\n\n"
         f"Ответить: https://vk.com/gim{abs(int(settings.group_id))}?sel={vk_user_id}"

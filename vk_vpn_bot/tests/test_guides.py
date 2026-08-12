@@ -37,7 +37,8 @@ def test_install_guides_are_actionable() -> None:
         assert "🔑 Ключ" in text, f"{slug}: не сказано, где взять ссылку"
         assert "скопируйте" in text.lower(), f"{slug}: нет шага копирования"
         assert "2ip.ru" in text, f"{slug}: нет способа проверить результат"
-        assert "①" in text and "④" in text, f"{slug}: нет пошаговой части"
+        assert "1." in text and "4." in text, f"{slug}: нет пошаговой части"
+        assert "①" not in text and "━━" not in text, f"{slug}: лишнее оформление"
 
     assert "App Store" in GUIDES["ios"]
     assert "Google Play" in GUIDES["android"] and "happ.su" in GUIDES["android"]
