@@ -982,7 +982,7 @@ class DwarBot:
             (self._client._session.get("sess_sid") or "")[:8],
         )
 
-        # HP≈0: auto-resurrect (phoenix / altar / codes), then regen
+        # HP≈0: auto-resurrect (phoenix / altar / codes). Never sit 180s on a ghost.
         if self._char.hp_max and self._char.hp_percent <= 0.5:
             if await self.combat.is_in_battle():
                 result = await self.combat.finish_fight(timeout=180.0)
@@ -990,13 +990,23 @@ class DwarBot:
                 await _sleep(1.0, 2.0)
                 return
 
+            rez_ok = False
             if getattr(farm, "auto_resurrect", True):
                 try:
+                    # Clear resurrect cooldown so we can retry every tick when stuck
+                    self.resurrection.session.last_attempt_at = 0.0
                     rez = await self.resurrection.ensure_alive(self)
-                    if rez.ok and rez.method != "already_alive":
-                        logger.info("Auto-resurrect: %s", rez.summary)
+                    if rez.ok:
+                        rez_ok = True
+                        if rez.method != "already_alive":
+                            logger.info("Auto-resurrect: %s", rez.summary)
                         # Heal up after rez before farming
-                        if farm.auto_heal and self._char.hp_percent < float(farm.hp_heal or 55):
+                        if (
+                            farm.auto_heal
+                            and self._char.hp_max
+                            and self._char.hp_percent < float(farm.hp_heal or 55)
+                            and self._char.hp > 0
+                        ):
                             try:
                                 await self.combat.heal_if_needed(self._profile)
                             except Exception:
@@ -1004,15 +1014,16 @@ class DwarBot:
                             try:
                                 await self.timers.wait_for_hp(
                                     target_percent=max(50.0, float(farm.hp_heal or 55)),
-                                    max_wait=60,
+                                    max_wait=45,
                                 )
                             except Exception:
                                 await _sleep(5.0, 10.0)
                         return
+                    logger.warning("Auto-resurrect failed: %s", rez.summary)
                 except Exception as exc:
                     logger.warning("auto-resurrect error: %s", exc)
 
-            if farm.auto_heal and getattr(farm, "use_potions", True):
+            if farm.auto_heal and getattr(farm, "use_potions", True) and self._char.hp > 0:
                 try:
                     drank = await self.combat.heal_if_needed(
                         self._profile, force_threshold=100.0,
@@ -1024,15 +1035,44 @@ class DwarBot:
                 except Exception as exc:
                     logger.debug("HP≈0 potion: %s", exc)
 
-            if self._char.hp_percent <= 0.5:
-                logger.info("HP≈0 — wait regen (skip farm tick).")
+            if self._char.hp_max and self._char.hp_percent <= 0.5:
+                # Ghost-locked: short pause then retry resurrect next tick
+                # (do NOT wait_for_hp 180s — regen never ticks at HP=0).
+                if not rez_ok and getattr(farm, "auto_resurrect", True):
+                    logger.warning(
+                        "HP≈0 ghost-locked — retry resurrect next tick "
+                        "(skip long regen wait)."
+                    )
+                    try:
+                        if self.settings.notify.hp_low:
+                            now = time.time()
+                            last = float(getattr(self, "_ghost_tg_at", 0.0) or 0.0)
+                            if now - last >= 300.0:
+                                self._ghost_tg_at = now
+                                await self.notify(
+                                    "💀 HP=0 (дух). Реген не работает — "
+                                    "бот пробует возрождение. "
+                                    "Нужны Перо Феникса / алтарь «Возродиться».",
+                                    "hp_low",
+                                )
+                    except Exception:
+                        pass
+                    await _sleep(8.0, 15.0)
+                    return
+
+                logger.info("HP≈0 — short regen probe (alive but empty).")
                 if farm.auto_heal:
                     try:
-                        await self.timers.wait_for_hp(target_percent=50.0, max_wait=180)
+                        ok = await self.timers.wait_for_hp(
+                            target_percent=50.0, max_wait=45,
+                        )
+                        if not ok and getattr(farm, "auto_resurrect", True):
+                            self.resurrection.session.last_attempt_at = 0.0
+                            await self.resurrection.ensure_alive(self)
                     except Exception:
-                        await _sleep(20.0, 40.0)
+                        await _sleep(10.0, 20.0)
                 else:
-                    await _sleep(20.0, 40.0)
+                    await _sleep(10.0, 20.0)
                 return
 
         await self.timers.update_regen(self._char.hp, self._char.mp)
@@ -2051,12 +2091,27 @@ class DwarBot:
                 return bool(healed)
 
             if action == ActionType.WAIT_REGEN:
+                # If already dead — resurrect, don't sit on 600s regen
+                if self._char.hp_max and self._char.hp <= 0:
+                    logger.info("WAIT_REGEN but HP=0 — auto-resurrect instead.")
+                    if getattr(farm, "auto_resurrect", True):
+                        self.resurrection.session.last_attempt_at = 0.0
+                        rez = await self.resurrection.ensure_alive(self)
+                        return bool(rez.ok)
+                    await _sleep(8.0, 15.0)
+                    return False
                 logger.info("🩹 Реген HP до безопасного порога…")
                 if farm.auto_heal:
                     await self.notify("🩹 Восстановление HP…", "hp_low")
-                    await self.timers.wait_for_hp(target_percent=70.0, max_wait=600)
-                else:
-                    await _sleep(15.0, 40.0)
+                    ok = await self.timers.wait_for_hp(
+                        target_percent=70.0, max_wait=180,
+                    )
+                    if not ok and self._char.hp_max and self._char.hp <= 0:
+                        if getattr(farm, "auto_resurrect", True):
+                            self.resurrection.session.last_attempt_at = 0.0
+                            await self.resurrection.ensure_alive(self)
+                    return True
+                await _sleep(15.0, 40.0)
                 return True
 
             if action == ActionType.REPAIR:

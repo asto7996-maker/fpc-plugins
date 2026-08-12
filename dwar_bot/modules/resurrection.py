@@ -481,15 +481,20 @@ class ResurrectionEngine:
         return ResurrectResult(ok=False, method="action_codes")
 
     async def _try_regen_wait(self, bot: Any) -> ResurrectResult:
-        """Last resort: wait for HP tick (works if not ghost-locked)."""
+        """Last resort: short HP probe (abort immediately if ghost-locked)."""
         farm = getattr(getattr(bot, "settings", None), "farm", None)
         target = 40.0
         if farm is not None:
             target = max(40.0, float(getattr(farm, "hp_heal", 55) or 55) * 0.7)
+        # If already HP=0, regen cannot help — skip long wait
+        hp_now = int(getattr(getattr(bot, "_char", None), "hp", 0) or 0)
+        if hp_now <= 0:
+            self._last_fail_detail = "HP=0 — реген бесполезен (дух), нужен предмет/алтарь"
+            return ResurrectResult(ok=False, method="regen_wait", detail=self._last_fail_detail)
         try:
-            await bot.timers.wait_for_hp(target_percent=target, max_wait=90)
+            await bot.timers.wait_for_hp(target_percent=target, max_wait=45)
         except Exception:
-            await asyncio.sleep(20)
+            await asyncio.sleep(10)
         await self._refresh(bot)
         if int(getattr(bot._char, "hp", 0) or 0) > 0:
             r = self._success(bot, "regen_wait")

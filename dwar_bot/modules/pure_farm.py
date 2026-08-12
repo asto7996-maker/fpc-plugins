@@ -622,14 +622,21 @@ class PureFarmEngine:
                 except Exception as exc:
                     logger.debug("PureFarm heal_if_needed: %s", exc)
             if hp_pct < float(farm.hp_heal or 55):
-                if farm.auto_heal:
+                if farm.auto_heal and hp_pct > 0.5:
                     try:
-                        await bot.timers.wait_for_hp(
+                        ok = await bot.timers.wait_for_hp(
                             target_percent=max(50.0, float(farm.hp_heal or 55)),
-                            max_wait=90,
+                            max_wait=60,
                         )
+                        if not ok:
+                            # Stagnant / ghost — try resurrect once more
+                            if getattr(farm, "auto_resurrect", True):
+                                bot.resurrection.session.last_attempt_at = 0.0
+                                await bot.resurrection.ensure_alive(bot)
                     except Exception:
-                        await asyncio.sleep(15)
+                        await asyncio.sleep(10)
+                elif hp_pct <= 0.5:
+                    await asyncio.sleep(8)
                 return True
             # Potion raised HP above heal threshold — continue farm
             if hp_pct < float(farm.hp_retreat or 28):

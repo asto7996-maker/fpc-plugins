@@ -235,26 +235,75 @@ class TimersManager:
         return self.regen.seconds_to_full_hp(hp, hp_max)
 
     async def wait_for_hp(
-        self, target_percent: float = 90.0, max_wait: float = 1800.0
+        self,
+        target_percent: float = 90.0,
+        max_wait: float = 1800.0,
+        *,
+        allow_zero_hp: bool = False,
     ) -> bool:
         """
         Sleep (in poll increments) until HP reaches *target_percent*.
-        Returns True when reached, False on timeout.
+        Returns True when reached, False on timeout / ghost-stuck.
+
+        If HP stays at 0 (ghost / dead, no regen), exits early unless
+        ``allow_zero_hp=True`` — waiting 180s on a spirit is wasted time.
         """
         start = time.time()
+        last_hp = -1
+        stagnant_polls = 0
+        zero_polls = 0
         while time.time() - start < max_wait:
             char = await self._client.get_char_stats()
-            if char.hp_max and char.hp_percent >= target_percent:
-                logger.info("HP recovered to %.0f%%.", char.hp_percent)
+            hp = int(char.hp or 0)
+            hp_max = int(char.hp_max or 0)
+            pct = float(char.hp_percent or 0)
+
+            if hp_max and pct >= target_percent:
+                logger.info("HP recovered to %.0f%%.", pct)
                 return True
-            await self.update_regen(char.hp, char.mp)
-            eta = self.estimate_full_hp_wait(char.hp, char.hp_max)
-            wait = min(TIMERS.energy_regen_poll_interval, max(15.0, eta / 4))
+
+            # Ghost / dead: HP does not tick up — bail fast
+            if hp_max > 0 and hp <= 0 and not allow_zero_hp:
+                zero_polls += 1
+                if zero_polls >= 2:
+                    elapsed = time.time() - start
+                    logger.warning(
+                        "wait_for_hp aborted: HP stuck at 0 for %.0fs "
+                        "(дух/смерть — нужен resurrect, не реген).",
+                        elapsed,
+                    )
+                    return False
+                await asyncio.sleep(5.0)
+                continue
+
+            # No progress for several polls while below target
+            if hp == last_hp:
+                stagnant_polls += 1
+            else:
+                stagnant_polls = 0
+                last_hp = hp
+
+            await self.update_regen(hp, char.mp)
+            eta = self.estimate_full_hp_wait(hp, hp_max)
+            # If tracker sees no regen rate and HP is critically low — don't sit forever
+            if stagnant_polls >= 4 and pct < max(5.0, target_percent * 0.15):
+                elapsed = time.time() - start
+                logger.warning(
+                    "wait_for_hp aborted: HP stagnant at %.0f%% for %.0fs "
+                    "(no regen progress).",
+                    pct, elapsed,
+                )
+                return False
+
+            wait = min(TIMERS.energy_regen_poll_interval, max(15.0, eta / 4 if eta else 20.0))
+            # Cap single sleep so we re-check death/ghost sooner
+            wait = min(wait, 30.0)
             logger.debug(
                 "HP %.0f%% — waiting %.0fs (ETA full: %.0fs)",
-                char.hp_percent, wait, eta,
+                pct, wait, eta,
             )
             await asyncio.sleep(wait)
+
         logger.warning("wait_for_hp timed out after %.0fs.", max_wait)
         return False
 
