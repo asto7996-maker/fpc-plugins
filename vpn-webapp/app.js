@@ -212,9 +212,7 @@
   }
   const scrollOpts = { passive: true, capture: true };
   if (main) main.addEventListener("scroll", markScrolling, scrollOpts);
-  window.addEventListener("touchmove", markScrolling, scrollOpts);
-  window.addEventListener("wheel", markScrolling, scrollOpts);
-  document.addEventListener("visibilitychange", () => {
+      document.addEventListener("visibilitychange", () => {
     root.classList.toggle("pk-hidden", document.hidden);
   });
 

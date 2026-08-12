@@ -12,31 +12,27 @@ raw = p.read_text(encoding="utf-8")
 Path(str(p) + f".bak.{int(time.time())}").write_text(raw, encoding="utf-8")
 t = raw
 
-# Strip previous injections
+# Strip previous injections (all duplicates)
 t = re.sub(
     r'\n?\s*<script id="paskod-perf-boot">[\s\S]*?</script>\n?',
     "\n",
     t,
-    count=1,
 )
 t = re.sub(
     r'\n?\s*<!-- pk-build:[\w.-]+ -->\s*<style id="paskod-bg-fx">[\s\S]*?</style>\n?',
     "\n",
     t,
-    count=1,
 )
 t = re.sub(
     r'\n?\s*<div id="pk-fx"[\s\S]*?</div>\s*<script id="paskod-perf-runtime">[\s\S]*?</script>\n?',
     "\n",
     t,
-    count=1,
 )
 # legacy anonymous script after pk-fx
 t = re.sub(
     r'\n?\s*<div id="pk-fx"[\s\S]*?</div>\s*<script>try\{if\(window\.__paskodDisableBg\)[\s\S]*?</script>\n?',
     "\n",
     t,
-    count=1,
 )
 
 assert "</head>" in t and "<body>" in t
@@ -95,48 +91,30 @@ BOOT = r"""
 """
 
 FX_CSS = r"""
-      <!-- pk-build:20260809-nofreeze -->
+      <!-- pk-build:20260812-fix -->
       <style id="paskod-bg-fx">
-      /* ===== Freeze-safe shell (no universal selectors, no scroll style thrash) ===== */
+      /* Visual FX only — do NOT alter scroll/touch/layout semantics */
       html{background-color:#070b1c!important}
       body,.dark body,.light body{background-color:transparent!important}
-      #root{background:transparent!important;overscroll-behavior:contain;-webkit-overflow-scrolling:touch}
-      html,body{overscroll-behavior:none;-webkit-text-size-adjust:100%}
+      #root{background:transparent!important}
       html.dark #root [class*="min-h-viewport"],
       html.dark #root main{background-color:transparent!important}
 
-      /* Solid “glass” fill — NO backdrop-filter (main freeze source on mobile) */
-      html.dark #root div[class*="rounded-3xl"],
-      html.dark #root div[class*="rounded-2xl"],
-      html.dark #root section[class*="rounded-3xl"],
-      html.dark #root article[class*="rounded-3xl"],
-      html.dark #root div[class*="bg-dark-9"],
-      html.dark #root div[class*="bg-dark-950"],
-      html.dark #root div[class*="bg-[#0"]{
-        background-color:rgba(12,16,34,.78)!important;
+      /* Soften opaque page canvas so FX can show — narrow, no broad bg-[#0] / rounded overrides */
+      html.dark #root > div > div[class*="min-h-viewport"]{
+        background-color:rgba(8,12,28,.35)!important;
       }
 
-      #root main,
-      #root [class*="overflow-y-auto"],
-      #root [class*="overflow-auto"],
-      #root [class*="overflow-y-scroll"]{
-        overscroll-behavior:contain;
-        -webkit-overflow-scrolling:touch;
-      }
       #root button,
       #root a,
-      #root [role="button"],
-      #root [class*="cursor-pointer"]{
+      #root [role="button"]{
         touch-action:manipulation;
         -webkit-tap-highlight-color:transparent;
       }
 
-      /* Theme: only FX opacity, never whole #root */
       #pk-fx{transition:opacity .28s ease}
       html.pk-theme-swap #pk-fx{opacity:0!important}
-      #boot{transition:opacity .25s ease}
 
-      /* ===== Ambient FX: few animated layers, transform-only ===== */
       #pk-fx{
         position:fixed;inset:0;z-index:-1;pointer-events:none;overflow:hidden;
         contain:strict;isolation:isolate;
@@ -160,13 +138,10 @@ FX_CSS = r"""
       #pk-fx .o4{width:72vw;height:72vw;right:-12vw;bottom:-14vh;opacity:.28;
         background:radial-gradient(circle,rgba(45,212,191,.85) 0%,rgba(45,212,191,.16) 44%,transparent 68%);
         animation:pkO2 36s ease-in-out infinite reverse}
-      /* static accents — zero animation cost */
       #pk-fx .o5{width:58vw;height:58vw;left:22vw;top:28vh;opacity:.16;
         background:radial-gradient(circle,rgba(236,72,153,.75) 0%,rgba(236,72,153,.12) 44%,transparent 68%)}
       #pk-fx .o6{width:50vw;height:50vw;right:10vw;top:42vh;opacity:.12;
         background:radial-gradient(circle,rgba(250,204,21,.65) 0%,rgba(250,204,21,.1) 46%,transparent 70%)}
-
-      /* Static aurora/beam — look kept, no continuous rotate/paint */
       #pk-fx .aurora{
         position:absolute;inset:-20% -10%;opacity:.22;transform:translateZ(0);
         background:conic-gradient(from 210deg at 50% 40%,
@@ -200,12 +175,8 @@ FX_CSS = r"""
         radial-gradient(120% 90% at 50% 35%,transparent 55%,rgba(2,4,12,.28) 100%),
         linear-gradient(180deg,rgba(7,11,28,.15) 0%,transparent 28%,transparent 70%,rgba(5,7,18,.35) 100%)}
 
-      /* Scroll: INSTANT freeze of FX — no opacity transitions, no DOM-wide style */
-      html.pk-scrolling #pk-fx,
-      html.pk-scrolling #pk-fx *{transition:none!important}
+      /* Pause orb CSS only on real scroll class — no display:none thrash */
       html.pk-scrolling #pk-fx .orb{animation-play-state:paused!important}
-      html.pk-scrolling #pk-fx .aurora,
-      html.pk-scrolling #pk-fx .beam{display:none!important}
 
       html.light{background-color:#dceaf8!important}
       html.light #pk-fx{
@@ -218,17 +189,14 @@ FX_CSS = r"""
       html.light #pk-fx .o4{opacity:.24;background:radial-gradient(circle,rgba(167,243,208,.75) 0%,rgba(167,243,208,.14) 42%,transparent 68%)}
       html.light #pk-fx .o5{opacity:.14;background:radial-gradient(circle,rgba(251,207,232,.65) 0%,transparent 68%)}
       html.light #pk-fx .o6{opacity:.1;background:radial-gradient(circle,rgba(253,230,138,.55) 0%,transparent 70%)}
-      html.light #pk-fx .aurora{opacity:.14;background:conic-gradient(from 210deg at 50% 40%,rgba(147,197,253,0),rgba(125,211,252,.3),rgba(196,181,253,0),rgba(251,207,232,.25),rgba(167,243,208,.2),rgba(147,197,253,0))}
-      html.light #pk-fx .beam{opacity:.28;background:linear-gradient(105deg,transparent 20%,rgba(147,197,253,.2) 45%,rgba(196,181,253,.16) 55%,transparent 78%)}
-      html.light #pk-fx .beam.b2{background:linear-gradient(75deg,transparent 15%,rgba(167,243,208,.16) 48%,rgba(147,197,253,.14) 62%,transparent 85%)}
+      html.light #pk-fx .aurora{opacity:.14}
+      html.light #pk-fx .beam{opacity:.28}
       html.light #pk-fx .stars{opacity:.18}
       html.light #pk-fx .veil{background:
         radial-gradient(120% 90% at 50% 35%,transparent 50%,rgba(180,210,240,.3) 100%),
         linear-gradient(180deg,rgba(255,255,255,.2) 0%,transparent 30%,transparent 70%,rgba(190,215,240,.26) 100%)}
       html.light #root [class*="min-h-viewport"],
       html.light #root main{background-color:transparent!important}
-      html.light #root div[class*="rounded-3xl"],
-      html.light #root div[class*="rounded-2xl"]{background-color:rgba(255,255,255,.86)!important}
 
       @keyframes pkO1{0%,100%{transform:translate3d(0,0,0) scale(1)}50%{transform:translate3d(5vw,3vh,0) scale(1.05)}}
       @keyframes pkO2{0%,100%{transform:translate3d(0,0,0) scale(1.02)}50%{transform:translate3d(-4vw,2vh,0) scale(.97)}}
@@ -250,8 +218,6 @@ FX_CSS = r"""
       html.paskod-lite #pk-fx .stars{display:none!important}
       html.paskod-lite #pk-fx .orb{animation:none!important;opacity:.32}
       html.pk-hidden #pk-fx .orb{animation-play-state:paused!important}
-
-      #root > div.pointer-events-none.fixed.inset-0{display:none!important}
     </style>
 """
 
@@ -277,21 +243,14 @@ FX_BODY = r"""
         if (!scrolling) {
           scrolling = true;
           root.classList.add('pk-scrolling');
-          try { window.__paskodPauseAnim = true; } catch (e) {}
         }
         clearTimeout(timer);
         timer = setTimeout(function(){
           scrolling = false;
           root.classList.remove('pk-scrolling');
-          try {
-            if (!(location.pathname || '').includes('subscription')) {
-              window.__paskodPauseAnim = false;
-            }
-          } catch (e2) {}
         }, 180);
       }
 
-      /* Coalesce scroll/touch into 1 rAF — avoids class thrash */
       function onScrollHint(){
         if (raf) return;
         raf = requestAnimationFrame(function(){
@@ -300,10 +259,9 @@ FX_BODY = r"""
         });
       }
 
+      /* ONLY real scroll events — never touchmove (breaks gestures / felt like freeze) */
       var opts = {passive:true, capture:true};
       window.addEventListener('scroll', onScrollHint, opts);
-      window.addEventListener('wheel', onScrollHint, opts);
-      window.addEventListener('touchmove', onScrollHint, opts);
       document.addEventListener('scroll', onScrollHint, opts);
 
       document.addEventListener('visibilitychange', function(){
@@ -337,11 +295,11 @@ else:
     t = t.replace("<body>", "<body>\n" + FX_BODY, 1)
 
 p.write_text(t, encoding="utf-8")
-assert "pk-build:20260809-nofreeze" in t
+assert "pk-build:20260812-fix" in t
 assert 'id="pk-fx"' in t
 assert "paskod-perf-runtime" in t
 assert "pk-header-total" not in t
 assert t.count('id="paskod-perf-boot"') == 1
 assert t.count('id="paskod-bg-fx"') == 1
-print("OK nofreeze", len(t))
+print("OK fix", len(t))
 print("stock_patched", STOCK_NEW[:40] in t or "if (cls) window.__paskodPerfClass" in t)
