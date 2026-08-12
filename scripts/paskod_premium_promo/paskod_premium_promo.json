@@ -1,0 +1,7 @@
+{
+  "max_claims": 1000,
+  "claimed": 124,
+  "traffic_limit_gb": 10,
+  "duration_days": 3,
+  "claims": {}
+}
