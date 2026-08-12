@@ -1,39 +1,33 @@
 # Paskod Premium Promo (1000 slots / 10 GB)
 
-Limited Telegram promo for Paskod VPN.
+Limited Telegram promo for Paskod VPN with **premium custom emoji** from:
+
+| Pack | Short name |
+|------|------------|
+| Adaptive Pixel Emoji | `AdaptivePixelEmoji` |
+| @umarovman | `DasgirPubgm_by_fStikBot` |
+| Translucent Pack by @devaiden | `TranslucentPack` |
+| TG iOS & macOS Icons | `tgmacicons` |
 
 ## Message
 
-HTML promo matching the marketing copy, with a green inline button:
+HTML promo with `<tg-emoji emoji-id="...">` entities + green button:
 
-`Активировать премиум [N/1000]` (`style=success`)
+`Активировать премиум [N/1000]` (`style=success`, Adaptive Pixel gift icon)
 
 ## Limits
 
 - Max **1000** activations (`claimed` counter, seeded at 124)
-- Each promo activation gets **3 days** premium (squad `prem`) with **`traffic_limit_gb = 10`**
-  (caps white-list / bypass traffic via Remnawave `trafficLimitBytes`)
+- Each promo activation gets **3 days** premium with **`traffic_limit_gb = 10`**
 - Users who already have an active paid subscription do not consume a slot
 
 ## Deploy (VPS)
 
-Files live on the bot host:
-
-- `patches/paskod_premium_promo.py` → mounted to `/app/app/handlers/paskod_premium_promo.py`
-- `patches/bot.py` → registers `register_paskod_premium_promo_handlers(dp)`
-- `data/paskod_premium_promo.json` → persistent counter / claim map
-
-Recreate:
+- `patches/paskod_premium_promo.py` → `/app/app/handlers/paskod_premium_promo.py`
+- `patches/bot.py` → registers handlers
+- `data/paskod_premium_promo.json` → persistent counter
 
 ```bash
 cd /root/remnawave-bedolaga-telegram-bot
 docker compose up -d --force-recreate bot
 ```
-
-## Send to a user
-
-```bash
-docker exec remnawave_bot python /tmp/send_promo.py
-```
-
-Target for the initial campaign DM: `@xei1y` (`telegram_id=7835556726`).

@@ -27,25 +27,25 @@ PROMO_DAYS = 3
 PROMO_TRAFFIC_GB = 10  # white-list / bypass traffic cap per promo user
 PREMIUM_TARIFF_ID = 2
 PREMIUM_SQUAD_UUID = 'ca641cad-1797-43f0-8005-76d33c7f1046'
+BUTTON_ICON_CUSTOM_EMOJI_ID = '5235695112419303615'  # Adaptive Pixel gift
+
+# Premium custom emoji from attached packs:
+# AdaptivePixelEmoji, DasgirPubgm_by_fStikBot (@umarovman), TranslucentPack, tgmacicons
+PROMO_MESSAGE_HTML = """<tg-emoji emoji-id="5303040337059543238">🔥</tg-emoji> <b>Забудь про блокировки — Paskod VPN летает ВСЕГДА!</b>
+
+Пока другие сервисы падают, мы выдаем мощные 10 Гбит/с и намертво пробиваем любые «белые списки» и глушилки.
+
+<blockquote><tg-emoji emoji-id="5260389499334051366">📣</tg-emoji> <b>Что ты получаешь:</b>
+└ <tg-emoji emoji-id="5213232476410889569">📈</tg-emoji> Скорость до 10 Гбит/с — 4K-видео и игры без лагов
+└ <tg-emoji emoji-id="5258476306152038031">🔒</tg-emoji> Zero-Logs & Анонимность — не храним данные и логи
+└ <tg-emoji emoji-id="5276262671962892944">🛡</tg-emoji> Обход глушилок — связь работает даже при жестких блоках</blockquote>
+
+<tg-emoji emoji-id="5235695112419303615">🎁</tg-emoji> <b>ДАРИМ 3 ДНЯ ПРЕМИУМА БЕСПЛАТНО!</b>
+Без привязки карт, без вопросов и сложных настроек.
+
+<tg-emoji emoji-id="5260726538302660868">✔️</tg-emoji> Проверь скорость сам в один клик:"""
 
 _lock = threading.Lock()
-
-PROMO_MESSAGE_HTML = (
-    '🔥 <b>Забудь про блокировки — Paskod VPN летает ВСЕГДА!</b>\n'
-    '\n'
-    'Пока другие сервисы падают, мы выдаем мощные 10 Гбит/с и намертво пробиваем '
-    'любые «белые списки» и глушилки.\n'
-    '\n'
-    '<blockquote>📣 <b>Что ты получаешь:</b>\n'
-    '└ 📈 Скорость до 10 Гбит/с — 4K-видео и игры без лагов\n'
-    '└ 🔵 Zero-Logs & Анонимность — не храним данные и логи\n'
-    '└ 🟢 Обход глушилок — связь работает даже при жестких блоках</blockquote>\n'
-    '\n'
-    '🎁 <b>ДАРИМ 3 ДНЯ ПРЕМИУМА БЕСПЛАТНО!</b>\n'
-    'Без привязки карт, без вопросов и сложных настроек.\n'
-    '\n'
-    '✔️ Проверь скорость сам в один клик:'
-)
 
 
 def _default_state() -> dict:
@@ -54,7 +54,7 @@ def _default_state() -> dict:
         'claimed': INITIAL_CLAIMED,
         'traffic_limit_gb': PROMO_TRAFFIC_GB,
         'duration_days': PROMO_DAYS,
-        'claims': {},  # telegram_id(str) -> {claimed_at, subscription_id}
+        'claims': {},
     }
 
 
@@ -74,7 +74,6 @@ def load_state() -> dict:
         state.setdefault('traffic_limit_gb', PROMO_TRAFFIC_GB)
         state.setdefault('duration_days', PROMO_DAYS)
         state.setdefault('claims', {})
-        # Never allow claimed to drift below INITIAL_CLAIMED baseline from seed.
         if int(state.get('claimed') or 0) < INITIAL_CLAIMED and not state['claims']:
             state['claimed'] = INITIAL_CLAIMED
         return state
@@ -103,6 +102,7 @@ def build_keyboard(claimed: int | None = None, max_claims: int | None = None) ->
                     text=button_text(claimed, max_claims),
                     callback_data=CALLBACK_DATA,
                     style='success',
+                    icon_custom_emoji_id=BUTTON_ICON_CUSTOM_EMOJI_ID,
                 )
             ]
         ]
@@ -112,23 +112,14 @@ def build_keyboard(claimed: int | None = None, max_claims: int | None = None) ->
 def _has_active_paid(user: User) -> bool:
     now = datetime.now(UTC)
     for sub in getattr(user, 'subscriptions', None) or []:
-        if not sub:
-            continue
-        if getattr(sub, 'is_trial', False):
+        if not sub or getattr(sub, 'is_trial', False):
             continue
         status = getattr(sub, 'status', None)
-        if status not in (
-            SubscriptionStatus.ACTIVE.value,
-            SubscriptionStatus.TRIAL.value,
-            'limited',
-        ):
-            # also allow plain 'active'
-            if status != 'active':
-                continue
+        if status not in (SubscriptionStatus.ACTIVE.value, 'active', 'limited'):
+            continue
         end = getattr(sub, 'end_date', None)
         if end is None or end > now:
             return True
-    # fallback single subscription attr
     sub = getattr(user, 'subscription', None)
     if sub and not getattr(sub, 'is_trial', False):
         end = getattr(sub, 'end_date', None)
@@ -174,7 +165,6 @@ async def handle_promo_activate(callback: types.CallbackQuery, db_user: User, db
         await callback.answer('У вас уже активен премиум — слот не расходуем.', show_alert=True)
         return
 
-    # Create limited premium trial: 3 days, 10 GB (white-list traffic cap), prem squad.
     try:
         subscription = await create_trial_subscription(
             db,
@@ -185,13 +175,11 @@ async def handle_promo_activate(callback: types.CallbackQuery, db_user: User, db
             connected_squads=[PREMIUM_SQUAD_UUID],
             tariff_id=PREMIUM_TARIFF_ID,
         )
-        # Force traffic cap even if create_trial returned an existing live sub.
         if (subscription.traffic_limit_gb or 0) != PROMO_TRAFFIC_GB and getattr(subscription, 'is_trial', False):
             subscription.traffic_limit_gb = PROMO_TRAFFIC_GB
             await db.commit()
             await db.refresh(subscription)
 
-        # If create_trial returned an existing paid/live unlimited sub, do not claim slot.
         if not getattr(subscription, 'is_trial', False):
             await callback.answer('У вас уже есть активная подписка.', show_alert=True)
             return
@@ -249,7 +237,6 @@ async def handle_promo_activate(callback: types.CallbackQuery, db_user: User, db
 
 
 def register_handlers(dp: Dispatcher) -> None:
-    # Ensure state file exists with seeded counter.
     load_state()
     dp.callback_query.register(handle_promo_activate, F.data == CALLBACK_DATA)
     logger.info('Paskod premium promo handlers registered', max_claims=MAX_CLAIMS, traffic_gb=PROMO_TRAFFIC_GB)
