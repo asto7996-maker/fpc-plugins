@@ -308,7 +308,7 @@ def format_doc_for_bot(doc: LegalDoc, *, page: int = 1, page_size: int = 900) ->
     total = len(chunks)
     page = max(1, min(page, total))
     chunk = chunks[page - 1]
-    head = f"{doc.emoji}  {doc.title}"
-    meta = f"стр. {page}/{total}  ·  обновлено {doc.updated}"
-    text = f"{head}\n━━━━━━━━━━━━━━━━\n{meta}\n\n{chunk}"
+    head = f"{doc.emoji} {doc.title}"
+    meta = f"стр. {page}/{total} · обновлено {doc.updated}"
+    text = f"{head}\n{meta}\n\n{chunk}"
     return text, total

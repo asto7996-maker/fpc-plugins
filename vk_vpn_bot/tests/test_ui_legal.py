@@ -11,8 +11,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from handlers.helpers import format_info_menu, format_welcome
-from handlers.style import brand, header, step
+from handlers.helpers import format_info_menu, format_key_message, format_welcome
+from handlers.style import brand, bullet, footer_hint, header, step
 from keyboards.menus import (
     BTN_GUIDE,
     BTN_HELP,
@@ -45,8 +45,32 @@ class _Settings:
 
 def test_style() -> None:
     assert "𝗣" in brand("Paskod") or "P" in brand("P")
-    assert "━━" in header("✨", "Тест")
-    assert "①" in step(1, "шаг")
+    assert header("✨", "Тест") == "✨ Тест"
+    assert "━━" not in header("✨", "Тест")
+    assert step(1, "шаг") == "1. шаг"
+    assert "①" not in step(1, "шаг")
+    assert bullet("пункт") == "• пункт"
+    assert footer_hint("далее") == "далее"
+    assert "╰" not in footer_hint()
+
+
+def test_key_message_is_calm() -> None:
+    """Сообщение «🔑 Ключ» — без линий, блока «Что делать» и кружковых цифр."""
+    msg = format_key_message(
+        "https://sub.paskod.ru/demo",
+        _Settings(),
+        is_trial=False,
+    )
+    assert "Ваша ссылка" in msg
+    assert "https://sub.paskod.ru/demo" in msg
+    assert "Happ" in msg
+    assert "1." in msg and "3." in msg
+    assert "Что делать" not in msg
+    assert "━━" not in msg
+    assert "①" not in msg
+    assert "📋" not in msg
+    assert "╰" not in msg
+    assert "·  ·" not in msg
 
 
 def test_docs() -> None:

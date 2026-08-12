@@ -14,12 +14,10 @@ from database.models import User
 from handlers.style import (
     brand,
     bullet,
-    card_rule,
     error_banner,
     footer_hint,
     header,
     kv,
-    soft_rule,
     step,
     subhead,
     success_banner,
@@ -95,8 +93,7 @@ def format_welcome(
     price = catalog.entry_price_label if catalog else ""
 
     return (
-        f"✨  {hello}\n"
-        f"{card_rule()}\n\n"
+        f"✨ {hello}\n\n"
         f"{bot} — быстрый VPN для телефона и компьютера.\n"
         f"Можно попробовать бесплатно: {trial}.\n"
         f"Платные тарифы"
@@ -212,12 +209,12 @@ def format_tariffs(catalog: Catalog | None, settings: Settings) -> str:
     ]
 
     for tariff in catalog.tariffs:
-        lines.append(f"▸  {tariff.emoji}  {tariff.name}")
+        lines.append(f"{tariff.emoji} {tariff.name}")
         lines.append(f"     {tariff.short_description}")
         lines.append(f"     Интернет: {tariff.traffic_display}")
         lines.append(f"     Устройств: до {tariff.device_limit}")
         if tariff.has_whitelist_server:
-            lines.append("     📋 Есть сервер с белыми списками")
+            lines.append("     Есть сервер с белыми списками")
         if tariff.price_from_label:
             lines.append(f"     Цена: {tariff.price_from_label}/мес")
         if len(tariff.periods) > 1:
@@ -231,7 +228,6 @@ def format_tariffs(catalog: Catalog | None, settings: Settings) -> str:
             )
         lines.append("")
 
-    lines.append(soft_rule())
     lines.append(
         f"Оплата списывается со счёта в кабинете. Пополнить можно кнопкой "
         f"«💳 Оплатить», от {catalog.min_topup_kopeks // 100} ₽."
@@ -284,7 +280,7 @@ def format_subscription_card(
                 extra = f" ({percent}%)" if percent not in (None, 0) else ""
                 lines.append(kv("Интернет", f"{used} / {limit} ГБ{extra}"))
             elif sub.get("traffic_limit_gb") == 0:
-                lines.append(kv("Интернет", "♾️ без ограничений"))
+                lines.append(kv("Интернет", "без ограничений"))
             if sub.get("device_limit") is not None:
                 lines.append(kv("Устройства", f"до {sub.get('device_limit')}"))
             if sub.get("time_left_display") and sub.get("is_active"):
@@ -363,10 +359,10 @@ def format_key_message(
     _ = source
     if is_trial:
         head = header("🎁", f"Пробный период на {settings.trial_days} дня")
-        intro = f"VPN включён на {settings.trial_days} дня — можно пользоваться."
+        intro = f"VPN включён на {settings.trial_days} дня."
     else:
         head = header("🔑", "Ваша ссылка")
-        intro = "Скопируйте ссылку ниже и вставьте в приложение Happ."
+        intro = "Скопируйте и вставьте в Happ:"
 
     facts: list[str] = []
     if limits:
@@ -374,7 +370,7 @@ def format_key_message(
             used = limits.get("traffic_used_gb") or 0
             facts.append(kv("Интернет", f"{used} / {limits['traffic_limit_gb']} ГБ"))
         elif limits.get("unlimited"):
-            facts.append(kv("Интернет", "♾️ без ограничений"))
+            facts.append(kv("Интернет", "без ограничений"))
         if limits.get("device_limit"):
             facts.append(kv("Устройств", f"до {limits['device_limit']}"))
         if limits.get("end_date"):
@@ -389,15 +385,13 @@ def format_key_message(
 
     return (
         f"{head}\n\n"
-        f"{intro}\n\n"
+        f"{intro}\n"
         f"{facts_block}"
         f"{key}\n\n"
-        f"{subhead('📋', 'Что делать')}\n"
         f"{step(1, 'Скопируйте ссылку целиком')}\n"
-        f"{step(2, 'Откройте Happ → нажмите «+» → вставьте ссылку')}\n"
+        f"{step(2, 'Happ → «+» → вставьте ссылку')}\n"
         f"{step(3, 'Включите VPN')}\n\n"
-        f"Подробная инструкция — в «📱 Гайд». "
-        f"Проверить можно на сайте 2ip.ru."
+        f"Подробнее — «📱 Гайд». Проверка: 2ip.ru"
     )
 
 
@@ -563,8 +557,7 @@ def format_apps(settings: Settings) -> str:
     _ = settings
     return (
         f"{header('📱', 'Приложение')}\n\n"
-        f"Для подключения нужно приложение Happ — оно бесплатное.\n\n"
-        f"{subhead('✅', 'Где скачать')}\n"
+        f"Нужно Happ — оно бесплатное.\n\n"
         f"{bullet('iPhone и iPad — App Store, ищите «Happ»')}\n"
         f"{bullet('Android — Google Play или happ.su')}\n"
         f"{bullet('Компьютер — happ.su')}\n\n"
