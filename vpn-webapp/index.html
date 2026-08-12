@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1, user-scalable=no" />
+  <meta name="theme-color" content="#070b1c" />
+  <meta name="color-scheme" content="dark" />
+  <title>Paskod — кабинет</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@500;600;700;800&display=swap" rel="stylesheet" />
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <!-- Full-bleed ambient FX (does not participate in layout) -->
+  <div class="fx" aria-hidden="true">
+    <span class="fx__aurora"></span>
+    <span class="fx__orb fx__orb--1"></span>
+    <span class="fx__orb fx__orb--2"></span>
+    <span class="fx__orb fx__orb--3"></span>
+    <span class="fx__orb fx__orb--4"></span>
+    <span class="fx__orb fx__orb--5"></span>
+    <span class="fx__orb fx__orb--6"></span>
+    <span class="fx__beam"></span>
+    <span class="fx__beam fx__beam--2"></span>
+    <span class="fx__grid"></span>
+    <span class="fx__ring"></span>
+    <span class="fx__ring fx__ring--2"></span>
+    <span class="fx__stars"></span>
+    <span class="fx__stars fx__stars--2"></span>
+    <span class="fx__spark fx__spark--1"></span>
+    <span class="fx__spark fx__spark--2"></span>
+    <span class="fx__spark fx__spark--3"></span>
+    <span class="fx__spark fx__spark--4"></span>
+    <span class="fx__veil"></span>
+  </div>
+
+  <!--
+    TMA gold shell:
+    Header (flex 0) → Main scroll (flex 1) → Dock (fixed)
+    Safe areas via CSS vars + Telegram WebApp SDK
+  -->
+  <div class="app" id="app">
+    <header class="app-header" id="appHeader">
+      <a class="brand" href="#home" data-nav="home" aria-label="Paskod">
+        <span class="brand__mark" aria-hidden="true">P</span>
+        <span class="brand__name">Paskod</span>
+      </a>
+      <div class="app-header__actions">
+        <button type="button" class="icon-btn" id="btnTheme" aria-label="Тема">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M21 14.5A8.5 8.5 0 1 1 9.5 3a7 7 0 0 0 11.5 11.5Z" stroke-linejoin="round"/></svg>
+        </button>
+        <button type="button" class="icon-btn" id="btnBell" aria-label="Уведомления">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M6 9a6 6 0 1 1 12 0c0 7 3 7 3 7H3s3 0 3-7"/><path d="M10 19a2 2 0 0 0 4 0"/></svg>
+        </button>
+        <button type="button" class="lang-btn" id="btnLang" aria-label="Язык">
+          <span class="lang-btn__flag" aria-hidden="true">🇷🇺</span>
+          <span>RU</span>
+          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><path d="m6 9 6 6 6-6"/></svg>
+        </button>
+        <button type="button" class="icon-btn" id="btnMenu" aria-label="Меню">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M4 7h16M4 12h16M4 17h10" stroke-linecap="round"/></svg>
+        </button>
+      </div>
+    </header>
+
+    <main class="app-main" id="appMain">
+      <div class="app-main__inner">
+        <!-- HOME -->
+        <section class="page is-active" id="page-home" data-page="home">
+          <header class="greet">
+            <h1 class="greet__title">Добро пожаловать, <span id="userName">Vsevolod</span>!</h1>
+            <p class="greet__sub">
+              Ваша подписка
+              <span class="pill"><span class="pill__star" aria-hidden="true">★</span> Базовый юзер</span>
+            </p>
+          </header>
+
+          <div class="stack">
+            <article class="card card--hero">
+              <div class="card__row">
+                <span class="status-dot">БЕЗЛИМИТ</span>
+                <span class="infty" aria-hidden="true">∞</span>
+              </div>
+              <div class="traffic">
+                <div class="traffic__head">
+                  <h2 class="traffic__title">Расход трафика</h2>
+                  <span class="traffic__used">93.2 ГБ израсходовано</span>
+                </div>
+                <div class="bar" role="progressbar" aria-valuenow="100" aria-valuemin="0" aria-valuemax="100">
+                  <span class="bar__fill"></span>
+                </div>
+              </div>
+
+              <button type="button" class="device-row">
+                <span class="device-row__icon" aria-hidden="true">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="3" y="5" width="18" height="12" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
+                </span>
+                <span class="device-row__text">
+                  <strong>Подключить устройство</strong>
+                  <small>1 из 5 подключено</small>
+                </span>
+                <span class="device-row__dots" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></span>
+              </button>
+
+              <div class="mini-grid">
+                <div class="mini">
+                  <span class="mini__label">ТАРИФ</span>
+                  <strong class="mini__value">Премиум</strong>
+                  <span class="mini__meta">до 13.01.2027</span>
+                </div>
+                <div class="mini">
+                  <span class="mini__label">ОСТАЛОСЬ</span>
+                  <strong class="mini__value mini__value--count">156 дн.</strong>
+                  <span class="mini__meta">до окончания</span>
+                </div>
+              </div>
+
+              <div class="card__foot">
+                <button type="button" class="ghost-link" id="btnRefresh">↻ <span id="refreshSec">18s</span></button>
+                <a class="ghost-link ghost-link--accent" href="#subscription" data-nav="subscription">Управление подпиской →</a>
+              </div>
+            </article>
+
+            <div class="pair-grid">
+              <a class="card card--link" href="#balance" data-nav="balance">
+                <div class="card--link__head"><span>Баланс</span><span aria-hidden="true">›</span></div>
+                <div class="card--link__body">
+                  <span class="card--link__icon" aria-hidden="true">💳</span>
+                  <strong class="money">151.35 ₽</strong>
+                </div>
+              </a>
+              <a class="card card--link" href="#referrals" data-nav="referrals">
+                <div class="card--link__head"><span>Рефералы</span><span aria-hidden="true">›</span></div>
+                <div class="card--link__body">
+                  <span class="card--link__icon" aria-hidden="true">👥</span>
+                  <div>
+                    <strong class="money">34</strong>
+                    <small class="earn">+84.35 ₽</small>
+                  </div>
+                </div>
+              </a>
+            </div>
+          </div>
+        </section>
+
+        <!-- SUBSCRIPTION -->
+        <section class="page" id="page-subscription" data-page="subscription" hidden>
+          <header class="page-head">
+            <button type="button" class="back-btn" data-nav="home" aria-label="Назад">←</button>
+            <h1 class="page-head__title">Подписка</h1>
+          </header>
+
+          <div class="stack">
+            <article class="card card--hero">
+              <div class="card__row">
+                <span class="status-dot">БЕЗЛИМИТ</span>
+                <span class="badge badge--on">АКТИВНА</span>
+              </div>
+              <h2 class="plan-name">Премиум</h2>
+
+              <div class="traffic">
+                <div class="traffic__head">
+                  <span class="mini__label">ТРАФИК</span>
+                  <strong class="mono-num">93.2 ГБ</strong>
+                </div>
+                <div class="bar"><span class="bar__fill"></span></div>
+              </div>
+
+              <button type="button" class="device-row">
+                <span class="device-row__icon" aria-hidden="true">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="3" y="5" width="18" height="12" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
+                </span>
+                <span class="device-row__text">
+                  <strong>Подключить устройство</strong>
+                  <small>1 из 5 подключено</small>
+                </span>
+              </button>
+
+              <div class="countdown">
+                <span class="mini__label">ОСТАЛОСЬ</span>
+                <strong class="countdown__value" id="countdown">156 дн. 18 : 56 : 49</strong>
+                <span class="mini__meta">до 13 янв. 2027 г.</span>
+              </div>
+
+              <div class="locations">
+                <span class="mini__label">ЛОКАЦИИ</span>
+                <span class="tag">prem</span>
+              </div>
+
+              <label class="switch-row">
+                <span>Автопродление</span>
+                <input type="checkbox" id="autoRenew" checked />
+                <span class="switch" aria-hidden="true"></span>
+              </label>
+            </article>
+
+            <button type="button" class="cta">Продлить подписку</button>
+          </div>
+        </section>
+
+        <!-- BALANCE -->
+        <section class="page" id="page-balance" data-page="balance" hidden>
+          <header class="page-head"><h1 class="page-head__title">Баланс</h1></header>
+          <div class="stack">
+            <article class="card">
+              <p class="lead mono-num">151.35 ₽</p>
+              <button type="button" class="cta">Пополнить</button>
+            </article>
+          </div>
+        </section>
+
+        <!-- REFERRALS -->
+        <section class="page" id="page-referrals" data-page="referrals" hidden>
+          <header class="page-head"><h1 class="page-head__title">Рефералы</h1></header>
+          <div class="stack">
+            <article class="card">
+              <p class="lead mono-num">34 приглашения</p>
+              <p class="muted">Заработано +84.35 ₽</p>
+            </article>
+          </div>
+        </section>
+
+        <!-- SUPPORT -->
+        <section class="page" id="page-support" data-page="support" hidden>
+          <header class="page-head"><h1 class="page-head__title">Поддержка</h1></header>
+          <div class="stack">
+            <button type="button" class="cta cta--ghost">+ Новый тикет</button>
+            <article class="card contact">
+              <span>@HelperSlllS</span>
+              <button type="button" class="btn-sm">Написать</button>
+            </article>
+            <article class="card empty">Нет обращений</article>
+          </div>
+        </section>
+      </div>
+
+      <!-- Keeps last card clear of fixed dock -->
+      <div class="dock-spacer" id="dockSpacer" aria-hidden="true"></div>
+    </main>
+
+    <nav class="app-dock" id="appDock" aria-label="Навигация">
+      <button type="button" class="app-dock__item is-active" data-nav="home">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M4 10.5 12 4l8 6.5V20a1 1 0 0 1-1 1h-5v-6H10v6H5a1 1 0 0 1-1-1v-9.5Z"/></svg>
+        <span>Главная</span>
+      </button>
+      <button type="button" class="app-dock__item" data-nav="subscription">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M12 3l2.2 6.6H21l-5.4 4 2.1 6.4L12 16.8 6.3 20l2.1-6.4L3 9.6h6.8L12 3Z"/></svg>
+        <span>Подписка</span>
+      </button>
+      <button type="button" class="app-dock__item" data-nav="balance">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="3" y="6" width="18" height="12" rx="2"/><path d="M3 10h18"/></svg>
+        <span>Баланс</span>
+      </button>
+      <button type="button" class="app-dock__item" data-nav="referrals">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><circle cx="9" cy="8" r="3"/><circle cx="16" cy="9" r="2.5"/><path d="M3.5 19a5.5 5.5 0 0 1 11 0M13 19a4.5 4.5 0 0 1 7.5-3.3"/></svg>
+        <span>Рефералы</span>
+      </button>
+      <button type="button" class="app-dock__item" data-nav="support">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M4 12a8 8 0 1 1 3.2 6.4L4 20l1.2-3.2A7.9 7.9 0 0 1 4 12Z"/></svg>
+        <span>Поддержка</span>
+      </button>
+    </nav>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
