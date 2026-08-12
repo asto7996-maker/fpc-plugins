@@ -1,0 +1,266 @@
+{
+  "source": "https://dwar.browsergamebots.com/",
+  "screenshots": "https://dwar.browsergamebots.com/screenshots/",
+  "version_noted": "5.12",
+  "fetched_at": 1785789760.1093,
+  "combat_defaults": {
+    "hp_elixir_percent": 20.0,
+    "hp_scroll_percent": 40.0,
+    "skip_heal_mob_hp_percent": 5.0,
+    "hp_block_enter": 30.0,
+    "hp_block_exit": 60.0,
+    "post_battle_hp_wait": 100.0,
+    "food_skip_above_hp": 75.0,
+    "session_minutes": 60,
+    "session_kill_limit": 50,
+    "max_error_ops": 25,
+    "max_failed_ops": 100,
+    "hit_delay_min": 0.5,
+    "hit_delay_max": 5.0,
+    "fight_load_refresh_sec": 10.0,
+    "pet_if_enemies_gt": 1,
+    "pause_turns_after_elixir": 3,
+    "pause_turns_after_scroll": 6
+  },
+  "gather_defaults": {
+    "session_minutes": 60,
+    "session_resource_limit": 50,
+    "gather_process_timeout": 40,
+    "max_people_on_node": 1,
+    "strategy": "round_robin",
+    "zones": [
+      "N",
+      "S",
+      "W",
+      "E"
+    ],
+    "splinter_chat_interval_min": 5,
+    "splinter_retries_per_loc": 3,
+    "splinter_max_requests": 15
+  },
+  "operator_defaults": {
+    "pause_every_min_minutes": 10,
+    "pause_every_max_minutes": 20,
+    "pause_for_min_minutes": 3,
+    "pause_for_max_minutes": 5,
+    "pause_every_min_ops": 30,
+    "pause_every_max_ops": 50,
+    "pause_ops_for_min_minutes": 3,
+    "pause_ops_for_max_minutes": 5,
+    "human_see_delay": true
+  },
+  "mobs": [
+    {
+      "level": 1,
+      "name": "Крэтс",
+      "hunt_default": true
+    },
+    {
+      "level": 1,
+      "name": "Шальной пес",
+      "hunt_default": true
+    },
+    {
+      "level": 2,
+      "name": "Бешеный пес",
+      "hunt_default": true
+    },
+    {
+      "level": 2,
+      "name": "Дряхлый скелет",
+      "hunt_default": false
+    },
+    {
+      "level": 2,
+      "name": "Зигред",
+      "hunt_default": true
+    },
+    {
+      "level": 2,
+      "name": "Крэтс-лидер",
+      "hunt_default": false
+    },
+    {
+      "level": 2,
+      "name": "Огненный паук",
+      "hunt_default": false
+    },
+    {
+      "level": 3,
+      "name": "Зигред-воин",
+      "hunt_default": true
+    },
+    {
+      "level": 3,
+      "name": "Крэтс-вожак",
+      "hunt_default": true
+    },
+    {
+      "level": 3,
+      "name": "Неистовый пес",
+      "hunt_default": true
+    },
+    {
+      "level": 3,
+      "name": "Огненная паучиха",
+      "hunt_default": false
+    },
+    {
+      "level": 3,
+      "name": "Пепельный паук",
+      "hunt_default": false
+    },
+    {
+      "level": 3,
+      "name": "Пес-демон",
+      "hunt_default": false
+    },
+    {
+      "level": 3,
+      "name": "Скелет-воин",
+      "hunt_default": false
+    }
+  ],
+  "resources": [
+    {
+      "skill": 0,
+      "name": "Агат",
+      "profession": "geologist"
+    },
+    {
+      "skill": 0,
+      "name": "Бирюза",
+      "profession": "geologist"
+    },
+    {
+      "skill": 0,
+      "name": "Аквамарин",
+      "profession": "geologist"
+    },
+    {
+      "skill": 0,
+      "name": "Огневик",
+      "profession": "geologist"
+    },
+    {
+      "skill": 30,
+      "name": "Аметист",
+      "profession": "geologist"
+    },
+    {
+      "skill": 30,
+      "name": "Обсидиан",
+      "profession": "geologist"
+    },
+    {
+      "skill": 30,
+      "name": "Сапфир",
+      "profession": "geologist"
+    },
+    {
+      "skill": 60,
+      "name": "Топаз",
+      "profession": "geologist"
+    },
+    {
+      "skill": 60,
+      "name": "Изумруд",
+      "profession": "geologist"
+    },
+    {
+      "skill": 60,
+      "name": "Рубин",
+      "profession": "geologist"
+    },
+    {
+      "skill": 90,
+      "name": "Алмаз",
+      "profession": "geologist"
+    },
+    {
+      "skill": 120,
+      "name": "Эльдорилл",
+      "profession": "geologist"
+    },
+    {
+      "skill": 120,
+      "name": "Веридий",
+      "profession": "geologist"
+    },
+    {
+      "skill": 120,
+      "name": "Огненный сердолик",
+      "profession": "geologist"
+    },
+    {
+      "skill": 120,
+      "name": "Янтарь",
+      "profession": "geologist"
+    },
+    {
+      "skill": 150,
+      "name": "Драконова кровь",
+      "profession": "geologist"
+    }
+  ],
+  "food_ladder": [
+    {
+      "min_hp_percent": 75.0,
+      "name": "Сдобная булочка",
+      "heal": 60
+    },
+    {
+      "min_hp_percent": 50.0,
+      "name": "Груша",
+      "heal": 110
+    },
+    {
+      "min_hp_percent": 25.0,
+      "name": "Фелинойская вобла",
+      "heal": 140
+    },
+    {
+      "min_hp_percent": 1.0,
+      "name": "Огненный лещ",
+      "heal": 210
+    }
+  ],
+  "food_skip_above_hp": 75.0,
+  "formula_examples": {
+    "simple": "Б+ГНБ-Г",
+    "advanced": "ГН2Т",
+    "default_physical": "ГНТНГ",
+    "codes": {
+      "Т": "тело/middle",
+      "Г": "голова/top",
+      "Н": "ноги/bottom",
+      "Р": "random",
+      "Б+": "block on",
+      "Б-": "block off",
+      "1-6": "belt slot",
+      "П1-П9": "pause seconds"
+    }
+  },
+  "supported_servers_from_site": [
+    "official",
+    "dwar.top",
+    "w.pathofwar.su",
+    "dwar.cc",
+    "dwar-game.com",
+    "dwar2020.com",
+    "oldwar24.ru",
+    "dwar24.ru",
+    "asteriagame.ru"
+  ],
+  "features_from_site": [
+    "auto fights + HP control + elixirs/scrolls",
+    "super-hit combinations",
+    "gathering geologist/herbalist/fisher",
+    "traveler auto-path",
+    "operator emulation pauses",
+    "post-battle food",
+    "splinter (заноза) help requests",
+    "resurrection",
+    "ICQ / private message alerts"
+  ]
+}

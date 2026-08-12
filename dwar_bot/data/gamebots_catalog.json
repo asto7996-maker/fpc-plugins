@@ -1,0 +1,77 @@
+{
+  "source": "https://yougame.biz/threads/184351/",
+  "product": "Оповещатор v8 (edward_freedoms) / GameBots",
+  "note": "xCult thread, 28 Jan 2021 — features described by users",
+  "fetched_at": 1785787066.5601003,
+  "defaults": {
+    "skip_occupied": true,
+    "skip_hidden": true,
+    "occupied_retry": 2,
+    "log_target_split": true,
+    "ui_start_x": 20,
+    "ui_start_y": 50
+  },
+  "toggles": [
+    {
+      "key": "hide_occupied",
+      "label_ru": "Скрывать занятые",
+      "default": true,
+      "applies_to": "both"
+    },
+    {
+      "key": "hide_monsters",
+      "label_ru": "Скрыть монстров",
+      "default": false,
+      "applies_to": "gather"
+    },
+    {
+      "key": "change_map",
+      "label_ru": "Изменить карту",
+      "default": false,
+      "applies_to": "gather"
+    },
+    {
+      "key": "sound_gather",
+      "label_ru": "Звук при добыче",
+      "default": true,
+      "applies_to": "notify"
+    },
+    {
+      "key": "sound_fail",
+      "label_ru": "Звук при срыве",
+      "default": true,
+      "applies_to": "notify"
+    },
+    {
+      "key": "sound_puzzle",
+      "label_ru": "Звук при пазле",
+      "default": true,
+      "applies_to": "notify"
+    },
+    {
+      "key": "sound_appear",
+      "label_ru": "Звук при появлении",
+      "default": false,
+      "applies_to": "notify"
+    }
+  ],
+  "notify_categories": {
+    "gather": "gather",
+    "fail": "gather_fail",
+    "puzzle": "puzzle",
+    "appear": "world",
+    "occupied": "farm"
+  },
+  "user_described_features": [
+    "убрать лишнее с карты",
+    "собрать ресурсы визуально в одном месте",
+    "убрать уже занятые ресурсы",
+    "фильтр монстров на карте сбора",
+    "звуки: добыча / срыв / пазл / появление"
+  ],
+  "integration": {
+    "hunt": "filter_hunt_targets + occupied_retry on ATTACK_BOT",
+    "gather": "documented for future profession gather module",
+    "no_crack": true
+  }
+}
