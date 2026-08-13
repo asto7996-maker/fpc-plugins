@@ -71,10 +71,21 @@ def api_post(path: str, body: Dict[str, Any], secret: Optional[str], token: Opti
     if token:
         q["token"] = token
     url = API + path + (("?" + urllib.parse.urlencode(q)) if q else "")
+    # Cloudflare blocks bare Python-urllib UA (error 1010).
+    # Do NOT send Origin/Referer — those force LK actor (lk_actor_ticket) checks.
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+    }
     req = urllib.request.Request(
         url,
         data=json.dumps(body).encode("utf-8"),
-        headers={"Content-Type": "application/json", "Accept": "application/json"},
+        headers=headers,
         method="POST",
     )
     try:
@@ -101,15 +112,19 @@ def list_messages(bot_id: int, secret: Optional[str], token: Optional[str], limi
         )
         if not data.get("result"):
             raise RuntimeError(f"list failed: {data}")
-        payload = data.get("data") or {}
-        items = payload.get("messages") or payload.get("items") or payload.get("list")
-        if items is None and isinstance(payload, list):
+        payload = data.get("data")
+        if isinstance(payload, list):
             items = payload
-        if items is None and isinstance(data.get("data"), list):
-            items = data["data"]
-        if not items:
-            # Some BOT-T versions return {count, rows}
-            items = payload.get("rows") or []
+        elif isinstance(payload, dict):
+            items = (
+                payload.get("messages")
+                or payload.get("items")
+                or payload.get("list")
+                or payload.get("rows")
+                or []
+            )
+        else:
+            items = []
         if not items:
             break
         out.extend(items)
