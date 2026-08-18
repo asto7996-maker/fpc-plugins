@@ -140,12 +140,13 @@ def main() -> int:
     run(client, f"grep -E '^(VERSION|NAME) ' '{remote_plugin}' | head -5")
     run(
         client,
-        f"mkdir -p '{storage}'; rm -f '{storage}/catchup_v2412.done'; "
+        f"mkdir -p '{storage}'; rm -f '{storage}/catchup_v2412.done' '{storage}/catchup_v2413.done'; "
         f"python3 '{remote_clear}'; rm -f '{remote_clear}'",
     )
 
     restarted = False
     for cmd in (
+        "systemctl restart 'FunPayCardinal@fpc'",
         "systemctl restart funpay-cardinal",
         "systemctl restart cardinal",
         "systemctl restart fpc",

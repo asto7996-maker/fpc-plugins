@@ -2,7 +2,7 @@ from __future__ import annotations
 
 # === ОБЯЗАТЕЛЬНЫЕ ПОЛЯ FunPay Cardinal (НЕ УДАЛЯТЬ) ===
 NAME = "VexBoost AutoSMM"
-VERSION = "2.4.12"
+VERSION = "2.4.13"
 DESCRIPTION = "Автонакрутка SMM-услуг для FunPay Cardinal"
 CREDITS = "@xei1y"
 UUID = "a3f8c2e1-7b4d-4a9f-9e2c-1d5b8f6a0c3e"
@@ -310,7 +310,10 @@ def send_fp(c: "Cardinal", chat_id: Any, text: str) -> None:
     cleaned = _strip_html(text)
     for token in ("vexboost", "VexBoost", "VEXBOOST", "socpanel"):
         cleaned = cleaned.replace(token, "")
-    c.send_message(_normalize_chat_id(chat_id), cleaned)
+    try:
+        c.send_message(_normalize_chat_id(chat_id), cleaned)
+    except Exception as exc:
+        logger.error("%s: не удалось отправить сообщение в чат %s: %s", LOGGER_PREFIX, chat_id, exc)
 
 
 def _get_message_text(msg: Any) -> str:
@@ -1747,6 +1750,12 @@ def _remove_pay_order(buyer: str) -> None:
     save_payorders(orders)
 
 
+def _remove_pay_order_by_id(fp_id: str) -> None:
+    fp_id = str(fp_id)
+    orders = [o for o in load_payorders() if str(o.get("OrderID")) != fp_id]
+    save_payorders(orders)
+
+
 def _update_pay_order(order: Dict[str, Any]) -> None:
     orders = load_payorders()
     for idx, existing in enumerate(orders):
@@ -1898,11 +1907,15 @@ def confirm_order(c: "Cardinal", chat_id: Any, text: str, buyer: str = "") -> No
         _run_bg(f"refund-{oid}", _refund_order, c, oid)
 
 
-def _create_vexboost_order_safe(c: "Cardinal", order: Dict[str, Any]) -> None:
+def _create_vexboost_order_safe(
+    c: "Cardinal",
+    order: Dict[str, Any],
+    refund_on_error: Optional[bool] = None,
+) -> None:
     """Обёртка создания заказа с гарантированным unlock при необработанном сбое."""
     fp_id = str(order.get("OrderID", ""))
     try:
-        _create_vexboost_order(c, order)
+        _create_vexboost_order(c, order, refund_on_error=refund_on_error)
     except Exception as exc:
         _unlock_fp_order(fp_id)
         logger.error("%s: сбой создания VB для FP#%s: %s", LOGGER_PREFIX, fp_id, exc)
@@ -1922,8 +1935,14 @@ def _create_vexboost_order_safe(c: "Cardinal", order: Dict[str, Any]) -> None:
         StatisticsManager.record_failed()
 
 
-def _create_vexboost_order(c: "Cardinal", order: Dict[str, Any]) -> None:
+def _create_vexboost_order(
+    c: "Cardinal",
+    order: Dict[str, Any],
+    refund_on_error: Optional[bool] = None,
+) -> None:
     settings = load_settings()
+    if refund_on_error is None:
+        refund_on_error = bool(settings.get("auto_refund_on_error"))
     fp_id = str(order.get("OrderID", ""))
     existing_smm_id = get_submitted_smm_id(fp_id)
     if existing_smm_id is not None:
@@ -1994,7 +2013,7 @@ def _create_vexboost_order(c: "Cardinal", order: Dict[str, Any]) -> None:
             "buyer": order.get("buyer"),
             "service_id": order.get("service_id"),
         })
-        if settings.get("auto_refund_on_error"):
+        if refund_on_error:
             _refund_order(c, order["OrderID"])
 
 
@@ -2165,17 +2184,15 @@ def _cmd_refill(c: "Cardinal", chat_id: Any, message_text: str) -> None:
 # Фоновая проверка статусов заказов VexBoost
 # ─────────────────────────────────────────────────────────────────────────────
 
-CATCHUP_MARKER_FILE = f"{STORAGE_DIR}/catchup_v2412.done"
+CATCHUP_MARKER_FILE = f"{STORAGE_DIR}/catchup_v2413.done"
 CATCHUP_BUYER_MESSAGE_NO_LINK = (
     "⚠️ Бот был временно недоступен и мог пропустить ваше сообщение.\n\n"
     "Ваш заказ FunPay #{order_id} ещё ожидает ссылку для накрутки.\n"
     "Пожалуйста, отправьте ссылку на аккаунт или пост ещё раз."
 )
-CATCHUP_BUYER_MESSAGE_WITH_LINK = (
-    "⚠️ Бот был временно недоступен.\n\n"
-    "Ваш заказ FunPay #{order_id} готов к запуску.\n"
-    "Подтвердите ссылку ответом + или отправьте новую ссылку.\n"
-    "Для отмены и возврата отправьте -."
+CATCHUP_BUYER_MESSAGE_AUTO_START = (
+    "♻️ Бот восстановил работу после сбоя.\n\n"
+    "Запускаю ваш заказ FunPay #{order_id} по ранее отправленной ссылке."
 )
 
 
@@ -2196,64 +2213,91 @@ def _resolve_order_chat_id(c: "Cardinal", order: Dict[str, Any]) -> Any:
     return None
 
 
-def catchup_unfinished_orders(c: "Cardinal") -> None:
-    """После рестарта: ответить покупателям с незавершёнными AutoSMM-заказами.
+def _restore_pending_from_payorders() -> None:
+    """После рестарта pending в памяти пуст — восстановить заказы, где уже есть ссылка."""
+    restored = 0
+    for order in load_payorders():
+        if (order.get("url") or "").strip():
+            set_pending(order)
+            restored += 1
+    if restored:
+        logger.info("%s: восстановлено pending-заказов: %s", LOGGER_PREFIX, restored)
 
-    - payorders без ссылки → просьба прислать ссылку снова
-    - payorders со ссылкой → повторный запрос подтверждения +/-
+
+def catchup_unfinished_orders(c: "Cardinal") -> None:
+    """После рестарта: выполнить AutoSMM-заказы, застрявшие из‑за сбоя.
+
+    - payorders со ссылкой → сразу создать SMM-заказ (не ждать повторный +)
+    - payorders без ссылки → один раз попросить ссылку
     - active Completed/Canceled → догнать уведомление покупателю
-    Запускается один раз на версию (маркер-файл), чтобы не спамить.
+    - Partial / In progress не трогаем
+    Уже отправленные в SMM заказы пропускаются.
     """
     try:
         _ensure_storage()
-        if os.path.exists(CATCHUP_MARKER_FILE):
-            logger.info("%s: catchup уже выполнен (%s)", LOGGER_PREFIX, CATCHUP_MARKER_FILE)
-            return
         # Дать Cardinal полностью подняться
         time.sleep(8)
 
         contacted = 0
-        pay_orders = load_payorders()
-        changed = False
-        for order in pay_orders:
-            if order.get("catchup_sent"):
-                continue
-            chat_id = _resolve_order_chat_id(c, order)
-            if not chat_id:
-                logger.warning(
-                    "%s: catchup — нет chat_id для FP#%s buyer=%s",
-                    LOGGER_PREFIX, order.get("OrderID"), order.get("buyer"),
-                )
-                continue
-            order["chat_id"] = chat_id
+        fulfilled = 0
+        for order in list(load_payorders()):
             fp_id = str(order.get("OrderID", ""))
+            if not fp_id:
+                continue
+            if _fp_order_already_submitted(fp_id):
+                logger.info("%s: catchup — FP#%s уже в SMM, убираю из очереди", LOGGER_PREFIX, fp_id)
+                _remove_pay_order_by_id(fp_id)
+                continue
+
+            chat_id = _resolve_order_chat_id(c, order)
+            if chat_id:
+                order["chat_id"] = chat_id
+                _update_pay_order(order)
+
             link = (order.get("url") or "").strip()
             try:
                 if link:
-                    send_fp(
-                        c, chat_id,
-                        CATCHUP_BUYER_MESSAGE_WITH_LINK.format(order_id=fp_id),
+                    if not _try_lock_fp_order(fp_id):
+                        logger.warning(
+                            "%s: catchup — FP#%s уже в работе, пропускаю",
+                            LOGGER_PREFIX, fp_id,
+                        )
+                        continue
+                    if chat_id:
+                        send_fp(
+                            c, chat_id,
+                            CATCHUP_BUYER_MESSAGE_AUTO_START.format(order_id=fp_id),
+                        )
+                        send_fp(c, chat_id, _format_buyer_template("creating_order_message"))
+                    _create_vexboost_order(c, order, refund_on_error=False)
+                    clear_pending(order.get("chat_id"), order.get("buyer") or "")
+                    fulfilled += 1
+                    contacted += 1
+                    time.sleep(1.2)
+                    continue
+
+                if order.get("catchup_sent"):
+                    continue
+                if not chat_id:
+                    logger.warning(
+                        "%s: catchup — нет chat_id для FP#%s buyer=%s",
+                        LOGGER_PREFIX, fp_id, order.get("buyer"),
                     )
-                    # Восстановить pending и показать детали
-                    request_confirmation(c, order, link)
-                else:
-                    send_fp(
-                        c, chat_id,
-                        CATCHUP_BUYER_MESSAGE_NO_LINK.format(order_id=fp_id),
-                    )
-                order["catchup_sent"] = True
-                changed = True
-                contacted += 1
-                time.sleep(1.2)  # не упираться в FunPay rate-limit
-            except Exception as exc:
-                logger.error(
-                    "%s: catchup FP#%s: %s", LOGGER_PREFIX, fp_id, exc,
+                    continue
+                send_fp(
+                    c, chat_id,
+                    CATCHUP_BUYER_MESSAGE_NO_LINK.format(order_id=fp_id),
                 )
+                order["catchup_sent"] = True
+                _update_pay_order(order)
+                contacted += 1
+                time.sleep(1.2)
+            except Exception as exc:
+                _unlock_fp_order(fp_id)
+                logger.error("%s: catchup FP#%s: %s", LOGGER_PREFIX, fp_id, exc)
 
-        if changed:
-            save_payorders(pay_orders)
-
-        # Догон active: Completed/Canceled могли не уйти покупателю из‑за зависания
+        # Догон active: Completed/Canceled могли не уйти покупателю из‑за зависания.
+        # Partial / In progress не трогаем — накрутка уже идёт.
         if is_api_configured():
             active = load_active_orders()
             updated = dict(active)
@@ -2274,13 +2318,21 @@ def catchup_unfinished_orders(c: "Cardinal") -> None:
                     logger.error("%s: catchup active VB#%s: %s", LOGGER_PREFIX, smm_id, exc)
             save_active_orders(updated)
 
-        with open(CATCHUP_MARKER_FILE, "w", encoding="utf-8") as fh:
-            fh.write(datetime.now().isoformat())
-        logger.info("%s: catchup завершён, сообщений: %s", LOGGER_PREFIX, contacted)
-        if contacted:
+        try:
+            with open(CATCHUP_MARKER_FILE, "w", encoding="utf-8") as fh:
+                fh.write(datetime.now().isoformat())
+        except OSError as exc:
+            logger.warning("%s: не удалось записать catchup-маркер: %s", LOGGER_PREFIX, exc)
+
+        logger.info(
+            "%s: catchup завершён, сообщений: %s, запущено SMM: %s",
+            LOGGER_PREFIX, contacted, fulfilled,
+        )
+        if contacted or fulfilled:
             _send_tg_to_admins(
                 c,
                 f"♻️ <b>{NAME}</b>: догон незавершённых заказов\n"
+                f"Запущено в SMM: <b>{fulfilled}</b>\n"
                 f"Сообщений покупателям: <b>{contacted}</b>",
             )
     except Exception as exc:
@@ -2298,6 +2350,8 @@ def start_status_checker(c: "Cardinal") -> None:
         name="VexBoostStatusChecker", daemon=True,
     ).start()
     logger.info("%s: фоновая проверка статусов запущена", LOGGER_PREFIX)
+    # После рестарта pending в RAM пуст — вернуть заказы со ссылкой до догона.
+    _restore_pending_from_payorders()
     # Догон покупателей с незавершёнными заказами (после зависания плагина)
     _run_bg("catchup-unfinished", catchup_unfinished_orders, c)
 
@@ -2940,12 +2994,15 @@ def init_commands(cardinal: "Cardinal", *args) -> None:
                     os.remove(CATCHUP_MARKER_FILE)
                 except OSError:
                     pass
-            # Сбросить флаги catchup_sent, чтобы повторно уведомить ожидающих
+            # Сбросить флаги catchup_sent, чтобы повторно уведомить ожидающих без ссылки
             orders = load_payorders()
             for order in orders:
                 order.pop("catchup_sent", None)
             save_payorders(orders)
-            bot.reply_to(message, "♻️ Запускаю догон незавершённых заказов AutoSMM…")
+            bot.reply_to(
+                message,
+                "♻️ Запускаю догон: заказы со ссылкой уйдут в SMM, без ссылки — запрос ссылки.",
+            )
             _run_bg("tg-vb-catchup", catchup_unfinished_orders, cardinal)
         except Exception as exc:
             logger.error("%s: ошибка /vb_catchup: %s", LOGGER_PREFIX, exc)
