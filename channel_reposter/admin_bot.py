@@ -392,9 +392,8 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
         "2️⃣ Источник + назначение\n"
         "3️⃣ Ссылка на пост или «С начала»\n"
         "4️⃣ Описание → ⏱ Интервал → ▶️ Старт\n\n"
-        "Команды: /status /run /pause /run_now /test\n"
-        "/interval 2ч · /limit 5 · /filter · /reconnect · /login\n"
-        "Если кажется, что бот повис: /ping и /unstick\n\n"
+        "Управление — кнопками ниже.\n"
+        "Команды на всякий случай: /status /run_now /test /ping /unstick\n\n"
         + status_text(db),
         reply_markup=main_kb(db),
         parse_mode="HTML",
@@ -1539,9 +1538,9 @@ async def on_unknown(message: Message) -> None:
     _remember_admin(message.from_user.id if message.from_user else None)
     db = _require_db()
     await message.answer(
-        "Не понял команду. Управление — кнопками ниже.\n"
-        "Подсказка: /status — статус, /run_now — цикл сейчас, /test — диагностика, "
-        "/ping — проверить, что панель жива.\n\n"
+        "Не понял команду. Управление — <b>кнопками ниже</b>.\n"
+        "🧹 Чистый перелив — без ссылок, файлов, гифок и голосовых.\n"
+        "Подсказка: /status · /run_now · /test · /ping\n\n"
         + status_text(db),
         reply_markup=main_kb(db),
         parse_mode="HTML",
