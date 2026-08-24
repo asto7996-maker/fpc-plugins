@@ -46,6 +46,10 @@ from links import (
     parse_post_link,
     to_channel_chat_id,
 )
+from transfer_filters import (
+    filter_album_for_transfer,
+    transfer_skip_reason,
+)
 
 # Ошибки доступа к закрытому каналу — останавливаем цикл, не «прожигаем» progress
 _CHANNEL_ACCESS_ERRORS = (ChannelPrivate, ChannelInvalid, PeerIdInvalid)
@@ -967,6 +971,10 @@ class ChannelPoster:
                 )
                 await asyncio.sleep(2.0 * attempt)
 
+    def _clean_transfer_enabled(self) -> bool:
+        """Чистый перелив: пропускать ссылки, файлы, гифки и голосовые."""
+        return bool(self.db.get_settings().clean_transfer)
+
     async def _process(
         self, source, target, message_id: int, caption: str
     ) -> str:
@@ -989,6 +997,13 @@ class ChannelPoster:
                 logger.info("album %s уже публиковался — пропуск", gid)
                 return "skip"
             return await self._publish_album(source, target, msg, caption)
+
+        if self._clean_transfer_enabled():
+            reason = transfer_skip_reason(msg)
+            if reason:
+                logger.info("чистый перелив: пропуск %s (%s)", msg.id, reason)
+                self.db.add_history(msg.id, status="skip", error=reason)
+                return "skip"
 
         if _is_media(msg) or msg.sticker or (msg.text or msg.caption):
             return await self._publish_single(target, msg, caption)
@@ -1143,11 +1158,46 @@ class ChannelPoster:
             return "skip"
 
         album = sorted(album, key=lambda m: m.id)
+        original_album = album
+        rebuild_album = False
+        if self._clean_transfer_enabled():
+            kept, skip_reason = filter_album_for_transfer(album)
+            if skip_reason:
+                logger.info(
+                    "чистый перелив: пропуск альбома %s (%s)", gid, skip_reason
+                )
+                for m in original_album:
+                    self.db.add_history(
+                        source_message_id=m.id,
+                        grouped_id=gid,
+                        status="skip",
+                        error=skip_reason,
+                    )
+                return "skip"
+            if len(kept) != len(album):
+                kept_ids = {m.id for m in kept}
+                logger.info(
+                    "чистый перелив: альбом %s без %s файл/гиф/голос",
+                    gid,
+                    len(album) - len(kept),
+                )
+                for m in album:
+                    if m.id not in kept_ids:
+                        self.db.add_history(
+                            source_message_id=m.id,
+                            grouped_id=gid,
+                            status="skip",
+                            error=transfer_skip_reason(m) or "файл",
+                        )
+                album = kept
+                rebuild_album = True
+
         sent_list = None
         try:
-            if caption:
+            if caption or rebuild_album:
                 # Шаблон задан — публикуем через send_media_group с caption сразу,
                 # чтобы не было метки «изменено» от последующего edit.
+                # После фильтрации альбома copy_media_group нельзя: уйдёт и мусор.
                 sent_list = await self._send_album_with_caption(target, album, caption)
             else:
                 try:
@@ -1161,7 +1211,7 @@ class ChannelPoster:
                     sent_list = await self._send_album_with_caption(target, album, "")
 
             first_id = sent_list[0].id if sent_list else None
-            max_src = max(m.id for m in album)
+            max_src = max(m.id for m in original_album)
             for m in album:
                 self.db.add_history(
                     source_message_id=m.id,

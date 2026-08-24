@@ -188,7 +188,13 @@ def _remember_admin(uid: Optional[int]) -> None:
 
 # ----- keyboards -----
 
-def menu_kb(running: bool, *, catchup: bool = False, notify: bool = False) -> InlineKeyboardMarkup:
+def menu_kb(
+    running: bool,
+    *,
+    catchup: bool = False,
+    notify: bool = False,
+    clean_transfer: bool = True,
+) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -227,6 +233,12 @@ def menu_kb(running: bool, *, catchup: bool = False, notify: bool = False) -> In
                 ),
             ],
             [
+                InlineKeyboardButton(
+                    text=f"🧹 Чистый перелив: {'вкл' if clean_transfer else 'выкл'}",
+                    callback_data="a:clean",
+                ),
+            ],
+            [
                 InlineKeyboardButton(text="📝 Rewrite подписей", callback_data="a:rewrite"),
                 InlineKeyboardButton(text="🧹 Разблокировать", callback_data="a:unstick"),
             ],
@@ -240,7 +252,12 @@ def main_kb(db: Optional[Database] = None) -> InlineKeyboardMarkup:
     if database is None:
         return menu_kb(False)
     s = database.get_settings()
-    return menu_kb(s.is_running, catchup=s.catchup_enabled, notify=s.notify_cycles)
+    return menu_kb(
+        s.is_running,
+        catchup=s.catchup_enabled,
+        notify=s.notify_cycles,
+        clean_transfer=s.clean_transfer,
+    )
 
 
 def cancel_kb() -> InlineKeyboardMarkup:
@@ -331,6 +348,12 @@ def status_text(db: Database) -> str:
             if s.catchup_enabled
             else ""
         ),
+        f"🧹 Чистый перелив: <b>{'вкл' if s.clean_transfer else 'выкл'}</b>"
+        + (
+            " (пропуск ссылок, файлов, гифок, голосовых)"
+            if s.clean_transfer
+            else ""
+        ),
         f"✅ Скопировано: <b>{db.history_count()}</b> · ошибок: <b>{db.error_count()}</b>",
     ]
     if last_pub:
@@ -370,7 +393,7 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
         "3️⃣ Ссылка на пост или «С начала»\n"
         "4️⃣ Описание → ⏱ Интервал → ▶️ Старт\n\n"
         "Команды: /status /run /pause /run_now /test\n"
-        "/interval 2ч · /limit 5 · /reconnect · /login\n"
+        "/interval 2ч · /limit 5 · /filter · /reconnect · /login\n"
         "Если кажется, что бот повис: /ping и /unstick\n\n"
         + status_text(db),
         reply_markup=main_kb(db),
@@ -685,6 +708,52 @@ async def cb_notify(c: CallbackQuery) -> None:
         else "🔕 Отчёты о циклах выключены (об ошибках сообщу всё равно)."
     )
     await _replace(c, text + "\n\n" + status_text(db), main_kb(db))
+
+
+@router.callback_query(F.data == "a:clean")
+async def cb_clean_transfer(c: CallbackQuery) -> None:
+    """Отдельный режим перелива: без ссылок, файлов, гифок и голосовых."""
+    if await _deny_cb(c):
+        return
+    db = _require_db()
+    new_state = not db.get_settings().clean_transfer
+    db.set_clean_transfer(new_state)
+    await _ack(c, "Чистый перелив включён" if new_state else "Чистый перелив выключен")
+    if new_state:
+        text = (
+            "🧹 <b>Чистый перелив включён</b>\n"
+            "При копировании из канала в канал бот <b>пропускает</b>:\n"
+            "• ссылки (URL, t.me, превью страниц)\n"
+            "• файлы (документы)\n"
+            "• гифки\n"
+            "• голосовые\n\n"
+            "Фото, видео, стикеры и обычный текст без ссылок — переливаются."
+        )
+    else:
+        text = (
+            "🧹 <b>Чистый перелив выключен</b>\n"
+            "Копирую посты как есть, включая ссылки, файлы, гифки и голосовые."
+        )
+    await _replace(c, text + "\n\n" + status_text(db), main_kb(db))
+
+
+@router.message(Command("filter", "clean"))
+async def cmd_clean_transfer(message: Message) -> None:
+    if await _deny(message.from_user.id if message.from_user else None, message.answer):
+        return
+    db = _require_db()
+    new_state = not db.get_settings().clean_transfer
+    db.set_clean_transfer(new_state)
+    text = (
+        "🧹 <b>Чистый перелив включён</b> — пропускаю ссылки, файлы, гифки и голосовые."
+        if new_state
+        else "🧹 <b>Чистый перелив выключен</b> — копирую всё как есть."
+    )
+    await message.answer(
+        text + "\n\n" + status_text(db),
+        reply_markup=main_kb(db),
+        parse_mode="HTML",
+    )
 
 
 @router.callback_query(F.data == "a:login")

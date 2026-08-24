@@ -38,6 +38,7 @@ SETTING_START_LINK = "start_link"
 SETTING_CATCHUP = "catchup_enabled"
 SETTING_CATCHUP_SECONDS = "catchup_interval_seconds"
 SETTING_NOTIFY_CYCLES = "notify_cycles"
+SETTING_CLEAN_TRANSFER = "clean_transfer"
 
 # Состояние планировщика (не настройки — сбрасывается по ходу работы)
 STATE_NEXT_RUN_AT = "next_run_at"
@@ -73,6 +74,7 @@ class Settings:
     catchup_enabled: bool
     catchup_seconds: float
     notify_cycles: bool
+    clean_transfer: bool
 
     @property
     def interval_hours(self) -> float:
@@ -214,6 +216,7 @@ class Database:
             SETTING_CATCHUP: "0",
             SETTING_CATCHUP_SECONDS: str(float(catchup_seconds)),
             SETTING_NOTIFY_CYCLES: "0",
+            SETTING_CLEAN_TRANSFER: "1",
         }
         with self._connect() as conn:
             for key, value in defaults.items():
@@ -264,6 +267,7 @@ class Database:
             SETTING_CATCHUP,
             SETTING_CATCHUP_SECONDS,
             SETTING_NOTIFY_CYCLES,
+            SETTING_CLEAN_TRANSFER,
         )
         with self._connect() as conn:
             rows = conn.execute(
@@ -308,6 +312,7 @@ class Database:
                 MIN_INTERVAL_SECONDS, _f(SETTING_CATCHUP_SECONDS, DEFAULT_CATCHUP_SECONDS)
             ),
             notify_cycles=_b(SETTING_NOTIFY_CYCLES, False),
+            clean_transfer=_b(SETTING_CLEAN_TRANSFER, True),
         )
 
     def set_caption(self, text: str) -> None:
@@ -331,6 +336,9 @@ class Database:
 
     def set_notify_cycles(self, enabled: bool) -> None:
         self.set(SETTING_NOTIFY_CYCLES, "1" if enabled else "0")
+
+    def set_clean_transfer(self, enabled: bool) -> None:
+        self.set(SETTING_CLEAN_TRANSFER, "1" if enabled else "0")
 
     def set_posts_per_cycle(self, count: int) -> None:
         if count < 1:

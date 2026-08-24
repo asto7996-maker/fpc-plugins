@@ -23,9 +23,12 @@ from fake_client import (  # noqa: E402
     SOURCE_ID,
     TARGET_ID,
     FakeClient,
+    animation_message,
+    document_message,
     photo_message,
     sticker_message,
     text_message,
+    voice_message,
 )
 from poster import (  # noqa: E402
     REASON_FATAL,
@@ -365,6 +368,66 @@ class FailureTests(CycleTestCase):
         result, _ = self.run_cycle(client, limit=1)
         self.assertEqual(result.published, 1)
         self.assertEqual(client.published[0]["text"], "to saved")
+
+
+class CleanTransferCycleTests(CycleTestCase):
+    """Отдельная функция перелива: игнор ссылок, файлов, гифок, голосовых."""
+
+    def test_skips_links_files_gifs_voice_keeps_photo_and_text(self) -> None:
+        client = FakeClient(
+            [
+                text_message(1, "https://spam.example/x"),
+                document_message(2),
+                animation_message(3),
+                voice_message(4),
+                photo_message(5),
+                text_message(6, "чистый текст"),
+            ]
+        )
+        result, _ = self.run_cycle(client, limit=2)
+
+        self.assertEqual(result.published, 2)
+        self.assertEqual([p["kind"] for p in client.published], ["copy", "text"])
+        self.assertEqual(client.published[1]["text"], "чистый текст")
+        self.assertEqual(self.db.get_progress_id(), 6)
+
+    def test_disabled_filter_copies_document(self) -> None:
+        self.db.set_clean_transfer(False)
+        client = FakeClient([document_message(1), text_message(2, "ok")])
+        result, _ = self.run_cycle(client, limit=1)
+
+        self.assertEqual(result.published, 1)
+        self.assertEqual(client.published[0]["kind"], "copy")
+        self.assertEqual(self.db.get_progress_id(), 1)
+
+    def test_album_with_file_publishes_photos_only(self) -> None:
+        client = FakeClient(
+            [
+                photo_message(1, group="g1"),
+                document_message(2, group="g1"),
+                photo_message(3, group="g1"),
+            ]
+        )
+        result, _ = self.run_cycle(client, limit=1)
+
+        self.assertEqual(result.published, 1)
+        self.assertEqual(client.published[0]["kind"], "album")
+        self.assertEqual(client.published[0]["size"], 2)
+        self.assertEqual(self.db.get_progress_id(), 3)
+
+    def test_album_of_gifs_is_skipped(self) -> None:
+        client = FakeClient(
+            [
+                animation_message(1, group="gifs"),
+                animation_message(2, group="gifs"),
+                text_message(3, "после"),
+            ]
+        )
+        result, _ = self.run_cycle(client, limit=1)
+
+        self.assertEqual(result.published, 1)
+        self.assertEqual(client.published[0]["kind"], "text")
+        self.assertEqual(self.db.get_progress_id(), 3)
 
 
 if __name__ == "__main__":
