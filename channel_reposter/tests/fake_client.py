@@ -51,6 +51,22 @@ def photo_message(
     )
 
 
+def video_message(
+    message_id: int,
+    *,
+    caption: Optional[str] = None,
+    group: Optional[str] = None,
+    chat_id: int = SOURCE_ID,
+) -> Message:
+    return Message(
+        id=message_id,
+        chat=make_chat(chat_id),
+        video=_Media(f"vid_{message_id}", mime_type="video/mp4"),
+        caption=caption,
+        media_group_id=group,
+    )
+
+
 def sticker_message(message_id: int, chat_id: int = SOURCE_ID) -> Message:
     sticker = Sticker(
         file_id=f"sticker_{message_id}",
@@ -61,6 +77,70 @@ def sticker_message(message_id: int, chat_id: int = SOURCE_ID) -> Message:
         is_video=False,
     )
     return Message(id=message_id, chat=make_chat(chat_id), sticker=sticker)
+
+
+class _Media:
+    """Минимальный объект медиа для тестов (file_id + опциональный mime)."""
+
+    def __init__(
+        self,
+        file_id: str,
+        *,
+        file_name: str = "",
+        mime_type: str = "",
+        attributes: Optional[list] = None,
+    ) -> None:
+        self.file_id = file_id
+        self.file_unique_id = f"u_{file_id}"
+        self.file_name = file_name
+        self.mime_type = mime_type
+        self.file_size = 1000
+        self.attributes = attributes or []
+        self.width = 100
+        self.height = 100
+        self.duration = 1
+
+
+def document_message(
+    message_id: int,
+    *,
+    file_name: str = "file.pdf",
+    mime_type: str = "application/pdf",
+    caption: Optional[str] = None,
+    group: Optional[str] = None,
+    chat_id: int = SOURCE_ID,
+) -> Message:
+    return Message(
+        id=message_id,
+        chat=make_chat(chat_id),
+        document=_Media(f"doc_{message_id}", file_name=file_name, mime_type=mime_type),
+        caption=caption,
+        media_group_id=group,
+    )
+
+
+def animation_message(
+    message_id: int,
+    *,
+    caption: Optional[str] = None,
+    group: Optional[str] = None,
+    chat_id: int = SOURCE_ID,
+) -> Message:
+    return Message(
+        id=message_id,
+        chat=make_chat(chat_id),
+        animation=_Media(f"gif_{message_id}", file_name="loop.gif", mime_type="image/gif"),
+        caption=caption,
+        media_group_id=group,
+    )
+
+
+def voice_message(message_id: int, chat_id: int = SOURCE_ID) -> Message:
+    return Message(
+        id=message_id,
+        chat=make_chat(chat_id),
+        voice=_Media(f"voice_{message_id}", mime_type="audio/ogg"),
+    )
 
 
 class FakeClient:

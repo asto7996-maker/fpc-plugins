@@ -197,6 +197,14 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(s.posts_per_cycle, 5)
         self.assertFalse(s.is_running)
         self.assertEqual(s.progress_id, 0)
+        self.assertTrue(s.clean_transfer)
+
+    def test_clean_transfer_toggle(self) -> None:
+        self.assertTrue(self.db.get_settings().clean_transfer)
+        self.db.set_clean_transfer(False)
+        self.assertFalse(self.db.get_settings().clean_transfer)
+        self.db.set_clean_transfer(True)
+        self.assertTrue(self.db.get_settings().clean_transfer)
 
     def test_progress_and_history(self) -> None:
         self.db.set_progress_id(100)

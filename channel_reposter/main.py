@@ -31,8 +31,15 @@ from poster import REASON_ERROR as POST_REASON_ERROR
 from poster import REASON_FATAL as POST_REASON_FATAL
 from poster import REASON_FLOOD as POST_REASON_FLOOD
 from poster import REASON_SOURCE_EMPTY as POST_REASON_SOURCE_EMPTY
-from poster import ChannelPoster
-from scheduling import NextRun, humanize_duration, plan_next_delay
+from poster import REASON_TIMEOUT as POST_REASON_TIMEOUT
+from poster import ChannelPoster, CycleResult
+from scheduling import (
+    NextRun,
+    fair_window_limit,
+    humanize_duration,
+    plan_next_delay,
+    slice_timeout,
+)
 from userbot_auth import UserbotAuth
 
 # Как часто планировщик просыпается и как быстро реагирует на «Старт»
@@ -40,11 +47,13 @@ TICK = 5.0
 # Пауза перед первым тиком: даём юзерботу подняться
 START_DELAY = 3.0
 # Через сколько секунд «занятый» цикл считается зависшим
-STUCK_AFTER = 300.0
+STUCK_AFTER = max(180.0, config.WINDOW_CYCLE_TIMEOUT + 60.0)
 # Как часто проверять живость сессии юзербота
 HEALTH_EVERY = 300.0
 # Не спамить админа сообщениями про flood
 FLOOD_NOTICE_EVERY = 600.0
+# Пауза между окнами в одном проходе (один юзербот, без параллельного flood)
+WINDOW_GAP = 0.8
 # Сколько ждать вход юзербота при старте (панель при этом уже работает)
 BOOTSTRAP_TIMEOUT = 120.0
 # Отставание event loop, после которого пишем в лог «панель подтормаживает»
@@ -182,6 +191,37 @@ def _sync_poster(db: Database, poster: ChannelPoster) -> ChannelPoster:
     return poster
 
 
+async def _run_window_cycle(
+    poster: ChannelPoster,
+    *,
+    limit: int,
+    deadline: float,
+    timeout: float,
+):
+    """Цикл одного окна с жёстким потолком времени (остальные окна ждут)."""
+    try:
+        return await asyncio.wait_for(
+            poster.run_cycle(limit=limit, deadline=deadline),
+            timeout=max(8.0, float(timeout)),
+        )
+    except asyncio.TimeoutError:
+        logger.warning("таймаут окна %.0fs — прерываю и отдаю очередь дальше", timeout)
+        abort = getattr(poster, "request_abort", None)
+        if callable(abort):
+            abort()
+        wait = getattr(poster, "wait_until_idle", None)
+        if callable(wait):
+            try:
+                await wait(timeout=8.0)
+            except Exception:
+                logger.debug("wait_until_idle after timeout failed", exc_info=True)
+        if getattr(poster, "is_busy", False):
+            unlock = getattr(poster, "force_unlock", None)
+            if callable(unlock):
+                unlock()
+        return CycleResult(reason=POST_REASON_TIMEOUT, error="таймаут окна")
+
+
 async def _reconnect_userbot(db: Database) -> bool:
     """Поднять юзербота заново из сохранённой сессии после обрыва связи."""
     auth = BRIDGE.auth
@@ -213,6 +253,110 @@ def _schedule_next(db: Database, plan: NextRun) -> float:
     return at
 
 
+async def _finish_scheduled_cycle(
+    db: Database,
+    poster: ChannelPoster,
+    result,
+    *,
+    idle_streaks: dict[int, int],
+    error_streaks: dict[int, int],
+    fatal_notified: dict[int, str],
+    now: float,
+    last_health: float,
+    last_flood_notice: float,
+) -> tuple[ChannelPoster, float, float]:
+    """Учесть итог цикла окна и запланировать следующий. Возвращает poster и таймеры."""
+    jid = db.get_settings().job_id
+    db.mark_cycle(result.published)
+    settings = db.get_settings()
+    idle_streak = idle_streaks.get(jid, 0)
+    error_streak = error_streaks.get(jid, 0)
+    window = settings.pair_label()
+
+    if result.published:
+        idle_streak = 0
+        error_streak = 0
+        db.clear_last_error()
+        fatal_notified.pop(jid, None)
+        if settings.notify_cycles:
+            _notify_admin(
+                db,
+                f"✅ <b>{window}</b>\n"
+                f"Опубликовано: <b>{result.published}</b>\n"
+                f"Очередь: <b>{result.backlog}</b>",
+            )
+    elif result.reason in (POST_REASON_ERROR, POST_REASON_SOURCE_EMPTY):
+        error_streak += 1
+        db.set_last_error(result.error or result.reason)
+        if error_streak in (1, 5) or error_streak % 20 == 0:
+            _notify_admin(
+                db,
+                f"⚠️ <b>{window}</b> — цикл не удался ({error_streak}-й раз):\n"
+                f"<code>{(result.error or result.reason)[:300]}</code>",
+            )
+    elif result.reason == POST_REASON_FLOOD:
+        db.set_last_error(
+            f"Telegram просит подождать {result.flood_seconds:.0f} сек"
+        )
+        if now - last_flood_notice > FLOOD_NOTICE_EVERY:
+            last_flood_notice = now
+            _notify_admin(
+                db,
+                f"⏳ <b>{window}</b> — Telegram ограничил аккаунт (flood).\n"
+                f"Пауза: <b>{humanize_duration(result.flood_seconds)}</b>. "
+                "Публикация продолжится сама.",
+            )
+    elif result.reason == POST_REASON_TIMEOUT:
+        error_streak = 0
+        if not result.published:
+            db.set_last_error("таймаут окна — очередь продолжит следующий проход")
+        idle_streak += 1
+    elif result.reason == POST_REASON_FATAL:
+        db.set_running(False)
+        db.set_last_error(result.fatal_text or "критическая ошибка")
+        if fatal_notified.get(jid) != result.fatal_text:
+            fatal_notified[jid] = result.fatal_text
+            _notify_admin(
+                db,
+                f"🛑 Окно <b>{window}</b> остановлено.\n"
+                f"Причина: {result.fatal_text or 'критическая ошибка'}\n\n"
+                "Исправьте и нажмите ▶️ Старт. Остальные окна продолжают работу.",
+            )
+        idle_streaks[jid] = idle_streak
+        error_streaks[jid] = error_streak
+        logger.info("Окно %s %s: %s", jid, window, result.reason)
+        return poster, last_health, last_flood_notice
+    else:
+        idle_streak += 1
+        error_streak = 0
+        if result.reason != POST_REASON_ABORTED:
+            db.clear_last_error()
+
+    idle_streaks[jid] = idle_streak
+    error_streaks[jid] = error_streak
+
+    if (result.needs_reconnect or error_streak >= 2) and (
+        now - last_health > HEALTH_EVERY or result.needs_reconnect
+    ):
+        last_health = now
+        if await _reconnect_userbot(db):
+            poster = BRIDGE.poster or poster
+
+    plan = plan_next_delay(
+        published=result.published,
+        interval_seconds=settings.interval_seconds,
+        catchup=settings.catchup_enabled,
+        catchup_seconds=settings.catchup_seconds,
+        backlog=result.backlog,
+        idle_streak=idle_streak,
+        error_streak=error_streak,
+        flood_seconds=result.flood_seconds,
+    )
+    _schedule_next(db, plan)
+    logger.info("Окно %s %s: %s", jid, window, result.reason)
+    return poster, last_health, last_flood_notice
+
+
 async def _worker_scheduler() -> None:
     """
     Единственный источник автопостинга.
@@ -224,12 +368,12 @@ async def _worker_scheduler() -> None:
     logger.info("Планировщик запущен (tick=%ss)", TICK)
     await asyncio.sleep(START_DELAY)
 
-    idle_streak = 0
-    error_streak = 0
+    idle_streaks: dict[int, int] = {}
+    error_streaks: dict[int, int] = {}
     last_health = 0.0
     last_flood_notice = 0.0
     warned_no_userbot = False
-    fatal_notified = ""
+    fatal_notified: dict[int, str] = {}
 
     while True:
         try:
@@ -239,9 +383,10 @@ async def _worker_scheduler() -> None:
                 continue
 
             poster = BRIDGE.poster
-            settings = db.get_settings()
             now = time.time()
             db.mark_scheduler_tick()
+            jobs = db.list_jobs()
+            running = [j for j in jobs if j.is_running]
 
             # Залипший цикл (обрыв сети / вечный await) — принудительно снять
             if poster is not None and poster.busy_seconds > STUCK_AFTER:
@@ -249,12 +394,14 @@ async def _worker_scheduler() -> None:
                     "Цикл висит %.0f сек — снимаю блокировку", poster.busy_seconds
                 )
                 poster.force_unlock()
-                db.set_last_error("цикл зависал, блокировка снята")
-                db.run_asap()
+                for j in running or jobs:
+                    with db.job_scope(j.job_id):
+                        db.set_last_error("цикл зависал, блокировка снята")
+                        db.run_asap()
 
-            if not settings.is_running:
-                idle_streak = 0
-                error_streak = 0
+            if not running:
+                idle_streaks.clear()
+                error_streaks.clear()
                 await asyncio.sleep(TICK)
                 continue
 
@@ -264,7 +411,8 @@ async def _worker_scheduler() -> None:
                         "Автопост включён, но юзербот не авторизован — нужен «🔐 Вход»"
                     )
                     warned_no_userbot = True
-                    db.set_last_error("юзербот не авторизован — нужен «🔐 Вход»")
+                    with db.job_scope(running[0].job_id):
+                        db.set_last_error("юзербот не авторизован — нужен «🔐 Вход»")
                     _notify_admin(
                         db,
                         "⚠️ Автопостинг включён, но юзербот не авторизован.\n"
@@ -279,89 +427,65 @@ async def _worker_scheduler() -> None:
                 await asyncio.sleep(TICK)
                 continue
 
-            due = db.get_next_run()
-            if now < due:
+            due = db.due_jobs(now)
+            if not due:
                 await asyncio.sleep(TICK)
                 continue
 
-            # Клиент могли пересоздать (повторный вход) — берём актуальный
-            poster = _sync_poster(db, poster)
-
-            result = await poster.run_cycle()
-            db.mark_cycle(result.published)
-            # Настройки могли измениться за время цикла — планируем по свежим
-            settings = db.get_settings()
-
-            if result.published:
-                idle_streak = 0
-                error_streak = 0
-                db.clear_last_error()
-                fatal_notified = ""
-                if settings.notify_cycles:
-                    _notify_admin(
-                        db,
-                        f"✅ Опубликовано: <b>{result.published}</b>\n"
-                        f"Очередь: <b>{result.backlog}</b>",
-                    )
-            elif result.reason in (POST_REASON_ERROR, POST_REASON_SOURCE_EMPTY):
-                error_streak += 1
-                db.set_last_error(result.error or result.reason)
-                if error_streak in (1, 5) or error_streak % 20 == 0:
-                    _notify_admin(
-                        db,
-                        f"⚠️ Цикл не удался ({error_streak}-й раз):\n"
-                        f"<code>{(result.error or result.reason)[:300]}</code>",
-                    )
-            elif result.reason == POST_REASON_FLOOD:
-                db.set_last_error(
-                    f"Telegram просит подождать {result.flood_seconds:.0f} сек"
+            # Все просроченные окна — в одном проходе, по очереди (один юзербот).
+            # Бюджет времени и публикаций общий, чтобы одно окно не забивало остальные.
+            pass_deadline = time.monotonic() + config.PASS_TIMEOUT
+            remaining_budget = int(config.PASS_PUBLISH_LIMIT)
+            for index, job in enumerate(due):
+                poster = BRIDGE.poster
+                if poster is None or poster.is_busy:
+                    break
+                live = db.get_job(job.job_id)
+                if live is None or not live.is_running:
+                    continue
+                pass_left = pass_deadline - time.monotonic()
+                slot = slice_timeout(config.WINDOW_CYCLE_TIMEOUT, pass_left)
+                windows_left = len(due) - index
+                limit = fair_window_limit(
+                    live.posts_per_cycle, windows_left, remaining_budget
                 )
-                if now - last_flood_notice > FLOOD_NOTICE_EVERY:
-                    last_flood_notice = now
-                    _notify_admin(
-                        db,
-                        "⏳ Telegram ограничил аккаунт (flood).\n"
-                        f"Пауза: <b>{humanize_duration(result.flood_seconds)}</b>. "
-                        "Публикация продолжится сама.",
+                if slot <= 0 or limit <= 0:
+                    logger.info(
+                        "проход окон: лимит (осталось %.0fс / %s публикаций)",
+                        pass_left,
+                        remaining_budget,
                     )
-            elif result.reason == POST_REASON_FATAL:
-                db.set_running(False)
-                db.set_last_error(result.fatal_text or "критическая ошибка")
-                if fatal_notified != result.fatal_text:
-                    fatal_notified = result.fatal_text
-                    _notify_admin(
-                        db,
-                        "🛑 Автопостинг остановлен.\n"
-                        f"Причина: {result.fatal_text or 'критическая ошибка'}\n\n"
-                        "Исправьте и нажмите ▶️ Старт.",
+                    break
+                poster = _sync_poster(db, poster)
+                if index > 0:
+                    await asyncio.sleep(WINDOW_GAP)
+                    if poster is None or poster.is_busy:
+                        break
+                    live = db.get_job(job.job_id)
+                    if live is None or not live.is_running:
+                        continue
+                deadline = time.monotonic() + slot
+                with db.job_scope(job.job_id):
+                    result = await _run_window_cycle(
+                        poster,
+                        limit=limit,
+                        deadline=deadline,
+                        timeout=slot + 8.0,
                     )
-                continue
-            else:
-                idle_streak += 1
-                error_streak = 0
-                if result.reason != POST_REASON_ABORTED:
-                    db.clear_last_error()
-
-            # Лечим связь только когда цикл действительно упал по сети:
-            # проверка «на всякий случай» не должна мешать публикации
-            if (result.needs_reconnect or error_streak >= 2) and (
-                now - last_health > HEALTH_EVERY or result.needs_reconnect
-            ):
-                last_health = now
-                if await _reconnect_userbot(db):
-                    poster = BRIDGE.poster or poster
-
-            plan = plan_next_delay(
-                published=result.published,
-                interval_seconds=settings.interval_seconds,
-                catchup=settings.catchup_enabled,
-                catchup_seconds=settings.catchup_seconds,
-                backlog=result.backlog,
-                idle_streak=idle_streak,
-                error_streak=error_streak,
-                flood_seconds=result.flood_seconds,
-            )
-            _schedule_next(db, plan)
+                    remaining_budget = max(
+                        0, remaining_budget - int(getattr(result, "published", 0) or 0)
+                    )
+                    poster, last_health, last_flood_notice = await _finish_scheduled_cycle(
+                        db,
+                        poster,
+                        result,
+                        idle_streaks=idle_streaks,
+                        error_streaks=error_streaks,
+                        fatal_notified=fatal_notified,
+                        now=time.time(),
+                        last_health=last_health,
+                        last_flood_notice=last_flood_notice,
+                    )
         except Exception:
             logger.exception("Ошибка планировщика")
             try:
@@ -377,13 +501,17 @@ async def _heartbeat(bot: Bot, db: Database) -> None:
         try:
             me = await asyncio.wait_for(bot.get_me(), timeout=15)
             wh = await asyncio.wait_for(bot.get_webhook_info(), timeout=15)
+            jobs = db.list_jobs()
+            running_n = sum(1 for j in jobs if j.is_running)
             s = db.get_settings()
             left = max(0.0, db.get_next_run() - time.time())
             logger.info(
-                "heartbeat @%s pending=%s | автопост=%s юзербот=%s цикл=%s "
-                "интервал=%s следующий=%s очередь=%s всего=%s",
+                "heartbeat @%s pending=%s | окна=%s/%s автопост=%s юзербот=%s цикл=%s "
+                "интервал=%s следующий=%s очередь=%s всего=%s текущее=%s",
                 me.username,
                 wh.pending_update_count,
+                running_n,
+                len(jobs),
                 "вкл" if s.is_running else "пауза",
                 "готов" if BRIDGE.poster is not None else "нет входа",
                 "идёт" if (BRIDGE.poster and BRIDGE.poster.is_busy) else "idle",
@@ -391,6 +519,7 @@ async def _heartbeat(bot: Bot, db: Database) -> None:
                 humanize_duration(left) if s.is_running else "—",
                 db.backlog(),
                 db.history_count(),
+                s.pair_label(),
             )
             if wh.url:
                 await bot.delete_webhook(drop_pending_updates=False)

@@ -38,6 +38,8 @@ SETTING_START_LINK = "start_link"
 SETTING_CATCHUP = "catchup_enabled"
 SETTING_CATCHUP_SECONDS = "catchup_interval_seconds"
 SETTING_NOTIFY_CYCLES = "notify_cycles"
+SETTING_CLEAN_TRANSFER = "clean_transfer"
+SETTING_ACTIVE_JOB = "active_job_id"
 
 # Состояние планировщика (не настройки — сбрасывается по ходу работы)
 STATE_NEXT_RUN_AT = "next_run_at"
@@ -53,6 +55,32 @@ DEFAULT_INTERVAL_SECONDS = 3600.0
 DEFAULT_CATCHUP_SECONDS = 60.0
 # Ниже этого интервала Telegram начинает ограничивать аккаунт
 MIN_INTERVAL_SECONDS = 5.0
+# Сколько независимых пар «источник → назначение» можно держать сразу
+MAX_JOBS = 16
+
+# Поля окна ↔ ключи settings (зеркало активного окна + миграция)
+_JOB_KV = {
+    "caption_template": SETTING_CAPTION,
+    "interval_seconds": SETTING_INTERVAL_SECONDS,
+    "posts_per_cycle": SETTING_POSTS_PER_CYCLE,
+    "is_running": SETTING_IS_RUNNING,
+    "progress_id": SETTING_PROGRESS_ID,
+    "source_channel": SETTING_SOURCE_CHANNEL,
+    "target_channel": SETTING_TARGET_CHANNEL,
+    "start_link": SETTING_START_LINK,
+    "catchup_enabled": SETTING_CATCHUP,
+    "catchup_seconds": SETTING_CATCHUP_SECONDS,
+    "notify_cycles": SETTING_NOTIFY_CYCLES,
+    "clean_transfer": SETTING_CLEAN_TRANSFER,
+    "next_run_at": STATE_NEXT_RUN_AT,
+    "next_run_reason": STATE_NEXT_RUN_REASON,
+    "last_cycle_at": STATE_LAST_CYCLE_AT,
+    "last_published_at": STATE_LAST_PUBLISHED_AT,
+    "last_error": STATE_LAST_ERROR,
+    "last_error_at": STATE_LAST_ERROR_AT,
+    "latest_source_id": STATE_LATEST_SOURCE_ID,
+}
+_KV_JOB = {v: k for k, v in _JOB_KV.items()}
 
 _BUSY_TIMEOUT_MS = 15000
 _SQLITE_TIMEOUT = 30.0
@@ -73,10 +101,35 @@ class Settings:
     catchup_enabled: bool
     catchup_seconds: float
     notify_cycles: bool
+    clean_transfer: bool
+    job_id: int = 1
+    title: str = ""
+    next_run_at: float = 0.0
+    next_run_reason: str = ""
+    last_cycle_at: float = 0.0
+    last_published_at: float = 0.0
+    last_error: str = ""
+    last_error_at: float = 0.0
+    latest_source_id: int = 0
 
     @property
     def interval_hours(self) -> float:
         return self.interval_seconds / 3600.0
+
+    def pair_label(self) -> str:
+        """Короткая подпись окна: @src → @dst."""
+        from links import format_channel_label
+
+        src = format_channel_label(self.source_channel) if self.source_channel else "—"
+        dst = format_channel_label(self.target_channel) if self.target_channel else "—"
+        return f"{src} → {dst}"
+
+    def window_title(self) -> str:
+        return (self.title or "").strip() or f"Окно {self.job_id}"
+
+    def is_ready(self) -> bool:
+        """Можно стартовать: есть оба канала и точка прогресса."""
+        return bool(self.source_channel and self.target_channel and self.progress_id >= 0)
 
 
 class Database:
@@ -86,6 +139,7 @@ class Database:
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
+        self._tls = threading.local()
         self._init_schema()
 
     @contextmanager
@@ -138,7 +192,44 @@ class Database:
                     ON history(grouped_id);
                 CREATE INDEX IF NOT EXISTS idx_history_status
                     ON history(status);
+
+                CREATE TABLE IF NOT EXISTS jobs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    title TEXT NOT NULL DEFAULT '',
+                    caption_template TEXT NOT NULL DEFAULT '',
+                    interval_seconds REAL NOT NULL DEFAULT 3600,
+                    posts_per_cycle INTEGER NOT NULL DEFAULT 3,
+                    is_running INTEGER NOT NULL DEFAULT 0,
+                    progress_id INTEGER NOT NULL DEFAULT 0,
+                    source_channel TEXT NOT NULL DEFAULT '',
+                    target_channel TEXT NOT NULL DEFAULT '',
+                    start_link TEXT NOT NULL DEFAULT '',
+                    catchup_enabled INTEGER NOT NULL DEFAULT 0,
+                    catchup_seconds REAL NOT NULL DEFAULT 60,
+                    notify_cycles INTEGER NOT NULL DEFAULT 0,
+                    clean_transfer INTEGER NOT NULL DEFAULT 1,
+                    next_run_at REAL NOT NULL DEFAULT 0,
+                    next_run_reason TEXT NOT NULL DEFAULT '',
+                    last_cycle_at REAL NOT NULL DEFAULT 0,
+                    last_published_at REAL NOT NULL DEFAULT 0,
+                    last_error TEXT NOT NULL DEFAULT '',
+                    last_error_at REAL NOT NULL DEFAULT 0,
+                    latest_source_id INTEGER NOT NULL DEFAULT 0
+                );
                 """
+            )
+            cols = [r[1] for r in conn.execute("PRAGMA table_info(history)")]
+            if "job_id" not in cols:
+                conn.execute(
+                    "ALTER TABLE history ADD COLUMN job_id INTEGER NOT NULL DEFAULT 1"
+                )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_history_job_source "
+                "ON history(job_id, source_message_id)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_history_job_group "
+                "ON history(job_id, grouped_id)"
             )
 
     # ------------------------------------------------------------------
@@ -161,6 +252,9 @@ class Database:
                 """,
                 (key, str(value)),
             )
+        col = _KV_JOB.get(key)
+        if col and self._job_count():
+            self._update_job_col(self._current_job_id(), col, value)
 
     def get_float(self, key: str, default: float) -> float:
         raw = self.get(key)
@@ -214,6 +308,7 @@ class Database:
             SETTING_CATCHUP: "0",
             SETTING_CATCHUP_SECONDS: str(float(catchup_seconds)),
             SETTING_NOTIFY_CYCLES: "0",
+            SETTING_CLEAN_TRANSFER: "1",
         }
         with self._connect() as conn:
             for key, value in defaults.items():
@@ -225,6 +320,7 @@ class Database:
                     (key, value),
                 )
         self.migrate_interval()
+        self.migrate_jobs()
 
     def migrate_interval(self) -> None:
         """Старая настройка interval_hours → секунды (одноразово)."""
@@ -247,68 +343,358 @@ class Database:
             )
 
     # ------------------------------------------------------------------
-    # Типизированные хелперы
+    # Окна перелива (несколько пар источник → назначение)
     # ------------------------------------------------------------------
 
-    def get_settings(self) -> Settings:
-        """Прочитать все настройки одним запросом (не 11 отдельных)."""
-        keys = (
-            SETTING_CAPTION,
-            SETTING_INTERVAL_SECONDS,
-            SETTING_POSTS_PER_CYCLE,
-            SETTING_IS_RUNNING,
-            SETTING_PROGRESS_ID,
-            SETTING_SOURCE_CHANNEL,
-            SETTING_TARGET_CHANNEL,
-            SETTING_START_LINK,
-            SETTING_CATCHUP,
-            SETTING_CATCHUP_SECONDS,
-            SETTING_NOTIFY_CYCLES,
-        )
+    def _job_count(self) -> int:
         with self._connect() as conn:
-            rows = conn.execute(
-                f"SELECT key, value FROM settings WHERE key IN ({','.join('?' * len(keys))})",
-                keys,
-            ).fetchall()
-        data = {r["key"]: r["value"] for r in rows}
+            row = conn.execute("SELECT COUNT(*) AS c FROM jobs").fetchone()
+        return int(row["c"]) if row else 0
 
-        def _f(key: str, default: float) -> float:
-            try:
-                return float(data[key]) if data.get(key) not in (None, "") else float(default)
-            except (TypeError, ValueError, KeyError):
-                return float(default)
+    def _current_job_id(self) -> int:
+        override = getattr(self._tls, "job_id", None)
+        if override is not None:
+            return int(override)
+        raw = self.get(SETTING_ACTIVE_JOB)
+        try:
+            jid = int(raw) if raw not in (None, "") else 0
+        except (TypeError, ValueError):
+            jid = 0
+        if jid and self._job_exists(jid):
+            return jid
+        ids = self.list_job_ids()
+        return ids[0] if ids else 1
 
-        def _i(key: str, default: int) -> int:
-            try:
-                return int(float(data[key])) if data.get(key) not in (None, "") else int(default)
-            except (TypeError, ValueError, KeyError):
-                return int(default)
+    def _job_exists(self, job_id: int) -> bool:
+        with self._connect() as conn:
+            row = conn.execute("SELECT 1 FROM jobs WHERE id = ?", (int(job_id),)).fetchone()
+        return row is not None
 
-        def _b(key: str, default: bool = False) -> bool:
-            raw = (data.get(key) or "").strip().lower()
+    def list_job_ids(self) -> list[int]:
+        with self._connect() as conn:
+            rows = conn.execute("SELECT id FROM jobs ORDER BY id").fetchall()
+        return [int(r["id"]) for r in rows]
+
+    @contextmanager
+    def job_scope(self, job_id: int) -> Iterator[None]:
+        prev = getattr(self._tls, "job_id", None)
+        self._tls.job_id = int(job_id)
+        try:
+            yield
+        finally:
+            if prev is None:
+                if hasattr(self._tls, "job_id"):
+                    delattr(self._tls, "job_id")
+            else:
+                self._tls.job_id = prev
+
+    def _update_job_col(self, job_id: int, column: str, value: Any) -> None:
+        if column not in _JOB_KV:
+            return
+        raw = value
+        if column in (
+            "is_running",
+            "catchup_enabled",
+            "notify_cycles",
+            "clean_transfer",
+        ):
+            if isinstance(value, bool):
+                raw = 1 if value else 0
+            elif str(value).strip().lower() in ("1", "true", "yes", "on"):
+                raw = 1
+            elif str(value).strip().lower() in ("0", "false", "no", "off", ""):
+                raw = 0
+        with self._connect() as conn:
+            conn.execute(
+                f"UPDATE jobs SET {column} = ? WHERE id = ?",
+                (raw, int(job_id)),
+            )
+
+    def _settings_from_job_row(self, row: sqlite3.Row) -> Settings:
+        def _b(val: Any, default: bool = False) -> bool:
+            if val in (None, ""):
+                return default
+            if isinstance(val, (int, float)):
+                return bool(int(val))
+            raw = str(val).strip().lower()
             if raw in ("1", "true", "yes", "on"):
                 return True
             if raw in ("0", "false", "no", "off"):
                 return False
             return default
 
+        def _f(val: Any, default: float) -> float:
+            try:
+                return float(val) if val not in (None, "") else float(default)
+            except (TypeError, ValueError):
+                return float(default)
+
+        def _i(val: Any, default: int) -> int:
+            try:
+                return int(float(val)) if val not in (None, "") else int(default)
+            except (TypeError, ValueError):
+                return int(default)
+
         return Settings(
-            caption_template=data.get(SETTING_CAPTION, "") or "",
+            caption_template=row["caption_template"] or "",
             interval_seconds=max(
-                MIN_INTERVAL_SECONDS, _f(SETTING_INTERVAL_SECONDS, DEFAULT_INTERVAL_SECONDS)
+                MIN_INTERVAL_SECONDS, _f(row["interval_seconds"], DEFAULT_INTERVAL_SECONDS)
             ),
-            posts_per_cycle=max(1, _i(SETTING_POSTS_PER_CYCLE, 5)),
-            is_running=_b(SETTING_IS_RUNNING, False),
-            progress_id=_i(SETTING_PROGRESS_ID, 0),
-            source_channel=data.get(SETTING_SOURCE_CHANNEL, "") or "",
-            target_channel=data.get(SETTING_TARGET_CHANNEL, "") or "",
-            start_link=data.get(SETTING_START_LINK, "") or "",
-            catchup_enabled=_b(SETTING_CATCHUP, False),
+            posts_per_cycle=max(1, _i(row["posts_per_cycle"], 5)),
+            is_running=_b(row["is_running"], False),
+            progress_id=_i(row["progress_id"], 0),
+            source_channel=row["source_channel"] or "",
+            target_channel=row["target_channel"] or "",
+            start_link=row["start_link"] or "",
+            catchup_enabled=_b(row["catchup_enabled"], False),
             catchup_seconds=max(
-                MIN_INTERVAL_SECONDS, _f(SETTING_CATCHUP_SECONDS, DEFAULT_CATCHUP_SECONDS)
+                MIN_INTERVAL_SECONDS, _f(row["catchup_seconds"], DEFAULT_CATCHUP_SECONDS)
             ),
-            notify_cycles=_b(SETTING_NOTIFY_CYCLES, False),
+            notify_cycles=_b(row["notify_cycles"], False),
+            clean_transfer=_b(row["clean_transfer"], True),
+            job_id=int(row["id"]),
+            title=row["title"] or "",
+            next_run_at=_f(row["next_run_at"], 0.0),
+            next_run_reason=row["next_run_reason"] or "",
+            last_cycle_at=_f(row["last_cycle_at"], 0.0),
+            last_published_at=_f(row["last_published_at"], 0.0),
+            last_error=row["last_error"] or "",
+            last_error_at=_f(row["last_error_at"], 0.0),
+            latest_source_id=_i(row["latest_source_id"], 0),
         )
+
+    def _mirror_job_to_kv(self, job: Settings) -> None:
+        """Зеркало активного окна в settings — для старых ключей и тестов."""
+        pairs = {
+            SETTING_CAPTION: job.caption_template,
+            SETTING_INTERVAL_SECONDS: str(float(job.interval_seconds)),
+            SETTING_POSTS_PER_CYCLE: str(job.posts_per_cycle),
+            SETTING_IS_RUNNING: "1" if job.is_running else "0",
+            SETTING_PROGRESS_ID: str(job.progress_id),
+            SETTING_SOURCE_CHANNEL: job.source_channel,
+            SETTING_TARGET_CHANNEL: job.target_channel,
+            SETTING_START_LINK: job.start_link,
+            SETTING_CATCHUP: "1" if job.catchup_enabled else "0",
+            SETTING_CATCHUP_SECONDS: str(float(job.catchup_seconds)),
+            SETTING_NOTIFY_CYCLES: "1" if job.notify_cycles else "0",
+            SETTING_CLEAN_TRANSFER: "1" if job.clean_transfer else "0",
+            STATE_NEXT_RUN_AT: f"{job.next_run_at:.0f}",
+            STATE_NEXT_RUN_REASON: job.next_run_reason,
+            STATE_LAST_CYCLE_AT: f"{job.last_cycle_at:.0f}",
+            STATE_LAST_PUBLISHED_AT: f"{job.last_published_at:.0f}",
+            STATE_LAST_ERROR: job.last_error,
+            STATE_LAST_ERROR_AT: f"{job.last_error_at:.0f}",
+            STATE_LATEST_SOURCE_ID: str(job.latest_source_id),
+            SETTING_ACTIVE_JOB: str(job.job_id),
+        }
+        with self._connect() as conn:
+            for key, value in pairs.items():
+                conn.execute(
+                    """
+                    INSERT INTO settings(key, value) VALUES(?, ?)
+                    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                    """,
+                    (key, str(value)),
+                )
+
+    def migrate_jobs(self) -> None:
+        """Первый запуск / апгрейд: одно текущее окно из старых settings."""
+        if self._job_count():
+            return
+        kv = {k: self.get(k) for k in _KV_JOB}
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO jobs(
+                    title, caption_template, interval_seconds, posts_per_cycle,
+                    is_running, progress_id, source_channel, target_channel,
+                    start_link, catchup_enabled, catchup_seconds, notify_cycles,
+                    clean_transfer, next_run_at, next_run_reason, last_cycle_at,
+                    last_published_at, last_error, last_error_at, latest_source_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "Окно 1",
+                    kv.get(SETTING_CAPTION) or "",
+                    float(kv.get(SETTING_INTERVAL_SECONDS) or DEFAULT_INTERVAL_SECONDS),
+                    int(float(kv.get(SETTING_POSTS_PER_CYCLE) or 3)),
+                    1 if (kv.get(SETTING_IS_RUNNING) or "0") in ("1", "true", "yes", "on") else 0,
+                    int(float(kv.get(SETTING_PROGRESS_ID) or 0)),
+                    kv.get(SETTING_SOURCE_CHANNEL) or "",
+                    kv.get(SETTING_TARGET_CHANNEL) or "",
+                    kv.get(SETTING_START_LINK) or "",
+                    1 if (kv.get(SETTING_CATCHUP) or "0") in ("1", "true", "yes", "on") else 0,
+                    float(kv.get(SETTING_CATCHUP_SECONDS) or DEFAULT_CATCHUP_SECONDS),
+                    1 if (kv.get(SETTING_NOTIFY_CYCLES) or "0") in ("1", "true", "yes", "on") else 0,
+                    0 if (kv.get(SETTING_CLEAN_TRANSFER) or "1") in ("0", "false", "no", "off") else 1,
+                    float(kv.get(STATE_NEXT_RUN_AT) or 0),
+                    kv.get(STATE_NEXT_RUN_REASON) or "",
+                    float(kv.get(STATE_LAST_CYCLE_AT) or 0),
+                    float(kv.get(STATE_LAST_PUBLISHED_AT) or 0),
+                    kv.get(STATE_LAST_ERROR) or "",
+                    float(kv.get(STATE_LAST_ERROR_AT) or 0),
+                    int(float(kv.get(STATE_LATEST_SOURCE_ID) or 0)),
+                ),
+            )
+            job_id = int(cur.lastrowid or 1)
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO settings(key, value) VALUES(?, ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """,
+                (SETTING_ACTIVE_JOB, str(job_id)),
+            )
+        logger.info("Окна перелива: создано окно %s из текущих настроек", job_id)
+
+    def list_jobs(self) -> list[Settings]:
+        self.migrate_jobs()
+        with self._connect() as conn:
+            rows = conn.execute("SELECT * FROM jobs ORDER BY id").fetchall()
+        return [self._settings_from_job_row(r) for r in rows]
+
+    def get_job(self, job_id: int) -> Optional[Settings]:
+        self.migrate_jobs()
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM jobs WHERE id = ?", (int(job_id),)).fetchone()
+        return self._settings_from_job_row(row) if row else None
+
+    def set_active_job(self, job_id: int) -> Settings:
+        job = self.get_job(job_id)
+        if job is None:
+            raise ValueError(f"Нет окна {job_id}")
+        self._mirror_job_to_kv(job)
+        return job
+
+    def any_job_running(self) -> bool:
+        return any(j.is_running for j in self.list_jobs())
+
+    def due_jobs(self, now: float) -> list[Settings]:
+        """Окна, которые пора крутить (включены и next_run_at наступил)."""
+        running = [j for j in self.list_jobs() if j.is_running]
+        due = [j for j in running if j.next_run_at <= now]
+        due.sort(key=lambda j: (j.next_run_at, j.job_id))
+        return due
+
+    def start_ready_jobs(self) -> tuple[list[int], list[int]]:
+        """Включить автопост у всех окон с каналами. (стартовали, пропущены)."""
+        started: list[int] = []
+        skipped: list[int] = []
+        for job in self.list_jobs():
+            if not job.is_ready():
+                skipped.append(job.job_id)
+                continue
+            with self.job_scope(job.job_id):
+                self.set_running(True)
+                self.clear_last_error()
+                self.run_asap()
+            started.append(job.job_id)
+        return started, skipped
+
+    def pause_all_jobs(self) -> list[int]:
+        """Поставить на паузу все окна. Возвращает id, которые были включены."""
+        paused: list[int] = []
+        for job in self.list_jobs():
+            if not job.is_running:
+                continue
+            with self.job_scope(job.job_id):
+                self.set_running(False)
+            paused.append(job.job_id)
+        return paused
+
+    def clone_job(self, job_id: Optional[int] = None) -> Settings:
+        """Новое окно с тем же источником и настройками, назначение пустое."""
+        src = self.get_job(int(job_id)) if job_id else self.get_settings()
+        if src is None:
+            src = self.get_settings()
+        created = self.create_job(title="")
+        with self.job_scope(created.job_id):
+            if src.source_channel:
+                self.set_source_channel(src.source_channel)
+            self.set_caption(src.caption_template)
+            self.set_interval_seconds(src.interval_seconds)
+            self.set_posts_per_cycle(src.posts_per_cycle)
+            self.set_catchup(src.catchup_enabled)
+            self.set_catchup_seconds(src.catchup_seconds)
+            self.set_notify_cycles(src.notify_cycles)
+            self.set_clean_transfer(src.clean_transfer)
+        job = self.get_job(created.job_id)
+        if job is None:
+            raise RuntimeError("Не удалось клонировать окно")
+        logger.info(
+            "Клон окна %s → %s (источник %s)",
+            src.job_id,
+            job.job_id,
+            src.source_channel or "—",
+        )
+        return job
+
+    def create_job(self, *, title: str = "") -> Settings:
+        if self._job_count() >= MAX_JOBS:
+            raise ValueError(f"Максимум {MAX_JOBS} окон")
+        src = self.get_settings()
+        n = self._job_count() + 1
+        name = (title or "").strip() or f"Окно {n}"
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO jobs(
+                    title, caption_template, interval_seconds, posts_per_cycle,
+                    is_running, progress_id, source_channel, target_channel,
+                    start_link, catchup_enabled, catchup_seconds, notify_cycles,
+                    clean_transfer
+                ) VALUES (?, ?, ?, ?, 0, 0, '', '', '', ?, ?, ?, ?)
+                """,
+                (
+                    name,
+                    src.caption_template,
+                    src.interval_seconds,
+                    src.posts_per_cycle,
+                    1 if src.catchup_enabled else 0,
+                    src.catchup_seconds,
+                    1 if src.notify_cycles else 0,
+                    1 if src.clean_transfer else 0,
+                ),
+            )
+            job_id = int(cur.lastrowid or 0)
+        job = self.get_job(job_id)
+        if job is None:
+            raise RuntimeError("Не удалось создать окно")
+        logger.info("Создано окно %s (%s)", job_id, name)
+        return job
+
+    def delete_job(self, job_id: int) -> None:
+        if self._job_count() <= 1:
+            raise ValueError("Нельзя удалить последнее окно")
+        if not self._job_exists(job_id):
+            raise ValueError(f"Нет окна {job_id}")
+        with self._connect() as conn:
+            conn.execute("DELETE FROM history WHERE job_id = ?", (int(job_id),))
+            conn.execute("DELETE FROM jobs WHERE id = ?", (int(job_id),))
+        remaining = self.list_job_ids()
+        if remaining:
+            self.set_active_job(remaining[0])
+        logger.info("Удалено окно %s", job_id)
+
+    def set_job_title(self, title: str, job_id: Optional[int] = None) -> None:
+        jid = int(job_id or self._current_job_id())
+        with self._connect() as conn:
+            conn.execute("UPDATE jobs SET title = ? WHERE id = ?", (title.strip(), jid))
+
+    # ------------------------------------------------------------------
+    # Типизированные хелперы
+    # ------------------------------------------------------------------
+
+    def get_settings(self) -> Settings:
+        """Снимок текущего (активного) окна перелива."""
+        self.migrate_jobs()
+        job = self.get_job(self._current_job_id())
+        if job is None:
+            self.migrate_jobs()
+            job = self.get_job(self._current_job_id())
+        if job is None:
+            raise RuntimeError("Нет окон перелива")
+        return job
 
     def set_caption(self, text: str) -> None:
         self.set(SETTING_CAPTION, text)
@@ -332,6 +718,9 @@ class Database:
     def set_notify_cycles(self, enabled: bool) -> None:
         self.set(SETTING_NOTIFY_CYCLES, "1" if enabled else "0")
 
+    def set_clean_transfer(self, enabled: bool) -> None:
+        self.set(SETTING_CLEAN_TRANSFER, "1" if enabled else "0")
+
     def set_posts_per_cycle(self, count: int) -> None:
         if count < 1:
             raise ValueError("Количество постов за цикл должно быть ≥ 1")
@@ -341,24 +730,11 @@ class Database:
         self.set(SETTING_IS_RUNNING, "1" if running else "0")
 
     def get_progress_id(self) -> int:
-        return self.get_int(SETTING_PROGRESS_ID, 0)
+        return self.get_settings().progress_id
 
     def set_progress_id(self, message_id: int) -> None:
         """Сохранить ID последнего обработанного поста (для продолжения после рестарта)."""
         self.set(SETTING_PROGRESS_ID, message_id)
-
-    def max_ok_source_id(self) -> int:
-        """Максимальный source_message_id со статусом ok (0 если пусто)."""
-        with self._connect() as conn:
-            row = conn.execute(
-                """
-                SELECT MAX(source_message_id) AS m FROM history
-                WHERE status = 'ok'
-                """
-            ).fetchone()
-        if not row or row["m"] is None:
-            return 0
-        return int(row["m"])
 
     def set_start_link(self, link: str) -> None:
         self.set(SETTING_START_LINK, link)
@@ -383,10 +759,10 @@ class Database:
             self.set(STATE_NEXT_RUN_REASON, reason)
 
     def get_next_run(self) -> float:
-        return self.get_float(STATE_NEXT_RUN_AT, 0.0)
+        return self.get_settings().next_run_at
 
     def get_next_run_reason(self) -> str:
-        return self.get(STATE_NEXT_RUN_REASON, "") or ""
+        return self.get_settings().next_run_reason
 
     def run_asap(self) -> None:
         """Запросить цикл при первой возможности (кнопка ▶️ Старт и т.п.)."""
@@ -399,10 +775,10 @@ class Database:
             self.set(STATE_LAST_PUBLISHED_AT, f"{now:.0f}")
 
     def get_last_cycle_at(self) -> float:
-        return self.get_float(STATE_LAST_CYCLE_AT, 0.0)
+        return self.get_settings().last_cycle_at
 
     def get_last_published_at(self) -> float:
-        return self.get_float(STATE_LAST_PUBLISHED_AT, 0.0)
+        return self.get_settings().last_published_at
 
     def set_last_error(self, text: str) -> None:
         self.set(STATE_LAST_ERROR, text or "")
@@ -412,10 +788,8 @@ class Database:
         self.set(STATE_LAST_ERROR, "")
 
     def get_last_error(self) -> tuple[str, float]:
-        return (
-            self.get(STATE_LAST_ERROR, "") or "",
-            self.get_float(STATE_LAST_ERROR_AT, 0.0),
-        )
+        s = self.get_settings()
+        return (s.last_error, s.last_error_at)
 
     def mark_scheduler_tick(self) -> None:
         """Отметка живости планировщика — видно в диагностике панели."""
@@ -432,13 +806,12 @@ class Database:
         self.set(STATE_LATEST_SOURCE_ID, int(message_id))
 
     def get_latest_source_id(self) -> int:
-        return self.get_int(STATE_LATEST_SOURCE_ID, 0)
+        return self.get_settings().latest_source_id
 
     def backlog(self) -> int:
         """Сколько ID источника ещё впереди (грубая оценка очереди)."""
-        latest = self.get_latest_source_id()
-        progress = self.get_progress_id()
-        return max(0, latest - progress)
+        s = self.get_settings()
+        return max(0, s.latest_source_id - s.progress_id)
 
     # ------------------------------------------------------------------
     # История
@@ -453,13 +826,14 @@ class Database:
         error: Optional[str] = None,
     ) -> None:
         now = datetime.now(timezone.utc).isoformat()
+        job_id = self._current_job_id()
         with self._connect() as conn:
             conn.execute(
                 """
                 INSERT INTO history(
                     source_message_id, target_message_id, grouped_id,
-                    status, error, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?)
+                    status, error, created_at, job_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     source_message_id,
@@ -468,19 +842,21 @@ class Database:
                     status,
                     error,
                     now,
+                    job_id,
                 ),
             )
 
     def was_processed(self, source_message_id: int) -> bool:
         """Проверить, есть ли пост уже в истории со статусом ok."""
+        job_id = self._current_job_id()
         with self._connect() as conn:
             row = conn.execute(
                 """
                 SELECT 1 FROM history
-                WHERE source_message_id = ? AND status = 'ok'
+                WHERE source_message_id = ? AND status = 'ok' AND job_id = ?
                 LIMIT 1
                 """,
-                (source_message_id,),
+                (source_message_id, job_id),
             ).fetchone()
         return row is not None
 
@@ -488,81 +864,106 @@ class Database:
         """Альбом уже публиковался? (страховка от дублей после рестарта)."""
         if not grouped_id:
             return False
+        job_id = self._current_job_id()
         with self._connect() as conn:
             row = conn.execute(
                 """
                 SELECT 1 FROM history
-                WHERE grouped_id = ? AND status = 'ok'
+                WHERE grouped_id = ? AND status = 'ok' AND job_id = ?
                 LIMIT 1
                 """,
-                (str(grouped_id),),
+                (str(grouped_id), job_id),
             ).fetchone()
         return row is not None
 
     def history_count(self) -> int:
+        job_id = self._current_job_id()
         with self._connect() as conn:
             row = conn.execute(
-                "SELECT COUNT(*) AS c FROM history WHERE status = 'ok'"
+                "SELECT COUNT(*) AS c FROM history WHERE status = 'ok' AND job_id = ?",
+                (job_id,),
             ).fetchone()
         return int(row["c"]) if row else 0
 
     def error_count(self) -> int:
+        job_id = self._current_job_id()
         with self._connect() as conn:
             row = conn.execute(
-                "SELECT COUNT(*) AS c FROM history WHERE status = 'error'"
+                "SELECT COUNT(*) AS c FROM history WHERE status = 'error' AND job_id = ?",
+                (job_id,),
             ).fetchone()
         return int(row["c"]) if row else 0
 
     def published_since(self, unix_ts: float) -> int:
         """Сколько успешных публикаций после указанного момента."""
         iso = datetime.fromtimestamp(max(0.0, unix_ts), tz=timezone.utc).isoformat()
+        job_id = self._current_job_id()
         with self._connect() as conn:
             row = conn.execute(
                 """
                 SELECT COUNT(*) AS c FROM history
-                WHERE status = 'ok' AND created_at >= ?
+                WHERE status = 'ok' AND created_at >= ? AND job_id = ?
                 """,
-                (iso,),
+                (iso, job_id),
             ).fetchone()
         return int(row["c"]) if row else 0
 
     def last_errors(self, limit: int = 5) -> list[tuple[int, str]]:
+        job_id = self._current_job_id()
         with self._connect() as conn:
             rows = conn.execute(
                 """
                 SELECT source_message_id AS mid, error FROM history
-                WHERE status = 'error'
+                WHERE status = 'error' AND job_id = ?
                 ORDER BY id DESC LIMIT ?
                 """,
-                (int(limit),),
+                (job_id, int(limit)),
             ).fetchall()
         return [(int(r["mid"]), r["error"] or "") for r in rows]
 
     def clear_history(self) -> int:
-        """Удалить всю историю публикаций. Возвращает число удалённых строк."""
+        """Удалить историю текущего окна. Возвращает число удалённых строк."""
+        job_id = self._current_job_id()
         with self._connect() as conn:
-            cur = conn.execute("DELETE FROM history")
+            cur = conn.execute("DELETE FROM history WHERE job_id = ?", (job_id,))
             return int(cur.rowcount or 0)
 
     def clear_history_after(self, source_message_id: int) -> int:
         """Удалить историю с source_message_id > порога (для старта со ссылки)."""
+        job_id = self._current_job_id()
         with self._connect() as conn:
             cur = conn.execute(
-                "DELETE FROM history WHERE source_message_id > ?",
-                (int(source_message_id),),
+                "DELETE FROM history WHERE source_message_id > ? AND job_id = ?",
+                (int(source_message_id), job_id),
             )
             return int(cur.rowcount or 0)
+
+    def max_ok_source_id(self) -> int:
+        """Максимальный source_message_id со статусом ok (0 если пусто)."""
+        job_id = self._current_job_id()
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT MAX(source_message_id) AS m FROM history
+                WHERE status = 'ok' AND job_id = ?
+                """,
+                (job_id,),
+            ).fetchone()
+        if not row or row["m"] is None:
+            return 0
+        return int(row["m"])
 
     def list_target_message_ids(self, limit: Optional[int] = None) -> list[int]:
         """ID сообщений в канале-назначении, которые бот успешно опубликовал."""
         sql = """
             SELECT DISTINCT target_message_id AS mid
             FROM history
-            WHERE status = 'ok' AND target_message_id IS NOT NULL
+            WHERE status = 'ok' AND target_message_id IS NOT NULL AND job_id = ?
             ORDER BY target_message_id DESC
         """
+        job_id = self._current_job_id()
         if limit is not None and limit > 0:
             sql += f" LIMIT {int(limit)}"
         with self._connect() as conn:
-            rows = conn.execute(sql).fetchall()
+            rows = conn.execute(sql, (job_id,)).fetchall()
         return [int(r["mid"]) for r in rows if r["mid"] is not None]

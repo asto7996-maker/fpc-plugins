@@ -46,6 +46,10 @@ from links import (
     parse_post_link,
     to_channel_chat_id,
 )
+from transfer_filters import (
+    filter_album_for_transfer,
+    transfer_skip_reason,
+)
 
 # Ошибки доступа к закрытому каналу — останавливаем цикл, не «прожигаем» progress
 _CHANNEL_ACCESS_ERRORS = (ChannelPrivate, ChannelInvalid, PeerIdInvalid)
@@ -62,6 +66,7 @@ REASON_ABORTED = "aborted"
 REASON_FLOOD = "flood"
 REASON_FATAL = "fatal"
 REASON_ERROR = "error"
+REASON_TIMEOUT = "timeout"
 
 # Долгий FloodWait не «пересиживаем» внутри цикла — отдаём планировщику
 FLOOD_INLINE_LIMIT = 90
@@ -315,6 +320,8 @@ class ChannelPoster:
         self._abort_cycle = False
         self._busy_since = 0.0
         self._cycle_gen = 0
+        self._running_job_id: Optional[int] = None
+        self._cycle_deadline = 0.0
         self.last_result: Optional[CycleResult] = None
         # Быстрый путь поиска новых ID: None — ещё не проверяли, False — не работает
         self._history_window_ok: Optional[bool] = None
@@ -393,6 +400,39 @@ class ChannelPoster:
     def request_abort(self) -> None:
         """Прервать текущий цикл как можно скорее."""
         self._abort_cycle = True
+
+    def stop_cycle(self) -> bool:
+        """Остановить текущий цикл и rewrite. True, если цикл ещё шёл."""
+        was_busy = self._busy
+        self.request_abort()
+        self.cancel_rewrite()
+        logger.info("stop_cycle busy=%s job=%s", was_busy, self._running_job_id)
+        return was_busy
+
+    async def _sleep_or_abort(self, seconds: float, my_gen: int) -> bool:
+        """Сон, который можно прервать Стопом или тайм-аутом. True = прервали."""
+        deadline = time.monotonic() + max(0.0, float(seconds))
+        while time.monotonic() < deadline:
+            if self._cycle_stop_reason(my_gen):
+                return True
+            await asyncio.sleep(min(0.25, max(0.0, deadline - time.monotonic())))
+        return bool(self._cycle_stop_reason(my_gen))
+
+    def _time_left(self) -> float:
+        if self._cycle_deadline <= 0:
+            return 1e9
+        return max(0.0, self._cycle_deadline - time.monotonic())
+
+    def _cycle_stop_reason(self, my_gen: int) -> Optional[str]:
+        if my_gen != self._cycle_gen or self._abort_cycle:
+            return REASON_ABORTED
+        if self._cycle_deadline and time.monotonic() >= self._cycle_deadline:
+            return REASON_TIMEOUT
+        return None
+
+    @property
+    def running_job_id(self) -> Optional[int]:
+        return self._running_job_id
 
     @property
     def is_busy(self) -> bool:
@@ -535,12 +575,15 @@ class ChannelPoster:
         self._cycle_gen += 1  # любой старый цикл сразу выйдет
         self._busy = False
         self._busy_since = 0.0
+        self._running_job_id = None
+        self._cycle_deadline = 0.0
 
     async def run_cycle(
         self,
         limit: Optional[int] = None,
         *,
         force: bool = False,
+        deadline: Optional[float] = None,
     ) -> CycleResult:
         """
         Один цикл публикации.
@@ -548,12 +591,13 @@ class ChannelPoster:
         Args:
             limit: разовый лимит публикаций (иначе берётся из настроек).
             force: игнорировать «пауза» — для ручного «Цикл сейчас» и теста.
+            deadline: monotonic-время, после которого цикл сам останавливается.
         """
         # Если уже идёт цикл — прерываем и ждём, не возвращаем тихо 0
         if self._busy:
             logger.info("cycle waiting: busy")
             self.request_abort()
-            ok = await self.wait_until_idle(timeout=180.0)
+            ok = await self.wait_until_idle(timeout=min(30.0, self._time_left() or 30.0))
             if not ok or self._busy:
                 logger.warning("cycle still busy — force unlock")
                 self.force_unlock()
@@ -561,9 +605,11 @@ class ChannelPoster:
         self._cycle_gen += 1
         my_gen = self._cycle_gen
         self._abort_cycle = False
+        self._cycle_deadline = float(deadline) if deadline else 0.0
         self._busy = True
         self._busy_since = time.monotonic()
         try:
+            self._running_job_id = int(self.db.get_settings().job_id)
             result = await self._run_cycle_inner(my_gen, limit=limit, force=force)
         except FloodWait as e:
             result = CycleResult(
@@ -587,6 +633,8 @@ class ChannelPoster:
                 self._busy = False
                 self._busy_since = 0.0
                 self._abort_cycle = False
+                self._running_job_id = None
+                self._cycle_deadline = 0.0
         self.last_result = result
         return result
 
@@ -701,6 +749,7 @@ class ChannelPoster:
         settings = self.db.get_settings()
         if not settings.is_running and not force:
             return CycleResult(reason=REASON_PAUSED, progress_id=settings.progress_id)
+        self._seen_grouped.clear()
 
         try:
             source = await _rpc(
@@ -790,14 +839,16 @@ class ChannelPoster:
 
         while published < limit_value and steps < MAX_STEPS_PER_CYCLE:
             steps += 1
-            if self._abort_cycle or my_gen != self._cycle_gen:
+            stop = self._cycle_stop_reason(my_gen)
+            if stop:
                 logger.info(
-                    "cycle aborted gen=%s/%s published=%s",
+                    "cycle stop %s gen=%s/%s published=%s",
+                    stop,
                     my_gen,
                     self._cycle_gen,
                     published,
                 )
-                result.reason = REASON_ABORTED
+                result.reason = stop
                 break
 
             live = self.db.get_settings()
@@ -847,18 +898,22 @@ class ChannelPoster:
                 )
             except FloodWait as e:
                 wait = float(getattr(e, "value", 0) or 0)
-                # Короткие ожидания пересиживаем, длинные (и сумму долгих
-                # коротких) отдаём планировщику — цикл не должен висеть
-                if wait > FLOOD_INLINE_LIMIT or flood_slept + wait > FLOOD_BUDGET:
+                # Короткие ожидания пересиживаем, длинные отдаём планировщику —
+                # иначе одно окно держит весь оконный проход.
+                remain = self._time_left()
+                if (
+                    wait > FLOOD_INLINE_LIMIT
+                    or wait + 1 > remain
+                    or flood_slept + wait > FLOOD_BUDGET
+                ):
                     logger.warning("FloodWait %.0fs — отдаём планировщику", wait)
                     result.reason = REASON_FLOOD
                     result.flood_seconds = wait
                     break
                 logger.warning("FloodWait %.0fs", wait)
                 flood_slept += wait
-                await asyncio.sleep(wait + 1)
-                if self._abort_cycle or my_gen != self._cycle_gen:
-                    result.reason = REASON_ABORTED
+                if await self._sleep_or_abort(wait + 1, my_gen):
+                    result.reason = self._cycle_stop_reason(my_gen) or REASON_ABORTED
                     break
                 pending.insert(0, message_id)
                 continue
@@ -928,9 +983,12 @@ class ChannelPoster:
             progress = max(self.db.get_progress_id(), message_id, progress)
             self.db.set_progress_id(progress)
             if published < limit_value:
-                await asyncio.sleep(
-                    random.uniform(config.POST_DELAY_MIN, config.POST_DELAY_MAX)
-                )
+                if await self._sleep_or_abort(
+                    random.uniform(config.POST_DELAY_MIN, config.POST_DELAY_MAX),
+                    my_gen,
+                ):
+                    result.reason = self._cycle_stop_reason(my_gen) or REASON_ABORTED
+                    break
 
         result.published = published
         result.errors = errors
@@ -966,6 +1024,25 @@ class ChannelPoster:
                     "сетевой сбой на %s (%s), попытка %s", message_id, e, attempt
                 )
                 await asyncio.sleep(2.0 * attempt)
+                if self._cycle_stop_reason(self._cycle_gen):
+                    raise
+
+    def _clean_transfer_enabled(self) -> bool:
+        """Чистый перелив: только фото/видео, без описания."""
+        return bool(self.db.get_settings().clean_transfer)
+
+    def _copy_caption_kwargs(self, caption: str) -> dict:
+        """
+        Аргументы caption для copy_message / send_*.
+
+        Pyrogram: не передавать caption → оставить оригинал источника.
+        caption="" → снять описание (чистый перелив).
+        """
+        if self._clean_transfer_enabled():
+            return {"caption": ""}
+        if caption:
+            return {"caption": caption, "parse_mode": enums.ParseMode.HTML}
+        return {}
 
     async def _process(
         self, source, target, message_id: int, caption: str
@@ -980,6 +1057,10 @@ class ChannelPoster:
         if msg is None or getattr(msg, "empty", False):
             return "empty"
 
+        if self._clean_transfer_enabled():
+            # Без описания поста и без шаблона «✏️ Описание»
+            caption = ""
+
         if msg.media_group_id:
             gid = str(msg.media_group_id)
             if gid in self._seen_grouped:
@@ -989,6 +1070,13 @@ class ChannelPoster:
                 logger.info("album %s уже публиковался — пропуск", gid)
                 return "skip"
             return await self._publish_album(source, target, msg, caption)
+
+        if self._clean_transfer_enabled():
+            reason = transfer_skip_reason(msg)
+            if reason:
+                logger.info("чистый перелив: пропуск %s (%s)", msg.id, reason)
+                self.db.add_history(msg.id, status="skip", error=reason)
+                return "skip"
 
         if _is_media(msg) or msg.sticker or (msg.text or msg.caption):
             return await self._publish_single(target, msg, caption)
@@ -1009,13 +1097,13 @@ class ChannelPoster:
                     message_id=msg.id,
                 )
             elif _is_media(msg):
+                cap_kw = self._copy_caption_kwargs(caption)
                 try:
                     sent = await self.client.copy_message(
                         chat_id=target,
                         from_chat_id=msg.chat.id,
                         message_id=msg.id,
-                        caption=caption or None,
-                        parse_mode=enums.ParseMode.HTML if caption else None,
+                        **cap_kw,
                     )
                 except RPCError as e:
                     if caption and "parse" in str(e).lower():
@@ -1044,7 +1132,10 @@ class ChannelPoster:
                         raise
             else:
                 # MessageMediaUnsupported и т.п. — материализуем и шлём с шаблоном
-                item = await self._input_media_from_msg(msg, caption=caption or None)
+                send_cap = self._copy_caption_kwargs(caption)
+                item = await self._input_media_from_msg(
+                    msg, caption=send_cap.get("caption")
+                )
                 if item is None:
                     logger.warning("skip unsupported single %s", msg.id)
                     self.db.add_history(msg.id, status="error", error="unsupported media")
@@ -1055,22 +1146,19 @@ class ChannelPoster:
                         sent = await self.client.send_photo(
                             target,
                             item.media,
-                            caption=caption or None,
-                            parse_mode=enums.ParseMode.HTML if caption else None,
+                            **send_cap,
                         )
                     elif isinstance(item, InputMediaVideo):
                         sent = await self.client.send_video(
                             target,
                             item.media,
-                            caption=caption or None,
-                            parse_mode=enums.ParseMode.HTML if caption else None,
+                            **send_cap,
                         )
                     else:
                         sent = await self.client.send_document(
                             target,
                             item.media,
-                            caption=caption or None,
-                            parse_mode=enums.ParseMode.HTML if caption else None,
+                            **send_cap,
                         )
                 except RPCError as e:
                     if caption and "parse" in str(e).lower():
@@ -1143,11 +1231,48 @@ class ChannelPoster:
             return "skip"
 
         album = sorted(album, key=lambda m: m.id)
+        original_album = album
+        rebuild_album = False
+        if self._clean_transfer_enabled():
+            caption = ""
+            kept, skip_reason = filter_album_for_transfer(album)
+            if skip_reason:
+                logger.info(
+                    "чистый перелив: пропуск альбома %s (%s)", gid, skip_reason
+                )
+                for m in original_album:
+                    self.db.add_history(
+                        source_message_id=m.id,
+                        grouped_id=gid,
+                        status="skip",
+                        error=skip_reason,
+                    )
+                return "skip"
+            if len(kept) != len(album):
+                kept_ids = {m.id for m in kept}
+                logger.info(
+                    "чистый перелив: альбом %s без %s не-медиа",
+                    gid,
+                    len(album) - len(kept),
+                )
+                for m in album:
+                    if m.id not in kept_ids:
+                        self.db.add_history(
+                            source_message_id=m.id,
+                            grouped_id=gid,
+                            status="skip",
+                            error=transfer_skip_reason(m) or "файл",
+                        )
+            album = kept
+            # Всегда пересобираем: copy_media_group оставляет описание источника
+            rebuild_album = True
+
         sent_list = None
         try:
-            if caption:
+            if caption or rebuild_album:
                 # Шаблон задан — публикуем через send_media_group с caption сразу,
                 # чтобы не было метки «изменено» от последующего edit.
+                # После фильтрации альбома copy_media_group нельзя: уйдёт и мусор.
                 sent_list = await self._send_album_with_caption(target, album, caption)
             else:
                 try:
@@ -1161,7 +1286,7 @@ class ChannelPoster:
                     sent_list = await self._send_album_with_caption(target, album, "")
 
             first_id = sent_list[0].id if sent_list else None
-            max_src = max(m.id for m in album)
+            max_src = max(m.id for m in original_album)
             for m in album:
                 self.db.add_history(
                     source_message_id=m.id,
@@ -1228,6 +1353,9 @@ class ChannelPoster:
             # на всякий случай — шаблон так и не повесили
             _attach_caption(media_list[0], caption)
 
+        if len(media_list) == 1:
+            return [await self._send_one_input_media(target, media_list[0], caption)]
+
         try:
             sent = await self.client.send_media_group(chat_id=target, media=media_list)
         except RPCError as e:
@@ -1267,6 +1395,15 @@ class ChannelPoster:
                 logger.error("album still without caption after retry")
 
         return sent
+
+    async def _send_one_input_media(self, target, item, caption: str) -> Message:
+        """Один оставшийся кадр альбома — обычное фото/видео, не media_group."""
+        cap_kw = self._copy_caption_kwargs(caption)
+        if isinstance(item, InputMediaPhoto):
+            return await self.client.send_photo(target, item.media, **cap_kw)
+        if isinstance(item, InputMediaVideo):
+            return await self.client.send_video(target, item.media, **cap_kw)
+        return await self.client.send_document(target, item.media, **cap_kw)
 
     # ------------------------------------------------------------------ rewrite
 

@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -23,14 +24,20 @@ from fake_client import (  # noqa: E402
     SOURCE_ID,
     TARGET_ID,
     FakeClient,
+    animation_message,
+    document_message,
     photo_message,
     sticker_message,
     text_message,
+    video_message,
+    voice_message,
 )
 from poster import (  # noqa: E402
+    REASON_ABORTED,
     REASON_FATAL,
     REASON_FLOOD,
     REASON_PAUSED,
+    REASON_TIMEOUT,
     REASON_UP_TO_DATE,
     ChannelPoster,
     _chat_ref,
@@ -53,6 +60,8 @@ class CycleTestCase(unittest.TestCase):
         )
         self.db.set_running(True)
         self.db.set_progress_id(0)
+        # Базовые тесты цикла — полный копир; чистый перелив проверяется отдельно
+        self.db.set_clean_transfer(False)
         # Пауза между публикациями внутри цикла не нужна в тестах
         self._delay_min = poster_module.config.POST_DELAY_MIN
         self._delay_max = poster_module.config.POST_DELAY_MAX
@@ -160,6 +169,83 @@ class BasicCycleTests(CycleTestCase):
         client = FakeClient([text_message(1, "текст и подпись")])
         self.run_cycle(client, limit=1)
         self.assertEqual(client.published[0]["text"], "текст и подпись")
+
+
+class AbortCycleTests(CycleTestCase):
+    """⏹ Стоп прерывает уже идущий цикл."""
+
+    def test_request_abort_stops_after_current_post(self) -> None:
+        client = FakeClient([text_message(i, f"post {i}") for i in range(1, 6)])
+        poster = ChannelPoster(client=client, db=self.db)  # type: ignore[arg-type]
+        original = poster._process
+
+        async def wrapped(source, target, message_id, caption):
+            status = await original(source, target, message_id, caption)
+            poster.request_abort()
+            return status
+
+        poster._process = wrapped  # type: ignore[method-assign]
+        result = asyncio.run(poster.run_cycle(limit=5))
+
+        self.assertEqual(result.reason, REASON_ABORTED)
+        self.assertEqual(result.published, 1)
+        self.assertEqual(len(client.published), 1)
+        self.assertEqual(self.db.get_progress_id(), 1)
+
+    def test_stop_cycle_sets_abort_flag(self) -> None:
+        poster = ChannelPoster(client=FakeClient([]), db=self.db)  # type: ignore[arg-type]
+        poster._busy = True
+        poster._running_job_id = 1
+        self.assertTrue(poster.stop_cycle())
+        self.assertTrue(poster._abort_cycle)
+        self.assertTrue(poster._rewrite_cancel)
+
+    def test_sleep_or_abort_returns_immediately_when_aborted(self) -> None:
+        poster = ChannelPoster(client=FakeClient([]), db=self.db)  # type: ignore[arg-type]
+        poster._cycle_gen = 1
+        poster.request_abort()
+        aborted = asyncio.run(poster._sleep_or_abort(30.0, 1))
+        self.assertTrue(aborted)
+
+    def test_force_cycle_is_stopped_by_abort(self) -> None:
+        """Ручной «Цикл сейчас» игнорирует паузу, но Стоп его обрывает."""
+        self.db.set_running(False)
+        client = FakeClient([text_message(i, f"post {i}") for i in range(1, 6)])
+        poster = ChannelPoster(client=client, db=self.db)  # type: ignore[arg-type]
+        original = poster._process
+
+        async def wrapped(source, target, message_id, caption):
+            status = await original(source, target, message_id, caption)
+            poster.stop_cycle()
+            return status
+
+        poster._process = wrapped  # type: ignore[method-assign]
+        result = asyncio.run(poster.run_cycle(limit=5, force=True))
+
+        self.assertEqual(result.reason, REASON_ABORTED)
+        self.assertEqual(result.published, 1)
+
+    def test_deadline_stops_before_posts(self) -> None:
+        client = FakeClient([text_message(i) for i in range(1, 6)])
+        poster = ChannelPoster(client=client, db=self.db)  # type: ignore[arg-type]
+        result = asyncio.run(poster.run_cycle(limit=5, deadline=time.monotonic() - 1))
+        self.assertEqual(result.reason, REASON_TIMEOUT)
+        self.assertEqual(result.published, 0)
+
+    def test_deadline_stops_after_current_post(self) -> None:
+        client = FakeClient([text_message(i, f"post {i}") for i in range(1, 6)])
+        poster = ChannelPoster(client=client, db=self.db)  # type: ignore[arg-type]
+        original = poster._process
+
+        async def wrapped(source, target, message_id, caption):
+            status = await original(source, target, message_id, caption)
+            poster._cycle_deadline = time.monotonic() - 1
+            return status
+
+        poster._process = wrapped  # type: ignore[method-assign]
+        result = asyncio.run(poster.run_cycle(limit=5, deadline=time.monotonic() + 60))
+        self.assertEqual(result.reason, REASON_TIMEOUT)
+        self.assertEqual(result.published, 1)
 
 
 class GapTests(CycleTestCase):
@@ -365,6 +451,84 @@ class FailureTests(CycleTestCase):
         result, _ = self.run_cycle(client, limit=1)
         self.assertEqual(result.published, 1)
         self.assertEqual(client.published[0]["text"], "to saved")
+
+
+class CleanTransferCycleTests(CycleTestCase):
+    """Строгий чистый перелив: только фото/видео, без описания."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.db.set_clean_transfer(True)
+
+    def test_skips_text_files_emoji_gifs_keeps_photo_video(self) -> None:
+        client = FakeClient(
+            [
+                text_message(1, "https://spam.example/x"),
+                document_message(2),
+                animation_message(3),
+                voice_message(4),
+                sticker_message(5),
+                text_message(6, "чистый текст"),
+                photo_message(7, caption="описание поста"),
+                video_message(8, caption="ещё описание"),
+            ]
+        )
+        result, _ = self.run_cycle(client, limit=2)
+
+        self.assertEqual(result.published, 2)
+        self.assertEqual([p["kind"] for p in client.published], ["copy", "copy"])
+        self.assertEqual(client.published[0]["caption"], "")
+        self.assertEqual(client.published[1]["caption"], "")
+        self.assertEqual(self.db.get_progress_id(), 8)
+
+    def test_strips_caption_and_ignores_template(self) -> None:
+        self.db.set_caption("<b>реклама VPN</b>")
+        client = FakeClient([photo_message(1, caption="исходное описание")])
+        result, _ = self.run_cycle(client, limit=1)
+
+        self.assertEqual(result.published, 1)
+        self.assertEqual(client.published[0]["kind"], "copy")
+        self.assertEqual(client.published[0]["caption"], "")
+
+    def test_disabled_filter_copies_document(self) -> None:
+        self.db.set_clean_transfer(False)
+        client = FakeClient([document_message(1), text_message(2, "ok")])
+        result, _ = self.run_cycle(client, limit=1)
+
+        self.assertEqual(result.published, 1)
+        self.assertEqual(client.published[0]["kind"], "copy")
+        self.assertEqual(self.db.get_progress_id(), 1)
+
+    def test_album_with_file_publishes_photos_only_without_caption(self) -> None:
+        self.db.set_caption("шаблон")
+        client = FakeClient(
+            [
+                photo_message(1, group="g1", caption="подпись альбома"),
+                document_message(2, group="g1"),
+                photo_message(3, group="g1"),
+            ]
+        )
+        result, _ = self.run_cycle(client, limit=1)
+
+        self.assertEqual(result.published, 1)
+        self.assertEqual(client.published[0]["kind"], "album")
+        self.assertEqual(client.published[0]["size"], 2)
+        self.assertFalse(client.published[0]["caption"])
+        self.assertEqual(self.db.get_progress_id(), 3)
+
+    def test_album_of_gifs_is_skipped_photo_kept(self) -> None:
+        client = FakeClient(
+            [
+                animation_message(1, group="gifs"),
+                animation_message(2, group="gifs"),
+                photo_message(3),
+            ]
+        )
+        result, _ = self.run_cycle(client, limit=1)
+
+        self.assertEqual(result.published, 1)
+        self.assertEqual(client.published[0]["kind"], "copy")
+        self.assertEqual(self.db.get_progress_id(), 3)
 
 
 if __name__ == "__main__":

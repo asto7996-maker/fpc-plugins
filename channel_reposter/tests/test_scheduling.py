@@ -24,9 +24,11 @@ from scheduling import (  # noqa: E402
     REASON_FLOOD,
     REASON_IDLE,
     REASON_INTERVAL,
+    fair_window_limit,
     humanize_duration,
     parse_duration,
     plan_next_delay,
+    slice_timeout,
 )
 
 
@@ -220,6 +222,19 @@ class IntervalStorageTests(unittest.TestCase):
         self.assertTrue(s.catchup_enabled)
         self.assertEqual(s.catchup_seconds, 45.0)
         self.assertTrue(s.notify_cycles)
+
+
+class WindowBudgetTests(unittest.TestCase):
+    def test_fair_split(self) -> None:
+        self.assertEqual(fair_window_limit(10, 2, 4), 2)
+        self.assertEqual(fair_window_limit(1, 8, 16), 1)
+        self.assertEqual(fair_window_limit(5, 1, 3), 3)
+        self.assertEqual(fair_window_limit(5, 4, 0), 0)
+
+    def test_slice_timeout(self) -> None:
+        self.assertEqual(slice_timeout(90, 180), 90)
+        self.assertEqual(slice_timeout(90, 20), 20)
+        self.assertEqual(slice_timeout(90, 3), 0.0)
 
 
 if __name__ == "__main__":

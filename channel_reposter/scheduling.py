@@ -202,3 +202,33 @@ def plan_next_delay(
     # Ничего не опубликовали: чаще опрашиваем источник, но не реже интервала
     step = IDLE_STEPS[min(max(idle_streak, 1), len(IDLE_STEPS)) - 1]
     return NextRun(max(MIN_DELAY, min(step, interval)), REASON_IDLE)
+
+
+def fair_window_limit(
+    posts_per_cycle: int, windows_left: int, remaining_budget: int
+) -> int:
+    """
+    Сколько публикаций отдать этому окну в текущем проходе.
+
+    Бюджет прохода делится поровну между оставшимися окнами, но не больше
+    личного лимита окна и не больше остатка.
+    """
+    budget = max(0, int(remaining_budget))
+    if budget <= 0 or windows_left <= 0:
+        return 0
+    per_window = max(1, int(posts_per_cycle or 1))
+    if windows_left == 1:
+        return min(per_window, budget)
+    fair = max(1, budget // int(windows_left))
+    return min(per_window, fair, budget)
+
+
+def slice_timeout(
+    window_timeout: float, pass_remaining: float, *, min_slice: float = 5.0
+) -> float:
+    """Таймаут слота окна с учётом оставшегося времени прохода."""
+    left = max(0.0, float(pass_remaining))
+    cap = max(min_slice, float(window_timeout or min_slice))
+    if left < min_slice:
+        return 0.0
+    return min(cap, left)

@@ -24,7 +24,7 @@ from aiogram.types import (
 )
 
 import config
-from database import Database
+from database import MAX_JOBS, Database
 from formatting import extract_caption_html, safe_preview, validate_telegram_html
 from links import format_channel_label, is_saved_messages, parse_post_link
 
@@ -165,6 +165,47 @@ def _start_autopost(db: Database) -> None:
     db.run_asap()
 
 
+def _stop_current_cycle(db: Database) -> str:
+    """
+    Прервать идущий цикл и поставить автопост на паузу.
+
+    Пауза не трогает текущую публикацию — Стоп обрывает её сразу,
+    в том числе ручной «Цикл сейчас».
+    """
+    poster = getattr(_bridge, "poster", None) if _bridge else _poster
+    was_busy = bool(poster and getattr(poster, "is_busy", False))
+    running_job_id = getattr(poster, "running_job_id", None) if poster else None
+    if poster is not None:
+        stop = getattr(poster, "stop_cycle", None)
+        if callable(stop):
+            stop()
+        else:
+            abort = getattr(poster, "request_abort", None)
+            if callable(abort):
+                abort()
+            cancel = getattr(poster, "cancel_rewrite", None)
+            if callable(cancel):
+                cancel()
+
+    paused_ids: list[int] = []
+    ids = {int(db.get_settings().job_id)}
+    if running_job_id:
+        ids.add(int(running_job_id))
+    for jid in sorted(ids):
+        with db.job_scope(jid):
+            if db.get_settings().is_running:
+                db.set_running(False)
+                paused_ids.append(jid)
+
+    if was_busy and paused_ids:
+        return "цикл остановлен, автопост на паузе"
+    if was_busy:
+        return "цикл остановлен"
+    if paused_ids:
+        return "автопост на паузе"
+    return "уже остановлено"
+
+
 def _start_hint(db: Database) -> str:
     s = db.get_settings()
     return (
@@ -188,7 +229,14 @@ def _remember_admin(uid: Optional[int]) -> None:
 
 # ----- keyboards -----
 
-def menu_kb(running: bool, *, catchup: bool = False, notify: bool = False) -> InlineKeyboardMarkup:
+def menu_kb(
+    running: bool,
+    *,
+    catchup: bool = False,
+    notify: bool = False,
+    clean_transfer: bool = True,
+    jobs_n: int = 1,
+) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -199,7 +247,18 @@ def menu_kb(running: bool, *, catchup: bool = False, notify: bool = False) -> In
                 ),
             ],
             [
+                InlineKeyboardButton(text="▶️ Старт все", callback_data="a:jall"),
+                InlineKeyboardButton(text="⏸ Пауза все", callback_data="a:jpause"),
+            ],
+            [
+                InlineKeyboardButton(
+                    text=f"🪟 Окна ({jobs_n})", callback_data="a:jobs"
+                ),
+                InlineKeyboardButton(text="➕ Новое окно", callback_data="a:ja"),
+            ],
+            [
                 InlineKeyboardButton(text="⚡ Цикл сейчас", callback_data="a:run"),
+                InlineKeyboardButton(text="⏹ Стоп", callback_data="a:stop"),
                 InlineKeyboardButton(text="🧪 Тест", callback_data="a:test"),
             ],
             [InlineKeyboardButton(text="🔐 Вход юзербота", callback_data="a:login")],
@@ -227,6 +286,12 @@ def menu_kb(running: bool, *, catchup: bool = False, notify: bool = False) -> In
                 ),
             ],
             [
+                InlineKeyboardButton(
+                    text=f"🧹 Чистый перелив: {'вкл' if clean_transfer else 'выкл'}",
+                    callback_data="a:clean",
+                ),
+            ],
+            [
                 InlineKeyboardButton(text="📝 Rewrite подписей", callback_data="a:rewrite"),
                 InlineKeyboardButton(text="🧹 Разблокировать", callback_data="a:unstick"),
             ],
@@ -240,7 +305,13 @@ def main_kb(db: Optional[Database] = None) -> InlineKeyboardMarkup:
     if database is None:
         return menu_kb(False)
     s = database.get_settings()
-    return menu_kb(s.is_running, catchup=s.catchup_enabled, notify=s.notify_cycles)
+    return menu_kb(
+        s.is_running,
+        catchup=s.catchup_enabled,
+        notify=s.notify_cycles,
+        clean_transfer=s.clean_transfer,
+        jobs_n=len(database.list_jobs()),
+    )
 
 
 def cancel_kb() -> InlineKeyboardMarkup:
@@ -289,6 +360,74 @@ def interval_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def jobs_kb(db: Database) -> InlineKeyboardMarkup:
+    """Список окон: одно на строку, старт/пауза, плюс добавить/клонировать."""
+    jobs = db.list_jobs()
+    active = db.get_settings().job_id
+    rows: list[list[InlineKeyboardButton]] = []
+    for j in jobs:
+        prefix = "• " if j.job_id == active else ""
+        st = "🟢" if j.is_running else "⏸"
+        label = f"{prefix}{st} {j.job_id}. {j.pair_label()}"
+        if len(label) > 48:
+            label = label[:45] + "…"
+        rows.append(
+            [
+                InlineKeyboardButton(text=label, callback_data=f"a:js:{j.job_id}"),
+                InlineKeyboardButton(
+                    text="⏸" if j.is_running else "▶️",
+                    callback_data=f"a:jt:{j.job_id}",
+                ),
+            ]
+        )
+    rows.append(
+        [
+            InlineKeyboardButton(text="▶️ Старт все", callback_data="a:jall"),
+            InlineKeyboardButton(text="⏸ Пауза все", callback_data="a:jpause"),
+        ]
+    )
+    rows.append(
+        [
+            InlineKeyboardButton(text="➕ Добавить", callback_data="a:ja"),
+            InlineKeyboardButton(text="📋 Клон", callback_data="a:jc"),
+            InlineKeyboardButton(text="🗑 Удалить", callback_data="a:jd"),
+        ]
+    )
+    rows.append([InlineKeyboardButton(text="◀️ К панели", callback_data="a:status")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def jobs_text(db: Database) -> str:
+    jobs = db.list_jobs()
+    active = db.get_settings().job_id
+    running_n = sum(1 for j in jobs if j.is_running)
+    lines = [
+        "<b>🪟 Окна перелива</b>",
+        "Каждое окно — своя пара каналов и свой прогресс.",
+        f"До <b>{MAX_JOBS}</b> штук. Один юзербот: окна ходят <b>по очереди</b> "
+        f"в одном проходе (канал1→2, потом канал3→4, …).\n"
+        f"Лимит прохода: <b>{int(config.PASS_PUBLISH_LIMIT)}</b> публикаций, "
+        f"таймаут окна <b>{humanize_duration(config.WINDOW_CYCLE_TIMEOUT)}</b>, "
+        f"всего проход <b>{humanize_duration(config.PASS_TIMEOUT)}</b>.",
+        f"Сейчас работают: <b>{running_n}/{len(jobs)}</b>",
+        "",
+    ]
+    for j in jobs:
+        mark = "•" if j.job_id == active else " "
+        st = "🟢" if j.is_running else "⏸"
+        cur = "  ← сейчас" if j.job_id == active else ""
+        ready = "" if j.is_ready() else "  ⚠️ нет каналов"
+        lines.append(
+            f"{mark} {st} <b>{j.window_title()}</b>: "
+            f"<code>{j.pair_label()}</code>{cur}{ready}"
+        )
+    lines.append(
+        "\n▶️ у окна — старт только его. <b>Старт все</b> — все готовые пары.\n"
+        "<b>📋 Клон</b> — то же источник, другое назначение."
+    )
+    return "\n".join(lines)
+
+
 def _next_run_line(db: Database, s) -> str:
     if not s.is_running:
         return "⏭ Следующий цикл: <i>на паузе</i>"
@@ -302,6 +441,7 @@ def _next_run_line(db: Database, s) -> str:
 
 def status_text(db: Database) -> str:
     s = db.get_settings()
+    jobs = db.list_jobs()
     st = "🟢 Работает" if s.is_running else "🔴 На паузе"
     engine = "🟢 USERBOT готов" if _has_userbot() else "🔴 нужен вход (api_id / api_hash)"
     busy = "⏳ публикация…" if _busy() else "idle"
@@ -313,8 +453,10 @@ def status_text(db: Database) -> str:
         "<b>✨ Channel Reposter</b>",
         "<i>Чистый юзербот · без Bot API заливки</i>",
         "",
+        f"🪟 <b>{s.window_title()}</b> · <code>{s.pair_label()}</code> "
+        f"({s.job_id}/{len(jobs)})",
         f"Движок: {engine}",
-        f"Автопост: <b>{st}</b> · <code>{busy}</code>",
+        f"Автопост этого окна: <b>{st}</b> · <code>{busy}</code>",
         _next_run_line(db, s),
         "",
         f"📥 Источник: <code>{_channel_label(s.source_channel)}</code>",
@@ -331,6 +473,12 @@ def status_text(db: Database) -> str:
             if s.catchup_enabled
             else ""
         ),
+        f"🧹 Чистый перелив: <b>{'вкл' if s.clean_transfer else 'выкл'}</b>"
+        + (
+            " (только фото/видео, без описания)"
+            if s.clean_transfer
+            else ""
+        ),
         f"✅ Скопировано: <b>{db.history_count()}</b> · ошибок: <b>{db.error_count()}</b>",
     ]
     if last_pub:
@@ -338,6 +486,18 @@ def status_text(db: Database) -> str:
             f"🕒 Последняя публикация: <b>{humanize_duration(time.time() - last_pub)}</b> назад"
         )
     lines.append(f"🔗 Старт: <code>{s.start_link or 'не задан'}</code>")
+    if len(jobs) > 1:
+        extra = []
+        for j in jobs:
+            mark = "→" if j.job_id == s.job_id else " "
+            stj = "🟢" if j.is_running else "⏸"
+            extra.append(f"{mark} {stj} {j.pair_label()}")
+        lines.append("\n<b>Все окна</b>\n" + "\n".join(extra))
+        lines.append(
+            f"⏱ Проход: ≤{humanize_duration(config.PASS_TIMEOUT)} / "
+            f"{int(config.PASS_PUBLISH_LIMIT)} публикаций, "
+            f"окно ≤{humanize_duration(config.WINDOW_CYCLE_TIMEOUT)}"
+        )
     if err_text:
         ago = humanize_duration(time.time() - err_at) if err_at else "—"
         lines.append(f"⚠️ Последняя ошибка ({ago} назад): <code>{safe_preview(err_text, 160)}</code>")
@@ -366,12 +526,11 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
         "Перезалив каналов через <b>api_id + api_hash</b> (юзербот).\n"
         "Бот — только панель. Контент льёт аккаунт.\n\n"
         "1️⃣ «🔐 Вход» — api_id, api_hash, телефон, код\n"
-        "2️⃣ Источник + назначение\n"
-        "3️⃣ Ссылка на пост или «С начала»\n"
+        "2️⃣ «🪟 Окна» — несколько пар каналов сразу (Старт все)\n"
+        "3️⃣ В каждом окне: источник + назначение + «С начала»\n"
         "4️⃣ Описание → ⏱ Интервал → ▶️ Старт\n\n"
-        "Команды: /status /run /pause /run_now /test\n"
-        "/interval 2ч · /limit 5 · /reconnect · /login\n"
-        "Если кажется, что бот повис: /ping и /unstick\n\n"
+        "Управление — кнопками ниже.\n"
+        "Команды на всякий случай: /status /run_now /stop /test /ping /unstick\n\n"
         + status_text(db),
         reply_markup=main_kb(db),
         parse_mode="HTML",
@@ -446,6 +605,19 @@ async def cmd_pause(message: Message) -> None:
         return
     _require_db().set_running(False)
     await message.answer("⏸ Пауза.", reply_markup=main_kb(), parse_mode="HTML")
+
+
+@router.message(Command("stop"))
+async def cmd_stop(message: Message) -> None:
+    if await _deny(message.from_user.id if message.from_user else None, message.answer):
+        return
+    db = _require_db()
+    detail = _stop_current_cycle(db)
+    await message.answer(
+        f"⏹ Стоп: {detail}.\n\n" + status_text(db),
+        reply_markup=main_kb(db),
+        parse_mode="HTML",
+    )
 
 
 @router.message(Command("ping"))
@@ -647,6 +819,22 @@ async def cb_pause(c: CallbackQuery) -> None:
     await _replace(c, "⏸ Пауза.\n\n" + status_text(db), main_kb(db))
 
 
+@router.callback_query(F.data == "a:stop")
+async def cb_stop(c: CallbackQuery) -> None:
+    if await _deny_cb(c):
+        return
+    db = _require_db()
+    detail = _stop_current_cycle(db)
+    await _ack(c, "Стоп")
+    await _replace(
+        c,
+        f"⏹ Стоп: {detail}.\n"
+        "Следующий цикл не стартует, пока не нажмёте ▶️ Старт.\n\n"
+        + status_text(db),
+        main_kb(db),
+    )
+
+
 @router.callback_query(F.data == "a:catchup")
 async def cb_catchup(c: CallbackQuery) -> None:
     """Догон: пока есть очередь — публикуем чаще пользовательского интервала."""
@@ -685,6 +873,217 @@ async def cb_notify(c: CallbackQuery) -> None:
         else "🔕 Отчёты о циклах выключены (об ошибках сообщу всё равно)."
     )
     await _replace(c, text + "\n\n" + status_text(db), main_kb(db))
+
+
+@router.callback_query(F.data == "a:clean")
+async def cb_clean_transfer(c: CallbackQuery) -> None:
+    """Строгий перелив: только фото и видео, без описания."""
+    if await _deny_cb(c):
+        return
+    db = _require_db()
+    new_state = not db.get_settings().clean_transfer
+    db.set_clean_transfer(new_state)
+    await _ack(c, "Чистый перелив включён" if new_state else "Чистый перелив выключен")
+    if new_state:
+        text = (
+            "🧹 <b>Чистый перелив включён</b>\n"
+            "В канал уходит <b>только медиа</b> — фото и видео.\n"
+            "Без описания поста, без шаблона подписи.\n\n"
+            "Пропускаю:\n"
+            "• текст и подписи\n"
+            "• файлы\n"
+            "• эмодзи и стикеры\n"
+            "• гифки\n"
+            "• голосовые и кружки"
+        )
+    else:
+        text = (
+            "🧹 <b>Чистый перелив выключен</b>\n"
+            "Копирую посты как есть, с описанием, файлами, гифками и текстом."
+        )
+    await _replace(c, text + "\n\n" + status_text(db), main_kb(db))
+
+
+@router.message(Command("filter", "clean"))
+async def cmd_clean_transfer(message: Message) -> None:
+    if await _deny(message.from_user.id if message.from_user else None, message.answer):
+        return
+    db = _require_db()
+    new_state = not db.get_settings().clean_transfer
+    db.set_clean_transfer(new_state)
+    text = (
+        "🧹 <b>Чистый перелив включён</b> — только фото и видео, без описания."
+        if new_state
+        else "🧹 <b>Чистый перелив выключен</b> — копирую всё как есть."
+    )
+    await message.answer(
+        text + "\n\n" + status_text(db),
+        reply_markup=main_kb(db),
+        parse_mode="HTML",
+    )
+
+
+@router.callback_query(F.data == "a:jobs")
+async def cb_jobs(c: CallbackQuery) -> None:
+    if await _deny_cb(c):
+        return
+    await _ack(c)
+    db = _require_db()
+    await _replace(c, jobs_text(db), jobs_kb(db))
+
+
+@router.callback_query(F.data.startswith("a:js:"))
+async def cb_job_switch(c: CallbackQuery) -> None:
+    if await _deny_cb(c):
+        return
+    db = _require_db()
+    try:
+        job_id = int((c.data or "").split(":")[-1])
+        job = db.set_active_job(job_id)
+    except (TypeError, ValueError) as e:
+        await _ack(c, str(e)[:80], show_alert=True)
+        return
+    await _ack(c, f"Окно {job.job_id}")
+    await _replace(
+        c,
+        f"🪟 Переключились на <b>{job.window_title()}</b>\n"
+        f"<code>{job.pair_label()}</code>\n\n" + status_text(db),
+        main_kb(db),
+    )
+
+
+@router.callback_query(F.data.startswith("a:jt:"))
+async def cb_job_toggle(c: CallbackQuery) -> None:
+    """Старт/пауза конкретного окна, не уходя из списка."""
+    if await _deny_cb(c):
+        return
+    db = _require_db()
+    try:
+        job_id = int((c.data or "").split(":")[-1])
+        job = db.get_job(job_id)
+        if job is None:
+            raise ValueError("Нет такого окна")
+        if job.is_running:
+            with db.job_scope(job_id):
+                db.set_running(False)
+            await _ack(c, f"Пауза окна {job_id}")
+        else:
+            if not _has_userbot():
+                await _ack(c, "Сначала вход юзербота", show_alert=True)
+                return
+            if not job.is_ready():
+                await _ack(c, "Каналы + стартовая точка", show_alert=True)
+                return
+            with db.job_scope(job_id):
+                _start_autopost(db)
+            await _ack(c, f"Старт окна {job_id}")
+    except (TypeError, ValueError) as e:
+        await _ack(c, str(e)[:80], show_alert=True)
+        return
+    await _replace(c, jobs_text(db), jobs_kb(db))
+
+
+@router.callback_query(F.data == "a:jall")
+async def cb_jobs_start_all(c: CallbackQuery) -> None:
+    if await _deny_cb(c):
+        return
+    if not _has_userbot():
+        await _ack(c, "Сначала вход юзербота", show_alert=True)
+        return
+    db = _require_db()
+    started, skipped = db.start_ready_jobs()
+    await _ack(c, f"Старт {len(started)} окон")
+    skip_note = (
+        f"\nПропущены без каналов: {', '.join(str(i) for i in skipped)}."
+        if skipped
+        else ""
+    )
+    await _replace(
+        c,
+        f"▶️ Включены <b>{len(started)}</b> окон — ходят по очереди.{skip_note}\n\n"
+        + jobs_text(db),
+        jobs_kb(db),
+    )
+
+
+@router.callback_query(F.data == "a:jpause")
+async def cb_jobs_pause_all(c: CallbackQuery) -> None:
+    if await _deny_cb(c):
+        return
+    db = _require_db()
+    paused = db.pause_all_jobs()
+    await _ack(c, "Пауза все")
+    await _replace(
+        c,
+        f"⏸ На паузе: <b>{len(paused)}</b> окон.\n\n" + jobs_text(db),
+        jobs_kb(db),
+    )
+
+
+@router.callback_query(F.data == "a:jc")
+async def cb_job_clone(c: CallbackQuery, state: FSMContext) -> None:
+    if await _deny_cb(c):
+        return
+    db = _require_db()
+    try:
+        job = db.clone_job()
+        db.set_active_job(job.job_id)
+    except ValueError as e:
+        await _ack(c, str(e)[:180], show_alert=True)
+        return
+    await _ack(c, f"Клон → окно {job.job_id}")
+    await state.set_state(S.target)
+    await _replace(
+        c,
+        f"📋 <b>{job.window_title()}</b> — копия источника "
+        f"<code>{_channel_label(job.source_channel)}</code>.\n\n"
+        "Пришлите <b>назначение</b> (@username или id) — это другой канал, "
+        "куда лить то же медиа. Потом «📜 С начала» и ▶️ Старт "
+        "(или «Старт все»).",
+        main_kb(db),
+    )
+
+
+@router.callback_query(F.data == "a:ja")
+async def cb_job_add(c: CallbackQuery, state: FSMContext) -> None:
+    if await _deny_cb(c):
+        return
+    db = _require_db()
+    try:
+        job = db.create_job()
+        db.set_active_job(job.job_id)
+    except ValueError as e:
+        await _ack(c, str(e)[:180], show_alert=True)
+        return
+    await _ack(c, f"Окно {job.job_id} создано")
+    await state.set_state(S.source)
+    await _replace(
+        c,
+        f"➕ <b>{job.window_title()}</b> создано и выбрано.\n"
+        "Оно на паузе, прогресс с нуля.\n\n"
+        "Пришлите <b>источник</b> (@username или id), потом назначение — "
+        "кнопка «📤 Назначение».",
+        main_kb(db),
+    )
+
+
+@router.callback_query(F.data == "a:jd")
+async def cb_job_delete(c: CallbackQuery) -> None:
+    if await _deny_cb(c):
+        return
+    db = _require_db()
+    s = db.get_settings()
+    try:
+        db.delete_job(s.job_id)
+    except ValueError as e:
+        await _ack(c, str(e)[:180], show_alert=True)
+        return
+    await _ack(c, "Окно удалено")
+    await _replace(
+        c,
+        "🗑 Окно удалено. Открыто другое.\n\n" + jobs_text(db),
+        jobs_kb(db),
+    )
 
 
 @router.callback_query(F.data == "a:login")
@@ -1286,7 +1685,8 @@ def _cycle_report(db: Database, result) -> str:
         ),
         "no_start": "Не задана стартовая точка: «🔗 Старт-ссылка» или «📜 С начала».",
         "paused": "Автопостинг на паузе.",
-        "aborted": "Цикл был прерван (например, новой командой).",
+        "aborted": "Цикл остановлен (⏹ Стоп).",
+        "timeout": "Окно упёрлось в тайм-аут — очередь продолжит следующий проход.",
         "flood": (
             "Telegram просит подождать "
             f"{humanize_duration(getattr(result, 'flood_seconds', 0))} (flood)."
@@ -1470,9 +1870,10 @@ async def on_unknown(message: Message) -> None:
     _remember_admin(message.from_user.id if message.from_user else None)
     db = _require_db()
     await message.answer(
-        "Не понял команду. Управление — кнопками ниже.\n"
-        "Подсказка: /status — статус, /run_now — цикл сейчас, /test — диагностика, "
-        "/ping — проверить, что панель жива.\n\n"
+        "Не понял команду. Управление — <b>кнопками ниже</b>.\n"
+        "⏹ Стоп — прервать текущий цикл сразу.\n"
+        "🧹 Чистый перелив — только фото и видео, без описания поста.\n"
+        "Подсказка: /status · /run_now · /stop · /test · /ping\n\n"
         + status_text(db),
         reply_markup=main_kb(db),
         parse_mode="HTML",
