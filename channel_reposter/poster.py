@@ -319,6 +319,7 @@ class ChannelPoster:
         self._abort_cycle = False
         self._busy_since = 0.0
         self._cycle_gen = 0
+        self._running_job_id: Optional[int] = None
         self.last_result: Optional[CycleResult] = None
         # Быстрый путь поиска новых ID: None — ещё не проверяли, False — не работает
         self._history_window_ok: Optional[bool] = None
@@ -397,6 +398,27 @@ class ChannelPoster:
     def request_abort(self) -> None:
         """Прервать текущий цикл как можно скорее."""
         self._abort_cycle = True
+
+    def stop_cycle(self) -> bool:
+        """Остановить текущий цикл и rewrite. True, если цикл ещё шёл."""
+        was_busy = self._busy
+        self.request_abort()
+        self.cancel_rewrite()
+        logger.info("stop_cycle busy=%s job=%s", was_busy, self._running_job_id)
+        return was_busy
+
+    async def _sleep_or_abort(self, seconds: float, my_gen: int) -> bool:
+        """Сон, который можно прервать кнопкой Стоп. True = прервали."""
+        deadline = time.monotonic() + max(0.0, float(seconds))
+        while time.monotonic() < deadline:
+            if self._abort_cycle or my_gen != self._cycle_gen:
+                return True
+            await asyncio.sleep(min(0.25, max(0.0, deadline - time.monotonic())))
+        return self._abort_cycle or my_gen != self._cycle_gen
+
+    @property
+    def running_job_id(self) -> Optional[int]:
+        return self._running_job_id
 
     @property
     def is_busy(self) -> bool:
@@ -539,6 +561,7 @@ class ChannelPoster:
         self._cycle_gen += 1  # любой старый цикл сразу выйдет
         self._busy = False
         self._busy_since = 0.0
+        self._running_job_id = None
 
     async def run_cycle(
         self,
@@ -568,6 +591,7 @@ class ChannelPoster:
         self._busy = True
         self._busy_since = time.monotonic()
         try:
+            self._running_job_id = int(self.db.get_settings().job_id)
             result = await self._run_cycle_inner(my_gen, limit=limit, force=force)
         except FloodWait as e:
             result = CycleResult(
@@ -591,6 +615,7 @@ class ChannelPoster:
                 self._busy = False
                 self._busy_since = 0.0
                 self._abort_cycle = False
+                self._running_job_id = None
         self.last_result = result
         return result
 
@@ -861,8 +886,7 @@ class ChannelPoster:
                     break
                 logger.warning("FloodWait %.0fs", wait)
                 flood_slept += wait
-                await asyncio.sleep(wait + 1)
-                if self._abort_cycle or my_gen != self._cycle_gen:
+                if await self._sleep_or_abort(wait + 1, my_gen):
                     result.reason = REASON_ABORTED
                     break
                 pending.insert(0, message_id)
@@ -933,9 +957,12 @@ class ChannelPoster:
             progress = max(self.db.get_progress_id(), message_id, progress)
             self.db.set_progress_id(progress)
             if published < limit_value:
-                await asyncio.sleep(
-                    random.uniform(config.POST_DELAY_MIN, config.POST_DELAY_MAX)
-                )
+                if await self._sleep_or_abort(
+                    random.uniform(config.POST_DELAY_MIN, config.POST_DELAY_MAX),
+                    my_gen,
+                ):
+                    result.reason = REASON_ABORTED
+                    break
 
         result.published = published
         result.errors = errors
@@ -971,6 +998,8 @@ class ChannelPoster:
                     "сетевой сбой на %s (%s), попытка %s", message_id, e, attempt
                 )
                 await asyncio.sleep(2.0 * attempt)
+                if self._abort_cycle:
+                    raise
 
     def _clean_transfer_enabled(self) -> bool:
         """Чистый перелив: только фото/видео, без описания."""

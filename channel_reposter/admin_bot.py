@@ -165,6 +165,47 @@ def _start_autopost(db: Database) -> None:
     db.run_asap()
 
 
+def _stop_current_cycle(db: Database) -> str:
+    """
+    Прервать идущий цикл и поставить автопост на паузу.
+
+    Пауза не трогает текущую публикацию — Стоп обрывает её сразу,
+    в том числе ручной «Цикл сейчас».
+    """
+    poster = getattr(_bridge, "poster", None) if _bridge else _poster
+    was_busy = bool(poster and getattr(poster, "is_busy", False))
+    running_job_id = getattr(poster, "running_job_id", None) if poster else None
+    if poster is not None:
+        stop = getattr(poster, "stop_cycle", None)
+        if callable(stop):
+            stop()
+        else:
+            abort = getattr(poster, "request_abort", None)
+            if callable(abort):
+                abort()
+            cancel = getattr(poster, "cancel_rewrite", None)
+            if callable(cancel):
+                cancel()
+
+    paused_ids: list[int] = []
+    ids = {int(db.get_settings().job_id)}
+    if running_job_id:
+        ids.add(int(running_job_id))
+    for jid in sorted(ids):
+        with db.job_scope(jid):
+            if db.get_settings().is_running:
+                db.set_running(False)
+                paused_ids.append(jid)
+
+    if was_busy and paused_ids:
+        return "цикл остановлен, автопост на паузе"
+    if was_busy:
+        return "цикл остановлен"
+    if paused_ids:
+        return "автопост на паузе"
+    return "уже остановлено"
+
+
 def _start_hint(db: Database) -> str:
     s = db.get_settings()
     return (
@@ -213,6 +254,7 @@ def menu_kb(
             ],
             [
                 InlineKeyboardButton(text="⚡ Цикл сейчас", callback_data="a:run"),
+                InlineKeyboardButton(text="⏹ Стоп", callback_data="a:stop"),
                 InlineKeyboardButton(text="🧪 Тест", callback_data="a:test"),
             ],
             [InlineKeyboardButton(text="🔐 Вход юзербота", callback_data="a:login")],
@@ -459,7 +501,7 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
         "3️⃣ В каждом окне: источник + назначение + «С начала»\n"
         "4️⃣ Описание → ⏱ Интервал → ▶️ Старт\n\n"
         "Управление — кнопками ниже.\n"
-        "Команды на всякий случай: /status /run_now /test /ping /unstick\n\n"
+        "Команды на всякий случай: /status /run_now /stop /test /ping /unstick\n\n"
         + status_text(db),
         reply_markup=main_kb(db),
         parse_mode="HTML",
@@ -534,6 +576,19 @@ async def cmd_pause(message: Message) -> None:
         return
     _require_db().set_running(False)
     await message.answer("⏸ Пауза.", reply_markup=main_kb(), parse_mode="HTML")
+
+
+@router.message(Command("stop"))
+async def cmd_stop(message: Message) -> None:
+    if await _deny(message.from_user.id if message.from_user else None, message.answer):
+        return
+    db = _require_db()
+    detail = _stop_current_cycle(db)
+    await message.answer(
+        f"⏹ Стоп: {detail}.\n\n" + status_text(db),
+        reply_markup=main_kb(db),
+        parse_mode="HTML",
+    )
 
 
 @router.message(Command("ping"))
@@ -733,6 +788,22 @@ async def cb_pause(c: CallbackQuery) -> None:
     db.set_running(False)
     await _ack(c, "Пауза")
     await _replace(c, "⏸ Пауза.\n\n" + status_text(db), main_kb(db))
+
+
+@router.callback_query(F.data == "a:stop")
+async def cb_stop(c: CallbackQuery) -> None:
+    if await _deny_cb(c):
+        return
+    db = _require_db()
+    detail = _stop_current_cycle(db)
+    await _ack(c, "Стоп")
+    await _replace(
+        c,
+        f"⏹ Стоп: {detail}.\n"
+        "Следующий цикл не стартует, пока не нажмёте ▶️ Старт.\n\n"
+        + status_text(db),
+        main_kb(db),
+    )
 
 
 @router.callback_query(F.data == "a:catchup")
@@ -1493,7 +1564,7 @@ def _cycle_report(db: Database, result) -> str:
         ),
         "no_start": "Не задана стартовая точка: «🔗 Старт-ссылка» или «📜 С начала».",
         "paused": "Автопостинг на паузе.",
-        "aborted": "Цикл был прерван (например, новой командой).",
+        "aborted": "Цикл остановлен (⏹ Стоп).",
         "flood": (
             "Telegram просит подождать "
             f"{humanize_duration(getattr(result, 'flood_seconds', 0))} (flood)."
@@ -1678,8 +1749,9 @@ async def on_unknown(message: Message) -> None:
     db = _require_db()
     await message.answer(
         "Не понял команду. Управление — <b>кнопками ниже</b>.\n"
+        "⏹ Стоп — прервать текущий цикл сразу.\n"
         "🧹 Чистый перелив — только фото и видео, без описания поста.\n"
-        "Подсказка: /status · /run_now · /test · /ping\n\n"
+        "Подсказка: /status · /run_now · /stop · /test · /ping\n\n"
         + status_text(db),
         reply_markup=main_kb(db),
         parse_mode="HTML",
