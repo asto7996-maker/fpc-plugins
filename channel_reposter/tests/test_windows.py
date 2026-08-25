@@ -119,6 +119,38 @@ class MultiWindowTests(unittest.TestCase):
         self.assertEqual(self.db.get_progress_id(), 0)
         self.assertEqual(self.db.get_job(b).progress_id, 77)  # type: ignore[union-attr]
 
+    def test_clone_copies_source_not_target(self) -> None:
+        first = self.db.get_settings()
+        clone = self.db.clone_job(first.job_id)
+        self.assertEqual(clone.source_channel, "@src_a")
+        self.assertEqual(clone.target_channel, "")
+        self.assertFalse(clone.is_running)
+        self.assertEqual(clone.caption_template, "cap")
+        self.assertEqual(len(self.db.list_jobs()), 2)
+
+    def test_start_ready_and_pause_all(self) -> None:
+        a = self.db.get_settings()
+        b = self.db.create_job()
+        self.db.set_active_job(b.job_id)
+        self.db.set_source_channel("@src_b")
+        self.db.set_target_channel("@dst_b")
+        self.db.set_progress_id(0)
+
+        started, skipped = self.db.start_ready_jobs()
+        self.assertEqual(set(started), {a.job_id, b.job_id})
+        self.assertEqual(skipped, [])
+        jobs = {j.job_id: j for j in self.db.list_jobs()}
+        self.assertTrue(jobs[a.job_id].is_running)
+        self.assertTrue(jobs[b.job_id].is_running)
+
+        empty = self.db.create_job()
+        started, skipped = self.db.start_ready_jobs()
+        self.assertIn(empty.job_id, skipped)
+
+        paused = self.db.pause_all_jobs()
+        self.assertGreaterEqual(len(paused), 2)
+        self.assertFalse(any(j.is_running for j in self.db.list_jobs()))
+
 
 if __name__ == "__main__":
     unittest.main()

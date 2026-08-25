@@ -357,7 +357,7 @@ def interval_kb() -> InlineKeyboardMarkup:
 
 
 def jobs_kb(db: Database) -> InlineKeyboardMarkup:
-    """Список окон: одно на строку, плюс добавить/удалить."""
+    """Список окон: одно на строку, старт/пауза, плюс добавить/клонировать."""
     jobs = db.list_jobs()
     active = db.get_settings().job_id
     rows: list[list[InlineKeyboardButton]] = []
@@ -365,15 +365,28 @@ def jobs_kb(db: Database) -> InlineKeyboardMarkup:
         prefix = "• " if j.job_id == active else ""
         st = "🟢" if j.is_running else "⏸"
         label = f"{prefix}{st} {j.job_id}. {j.pair_label()}"
-        if len(label) > 56:
-            label = label[:53] + "…"
+        if len(label) > 48:
+            label = label[:45] + "…"
         rows.append(
-            [InlineKeyboardButton(text=label, callback_data=f"a:js:{j.job_id}")]
+            [
+                InlineKeyboardButton(text=label, callback_data=f"a:js:{j.job_id}"),
+                InlineKeyboardButton(
+                    text="⏸" if j.is_running else "▶️",
+                    callback_data=f"a:jt:{j.job_id}",
+                ),
+            ]
         )
     rows.append(
         [
+            InlineKeyboardButton(text="▶️ Старт все", callback_data="a:jall"),
+            InlineKeyboardButton(text="⏸ Пауза все", callback_data="a:jpause"),
+        ]
+    )
+    rows.append(
+        [
             InlineKeyboardButton(text="➕ Добавить", callback_data="a:ja"),
-            InlineKeyboardButton(text="🗑 Удалить это", callback_data="a:jd"),
+            InlineKeyboardButton(text="📋 Клон", callback_data="a:jc"),
+            InlineKeyboardButton(text="🗑 Удалить", callback_data="a:jd"),
         ]
     )
     rows.append([InlineKeyboardButton(text="◀️ К панели", callback_data="a:status")])
@@ -383,23 +396,27 @@ def jobs_kb(db: Database) -> InlineKeyboardMarkup:
 def jobs_text(db: Database) -> str:
     jobs = db.list_jobs()
     active = db.get_settings().job_id
+    running_n = sum(1 for j in jobs if j.is_running)
     lines = [
         "<b>🪟 Окна перелива</b>",
         "Каждое окно — своя пара каналов и свой прогресс.",
-        f"Можно до <b>{MAX_JOBS}</b> штук. Циклы идут по очереди, не параллельно.",
+        f"До <b>{MAX_JOBS}</b> штук. Один юзербот: окна ходят <b>по очереди</b> "
+        f"в одном проходе (канал1→2, потом канал3→4, …).",
+        f"Сейчас работают: <b>{running_n}/{len(jobs)}</b>",
         "",
     ]
     for j in jobs:
         mark = "•" if j.job_id == active else " "
         st = "🟢" if j.is_running else "⏸"
         cur = "  ← сейчас" if j.job_id == active else ""
+        ready = "" if j.is_ready() else "  ⚠️ нет каналов"
         lines.append(
             f"{mark} {st} <b>{j.window_title()}</b>: "
-            f"<code>{j.pair_label()}</code>{cur}"
+            f"<code>{j.pair_label()}</code>{cur}{ready}"
         )
     lines.append(
-        "\nНажмите окно, чтобы переключиться. "
-        "Дальше в панели задайте источник и назначение."
+        "\n▶️ у окна — старт только его. <b>Старт все</b> — все готовые пары.\n"
+        "<b>📋 Клон</b> — то же источник, другое назначение."
     )
     return "\n".join(lines)
 
@@ -497,7 +514,7 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
         "Перезалив каналов через <b>api_id + api_hash</b> (юзербот).\n"
         "Бот — только панель. Контент льёт аккаунт.\n\n"
         "1️⃣ «🔐 Вход» — api_id, api_hash, телефон, код\n"
-        "2️⃣ «🪟 Окна» — несколько пар каналов сразу\n"
+        "2️⃣ «🪟 Окна» — несколько пар каналов сразу (Старт все)\n"
         "3️⃣ В каждом окне: источник + назначение + «С начала»\n"
         "4️⃣ Описание → ⏱ Интервал → ▶️ Старт\n\n"
         "Управление — кнопками ниже.\n"
@@ -919,6 +936,98 @@ async def cb_job_switch(c: CallbackQuery) -> None:
         c,
         f"🪟 Переключились на <b>{job.window_title()}</b>\n"
         f"<code>{job.pair_label()}</code>\n\n" + status_text(db),
+        main_kb(db),
+    )
+
+
+@router.callback_query(F.data.startswith("a:jt:"))
+async def cb_job_toggle(c: CallbackQuery) -> None:
+    """Старт/пауза конкретного окна, не уходя из списка."""
+    if await _deny_cb(c):
+        return
+    db = _require_db()
+    try:
+        job_id = int((c.data or "").split(":")[-1])
+        job = db.get_job(job_id)
+        if job is None:
+            raise ValueError("Нет такого окна")
+        if job.is_running:
+            with db.job_scope(job_id):
+                db.set_running(False)
+            await _ack(c, f"Пауза окна {job_id}")
+        else:
+            if not _has_userbot():
+                await _ack(c, "Сначала вход юзербота", show_alert=True)
+                return
+            if not job.is_ready():
+                await _ack(c, "Каналы + стартовая точка", show_alert=True)
+                return
+            with db.job_scope(job_id):
+                _start_autopost(db)
+            await _ack(c, f"Старт окна {job_id}")
+    except (TypeError, ValueError) as e:
+        await _ack(c, str(e)[:80], show_alert=True)
+        return
+    await _replace(c, jobs_text(db), jobs_kb(db))
+
+
+@router.callback_query(F.data == "a:jall")
+async def cb_jobs_start_all(c: CallbackQuery) -> None:
+    if await _deny_cb(c):
+        return
+    if not _has_userbot():
+        await _ack(c, "Сначала вход юзербота", show_alert=True)
+        return
+    db = _require_db()
+    started, skipped = db.start_ready_jobs()
+    await _ack(c, f"Старт {len(started)} окон")
+    skip_note = (
+        f"\nПропущены без каналов: {', '.join(str(i) for i in skipped)}."
+        if skipped
+        else ""
+    )
+    await _replace(
+        c,
+        f"▶️ Включены <b>{len(started)}</b> окон — ходят по очереди.{skip_note}\n\n"
+        + jobs_text(db),
+        jobs_kb(db),
+    )
+
+
+@router.callback_query(F.data == "a:jpause")
+async def cb_jobs_pause_all(c: CallbackQuery) -> None:
+    if await _deny_cb(c):
+        return
+    db = _require_db()
+    paused = db.pause_all_jobs()
+    await _ack(c, "Пауза все")
+    await _replace(
+        c,
+        f"⏸ На паузе: <b>{len(paused)}</b> окон.\n\n" + jobs_text(db),
+        jobs_kb(db),
+    )
+
+
+@router.callback_query(F.data == "a:jc")
+async def cb_job_clone(c: CallbackQuery, state: FSMContext) -> None:
+    if await _deny_cb(c):
+        return
+    db = _require_db()
+    try:
+        job = db.clone_job()
+        db.set_active_job(job.job_id)
+    except ValueError as e:
+        await _ack(c, str(e)[:180], show_alert=True)
+        return
+    await _ack(c, f"Клон → окно {job.job_id}")
+    await state.set_state(S.target)
+    await _replace(
+        c,
+        f"📋 <b>{job.window_title()}</b> — копия источника "
+        f"<code>{_channel_label(job.source_channel)}</code>.\n\n"
+        "Пришлите <b>назначение</b> (@username или id) — это другой канал, "
+        "куда лить то же медиа. Потом «📜 С начала» и ▶️ Старт "
+        "(или «Старт все»).",
         main_kb(db),
     )
 

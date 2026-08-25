@@ -56,7 +56,7 @@ DEFAULT_CATCHUP_SECONDS = 60.0
 # Ниже этого интервала Telegram начинает ограничивать аккаунт
 MIN_INTERVAL_SECONDS = 5.0
 # Сколько независимых пар «источник → назначение» можно держать сразу
-MAX_JOBS = 8
+MAX_JOBS = 16
 
 # Поля окна ↔ ключи settings (зеркало активного окна + миграция)
 _JOB_KV = {
@@ -126,6 +126,10 @@ class Settings:
 
     def window_title(self) -> str:
         return (self.title or "").strip() or f"Окно {self.job_id}"
+
+    def is_ready(self) -> bool:
+        """Можно стартовать: есть оба канала и точка прогресса."""
+        return bool(self.source_channel and self.target_channel and self.progress_id >= 0)
 
 
 class Database:
@@ -571,6 +575,59 @@ class Database:
         due = [j for j in running if j.next_run_at <= now]
         due.sort(key=lambda j: (j.next_run_at, j.job_id))
         return due
+
+    def start_ready_jobs(self) -> tuple[list[int], list[int]]:
+        """Включить автопост у всех окон с каналами. (стартовали, пропущены)."""
+        started: list[int] = []
+        skipped: list[int] = []
+        for job in self.list_jobs():
+            if not job.is_ready():
+                skipped.append(job.job_id)
+                continue
+            with self.job_scope(job.job_id):
+                self.set_running(True)
+                self.clear_last_error()
+                self.run_asap()
+            started.append(job.job_id)
+        return started, skipped
+
+    def pause_all_jobs(self) -> list[int]:
+        """Поставить на паузу все окна. Возвращает id, которые были включены."""
+        paused: list[int] = []
+        for job in self.list_jobs():
+            if not job.is_running:
+                continue
+            with self.job_scope(job.job_id):
+                self.set_running(False)
+            paused.append(job.job_id)
+        return paused
+
+    def clone_job(self, job_id: Optional[int] = None) -> Settings:
+        """Новое окно с тем же источником и настройками, назначение пустое."""
+        src = self.get_job(int(job_id)) if job_id else self.get_settings()
+        if src is None:
+            src = self.get_settings()
+        created = self.create_job(title="")
+        with self.job_scope(created.job_id):
+            if src.source_channel:
+                self.set_source_channel(src.source_channel)
+            self.set_caption(src.caption_template)
+            self.set_interval_seconds(src.interval_seconds)
+            self.set_posts_per_cycle(src.posts_per_cycle)
+            self.set_catchup(src.catchup_enabled)
+            self.set_catchup_seconds(src.catchup_seconds)
+            self.set_notify_cycles(src.notify_cycles)
+            self.set_clean_transfer(src.clean_transfer)
+        job = self.get_job(created.job_id)
+        if job is None:
+            raise RuntimeError("Не удалось клонировать окно")
+        logger.info(
+            "Клон окна %s → %s (источник %s)",
+            src.job_id,
+            job.job_id,
+            src.source_channel or "—",
+        )
+        return job
 
     def create_job(self, *, title: str = "") -> Settings:
         if self._job_count() >= MAX_JOBS:

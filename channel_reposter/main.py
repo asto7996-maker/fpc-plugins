@@ -45,6 +45,8 @@ STUCK_AFTER = 300.0
 HEALTH_EVERY = 300.0
 # Не спамить админа сообщениями про flood
 FLOOD_NOTICE_EVERY = 600.0
+# Пауза между окнами в одном проходе (один юзербот, без параллельного flood)
+WINDOW_GAP = 0.8
 # Сколько ждать вход юзербота при старте (панель при этом уже работает)
 BOOTSTRAP_TIMEOUT = 120.0
 # Отставание event loop, после которого пишем в лог «панель подтормаживает»
@@ -213,6 +215,105 @@ def _schedule_next(db: Database, plan: NextRun) -> float:
     return at
 
 
+async def _finish_scheduled_cycle(
+    db: Database,
+    poster: ChannelPoster,
+    result,
+    *,
+    idle_streaks: dict[int, int],
+    error_streaks: dict[int, int],
+    fatal_notified: dict[int, str],
+    now: float,
+    last_health: float,
+    last_flood_notice: float,
+) -> tuple[ChannelPoster, float, float]:
+    """Учесть итог цикла окна и запланировать следующий. Возвращает poster и таймеры."""
+    jid = db.get_settings().job_id
+    db.mark_cycle(result.published)
+    settings = db.get_settings()
+    idle_streak = idle_streaks.get(jid, 0)
+    error_streak = error_streaks.get(jid, 0)
+    window = settings.pair_label()
+
+    if result.published:
+        idle_streak = 0
+        error_streak = 0
+        db.clear_last_error()
+        fatal_notified.pop(jid, None)
+        if settings.notify_cycles:
+            _notify_admin(
+                db,
+                f"✅ <b>{window}</b>\n"
+                f"Опубликовано: <b>{result.published}</b>\n"
+                f"Очередь: <b>{result.backlog}</b>",
+            )
+    elif result.reason in (POST_REASON_ERROR, POST_REASON_SOURCE_EMPTY):
+        error_streak += 1
+        db.set_last_error(result.error or result.reason)
+        if error_streak in (1, 5) or error_streak % 20 == 0:
+            _notify_admin(
+                db,
+                f"⚠️ <b>{window}</b> — цикл не удался ({error_streak}-й раз):\n"
+                f"<code>{(result.error or result.reason)[:300]}</code>",
+            )
+    elif result.reason == POST_REASON_FLOOD:
+        db.set_last_error(
+            f"Telegram просит подождать {result.flood_seconds:.0f} сек"
+        )
+        if now - last_flood_notice > FLOOD_NOTICE_EVERY:
+            last_flood_notice = now
+            _notify_admin(
+                db,
+                f"⏳ <b>{window}</b> — Telegram ограничил аккаунт (flood).\n"
+                f"Пауза: <b>{humanize_duration(result.flood_seconds)}</b>. "
+                "Публикация продолжится сама.",
+            )
+    elif result.reason == POST_REASON_FATAL:
+        db.set_running(False)
+        db.set_last_error(result.fatal_text or "критическая ошибка")
+        if fatal_notified.get(jid) != result.fatal_text:
+            fatal_notified[jid] = result.fatal_text
+            _notify_admin(
+                db,
+                f"🛑 Окно <b>{window}</b> остановлено.\n"
+                f"Причина: {result.fatal_text or 'критическая ошибка'}\n\n"
+                "Исправьте и нажмите ▶️ Старт. Остальные окна продолжают работу.",
+            )
+        idle_streaks[jid] = idle_streak
+        error_streaks[jid] = error_streak
+        logger.info("Окно %s %s: %s", jid, window, result.reason)
+        return poster, last_health, last_flood_notice
+    else:
+        idle_streak += 1
+        error_streak = 0
+        if result.reason != POST_REASON_ABORTED:
+            db.clear_last_error()
+
+    idle_streaks[jid] = idle_streak
+    error_streaks[jid] = error_streak
+
+    if (result.needs_reconnect or error_streak >= 2) and (
+        now - last_health > HEALTH_EVERY or result.needs_reconnect
+    ):
+        last_health = now
+        if await _reconnect_userbot(db):
+            poster = BRIDGE.poster or poster
+
+    plan = plan_next_delay(
+        published=result.published,
+        interval_seconds=settings.interval_seconds,
+        catchup=settings.catchup_enabled,
+        catchup_seconds=settings.catchup_seconds,
+        backlog=result.backlog,
+        idle_streak=idle_streak,
+        error_streak=error_streak,
+        flood_seconds=result.flood_seconds,
+    )
+    _schedule_next(db, plan)
+    logger.info("Окно %s %s: %s", jid, window, result.reason)
+    return poster, last_health, last_flood_notice
+
+
 async def _worker_scheduler() -> None:
     """
     Единственный источник автопостинга.
@@ -288,94 +389,35 @@ async def _worker_scheduler() -> None:
                 await asyncio.sleep(TICK)
                 continue
 
-            job = due[0]
-            jid = job.job_id
-            # Клиент могли пересоздать (повторный вход) — берём актуальный
-            poster = _sync_poster(db, poster)
-
-            with db.job_scope(jid):
-                result = await poster.run_cycle()
-                db.mark_cycle(result.published)
-                settings = db.get_settings()
-                idle_streak = idle_streaks.get(jid, 0)
-                error_streak = error_streaks.get(jid, 0)
-                window = settings.pair_label()
-
-                if result.published:
-                    idle_streak = 0
-                    error_streak = 0
-                    db.clear_last_error()
-                    fatal_notified.pop(jid, None)
-                    if settings.notify_cycles:
-                        _notify_admin(
-                            db,
-                            f"✅ <b>{window}</b>\n"
-                            f"Опубликовано: <b>{result.published}</b>\n"
-                            f"Очередь: <b>{result.backlog}</b>",
-                        )
-                elif result.reason in (POST_REASON_ERROR, POST_REASON_SOURCE_EMPTY):
-                    error_streak += 1
-                    db.set_last_error(result.error or result.reason)
-                    if error_streak in (1, 5) or error_streak % 20 == 0:
-                        _notify_admin(
-                            db,
-                            f"⚠️ <b>{window}</b> — цикл не удался ({error_streak}-й раз):\n"
-                            f"<code>{(result.error or result.reason)[:300]}</code>",
-                        )
-                elif result.reason == POST_REASON_FLOOD:
-                    db.set_last_error(
-                        f"Telegram просит подождать {result.flood_seconds:.0f} сек"
-                    )
-                    if now - last_flood_notice > FLOOD_NOTICE_EVERY:
-                        last_flood_notice = now
-                        _notify_admin(
-                            db,
-                            f"⏳ <b>{window}</b> — Telegram ограничил аккаунт (flood).\n"
-                            f"Пауза: <b>{humanize_duration(result.flood_seconds)}</b>. "
-                            "Публикация продолжится сама.",
-                        )
-                elif result.reason == POST_REASON_FATAL:
-                    db.set_running(False)
-                    db.set_last_error(result.fatal_text or "критическая ошибка")
-                    if fatal_notified.get(jid) != result.fatal_text:
-                        fatal_notified[jid] = result.fatal_text
-                        _notify_admin(
-                            db,
-                            f"🛑 Окно <b>{window}</b> остановлено.\n"
-                            f"Причина: {result.fatal_text or 'критическая ошибка'}\n\n"
-                            "Исправьте и нажмите ▶️ Старт. Остальные окна продолжают работу.",
-                        )
-                    idle_streaks[jid] = idle_streak
-                    error_streaks[jid] = error_streak
+            # Все просроченные окна — в одном проходе, по очереди (один юзербот)
+            for index, job in enumerate(due):
+                poster = BRIDGE.poster
+                if poster is None or poster.is_busy:
+                    break
+                live = db.get_job(job.job_id)
+                if live is None or not live.is_running:
                     continue
-                else:
-                    idle_streak += 1
-                    error_streak = 0
-                    if result.reason != POST_REASON_ABORTED:
-                        db.clear_last_error()
-
-                idle_streaks[jid] = idle_streak
-                error_streaks[jid] = error_streak
-
-                if (result.needs_reconnect or error_streak >= 2) and (
-                    now - last_health > HEALTH_EVERY or result.needs_reconnect
-                ):
-                    last_health = now
-                    if await _reconnect_userbot(db):
-                        poster = BRIDGE.poster or poster
-
-                plan = plan_next_delay(
-                    published=result.published,
-                    interval_seconds=settings.interval_seconds,
-                    catchup=settings.catchup_enabled,
-                    catchup_seconds=settings.catchup_seconds,
-                    backlog=result.backlog,
-                    idle_streak=idle_streak,
-                    error_streak=error_streak,
-                    flood_seconds=result.flood_seconds,
-                )
-                _schedule_next(db, plan)
-                logger.info("Окно %s %s: %s", jid, window, result.reason)
+                poster = _sync_poster(db, poster)
+                if index > 0:
+                    await asyncio.sleep(WINDOW_GAP)
+                    if poster.is_busy:
+                        break
+                    live = db.get_job(job.job_id)
+                    if live is None or not live.is_running:
+                        continue
+                with db.job_scope(job.job_id):
+                    result = await poster.run_cycle()
+                    poster, last_health, last_flood_notice = await _finish_scheduled_cycle(
+                        db,
+                        poster,
+                        result,
+                        idle_streaks=idle_streaks,
+                        error_streaks=error_streaks,
+                        fatal_notified=fatal_notified,
+                        now=time.time(),
+                        last_health=last_health,
+                        last_flood_notice=last_flood_notice,
+                    )
         except Exception:
             logger.exception("Ошибка планировщика")
             try:
