@@ -1,13 +1,9 @@
 """
-transfer_filters.py — отдельная функция чистого перелива канала в канал.
+transfer_filters.py — чистый перелив канала в канал.
 
-При переносе контента игнорируем:
-  • ссылки (URL, text_link, превью web_page, http(s)/t.me в тексте);
-  • файлы (document);
-  • гифки (animation и gif-документы);
-  • голосовые (voice).
-
-Фото, видео, кружки, стикеры и обычный текст без ссылок — оставляем.
+Строгий режим: в назначение уходит только фото и видео.
+Без описания поста, без шаблона подписи, без файлов, эмодзи, гифок,
+голосовых, стикеров, кружков и текста.
 """
 
 from __future__ import annotations
@@ -34,10 +30,20 @@ _LINK_ENTITY_TYPES = frozenset(
     }
 )
 
+_EMOJI_ENTITY_TYPES = frozenset(
+    {
+        "customemoji",
+        "custom_emoji",
+        "messageentitycustomemoji",
+    }
+)
+
 REASON_LINK = "ссылка"
 REASON_FILE = "файл"
 REASON_GIF = "гифка"
 REASON_VOICE = "голосовое"
+REASON_TEXT = "текст"
+REASON_EMOJI = "эмодзи"
 
 
 def _entity_type_name(entity: Any) -> str:
@@ -87,6 +93,22 @@ def _is_gif_document(doc: Any) -> bool:
     return False
 
 
+def _has_custom_emoji(msg: Any) -> bool:
+    for entity in _iter_entities(msg):
+        if _entity_type_name(entity) in _EMOJI_ENTITY_TYPES:
+            return True
+        if getattr(entity, "custom_emoji_id", None):
+            return True
+    return False
+
+
+def is_photo_or_video(msg: Any) -> bool:
+    """Обычное фото или видео. Гифки (animation) — нет."""
+    if getattr(msg, "animation", None):
+        return False
+    return bool(getattr(msg, "photo", None) or getattr(msg, "video", None))
+
+
 def ignored_link_reason(msg: Any) -> Optional[str]:
     """Почему пост считается ссылкой, либо None."""
     if _has_web_preview(msg):
@@ -103,11 +125,17 @@ def ignored_link_reason(msg: Any) -> Optional[str]:
 
 
 def ignored_media_reason(msg: Any) -> Optional[str]:
-    """Почему медиа игнорируем (файл / гифка / голосовое), либо None."""
+    """Почему медиа игнорируем (файл / гифка / голосовое / эмодзи), либо None."""
     if getattr(msg, "voice", None):
         return REASON_VOICE
     if getattr(msg, "animation", None):
         return REASON_GIF
+    if getattr(msg, "sticker", None) or getattr(msg, "dice", None):
+        return REASON_EMOJI
+    if getattr(msg, "video_note", None):
+        return REASON_FILE
+    if getattr(msg, "audio", None):
+        return REASON_FILE
     doc = getattr(msg, "document", None)
     if not doc:
         return None
@@ -118,12 +146,20 @@ def ignored_media_reason(msg: Any) -> Optional[str]:
 
 def transfer_skip_reason(msg: Any) -> Optional[str]:
     """
-    Отдельная функция перелива: почему этот пост не копируем.
+    Почему этот пост не копируем при чистом переливе.
 
-    Возвращает короткую причину («ссылка», «файл», «гифка», «голосовое»)
-    или None, если пост можно публиковать.
+    Фото и видео оставляем (описание потом снимается).
+    Всё остальное — пропуск.
     """
-    return ignored_link_reason(msg) or ignored_media_reason(msg)
+    if is_photo_or_video(msg):
+        return None
+    return ignored_media_reason(msg) or ignored_link_reason(msg) or _non_media_reason(msg)
+
+
+def _non_media_reason(msg: Any) -> str:
+    if _has_custom_emoji(msg):
+        return REASON_EMOJI
+    return REASON_TEXT
 
 
 def should_skip_transfer(msg: Any) -> bool:
@@ -135,19 +171,14 @@ def filter_album_for_transfer(messages: list[Any]) -> tuple[list[Any], Optional[
     """
     Фильтр альбома для чистого перелива.
 
-    Если в любом элементе есть ссылка — пропускаем весь альбом.
-    Файлы / гифки / голосовые выкидываем поштучно.
-    Возвращает (оставленные сообщения, причина пропуска всего альбома).
+    Оставляем только фото/видео. Ссылки в описании не роняют альбом:
+    подпись всё равно снимается. Файлы, гифки, голосовые выкидываем
+    поштучно. Если медиа не осталось — пропускаем весь альбом.
     """
     if not messages:
         return [], "пусто"
 
-    for msg in messages:
-        reason = ignored_link_reason(msg)
-        if reason:
-            return [], reason
-
-    kept = [msg for msg in messages if ignored_media_reason(msg) is None]
+    kept = [msg for msg in messages if is_photo_or_video(msg)]
     if not kept:
-        return [], ignored_media_reason(messages[0]) or "файл"
+        return [], transfer_skip_reason(messages[0]) or REASON_FILE
     return kept, None

@@ -51,6 +51,22 @@ def photo_message(
     )
 
 
+def video_message(
+    message_id: int,
+    *,
+    caption: Optional[str] = None,
+    group: Optional[str] = None,
+    chat_id: int = SOURCE_ID,
+) -> Message:
+    return Message(
+        id=message_id,
+        chat=make_chat(chat_id),
+        video=_Media(f"vid_{message_id}", mime_type="video/mp4"),
+        caption=caption,
+        media_group_id=group,
+    )
+
+
 def sticker_message(message_id: int, chat_id: int = SOURCE_ID) -> Message:
     sticker = Sticker(
         file_id=f"sticker_{message_id}",

@@ -973,8 +973,21 @@ class ChannelPoster:
                 await asyncio.sleep(2.0 * attempt)
 
     def _clean_transfer_enabled(self) -> bool:
-        """Чистый перелив: пропускать ссылки, файлы, гифки и голосовые."""
+        """Чистый перелив: только фото/видео, без описания."""
         return bool(self.db.get_settings().clean_transfer)
+
+    def _copy_caption_kwargs(self, caption: str) -> dict:
+        """
+        Аргументы caption для copy_message / send_*.
+
+        Pyrogram: не передавать caption → оставить оригинал источника.
+        caption="" → снять описание (чистый перелив).
+        """
+        if self._clean_transfer_enabled():
+            return {"caption": ""}
+        if caption:
+            return {"caption": caption, "parse_mode": enums.ParseMode.HTML}
+        return {}
 
     async def _process(
         self, source, target, message_id: int, caption: str
@@ -988,6 +1001,10 @@ class ChannelPoster:
 
         if msg is None or getattr(msg, "empty", False):
             return "empty"
+
+        if self._clean_transfer_enabled():
+            # Без описания поста и без шаблона «✏️ Описание»
+            caption = ""
 
         if msg.media_group_id:
             gid = str(msg.media_group_id)
@@ -1025,13 +1042,13 @@ class ChannelPoster:
                     message_id=msg.id,
                 )
             elif _is_media(msg):
+                cap_kw = self._copy_caption_kwargs(caption)
                 try:
                     sent = await self.client.copy_message(
                         chat_id=target,
                         from_chat_id=msg.chat.id,
                         message_id=msg.id,
-                        caption=caption or None,
-                        parse_mode=enums.ParseMode.HTML if caption else None,
+                        **cap_kw,
                     )
                 except RPCError as e:
                     if caption and "parse" in str(e).lower():
@@ -1060,7 +1077,10 @@ class ChannelPoster:
                         raise
             else:
                 # MessageMediaUnsupported и т.п. — материализуем и шлём с шаблоном
-                item = await self._input_media_from_msg(msg, caption=caption or None)
+                send_cap = self._copy_caption_kwargs(caption)
+                item = await self._input_media_from_msg(
+                    msg, caption=send_cap.get("caption")
+                )
                 if item is None:
                     logger.warning("skip unsupported single %s", msg.id)
                     self.db.add_history(msg.id, status="error", error="unsupported media")
@@ -1071,22 +1091,19 @@ class ChannelPoster:
                         sent = await self.client.send_photo(
                             target,
                             item.media,
-                            caption=caption or None,
-                            parse_mode=enums.ParseMode.HTML if caption else None,
+                            **send_cap,
                         )
                     elif isinstance(item, InputMediaVideo):
                         sent = await self.client.send_video(
                             target,
                             item.media,
-                            caption=caption or None,
-                            parse_mode=enums.ParseMode.HTML if caption else None,
+                            **send_cap,
                         )
                     else:
                         sent = await self.client.send_document(
                             target,
                             item.media,
-                            caption=caption or None,
-                            parse_mode=enums.ParseMode.HTML if caption else None,
+                            **send_cap,
                         )
                 except RPCError as e:
                     if caption and "parse" in str(e).lower():
@@ -1162,6 +1179,7 @@ class ChannelPoster:
         original_album = album
         rebuild_album = False
         if self._clean_transfer_enabled():
+            caption = ""
             kept, skip_reason = filter_album_for_transfer(album)
             if skip_reason:
                 logger.info(
@@ -1178,7 +1196,7 @@ class ChannelPoster:
             if len(kept) != len(album):
                 kept_ids = {m.id for m in kept}
                 logger.info(
-                    "чистый перелив: альбом %s без %s файл/гиф/голос",
+                    "чистый перелив: альбом %s без %s не-медиа",
                     gid,
                     len(album) - len(kept),
                 )
@@ -1190,8 +1208,9 @@ class ChannelPoster:
                             status="skip",
                             error=transfer_skip_reason(m) or "файл",
                         )
-                album = kept
-                rebuild_album = True
+            album = kept
+            # Всегда пересобираем: copy_media_group оставляет описание источника
+            rebuild_album = True
 
         sent_list = None
         try:
@@ -1279,6 +1298,9 @@ class ChannelPoster:
             # на всякий случай — шаблон так и не повесили
             _attach_caption(media_list[0], caption)
 
+        if len(media_list) == 1:
+            return [await self._send_one_input_media(target, media_list[0], caption)]
+
         try:
             sent = await self.client.send_media_group(chat_id=target, media=media_list)
         except RPCError as e:
@@ -1318,6 +1340,15 @@ class ChannelPoster:
                 logger.error("album still without caption after retry")
 
         return sent
+
+    async def _send_one_input_media(self, target, item, caption: str) -> Message:
+        """Один оставшийся кадр альбома — обычное фото/видео, не media_group."""
+        cap_kw = self._copy_caption_kwargs(caption)
+        if isinstance(item, InputMediaPhoto):
+            return await self.client.send_photo(target, item.media, **cap_kw)
+        if isinstance(item, InputMediaVideo):
+            return await self.client.send_video(target, item.media, **cap_kw)
+        return await self.client.send_document(target, item.media, **cap_kw)
 
     # ------------------------------------------------------------------ rewrite
 

@@ -28,6 +28,7 @@ from fake_client import (  # noqa: E402
     photo_message,
     sticker_message,
     text_message,
+    video_message,
     voice_message,
 )
 from poster import (  # noqa: E402
@@ -56,6 +57,8 @@ class CycleTestCase(unittest.TestCase):
         )
         self.db.set_running(True)
         self.db.set_progress_id(0)
+        # Базовые тесты цикла — полный копир; чистый перелив проверяется отдельно
+        self.db.set_clean_transfer(False)
         # Пауза между публикациями внутри цикла не нужна в тестах
         self._delay_min = poster_module.config.POST_DELAY_MIN
         self._delay_max = poster_module.config.POST_DELAY_MAX
@@ -371,25 +374,41 @@ class FailureTests(CycleTestCase):
 
 
 class CleanTransferCycleTests(CycleTestCase):
-    """Отдельная функция перелива: игнор ссылок, файлов, гифок, голосовых."""
+    """Строгий чистый перелив: только фото/видео, без описания."""
 
-    def test_skips_links_files_gifs_voice_keeps_photo_and_text(self) -> None:
+    def setUp(self) -> None:
+        super().setUp()
+        self.db.set_clean_transfer(True)
+
+    def test_skips_text_files_emoji_gifs_keeps_photo_video(self) -> None:
         client = FakeClient(
             [
                 text_message(1, "https://spam.example/x"),
                 document_message(2),
                 animation_message(3),
                 voice_message(4),
-                photo_message(5),
+                sticker_message(5),
                 text_message(6, "чистый текст"),
+                photo_message(7, caption="описание поста"),
+                video_message(8, caption="ещё описание"),
             ]
         )
         result, _ = self.run_cycle(client, limit=2)
 
         self.assertEqual(result.published, 2)
-        self.assertEqual([p["kind"] for p in client.published], ["copy", "text"])
-        self.assertEqual(client.published[1]["text"], "чистый текст")
-        self.assertEqual(self.db.get_progress_id(), 6)
+        self.assertEqual([p["kind"] for p in client.published], ["copy", "copy"])
+        self.assertEqual(client.published[0]["caption"], "")
+        self.assertEqual(client.published[1]["caption"], "")
+        self.assertEqual(self.db.get_progress_id(), 8)
+
+    def test_strips_caption_and_ignores_template(self) -> None:
+        self.db.set_caption("<b>реклама VPN</b>")
+        client = FakeClient([photo_message(1, caption="исходное описание")])
+        result, _ = self.run_cycle(client, limit=1)
+
+        self.assertEqual(result.published, 1)
+        self.assertEqual(client.published[0]["kind"], "copy")
+        self.assertEqual(client.published[0]["caption"], "")
 
     def test_disabled_filter_copies_document(self) -> None:
         self.db.set_clean_transfer(False)
@@ -400,10 +419,11 @@ class CleanTransferCycleTests(CycleTestCase):
         self.assertEqual(client.published[0]["kind"], "copy")
         self.assertEqual(self.db.get_progress_id(), 1)
 
-    def test_album_with_file_publishes_photos_only(self) -> None:
+    def test_album_with_file_publishes_photos_only_without_caption(self) -> None:
+        self.db.set_caption("шаблон")
         client = FakeClient(
             [
-                photo_message(1, group="g1"),
+                photo_message(1, group="g1", caption="подпись альбома"),
                 document_message(2, group="g1"),
                 photo_message(3, group="g1"),
             ]
@@ -413,20 +433,21 @@ class CleanTransferCycleTests(CycleTestCase):
         self.assertEqual(result.published, 1)
         self.assertEqual(client.published[0]["kind"], "album")
         self.assertEqual(client.published[0]["size"], 2)
+        self.assertFalse(client.published[0]["caption"])
         self.assertEqual(self.db.get_progress_id(), 3)
 
-    def test_album_of_gifs_is_skipped(self) -> None:
+    def test_album_of_gifs_is_skipped_photo_kept(self) -> None:
         client = FakeClient(
             [
                 animation_message(1, group="gifs"),
                 animation_message(2, group="gifs"),
-                text_message(3, "после"),
+                photo_message(3),
             ]
         )
         result, _ = self.run_cycle(client, limit=1)
 
         self.assertEqual(result.published, 1)
-        self.assertEqual(client.published[0]["kind"], "text")
+        self.assertEqual(client.published[0]["kind"], "copy")
         self.assertEqual(self.db.get_progress_id(), 3)
 
 

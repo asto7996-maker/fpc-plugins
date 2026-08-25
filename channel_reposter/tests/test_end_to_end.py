@@ -49,6 +49,8 @@ class EndToEndSchedulingTests(unittest.TestCase):
         self.db.set_running(True)
         self.db.set_progress_id(0)
         self.db.run_asap()
+        # Сквозной тест гоняет текстовые посты — чистый перелив здесь выкл.
+        self.db.set_clean_transfer(False)
 
         self.client = FakeClient([text_message(i, f"post {i}") for i in range(1, 11)])
 

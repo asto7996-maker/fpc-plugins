@@ -409,7 +409,7 @@ def status_text(db: Database) -> str:
         ),
         f"🧹 Чистый перелив: <b>{'вкл' if s.clean_transfer else 'выкл'}</b>"
         + (
-            " (пропуск ссылок, файлов, гифок, голосовых)"
+            " (только фото/видео, без описания)"
             if s.clean_transfer
             else ""
         ),
@@ -777,7 +777,7 @@ async def cb_notify(c: CallbackQuery) -> None:
 
 @router.callback_query(F.data == "a:clean")
 async def cb_clean_transfer(c: CallbackQuery) -> None:
-    """Отдельный режим перелива: без ссылок, файлов, гифок и голосовых."""
+    """Строгий перелив: только фото и видео, без описания."""
     if await _deny_cb(c):
         return
     db = _require_db()
@@ -787,17 +787,19 @@ async def cb_clean_transfer(c: CallbackQuery) -> None:
     if new_state:
         text = (
             "🧹 <b>Чистый перелив включён</b>\n"
-            "При копировании из канала в канал бот <b>пропускает</b>:\n"
-            "• ссылки (URL, t.me, превью страниц)\n"
-            "• файлы (документы)\n"
+            "В канал уходит <b>только медиа</b> — фото и видео.\n"
+            "Без описания поста, без шаблона подписи.\n\n"
+            "Пропускаю:\n"
+            "• текст и подписи\n"
+            "• файлы\n"
+            "• эмодзи и стикеры\n"
             "• гифки\n"
-            "• голосовые\n\n"
-            "Фото, видео, стикеры и обычный текст без ссылок — переливаются."
+            "• голосовые и кружки"
         )
     else:
         text = (
             "🧹 <b>Чистый перелив выключен</b>\n"
-            "Копирую посты как есть, включая ссылки, файлы, гифки и голосовые."
+            "Копирую посты как есть, с описанием, файлами, гифками и текстом."
         )
     await _replace(c, text + "\n\n" + status_text(db), main_kb(db))
 
@@ -810,7 +812,7 @@ async def cmd_clean_transfer(message: Message) -> None:
     new_state = not db.get_settings().clean_transfer
     db.set_clean_transfer(new_state)
     text = (
-        "🧹 <b>Чистый перелив включён</b> — пропускаю ссылки, файлы, гифки и голосовые."
+        "🧹 <b>Чистый перелив включён</b> — только фото и видео, без описания."
         if new_state
         else "🧹 <b>Чистый перелив выключен</b> — копирую всё как есть."
     )
@@ -1676,7 +1678,7 @@ async def on_unknown(message: Message) -> None:
     db = _require_db()
     await message.answer(
         "Не понял команду. Управление — <b>кнопками ниже</b>.\n"
-        "🧹 Чистый перелив — без ссылок, файлов, гифок и голосовых.\n"
+        "🧹 Чистый перелив — только фото и видео, без описания поста.\n"
         "Подсказка: /status · /run_now · /test · /ping\n\n"
         + status_text(db),
         reply_markup=main_kb(db),
