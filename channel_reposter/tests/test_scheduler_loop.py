@@ -22,6 +22,7 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import main as main_module  # noqa: E402
+import config as config_module  # noqa: E402
 from bridge import BRIDGE  # noqa: E402
 from database import Database  # noqa: E402
 from poster import (  # noqa: E402
@@ -41,6 +42,7 @@ class FakePoster:
         self._busy = False
         self.unlocked = 0
         self.jobs_ran: list[int] = []
+        self.limits: list = []
 
     @property
     def is_busy(self) -> bool:
@@ -53,8 +55,15 @@ class FakePoster:
     def force_unlock(self) -> None:
         self.unlocked += 1
 
-    async def run_cycle(self, limit=None, *, force=False) -> CycleResult:
+    def request_abort(self) -> None:
+        return None
+
+    async def wait_until_idle(self, timeout: float = 120.0) -> bool:
+        return True
+
+    async def run_cycle(self, limit=None, *, force=False, deadline=None, **kwargs) -> CycleResult:
         self.calls += 1
+        self.limits.append(limit)
         if BRIDGE.db is not None:
             self.jobs_ran.append(int(BRIDGE.db.get_settings().job_id))
         if self.results:
@@ -320,6 +329,40 @@ class SchedulerLoopTests(unittest.TestCase):
         asyncio.run(self._run_loop(steps))
         self.assertGreaterEqual(poster.calls, 2)
         self.assertEqual(set(poster.jobs_ran[:2]), {first.job_id, second.job_id})
+
+    def test_pass_budget_splits_between_windows(self) -> None:
+        """Общий лимит прохода делится между окнами, а не отдаётся первому."""
+        saved = config_module.PASS_PUBLISH_LIMIT
+        config_module.PASS_PUBLISH_LIMIT = 2
+        self.addCleanup(setattr, config_module, "PASS_PUBLISH_LIMIT", saved)
+
+        first = self.db.get_settings()
+        self.db.set_posts_per_cycle(10)
+        second = self.db.create_job()
+        self.db.set_active_job(second.job_id)
+        self.db.set_source_channel("@src_b")
+        self.db.set_target_channel("@dst_b")
+        self.db.set_progress_id(0)
+        self.db.set_posts_per_cycle(10)
+        self.db.set_running(True)
+        self.db.run_asap()
+        self.db.set_active_job(first.job_id)
+
+        poster = FakePoster(
+            [
+                CycleResult(published=1, latest_id=10, progress_id=1),
+                CycleResult(published=1, latest_id=20, progress_id=1),
+            ]
+        )
+        BRIDGE.poster = poster
+
+        async def steps() -> None:
+            self.assertTrue(await self._wait_for(lambda: poster.calls >= 2))
+
+        asyncio.run(self._run_loop(steps))
+        self.assertGreaterEqual(len(poster.limits), 2)
+        self.assertEqual(poster.limits[0], 1)
+        self.assertEqual(poster.limits[1], 1)
 
 
 if __name__ == "__main__":

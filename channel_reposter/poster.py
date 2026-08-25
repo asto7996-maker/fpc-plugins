@@ -66,6 +66,7 @@ REASON_ABORTED = "aborted"
 REASON_FLOOD = "flood"
 REASON_FATAL = "fatal"
 REASON_ERROR = "error"
+REASON_TIMEOUT = "timeout"
 
 # Долгий FloodWait не «пересиживаем» внутри цикла — отдаём планировщику
 FLOOD_INLINE_LIMIT = 90
@@ -320,6 +321,7 @@ class ChannelPoster:
         self._busy_since = 0.0
         self._cycle_gen = 0
         self._running_job_id: Optional[int] = None
+        self._cycle_deadline = 0.0
         self.last_result: Optional[CycleResult] = None
         # Быстрый путь поиска новых ID: None — ещё не проверяли, False — не работает
         self._history_window_ok: Optional[bool] = None
@@ -408,13 +410,25 @@ class ChannelPoster:
         return was_busy
 
     async def _sleep_or_abort(self, seconds: float, my_gen: int) -> bool:
-        """Сон, который можно прервать кнопкой Стоп. True = прервали."""
+        """Сон, который можно прервать Стопом или тайм-аутом. True = прервали."""
         deadline = time.monotonic() + max(0.0, float(seconds))
         while time.monotonic() < deadline:
-            if self._abort_cycle or my_gen != self._cycle_gen:
+            if self._cycle_stop_reason(my_gen):
                 return True
             await asyncio.sleep(min(0.25, max(0.0, deadline - time.monotonic())))
-        return self._abort_cycle or my_gen != self._cycle_gen
+        return bool(self._cycle_stop_reason(my_gen))
+
+    def _time_left(self) -> float:
+        if self._cycle_deadline <= 0:
+            return 1e9
+        return max(0.0, self._cycle_deadline - time.monotonic())
+
+    def _cycle_stop_reason(self, my_gen: int) -> Optional[str]:
+        if my_gen != self._cycle_gen or self._abort_cycle:
+            return REASON_ABORTED
+        if self._cycle_deadline and time.monotonic() >= self._cycle_deadline:
+            return REASON_TIMEOUT
+        return None
 
     @property
     def running_job_id(self) -> Optional[int]:
@@ -562,12 +576,14 @@ class ChannelPoster:
         self._busy = False
         self._busy_since = 0.0
         self._running_job_id = None
+        self._cycle_deadline = 0.0
 
     async def run_cycle(
         self,
         limit: Optional[int] = None,
         *,
         force: bool = False,
+        deadline: Optional[float] = None,
     ) -> CycleResult:
         """
         Один цикл публикации.
@@ -575,12 +591,13 @@ class ChannelPoster:
         Args:
             limit: разовый лимит публикаций (иначе берётся из настроек).
             force: игнорировать «пауза» — для ручного «Цикл сейчас» и теста.
+            deadline: monotonic-время, после которого цикл сам останавливается.
         """
         # Если уже идёт цикл — прерываем и ждём, не возвращаем тихо 0
         if self._busy:
             logger.info("cycle waiting: busy")
             self.request_abort()
-            ok = await self.wait_until_idle(timeout=180.0)
+            ok = await self.wait_until_idle(timeout=min(30.0, self._time_left() or 30.0))
             if not ok or self._busy:
                 logger.warning("cycle still busy — force unlock")
                 self.force_unlock()
@@ -588,6 +605,7 @@ class ChannelPoster:
         self._cycle_gen += 1
         my_gen = self._cycle_gen
         self._abort_cycle = False
+        self._cycle_deadline = float(deadline) if deadline else 0.0
         self._busy = True
         self._busy_since = time.monotonic()
         try:
@@ -616,6 +634,7 @@ class ChannelPoster:
                 self._busy_since = 0.0
                 self._abort_cycle = False
                 self._running_job_id = None
+                self._cycle_deadline = 0.0
         self.last_result = result
         return result
 
@@ -820,14 +839,16 @@ class ChannelPoster:
 
         while published < limit_value and steps < MAX_STEPS_PER_CYCLE:
             steps += 1
-            if self._abort_cycle or my_gen != self._cycle_gen:
+            stop = self._cycle_stop_reason(my_gen)
+            if stop:
                 logger.info(
-                    "cycle aborted gen=%s/%s published=%s",
+                    "cycle stop %s gen=%s/%s published=%s",
+                    stop,
                     my_gen,
                     self._cycle_gen,
                     published,
                 )
-                result.reason = REASON_ABORTED
+                result.reason = stop
                 break
 
             live = self.db.get_settings()
@@ -877,9 +898,14 @@ class ChannelPoster:
                 )
             except FloodWait as e:
                 wait = float(getattr(e, "value", 0) or 0)
-                # Короткие ожидания пересиживаем, длинные (и сумму долгих
-                # коротких) отдаём планировщику — цикл не должен висеть
-                if wait > FLOOD_INLINE_LIMIT or flood_slept + wait > FLOOD_BUDGET:
+                # Короткие ожидания пересиживаем, длинные отдаём планировщику —
+                # иначе одно окно держит весь оконный проход.
+                remain = self._time_left()
+                if (
+                    wait > FLOOD_INLINE_LIMIT
+                    or wait + 1 > remain
+                    or flood_slept + wait > FLOOD_BUDGET
+                ):
                     logger.warning("FloodWait %.0fs — отдаём планировщику", wait)
                     result.reason = REASON_FLOOD
                     result.flood_seconds = wait
@@ -887,7 +913,7 @@ class ChannelPoster:
                 logger.warning("FloodWait %.0fs", wait)
                 flood_slept += wait
                 if await self._sleep_or_abort(wait + 1, my_gen):
-                    result.reason = REASON_ABORTED
+                    result.reason = self._cycle_stop_reason(my_gen) or REASON_ABORTED
                     break
                 pending.insert(0, message_id)
                 continue
@@ -961,7 +987,7 @@ class ChannelPoster:
                     random.uniform(config.POST_DELAY_MIN, config.POST_DELAY_MAX),
                     my_gen,
                 ):
-                    result.reason = REASON_ABORTED
+                    result.reason = self._cycle_stop_reason(my_gen) or REASON_ABORTED
                     break
 
         result.published = published
@@ -998,7 +1024,7 @@ class ChannelPoster:
                     "сетевой сбой на %s (%s), попытка %s", message_id, e, attempt
                 )
                 await asyncio.sleep(2.0 * attempt)
-                if self._abort_cycle:
+                if self._cycle_stop_reason(self._cycle_gen):
                     raise
 
     def _clean_transfer_enabled(self) -> bool:

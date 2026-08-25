@@ -31,8 +31,15 @@ from poster import REASON_ERROR as POST_REASON_ERROR
 from poster import REASON_FATAL as POST_REASON_FATAL
 from poster import REASON_FLOOD as POST_REASON_FLOOD
 from poster import REASON_SOURCE_EMPTY as POST_REASON_SOURCE_EMPTY
-from poster import ChannelPoster
-from scheduling import NextRun, humanize_duration, plan_next_delay
+from poster import REASON_TIMEOUT as POST_REASON_TIMEOUT
+from poster import ChannelPoster, CycleResult
+from scheduling import (
+    NextRun,
+    fair_window_limit,
+    humanize_duration,
+    plan_next_delay,
+    slice_timeout,
+)
 from userbot_auth import UserbotAuth
 
 # Как часто планировщик просыпается и как быстро реагирует на «Старт»
@@ -40,7 +47,7 @@ TICK = 5.0
 # Пауза перед первым тиком: даём юзерботу подняться
 START_DELAY = 3.0
 # Через сколько секунд «занятый» цикл считается зависшим
-STUCK_AFTER = 300.0
+STUCK_AFTER = max(180.0, config.WINDOW_CYCLE_TIMEOUT + 60.0)
 # Как часто проверять живость сессии юзербота
 HEALTH_EVERY = 300.0
 # Не спамить админа сообщениями про flood
@@ -184,6 +191,37 @@ def _sync_poster(db: Database, poster: ChannelPoster) -> ChannelPoster:
     return poster
 
 
+async def _run_window_cycle(
+    poster: ChannelPoster,
+    *,
+    limit: int,
+    deadline: float,
+    timeout: float,
+):
+    """Цикл одного окна с жёстким потолком времени (остальные окна ждут)."""
+    try:
+        return await asyncio.wait_for(
+            poster.run_cycle(limit=limit, deadline=deadline),
+            timeout=max(8.0, float(timeout)),
+        )
+    except asyncio.TimeoutError:
+        logger.warning("таймаут окна %.0fs — прерываю и отдаю очередь дальше", timeout)
+        abort = getattr(poster, "request_abort", None)
+        if callable(abort):
+            abort()
+        wait = getattr(poster, "wait_until_idle", None)
+        if callable(wait):
+            try:
+                await wait(timeout=8.0)
+            except Exception:
+                logger.debug("wait_until_idle after timeout failed", exc_info=True)
+        if getattr(poster, "is_busy", False):
+            unlock = getattr(poster, "force_unlock", None)
+            if callable(unlock):
+                unlock()
+        return CycleResult(reason=POST_REASON_TIMEOUT, error="таймаут окна")
+
+
 async def _reconnect_userbot(db: Database) -> bool:
     """Поднять юзербота заново из сохранённой сессии после обрыва связи."""
     auth = BRIDGE.auth
@@ -268,6 +306,11 @@ async def _finish_scheduled_cycle(
                 f"Пауза: <b>{humanize_duration(result.flood_seconds)}</b>. "
                 "Публикация продолжится сама.",
             )
+    elif result.reason == POST_REASON_TIMEOUT:
+        error_streak = 0
+        if not result.published:
+            db.set_last_error("таймаут окна — очередь продолжит следующий проход")
+        idle_streak += 1
     elif result.reason == POST_REASON_FATAL:
         db.set_running(False)
         db.set_last_error(result.fatal_text or "критическая ошибка")
@@ -389,7 +432,10 @@ async def _worker_scheduler() -> None:
                 await asyncio.sleep(TICK)
                 continue
 
-            # Все просроченные окна — в одном проходе, по очереди (один юзербот)
+            # Все просроченные окна — в одном проходе, по очереди (один юзербот).
+            # Бюджет времени и публикаций общий, чтобы одно окно не забивало остальные.
+            pass_deadline = time.monotonic() + config.PASS_TIMEOUT
+            remaining_budget = int(config.PASS_PUBLISH_LIMIT)
             for index, job in enumerate(due):
                 poster = BRIDGE.poster
                 if poster is None or poster.is_busy:
@@ -397,16 +443,38 @@ async def _worker_scheduler() -> None:
                 live = db.get_job(job.job_id)
                 if live is None or not live.is_running:
                     continue
+                pass_left = pass_deadline - time.monotonic()
+                slot = slice_timeout(config.WINDOW_CYCLE_TIMEOUT, pass_left)
+                windows_left = len(due) - index
+                limit = fair_window_limit(
+                    live.posts_per_cycle, windows_left, remaining_budget
+                )
+                if slot <= 0 or limit <= 0:
+                    logger.info(
+                        "проход окон: лимит (осталось %.0fс / %s публикаций)",
+                        pass_left,
+                        remaining_budget,
+                    )
+                    break
                 poster = _sync_poster(db, poster)
                 if index > 0:
                     await asyncio.sleep(WINDOW_GAP)
-                    if poster.is_busy:
+                    if poster is None or poster.is_busy:
                         break
                     live = db.get_job(job.job_id)
                     if live is None or not live.is_running:
                         continue
+                deadline = time.monotonic() + slot
                 with db.job_scope(job.job_id):
-                    result = await poster.run_cycle()
+                    result = await _run_window_cycle(
+                        poster,
+                        limit=limit,
+                        deadline=deadline,
+                        timeout=slot + 8.0,
+                    )
+                    remaining_budget = max(
+                        0, remaining_budget - int(getattr(result, "published", 0) or 0)
+                    )
                     poster, last_health, last_flood_notice = await _finish_scheduled_cycle(
                         db,
                         poster,

@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -36,6 +37,7 @@ from poster import (  # noqa: E402
     REASON_FATAL,
     REASON_FLOOD,
     REASON_PAUSED,
+    REASON_TIMEOUT,
     REASON_UP_TO_DATE,
     ChannelPoster,
     _chat_ref,
@@ -221,6 +223,28 @@ class AbortCycleTests(CycleTestCase):
         result = asyncio.run(poster.run_cycle(limit=5, force=True))
 
         self.assertEqual(result.reason, REASON_ABORTED)
+        self.assertEqual(result.published, 1)
+
+    def test_deadline_stops_before_posts(self) -> None:
+        client = FakeClient([text_message(i) for i in range(1, 6)])
+        poster = ChannelPoster(client=client, db=self.db)  # type: ignore[arg-type]
+        result = asyncio.run(poster.run_cycle(limit=5, deadline=time.monotonic() - 1))
+        self.assertEqual(result.reason, REASON_TIMEOUT)
+        self.assertEqual(result.published, 0)
+
+    def test_deadline_stops_after_current_post(self) -> None:
+        client = FakeClient([text_message(i, f"post {i}") for i in range(1, 6)])
+        poster = ChannelPoster(client=client, db=self.db)  # type: ignore[arg-type]
+        original = poster._process
+
+        async def wrapped(source, target, message_id, caption):
+            status = await original(source, target, message_id, caption)
+            poster._cycle_deadline = time.monotonic() - 1
+            return status
+
+        poster._process = wrapped  # type: ignore[method-assign]
+        result = asyncio.run(poster.run_cycle(limit=5, deadline=time.monotonic() + 60))
+        self.assertEqual(result.reason, REASON_TIMEOUT)
         self.assertEqual(result.published, 1)
 
 

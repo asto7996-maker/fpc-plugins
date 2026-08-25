@@ -247,6 +247,10 @@ def menu_kb(
                 ),
             ],
             [
+                InlineKeyboardButton(text="▶️ Старт все", callback_data="a:jall"),
+                InlineKeyboardButton(text="⏸ Пауза все", callback_data="a:jpause"),
+            ],
+            [
                 InlineKeyboardButton(
                     text=f"🪟 Окна ({jobs_n})", callback_data="a:jobs"
                 ),
@@ -401,7 +405,10 @@ def jobs_text(db: Database) -> str:
         "<b>🪟 Окна перелива</b>",
         "Каждое окно — своя пара каналов и свой прогресс.",
         f"До <b>{MAX_JOBS}</b> штук. Один юзербот: окна ходят <b>по очереди</b> "
-        f"в одном проходе (канал1→2, потом канал3→4, …).",
+        f"в одном проходе (канал1→2, потом канал3→4, …).\n"
+        f"Лимит прохода: <b>{int(config.PASS_PUBLISH_LIMIT)}</b> публикаций, "
+        f"таймаут окна <b>{humanize_duration(config.WINDOW_CYCLE_TIMEOUT)}</b>, "
+        f"всего проход <b>{humanize_duration(config.PASS_TIMEOUT)}</b>.",
         f"Сейчас работают: <b>{running_n}/{len(jobs)}</b>",
         "",
     ]
@@ -486,6 +493,11 @@ def status_text(db: Database) -> str:
             stj = "🟢" if j.is_running else "⏸"
             extra.append(f"{mark} {stj} {j.pair_label()}")
         lines.append("\n<b>Все окна</b>\n" + "\n".join(extra))
+        lines.append(
+            f"⏱ Проход: ≤{humanize_duration(config.PASS_TIMEOUT)} / "
+            f"{int(config.PASS_PUBLISH_LIMIT)} публикаций, "
+            f"окно ≤{humanize_duration(config.WINDOW_CYCLE_TIMEOUT)}"
+        )
     if err_text:
         ago = humanize_duration(time.time() - err_at) if err_at else "—"
         lines.append(f"⚠️ Последняя ошибка ({ago} назад): <code>{safe_preview(err_text, 160)}</code>")
@@ -1674,6 +1686,7 @@ def _cycle_report(db: Database, result) -> str:
         "no_start": "Не задана стартовая точка: «🔗 Старт-ссылка» или «📜 С начала».",
         "paused": "Автопостинг на паузе.",
         "aborted": "Цикл остановлен (⏹ Стоп).",
+        "timeout": "Окно упёрлось в тайм-аут — очередь продолжит следующий проход.",
         "flood": (
             "Telegram просит подождать "
             f"{humanize_duration(getattr(result, 'flood_seconds', 0))} (flood)."
