@@ -705,6 +705,7 @@ class ChannelPoster:
         settings = self.db.get_settings()
         if not settings.is_running and not force:
             return CycleResult(reason=REASON_PAUSED, progress_id=settings.progress_id)
+        self._seen_grouped.clear()
 
         try:
             source = await _rpc(

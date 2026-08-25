@@ -24,7 +24,7 @@ from aiogram.types import (
 )
 
 import config
-from database import Database
+from database import MAX_JOBS, Database
 from formatting import extract_caption_html, safe_preview, validate_telegram_html
 from links import format_channel_label, is_saved_messages, parse_post_link
 
@@ -194,6 +194,7 @@ def menu_kb(
     catchup: bool = False,
     notify: bool = False,
     clean_transfer: bool = True,
+    jobs_n: int = 1,
 ) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -203,6 +204,12 @@ def menu_kb(
                     text="⏸ Пауза" if running else "▶️ Старт",
                     callback_data="a:pause" if running else "a:start",
                 ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text=f"🪟 Окна ({jobs_n})", callback_data="a:jobs"
+                ),
+                InlineKeyboardButton(text="➕ Новое окно", callback_data="a:ja"),
             ],
             [
                 InlineKeyboardButton(text="⚡ Цикл сейчас", callback_data="a:run"),
@@ -257,6 +264,7 @@ def main_kb(db: Optional[Database] = None) -> InlineKeyboardMarkup:
         catchup=s.catchup_enabled,
         notify=s.notify_cycles,
         clean_transfer=s.clean_transfer,
+        jobs_n=len(database.list_jobs()),
     )
 
 
@@ -306,6 +314,54 @@ def interval_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def jobs_kb(db: Database) -> InlineKeyboardMarkup:
+    """Список окон: одно на строку, плюс добавить/удалить."""
+    jobs = db.list_jobs()
+    active = db.get_settings().job_id
+    rows: list[list[InlineKeyboardButton]] = []
+    for j in jobs:
+        prefix = "• " if j.job_id == active else ""
+        st = "🟢" if j.is_running else "⏸"
+        label = f"{prefix}{st} {j.job_id}. {j.pair_label()}"
+        if len(label) > 56:
+            label = label[:53] + "…"
+        rows.append(
+            [InlineKeyboardButton(text=label, callback_data=f"a:js:{j.job_id}")]
+        )
+    rows.append(
+        [
+            InlineKeyboardButton(text="➕ Добавить", callback_data="a:ja"),
+            InlineKeyboardButton(text="🗑 Удалить это", callback_data="a:jd"),
+        ]
+    )
+    rows.append([InlineKeyboardButton(text="◀️ К панели", callback_data="a:status")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def jobs_text(db: Database) -> str:
+    jobs = db.list_jobs()
+    active = db.get_settings().job_id
+    lines = [
+        "<b>🪟 Окна перелива</b>",
+        "Каждое окно — своя пара каналов и свой прогресс.",
+        f"Можно до <b>{MAX_JOBS}</b> штук. Циклы идут по очереди, не параллельно.",
+        "",
+    ]
+    for j in jobs:
+        mark = "•" if j.job_id == active else " "
+        st = "🟢" if j.is_running else "⏸"
+        cur = "  ← сейчас" if j.job_id == active else ""
+        lines.append(
+            f"{mark} {st} <b>{j.window_title()}</b>: "
+            f"<code>{j.pair_label()}</code>{cur}"
+        )
+    lines.append(
+        "\nНажмите окно, чтобы переключиться. "
+        "Дальше в панели задайте источник и назначение."
+    )
+    return "\n".join(lines)
+
+
 def _next_run_line(db: Database, s) -> str:
     if not s.is_running:
         return "⏭ Следующий цикл: <i>на паузе</i>"
@@ -319,6 +375,7 @@ def _next_run_line(db: Database, s) -> str:
 
 def status_text(db: Database) -> str:
     s = db.get_settings()
+    jobs = db.list_jobs()
     st = "🟢 Работает" if s.is_running else "🔴 На паузе"
     engine = "🟢 USERBOT готов" if _has_userbot() else "🔴 нужен вход (api_id / api_hash)"
     busy = "⏳ публикация…" if _busy() else "idle"
@@ -330,8 +387,10 @@ def status_text(db: Database) -> str:
         "<b>✨ Channel Reposter</b>",
         "<i>Чистый юзербот · без Bot API заливки</i>",
         "",
+        f"🪟 <b>{s.window_title()}</b> · <code>{s.pair_label()}</code> "
+        f"({s.job_id}/{len(jobs)})",
         f"Движок: {engine}",
-        f"Автопост: <b>{st}</b> · <code>{busy}</code>",
+        f"Автопост этого окна: <b>{st}</b> · <code>{busy}</code>",
         _next_run_line(db, s),
         "",
         f"📥 Источник: <code>{_channel_label(s.source_channel)}</code>",
@@ -361,6 +420,13 @@ def status_text(db: Database) -> str:
             f"🕒 Последняя публикация: <b>{humanize_duration(time.time() - last_pub)}</b> назад"
         )
     lines.append(f"🔗 Старт: <code>{s.start_link or 'не задан'}</code>")
+    if len(jobs) > 1:
+        extra = []
+        for j in jobs:
+            mark = "→" if j.job_id == s.job_id else " "
+            stj = "🟢" if j.is_running else "⏸"
+            extra.append(f"{mark} {stj} {j.pair_label()}")
+        lines.append("\n<b>Все окна</b>\n" + "\n".join(extra))
     if err_text:
         ago = humanize_duration(time.time() - err_at) if err_at else "—"
         lines.append(f"⚠️ Последняя ошибка ({ago} назад): <code>{safe_preview(err_text, 160)}</code>")
@@ -389,8 +455,8 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
         "Перезалив каналов через <b>api_id + api_hash</b> (юзербот).\n"
         "Бот — только панель. Контент льёт аккаунт.\n\n"
         "1️⃣ «🔐 Вход» — api_id, api_hash, телефон, код\n"
-        "2️⃣ Источник + назначение\n"
-        "3️⃣ Ссылка на пост или «С начала»\n"
+        "2️⃣ «🪟 Окна» — несколько пар каналов сразу\n"
+        "3️⃣ В каждом окне: источник + назначение + «С начала»\n"
         "4️⃣ Описание → ⏱ Интервал → ▶️ Старт\n\n"
         "Управление — кнопками ниже.\n"
         "Команды на всякий случай: /status /run_now /test /ping /unstick\n\n"
@@ -752,6 +818,77 @@ async def cmd_clean_transfer(message: Message) -> None:
         text + "\n\n" + status_text(db),
         reply_markup=main_kb(db),
         parse_mode="HTML",
+    )
+
+
+@router.callback_query(F.data == "a:jobs")
+async def cb_jobs(c: CallbackQuery) -> None:
+    if await _deny_cb(c):
+        return
+    await _ack(c)
+    db = _require_db()
+    await _replace(c, jobs_text(db), jobs_kb(db))
+
+
+@router.callback_query(F.data.startswith("a:js:"))
+async def cb_job_switch(c: CallbackQuery) -> None:
+    if await _deny_cb(c):
+        return
+    db = _require_db()
+    try:
+        job_id = int((c.data or "").split(":")[-1])
+        job = db.set_active_job(job_id)
+    except (TypeError, ValueError) as e:
+        await _ack(c, str(e)[:80], show_alert=True)
+        return
+    await _ack(c, f"Окно {job.job_id}")
+    await _replace(
+        c,
+        f"🪟 Переключились на <b>{job.window_title()}</b>\n"
+        f"<code>{job.pair_label()}</code>\n\n" + status_text(db),
+        main_kb(db),
+    )
+
+
+@router.callback_query(F.data == "a:ja")
+async def cb_job_add(c: CallbackQuery, state: FSMContext) -> None:
+    if await _deny_cb(c):
+        return
+    db = _require_db()
+    try:
+        job = db.create_job()
+        db.set_active_job(job.job_id)
+    except ValueError as e:
+        await _ack(c, str(e)[:180], show_alert=True)
+        return
+    await _ack(c, f"Окно {job.job_id} создано")
+    await state.set_state(S.source)
+    await _replace(
+        c,
+        f"➕ <b>{job.window_title()}</b> создано и выбрано.\n"
+        "Оно на паузе, прогресс с нуля.\n\n"
+        "Пришлите <b>источник</b> (@username или id), потом назначение — "
+        "кнопка «📤 Назначение».",
+        main_kb(db),
+    )
+
+
+@router.callback_query(F.data == "a:jd")
+async def cb_job_delete(c: CallbackQuery) -> None:
+    if await _deny_cb(c):
+        return
+    db = _require_db()
+    s = db.get_settings()
+    try:
+        db.delete_job(s.job_id)
+    except ValueError as e:
+        await _ack(c, str(e)[:180], show_alert=True)
+        return
+    await _ack(c, "Окно удалено")
+    await _replace(
+        c,
+        "🗑 Окно удалено. Открыто другое.\n\n" + jobs_text(db),
+        jobs_kb(db),
     )
 
 
