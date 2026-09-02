@@ -25,7 +25,9 @@ from receipt_forensics import inspect_receipt_bytes
 from shop_catalog import (
     Tariff,
     catalog_from_db_rows,
+    catalog_prices_summary,
     fetch_shop_catalog,
+    format_duration_label,
     match_period,
     match_tariff,
     tariffs_to_db_rows,
@@ -48,7 +50,8 @@ def welcome_text() -> str:
         "Приватные каналы с товаром были заблокированы — это поддержка.\n\n"
         "Можем <b>возместить максимум один тариф</b>: тот, который вы покупали. "
         "Нужен чек оплаты (его проверим на подделку и Photoshop).\n\n"
-        "Выберите тариф из актуального списка <b>@sweetshopxxx_bot</b>:"
+        "Выберите тариф из актуального списка <b>@sweetshopxxx_bot</b> "
+        "(сроки и цены — как в магазине):"
     )
 
 
@@ -340,7 +343,8 @@ async def handle_private_message(
             await _reply(
                 client,
                 peer_id,
-                f"Срок: <b>{days} д.</b>\nНапишите цену, которую платили, числом в рублях.",
+                f"Срок: <b>{format_duration_label(days, label)}</b>\n"
+                "Напишите цену, которую платили, числом в рублях.",
                 ReplyKeyboardRemove(),
             )
         return
@@ -373,7 +377,7 @@ async def _choose_tariff(client: Any, db: Database, peer_id: int, tariff: Tariff
         client,
         peer_id,
         f"Тариф: <b>{_esc(tariff.short_name)}</b>\n"
-        "На какой срок покупали? Выберите вариант.",
+        "На какой срок покупали? Кнопки уже с ценами из магазина.",
         period_keyboard(tariff),
     )
 
@@ -470,7 +474,7 @@ async def _handle_receipt(
         peer_id,
         "✅ Чек принят, следов Photoshop не видно.\n\n"
         f"Возмещаем <b>один</b> тариф: <b>{_esc(tariff_name)}</b> "
-        f"на <b>{days} д.</b> (цена {price:g} ₽).\n\n"
+        f"на <b>{format_duration_label(days)}</b> (цена {price:g} ₽).\n\n"
         "Больше одного тарифа выдать нельзя. Администратор откроет доступ.",
         ReplyKeyboardRemove(),
     )
@@ -503,7 +507,7 @@ async def _notify_admins_via_userbot(
         f"✅ Компенсация #{claim_id}: один тариф.\n"
         f"Пользователь id <code>{user_id}</code>\n"
         f"Тариф: {_esc(tariff)}\n"
-        f"{days} д. / {price:g} ₽\n"
+        f"{format_duration_label(days)} / {price:g} ₽\n"
         f"Проверка чека: ок ({_esc(notes) or 'без флагов'})"
     )
     for aid in config.ADMIN_IDS:
@@ -592,7 +596,10 @@ async def run_forever(bridge, db: Database) -> None:
                 try:
                     catalog = await refresh_catalog(client, db)
                     last_sync = now
-                    logger.info("Тарифы магазина обновлены: %s", [t.short_name for t in catalog])
+                    logger.info(
+                        "Тарифы магазина обновлены:\n%s",
+                        catalog_prices_summary(catalog),
+                    )
                 except Exception:
                     logger.exception("не удалось обновить тарифы магазина")
                     catalog = load_catalog(db) or catalog

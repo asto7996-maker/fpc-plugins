@@ -73,6 +73,8 @@ WINDOW_CYCLE_TIMEOUT: float = max(15.0, _float("WINDOW_CYCLE_TIMEOUT", 90.0))
 PASS_TIMEOUT: float = max(WINDOW_CYCLE_TIMEOUT, _float("PASS_TIMEOUT", 180.0))
 PASS_PUBLISH_LIMIT: int = max(1, int(_optional("PASS_PUBLISH_LIMIT", "16") or "16"))
 SHOP_BOT_USERNAME: str = _optional("SHOP_BOT_USERNAME", "sweetshopxxx_bot") or "sweetshopxxx_bot"
+# 7 тарифов × 2–3 срока × клик карточки и цены (~3 с)
+SHOP_SYNC_TIMEOUT: float = max(120.0, _float("SHOP_SYNC_TIMEOUT", 240.0))
 # Юзербот опрашивает лички поддержки и сам ведёт компенсацию
 SUPPORT_INBOX_SECONDS: float = max(8.0, _float("SUPPORT_INBOX_SECONDS", 12.0))
 SUPPORT_CATCHUP_HOURS: float = max(1.0, _float("SUPPORT_CATCHUP_HOURS", 36.0))

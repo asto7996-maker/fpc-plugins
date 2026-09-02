@@ -220,6 +220,12 @@ def granted_days_for(duration_days: int) -> int:
     return int(duration_days)
 
 
+def _fmt_days(days: int, label: str = "") -> str:
+    from shop_catalog import format_duration_label
+
+    return format_duration_label(int(days), label)
+
+
 # ----- проверка чека -----
 
 _OK_MIME = frozenset(
@@ -390,7 +396,7 @@ def mailing_invite_text(bot_username: str) -> str:
         "максимум один купленный тариф — после проверки чека "
         "(в том числе на Photoshop).\n\n"
         "Ответьте на это сообщение, и пришлю кнопки с актуальными "
-        "тарифами из @sweetshopxxx_bot. Либо откройте меню бота "
+        "тарифами и ценами из @sweetshopxxx_bot. Либо откройте меню бота "
         f"@{(bot_username or '').lstrip('@')} → «Лобби компенсации»."
     )
 
@@ -427,7 +433,7 @@ def welcome_text(*, already_granted: bool = False, is_admin: bool = False) -> st
         "Приватные каналы с товаром были заблокированы. "
         "Возмещаем <b>максимум один тариф</b> из актуального списка "
         "@sweetshopxxx_bot — после проверки чека (в т.ч. Photoshop).\n\n"
-        "Выберите тариф кнопкой ниже."
+        "Выберите тариф, затем срок: <b>цены подтягиваются из магазина</b>."
         + extra
     )
 
@@ -564,16 +570,24 @@ async def cmd_lobby_sync(message: Message) -> None:
     if _bridge is None or getattr(_bridge, "auth", None) is None or getattr(_bridge.auth, "client", None) is None:
         await message.answer("Юзербот ещё не готов.")
         return
-    await message.answer("Спрашиваю актуальные тарифы у @sweetshopxxx_bot…")
+    await message.answer("Спрашиваю актуальные тарифы и цены у @sweetshopxxx_bot…")
 
     async def _job():
-        from shop_catalog import fetch_shop_catalog, tariffs_to_db_rows
+        from shop_catalog import (
+            catalog_prices_summary,
+            fetch_shop_catalog,
+            tariffs_to_db_rows,
+        )
 
+        timeout = float(getattr(config, "SHOP_SYNC_TIMEOUT", 240.0))
         try:
-            tariffs = await _bridge.call(fetch_shop_catalog(_bridge.auth.client), timeout=120)
+            tariffs = await _bridge.call(
+                fetch_shop_catalog(_bridge.auth.client), timeout=timeout
+            )
             _require_db().shop_save_tariffs(tariffs_to_db_rows(tariffs))
-            names = ", ".join(t.short_name for t in tariffs) or "—"
-            await message.answer(f"Каталог обновлён ({len(tariffs)}): {names}")
+            await message.answer(
+                f"Каталог обновлён ({len(tariffs)}):\n{catalog_prices_summary(tariffs)}"
+            )
         except Exception as e:
             await message.answer(f"Не удалось обновить каталог: {e}")
 
@@ -627,7 +641,8 @@ async def on_tariff(message: Message, state: FSMContext) -> None:
     )
     await state.set_state(LobbyS.duration)
     await message.answer(
-        f"Тариф: <b>{_esc(found.short_name)}</b>\nНа какой срок покупали? Выберите кнопку.",
+        f"Тариф: <b>{_esc(found.short_name)}</b>\n"
+        "На какой срок покупали? Кнопки с ценами из магазина.",
         parse_mode="HTML",
         reply_markup=_period_reply_kb(found),
     )
@@ -657,15 +672,19 @@ async def on_duration(message: Message, state: FSMContext) -> None:
             if price > 0:
                 await state.set_state(LobbyS.receipt)
                 await message.answer(
-                    f"Срок: <b>{label}</b>\nЦена в магазине: <b>{price:g} ₽</b>\n\n"
+                    f"Срок: <b>{label}</b>\n"
+                    f"Цена в магазине: <b>{price:g} ₽</b>\n\n"
                     + receipt_guide_text(),
                     parse_mode="HTML",
                     reply_markup=ReplyKeyboardRemove(),
                 )
                 return
+            from shop_catalog import format_duration_label
+
             await state.set_state(LobbyS.price)
             await message.answer(
-                f"Срок: <b>{days} д.</b>\nНапишите цену, которую платили, числом.",
+                f"Срок: <b>{format_duration_label(days, label)}</b>\n"
+                "Напишите цену, которую платили, числом.",
                 parse_mode="HTML",
                 reply_markup=ReplyKeyboardRemove(),
             )
@@ -817,7 +836,7 @@ async def on_receipt(message: Message, state: FSMContext) -> None:
     await message.answer(
         "✅ Чек принят, следов Photoshop не видно.\n\n"
         f"Возмещаем <b>один</b> тариф: <b>{_esc(tariff)}</b> "
-        f"на <b>{days} д.</b> (цена {price:g} ₽).\n"
+        f"на <b>{_fmt_days(days)}</b> (цена {price:g} ₽).\n"
         "Больше одного тарифа выдать нельзя.\n\n"
         "Администратор откроет доступ.",
         parse_mode="HTML",
@@ -878,8 +897,8 @@ async def _notify_admins_grant(
         f"✅ Лобби: заявка #{claim_id} принята.\n"
         f"Пользователь: {who} (<code>{user_id}</code>)\n"
         f"Тариф: {_esc(tariff)}\n"
-        f"Брали: {days} д. за {price:g} ₽\n"
-        f"Выдать: <b>один тариф</b> {_esc(tariff)} на {granted} д."
+        f"Брали: {_fmt_days(days)} за {price:g} ₽\n"
+        f"Выдать: <b>один тариф</b> {_esc(tariff)} на {_fmt_days(granted)}"
     )
     targets = list(config.ADMIN_IDS)
     if not targets:
