@@ -23,6 +23,7 @@ from lobby import (  # noqa: E402
     normalize_tariff,
     parse_price,
     parse_tariff_duration,
+    receipt_guide_text,
     validate_receipt,
 )
 
@@ -117,7 +118,7 @@ class ReceiptValidationTests(unittest.TestCase):
             ReceiptInput(
                 has_photo=True,
                 file_size=20_000,
-                caption="FunPay заказ на 1 500 руб",
+                caption="заказ на 1 500 руб",
             ),
             1500,
         )
@@ -152,6 +153,12 @@ class MailingPeerTests(unittest.TestCase):
         self.assertIn("@ZzzLV_bot", text)
         self.assertIn("sweetshopxxx_bot", text)
         self.assertIn("один", text.lower())
+
+    def test_receipt_guide_has_no_funpay(self) -> None:
+        text = receipt_guide_text()
+        self.assertNotIn("FunPay", text)
+        self.assertNotIn("фанпей", text.lower())
+        self.assertIn("Банк", text)
 
 
 class LobbyDbTests(unittest.TestCase):
