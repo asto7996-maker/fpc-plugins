@@ -235,12 +235,34 @@ class Database:
                     status TEXT NOT NULL,
                     reject_reason TEXT NOT NULL DEFAULT '',
                     granted_days INTEGER NOT NULL DEFAULT 0,
+                    shop_id TEXT NOT NULL DEFAULT '',
+                    forensic_notes TEXT NOT NULL DEFAULT '',
                     created_at TEXT NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_lobby_claims_user
                     ON lobby_claims(user_id);
                 CREATE INDEX IF NOT EXISTS idx_lobby_claims_status
                     ON lobby_claims(status);
+
+                CREATE TABLE IF NOT EXISTS shop_tariffs (
+                    shop_id TEXT PRIMARY KEY,
+                    title TEXT NOT NULL,
+                    short_name TEXT NOT NULL,
+                    sort_order INTEGER NOT NULL DEFAULT 0,
+                    extra_json TEXT NOT NULL DEFAULT '{}',
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS support_sessions (
+                    peer_id INTEGER PRIMARY KEY,
+                    state TEXT NOT NULL,
+                    shop_id TEXT NOT NULL DEFAULT '',
+                    tariff TEXT NOT NULL DEFAULT '',
+                    duration_days INTEGER NOT NULL DEFAULT 0,
+                    price REAL NOT NULL DEFAULT 0,
+                    last_msg_id INTEGER NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL
+                );
                 """
             )
             cols = [r[1] for r in conn.execute("PRAGMA table_info(history)")]
@@ -256,6 +278,15 @@ class Database:
                 "CREATE INDEX IF NOT EXISTS idx_history_job_group "
                 "ON history(job_id, grouped_id)"
             )
+            claim_cols = [r[1] for r in conn.execute("PRAGMA table_info(lobby_claims)")]
+            if claim_cols and "shop_id" not in claim_cols:
+                conn.execute(
+                    "ALTER TABLE lobby_claims ADD COLUMN shop_id TEXT NOT NULL DEFAULT ''"
+                )
+            if claim_cols and "forensic_notes" not in claim_cols:
+                conn.execute(
+                    "ALTER TABLE lobby_claims ADD COLUMN forensic_notes TEXT NOT NULL DEFAULT ''"
+                )
 
     # ------------------------------------------------------------------
     # Низкоуровневые get / set
@@ -1044,6 +1075,8 @@ class Database:
         status: str,
         reject_reason: str = "",
         granted_days: int = 0,
+        shop_id: str = "",
+        forensic_notes: str = "",
     ) -> int:
         now = datetime.now(timezone.utc).isoformat()
         with self._connect() as conn:
@@ -1052,8 +1085,8 @@ class Database:
                 INSERT INTO lobby_claims(
                     user_id, username, tariff, duration_days, price,
                     receipt_file_id, receipt_type, status, reject_reason,
-                    granted_days, created_at
-                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    granted_days, shop_id, forensic_notes, created_at
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     int(user_id),
@@ -1066,6 +1099,8 @@ class Database:
                     status,
                     reject_reason or "",
                     int(granted_days),
+                    shop_id or "",
+                    forensic_notes or "",
                     now,
                 ),
             )
@@ -1096,3 +1131,96 @@ class Database:
                 (int(user_id),),
             ).fetchone()
         return row is not None
+
+    def shop_save_tariffs(self, rows: list[dict[str, Any]]) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        with self._connect() as conn:
+            conn.execute("DELETE FROM shop_tariffs")
+            for i, row in enumerate(rows):
+                conn.execute(
+                    """
+                    INSERT INTO shop_tariffs(
+                        shop_id, title, short_name, sort_order, extra_json, updated_at
+                    ) VALUES(?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        str(row.get("shop_id") or ""),
+                        str(row.get("title") or ""),
+                        str(row.get("short_name") or ""),
+                        int(row.get("sort_order", i)),
+                        str(row.get("extra_json") or "{}"),
+                        now,
+                    ),
+                )
+
+    def shop_list_tariffs(self) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM shop_tariffs ORDER BY sort_order, shop_id"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def support_get(self, peer_id: int) -> Optional[dict[str, Any]]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM support_sessions WHERE peer_id = ?",
+                (int(peer_id),),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def support_upsert(
+        self,
+        peer_id: int,
+        *,
+        state: Optional[str] = None,
+        shop_id: Optional[str] = None,
+        tariff: Optional[str] = None,
+        duration_days: Optional[int] = None,
+        price: Optional[float] = None,
+        last_msg_id: Optional[int] = None,
+    ) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        cur = self.support_get(peer_id) or {}
+        data = {
+            "state": state if state is not None else cur.get("state") or "idle",
+            "shop_id": shop_id if shop_id is not None else cur.get("shop_id") or "",
+            "tariff": tariff if tariff is not None else cur.get("tariff") or "",
+            "duration_days": (
+                int(duration_days)
+                if duration_days is not None
+                else int(cur.get("duration_days") or 0)
+            ),
+            "price": float(price) if price is not None else float(cur.get("price") or 0),
+            "last_msg_id": (
+                int(last_msg_id)
+                if last_msg_id is not None
+                else int(cur.get("last_msg_id") or 0)
+            ),
+        }
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO support_sessions(
+                    peer_id, state, shop_id, tariff, duration_days, price,
+                    last_msg_id, updated_at
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(peer_id) DO UPDATE SET
+                    state = excluded.state,
+                    shop_id = excluded.shop_id,
+                    tariff = excluded.tariff,
+                    duration_days = excluded.duration_days,
+                    price = excluded.price,
+                    last_msg_id = excluded.last_msg_id,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    int(peer_id),
+                    data["state"],
+                    data["shop_id"],
+                    data["tariff"],
+                    data["duration_days"],
+                    data["price"],
+                    data["last_msg_id"],
+                    now,
+                ),
+            )

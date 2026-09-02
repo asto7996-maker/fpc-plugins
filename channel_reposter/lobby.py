@@ -1,15 +1,10 @@
 """
 lobby.py — лобби компенсации.
 
-Вход только из меню команд бота (кнопка рядом со строкой ввода),
-не из инлайн-клавиатуры панели репостера.
-
-Сценарий:
-  1. Админ шлёт /lobby_mail — юзербот пишет в личку тем, кто уже
-     писал аккаунту, и зовёт открыть меню бота → «Лобби компенсации».
-  2. Пользователь в /lobby указывает тариф, срок и цену, присылает чек.
-  3. Чек проверяется (тип файла, размер, сумма в подписи если есть).
-  4. Если всё сходится — выдаём тот же тариф на срок ×2 как извинение.
+Вход для админа: меню команд бота (/lobby, /lobby_mail, /lobby_sync).
+Основной диалог с покупателями ведёт юзербот в личке поддержки:
+тарифы берём из @sweetshopxxx_bot, человек выбирает кнопкой,
+чек проверяется на Photoshop, возмещаем максимум один тариф.
 """
 
 from __future__ import annotations
@@ -28,8 +23,11 @@ from aiogram.types import (
     BotCommand,
     BotCommandScopeChat,
     BotCommandScopeDefault,
+    KeyboardButton,
     MenuButtonCommands,
     Message,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
 )
 
 import admin_bot
@@ -45,7 +43,7 @@ MIN_RECEIPT_BYTES = 8_000
 MAX_TARIFF_LEN = 80
 MIN_TARIFF_LEN = 2
 MAX_DURATION_DAYS = 365
-GRANT_MULTIPLIER = 2
+GRANT_MULTIPLIER = 1
 
 _db: Optional[Database] = None
 _bot: Optional[Bot] = None
@@ -218,7 +216,8 @@ def normalize_tariff(raw: str) -> str:
 
 
 def granted_days_for(duration_days: int) -> int:
-    return int(duration_days) * GRANT_MULTIPLIER
+    """Возмещаем тот же срок одного тарифа, без удвоения."""
+    return int(duration_days)
 
 
 # ----- проверка чека -----
@@ -385,18 +384,14 @@ def collect_private_user_ids(
 
 
 def mailing_invite_text(bot_username: str) -> str:
-    uname = (bot_username or "").lstrip("@")
-    bot_line = f"@{uname}" if uname else "бота панели"
     return (
-        "Здравствуйте.\n\n"
-        "Это сообщение от аккаунта, которому вы писали.\n\n"
-        "Мы компенсируем сбой. Если вы покупали тариф, откройте "
-        f"{bot_line} и в меню бота (кнопка рядом со строкой ввода, "
-        "не кнопки под сообщением) выберите «Лобби компенсации» "
-        "или отправьте /lobby.\n\n"
-        "Спросим: какой тариф, на какой срок и за какую цену — "
-        "и попросим чек покупки. Если всё сойдётся, выдадим тот же "
-        "тариф на срок в два раза больше, в качестве извинений."
+        "Здравствуйте. Это поддержка.\n\n"
+        "Приватные каналы были заблокированы. Можем возместить "
+        "максимум один купленный тариф — после проверки чека "
+        "(в том числе на Photoshop).\n\n"
+        "Ответьте на это сообщение, и пришлю кнопки с актуальными "
+        "тарифами из @sweetshopxxx_bot. Либо откройте меню бота "
+        f"@{(bot_username or '').lstrip('@')} → «Лобби компенсации»."
     )
 
 
@@ -417,22 +412,22 @@ def welcome_text(*, already_granted: bool = False, is_admin: bool = False) -> st
     if already_granted:
         return (
             "<b>Лобби компенсации</b>\n\n"
-            "Вам уже выдан тариф на удвоенный срок. "
-            "Если доступ ещё не открылся — напишите сюда, "
-            "администратор проверит заявку."
+            "Вам уже возмещён <b>один тариф</b> — больше одного выдать нельзя. "
+            "Если доступ ещё не открылся, напишите в поддержку на аккаунт, "
+            "с которого приходило это сообщение."
         )
     extra = ""
     if is_admin:
         extra = (
-            "\n\n<i>Админ: рассылка тем, кто писал аккаунту — "
-            "команда /lobby_mail в меню бота.</i>"
+            "\n\n<i>Админ: /lobby_mail — написать тем, кто писал аккаунту. "
+            "/lobby_sync — обновить тарифы из @sweetshopxxx_bot.</i>"
         )
     return (
         "<b>Лобби компенсации</b>\n\n"
-        "Мы приносим извинения. Если вы покупали тариф у этого аккаунта — "
-        "пройдите короткую проверку. Если данные и чек сойдутся, выдадим "
-        "<b>тот же тариф на срок в два раза больше</b>.\n\n"
-        "Напишите, <b>какой тариф</b> вы выбирали (название)."
+        "Приватные каналы с товаром были заблокированы. "
+        "Возмещаем <b>максимум один тариф</b> из актуального списка "
+        "@sweetshopxxx_bot — после проверки чека (в т.ч. Photoshop).\n\n"
+        "Выберите тариф кнопкой ниже."
         + extra
     )
 
@@ -442,6 +437,9 @@ def welcome_text(*, already_granted: bool = False, is_admin: bool = False) -> st
 LOBBY_COMMAND = BotCommand(command="lobby", description="Лобби компенсации")
 LOBBY_MAIL_COMMAND = BotCommand(
     command="lobby_mail", description="Написать тем, кто писал аккаунту"
+)
+LOBBY_SYNC_COMMAND = BotCommand(
+    command="lobby_sync", description="Обновить тарифы из магазина"
 )
 
 _ADMIN_EXTRA = [
@@ -465,7 +463,7 @@ async def setup_bot_menu(bot: Bot) -> None:
     for aid in config.ADMIN_IDS:
         try:
             await bot.set_my_commands(
-                [LOBBY_COMMAND, LOBBY_MAIL_COMMAND, *_ADMIN_EXTRA],
+                [LOBBY_COMMAND, LOBBY_MAIL_COMMAND, LOBBY_SYNC_COMMAND, *_ADMIN_EXTRA],
                 scope=BotCommandScopeChat(chat_id=aid),
             )
         except Exception:
@@ -479,15 +477,62 @@ def _is_cancel(message: Message) -> bool:
     return text in _CANCEL_WORDS
 
 
+def _catalog():
+    from shop_catalog import catalog_from_db_rows
+
+    return catalog_from_db_rows(_require_db().shop_list_tariffs())
+
+
+def _tariff_reply_kb():
+    from shop_catalog import catalog_from_db_rows
+
+    catalog = catalog_from_db_rows(_require_db().shop_list_tariffs())
+    rows: list[list[KeyboardButton]] = []
+    row: list[KeyboardButton] = []
+    for t in catalog:
+        row.append(KeyboardButton(text=t.short_name))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([KeyboardButton(text="Отмена")])
+    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
+
+
+def _period_reply_kb(tariff) -> ReplyKeyboardMarkup:
+    rows: list[list[KeyboardButton]] = []
+    row: list[KeyboardButton] = []
+    for _days, label, _price in tariff.period_buttons():
+        row.append(KeyboardButton(text=label))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([KeyboardButton(text="Отмена")])
+    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
+
+
 async def start_lobby(message: Message, state: FSMContext) -> None:
     await state.clear()
     db = _require_db()
     uid = message.from_user.id if message.from_user else 0
     granted = db.lobby_has_granted(uid) if uid else False
     is_admin = admin_bot.is_admin(uid or None)
+    catalog = _catalog()
+    kb = ReplyKeyboardRemove()
+    if not granted:
+        kb = _tariff_reply_kb() if catalog else ReplyKeyboardRemove()
     await message.answer(
-        welcome_text(already_granted=granted, is_admin=is_admin),
+        welcome_text(already_granted=granted, is_admin=is_admin)
+        + (
+            ""
+            if catalog or granted
+            else "\n\nКаталог ещё пуст — админ: /lobby_sync, либо напишите в поддержку на аккаунт юзербота."
+        ),
         parse_mode="HTML",
+        reply_markup=kb,
     )
     if not granted:
         await state.set_state(LobbyS.tariff)
@@ -504,7 +549,35 @@ async def cmd_lobby(message: Message, state: FSMContext) -> None:
 @router.message(Command("cancel"), LobbyS.receipt)
 async def cmd_cancel(message: Message, state: FSMContext) -> None:
     await state.clear()
-    await message.answer("Ок, отменил. Снова открыть лобби: меню бота → «Лобби компенсации».")
+    await message.answer(
+        "Ок, отменил. Снова открыть лобби: меню бота → «Лобби компенсации».",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+
+
+@router.message(Command("lobby_sync"))
+async def cmd_lobby_sync(message: Message) -> None:
+    uid = message.from_user.id if message.from_user else None
+    if not admin_bot.is_admin(uid):
+        await message.answer("Обновление каталога только для администратора.")
+        return
+    if _bridge is None or getattr(_bridge, "auth", None) is None or getattr(_bridge.auth, "client", None) is None:
+        await message.answer("Юзербот ещё не готов.")
+        return
+    await message.answer("Спрашиваю актуальные тарифы у @sweetshopxxx_bot…")
+
+    async def _job():
+        from shop_catalog import fetch_shop_catalog, tariffs_to_db_rows
+
+        try:
+            tariffs = await _bridge.call(fetch_shop_catalog(_bridge.auth.client), timeout=120)
+            _require_db().shop_save_tariffs(tariffs_to_db_rows(tariffs))
+            names = ", ".join(t.short_name for t in tariffs) or "—"
+            await message.answer(f"Каталог обновлён ({len(tariffs)}): {names}")
+        except Exception as e:
+            await message.answer(f"Не удалось обновить каталог: {e}")
+
+    asyncio.create_task(_job())
 
 
 @router.message(Command("lobby_mail"))
@@ -521,27 +594,48 @@ async def on_tariff(message: Message, state: FSMContext) -> None:
     if _is_cancel(message):
         await cmd_cancel(message, state)
         return
-    try:
-        name = normalize_tariff(message.text or "")
-    except ValueError as e:
-        if str(e) == "отменено":
-            await cmd_cancel(message, state)
+    from shop_catalog import match_tariff
+
+    catalog = _catalog()
+    found = match_tariff(message.text or "", catalog) if catalog else None
+    if found is None:
+        if catalog:
+            await message.answer(
+                "Нажмите кнопку с тарифом из актуального списка магазина.",
+                reply_markup=_tariff_reply_kb(),
+            )
             return
-        await message.answer(f"{e}. Напишите название тарифа ещё раз.")
+        try:
+            name = normalize_tariff(message.text or "")
+        except ValueError as e:
+            if str(e) == "отменено":
+                await cmd_cancel(message, state)
+                return
+            await message.answer(f"{e}. Напишите название тарифа ещё раз.")
+            return
+        await state.update_data(tariff=name, shop_id="", price=0)
+        await state.set_state(LobbyS.duration)
+        await message.answer(
+            f"Тариф: <b>{_esc(name)}</b>\nНа какой срок брали?",
+            parse_mode="HTML",
+        )
         return
-    await state.update_data(tariff=name)
+    await state.update_data(
+        tariff=found.short_name,
+        shop_id=found.shop_id,
+        price=0,
+    )
     await state.set_state(LobbyS.duration)
     await message.answer(
-        f"Тариф: <b>{_esc(name)}</b>\n\n"
-        "На какой <b>срок</b> вы его брали?\n"
-        "Например: <code>30 дней</code>, <code>1 месяц</code>, <code>3 мес</code>.",
+        f"Тариф: <b>{_esc(found.short_name)}</b>\nНа какой срок покупали? Выберите кнопку.",
         parse_mode="HTML",
+        reply_markup=_period_reply_kb(found),
     )
 
 
 @router.message(LobbyS.tariff)
 async def on_tariff_other(message: Message) -> None:
-    await message.answer("Напишите название тарифа текстом.")
+    await message.answer("Выберите тариф кнопкой.")
 
 
 @router.message(LobbyS.duration, F.text)
@@ -549,6 +643,33 @@ async def on_duration(message: Message, state: FSMContext) -> None:
     if _is_cancel(message):
         await cmd_cancel(message, state)
         return
+    data = await state.get_data()
+    from shop_catalog import match_period
+
+    catalog = _catalog()
+    shop_id = str(data.get("shop_id") or "")
+    tariff = next((t for t in catalog if t.shop_id == shop_id), None)
+    if tariff is not None:
+        hit = match_period(message.text or "", tariff)
+        if hit:
+            days, price, label = hit
+            await state.update_data(duration_days=days, price=price)
+            if price > 0:
+                await state.set_state(LobbyS.receipt)
+                await message.answer(
+                    f"Срок: <b>{label}</b>\nЦена в магазине: <b>{price:g} ₽</b>\n\n"
+                    + receipt_guide_text(),
+                    parse_mode="HTML",
+                    reply_markup=ReplyKeyboardRemove(),
+                )
+                return
+            await state.set_state(LobbyS.price)
+            await message.answer(
+                f"Срок: <b>{days} д.</b>\nНапишите цену, которую платили, числом.",
+                parse_mode="HTML",
+                reply_markup=ReplyKeyboardRemove(),
+            )
+            return
     try:
         days = parse_tariff_duration(message.text or "")
     except ValueError as e:
@@ -557,8 +678,9 @@ async def on_duration(message: Message, state: FSMContext) -> None:
     await state.update_data(duration_days=days)
     await state.set_state(LobbyS.price)
     await message.answer(
-        f"Срок: <b>{days} д.</b>\n\nЗа какую <b>цену</b> покупали? Число в рублях.",
+        f"Срок: <b>{days} д.</b>\nЗа какую цену покупали? Число в рублях.",
         parse_mode="HTML",
+        reply_markup=ReplyKeyboardRemove(),
     )
 
 
@@ -610,12 +732,14 @@ async def on_receipt(message: Message, state: FSMContext) -> None:
     username = ""
     if message.from_user:
         username = message.from_user.username or message.from_user.full_name or ""
+    shop_id = str(data.get("shop_id") or "")
 
     if db.lobby_has_granted(uid):
         await state.clear()
         await message.answer(
             welcome_text(already_granted=True),
             parse_mode="HTML",
+            reply_markup=ReplyKeyboardRemove(),
         )
         return
 
@@ -630,12 +754,50 @@ async def on_receipt(message: Message, state: FSMContext) -> None:
             receipt_type=_receipt_kind(item),
             status="rejected",
             reject_reason=reason,
+            shop_id=shop_id,
         )
         await message.answer(
             f"Чек не принят: {reason}.\n"
             "Пришлите другой скриншот или PDF, либо /lobby чтобы начать заново."
         )
         return
+
+    forensic_notes = ""
+    if _bot is not None and item.file_id:
+        try:
+            from receipt_forensics import inspect_receipt_bytes
+
+            buf = await _bot.download(item.file_id)
+            raw = buf.read() if hasattr(buf, "read") else bytes(buf)
+            forensic = inspect_receipt_bytes(
+                raw,
+                filename=item.file_name,
+                mime=item.mime,
+                declared_price=price,
+                caption=item.caption,
+            )
+            forensic_notes = "; ".join(forensic.flags)
+            if not forensic.ok:
+                db.lobby_save_claim(
+                    user_id=uid,
+                    username=username,
+                    tariff=tariff,
+                    duration_days=days,
+                    price=price,
+                    receipt_file_id=item.file_id,
+                    receipt_type=_receipt_kind(item),
+                    status="rejected",
+                    reject_reason=forensic.reason,
+                    shop_id=shop_id,
+                    forensic_notes=forensic_notes,
+                )
+                await message.answer(
+                    f"Чек отклонён: {forensic.reason}.\n"
+                    "Пришлите исходный файл без Photoshop / обработки."
+                )
+                return
+        except Exception:
+            logger.exception("forensics via admin-bot")
 
     granted = granted_days_for(days)
     claim_id = db.lobby_save_claim(
@@ -648,17 +810,18 @@ async def on_receipt(message: Message, state: FSMContext) -> None:
         receipt_type=_receipt_kind(item),
         status="granted",
         granted_days=granted,
+        shop_id=shop_id,
+        forensic_notes=forensic_notes,
     )
     await state.clear()
     await message.answer(
-        "✅ Чек принят.\n\n"
-        f"Тариф: <b>{_esc(tariff)}</b>\n"
-        f"Срок покупки: <b>{days} д.</b>\n"
-        f"Цена: <b>{price:g} ₽</b>\n\n"
-        "В качестве извинений выдаём "
-        f"<b>{_esc(tariff)}</b> на <b>{granted} д.</b> (×2).\n\n"
-        "Администратор подтвердит доступ. Если что-то нужно уточнить — напишите сюда.",
+        "✅ Чек принят, следов Photoshop не видно.\n\n"
+        f"Возмещаем <b>один</b> тариф: <b>{_esc(tariff)}</b> "
+        f"на <b>{days} д.</b> (цена {price:g} ₽).\n"
+        "Больше одного тарифа выдать нельзя.\n\n"
+        "Администратор откроет доступ.",
         parse_mode="HTML",
+        reply_markup=ReplyKeyboardRemove(),
     )
     await _notify_admins_grant(
         claim_id=claim_id,
@@ -716,7 +879,7 @@ async def _notify_admins_grant(
         f"Пользователь: {who} (<code>{user_id}</code>)\n"
         f"Тариф: {_esc(tariff)}\n"
         f"Брали: {days} д. за {price:g} ₽\n"
-        f"Выдать: <b>{_esc(tariff)}</b> на <b>{granted} д.</b> (×2, извинения)."
+        f"Выдать: <b>один тариф</b> {_esc(tariff)} на {granted} д."
     )
     targets = list(config.ADMIN_IDS)
     if not targets:

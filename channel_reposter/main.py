@@ -25,6 +25,7 @@ import admin_bot
 import config
 import lobby
 import single_instance
+import support_inbox
 from bridge import BRIDGE
 from database import Database
 from poster import REASON_ABORTED as POST_REASON_ABORTED
@@ -620,6 +621,7 @@ async def main() -> None:
     # Планировщик работает всегда: вход юзербота можно сделать позже
     # через панель, и автопостинг подхватится без перезапуска бота.
     BRIDGE.submit(_worker_scheduler())
+    BRIDGE.submit(support_inbox.run_forever(BRIDGE, db))
     # Вход юзербота — в фоне: панель начинает отвечать сразу, даже если
     # сессия битая или Telegram недоступен (иначе бот «висел» на старте)
     BRIDGE.submit(_bootstrap_userbot_forever(db, workdir))

@@ -127,9 +127,9 @@ class ReceiptValidationTests(unittest.TestCase):
         ok, _ = validate_receipt(ReceiptInput(has_video=True, file_size=90_000), 100)
         self.assertFalse(ok)
 
-    def test_grant_doubles(self) -> None:
-        self.assertEqual(granted_days_for(30), 60)
-        self.assertEqual(granted_days_for(90), 180)
+    def test_grant_one_tariff_same_period(self) -> None:
+        self.assertEqual(granted_days_for(30), 30)
+        self.assertEqual(granted_days_for(90), 90)
 
 
 class MailingPeerTests(unittest.TestCase):
@@ -147,11 +147,11 @@ class MailingPeerTests(unittest.TestCase):
         )
         self.assertEqual(ids, [111])
 
-    def test_invite_mentions_menu_not_message_buttons(self) -> None:
+    def test_invite_mentions_shop_and_one_tariff(self) -> None:
         text = mailing_invite_text("ZzzLV_bot")
         self.assertIn("@ZzzLV_bot", text)
-        self.assertIn("/lobby", text)
-        self.assertIn("меню бота", text.lower())
+        self.assertIn("sweetshopxxx_bot", text)
+        self.assertIn("один", text.lower())
 
 
 class LobbyDbTests(unittest.TestCase):
@@ -187,6 +187,22 @@ class LobbyDbTests(unittest.TestCase):
         self.assertEqual(row["tariff"], "VIP")
         self.assertEqual(row["granted_days"], 60)
         self.assertEqual(row["status"], "granted")
+
+    def test_shop_tariffs_roundtrip(self) -> None:
+        self.db.shop_save_tariffs(
+            [
+                {
+                    "shop_id": "19063",
+                    "title": "VIP ALL-IN",
+                    "short_name": "VIP ALL-IN",
+                    "sort_order": 0,
+                    "extra_json": '{"periods":[{"days":30,"price":990,"label":"30 д. — 990 ₽"}]}',
+                }
+            ]
+        )
+        rows = self.db.shop_list_tariffs()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["shop_id"], "19063")
 
 
 if __name__ == "__main__":
