@@ -598,6 +598,7 @@ async def main() -> None:
             logger.exception("notify")
 
     BRIDGE.notify_fn = _notify
+    BRIDGE.bot_username = me.username or ""
 
     admin_bot.set_dependencies(
         db=db,

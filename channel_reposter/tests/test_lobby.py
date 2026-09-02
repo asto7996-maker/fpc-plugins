@@ -151,8 +151,8 @@ class MailingPeerTests(unittest.TestCase):
     def test_invite_mentions_shop_and_one_tariff(self) -> None:
         text = mailing_invite_text("ZzzLV_bot")
         self.assertIn("@ZzzLV_bot", text)
-        self.assertIn("sweetshopxxx_bot", text)
-        self.assertIn("один", text.lower())
+        self.assertIn("/lobby", text)
+        self.assertIn("нейросеть", text.lower())
 
     def test_receipt_guide_has_no_funpay(self) -> None:
         text = receipt_guide_text()
@@ -210,6 +210,23 @@ class LobbyDbTests(unittest.TestCase):
         rows = self.db.shop_list_tariffs()
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["shop_id"], "19063")
+
+    def test_known_users_and_comp_channels(self) -> None:
+        self.assertIsNone(self.db.known_get(42))
+        self.db.known_upsert(42, username="Hgfthjj", source="unread")
+        row = self.db.known_get(42)
+        assert row is not None
+        self.assertEqual(row["username"], "Hgfthjj")
+        self.db.known_mark_blocked(99)
+        self.assertEqual(int(self.db.known_get(99)["blocked"]), 1)
+        self.db.known_unblock(99)
+        self.assertEqual(int(self.db.known_get(99)["blocked"]), 0)
+        cid = self.db.comp_add_channel(-100123, title="VIP", username="vipchan")
+        self.assertGreater(cid, 0)
+        listed = self.db.comp_list_channels(enabled_only=True)
+        self.assertEqual(len(listed), 1)
+        self.db.comp_toggle_channel(cid)
+        self.assertEqual(self.db.comp_list_channels(enabled_only=True), [])
 
 
 if __name__ == "__main__":

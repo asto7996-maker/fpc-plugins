@@ -263,6 +263,38 @@ class Database:
                     last_msg_id INTEGER NOT NULL DEFAULT 0,
                     updated_at TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS support_known (
+                    peer_id INTEGER PRIMARY KEY,
+                    username TEXT NOT NULL DEFAULT '',
+                    source TEXT NOT NULL DEFAULT 'unread',
+                    unread_at_scan INTEGER NOT NULL DEFAULT 0,
+                    invited INTEGER NOT NULL DEFAULT 0,
+                    invited_at TEXT NOT NULL DEFAULT '',
+                    blocked INTEGER NOT NULL DEFAULT 0,
+                    blocked_at TEXT NOT NULL DEFAULT '',
+                    last_msg_id INTEGER NOT NULL DEFAULT 0,
+                    first_seen TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS comp_channels (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    chat_id INTEGER NOT NULL UNIQUE,
+                    title TEXT NOT NULL DEFAULT '',
+                    username TEXT NOT NULL DEFAULT '',
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS comp_invites (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    claim_id INTEGER NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    channel_id INTEGER NOT NULL,
+                    invite_link TEXT NOT NULL,
+                    expire_at REAL NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL
+                );
                 """
             )
             cols = [r[1] for r in conn.execute("PRAGMA table_info(history)")]
@@ -1221,6 +1253,181 @@ class Database:
                     data["duration_days"],
                     data["price"],
                     data["last_msg_id"],
+                    now,
+                ),
+            )
+
+    def known_get(self, peer_id: int) -> Optional[dict[str, Any]]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM support_known WHERE peer_id = ?",
+                (int(peer_id),),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def known_upsert(
+        self,
+        peer_id: int,
+        *,
+        username: str = "",
+        source: str = "unread",
+        unread_at_scan: Optional[int] = None,
+        last_msg_id: Optional[int] = None,
+    ) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        cur = self.known_get(peer_id) or {}
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO support_known(
+                    peer_id, username, source, unread_at_scan, invited,
+                    invited_at, blocked, blocked_at, last_msg_id, first_seen
+                ) VALUES(?, ?, ?, ?, 0, '', 0, '', ?, ?)
+                ON CONFLICT(peer_id) DO UPDATE SET
+                    username = CASE
+                        WHEN excluded.username != '' THEN excluded.username
+                        ELSE support_known.username
+                    END,
+                    last_msg_id = CASE
+                        WHEN excluded.last_msg_id > 0 THEN excluded.last_msg_id
+                        ELSE support_known.last_msg_id
+                    END,
+                    unread_at_scan = CASE
+                        WHEN excluded.unread_at_scan > 0 THEN excluded.unread_at_scan
+                        ELSE support_known.unread_at_scan
+                    END
+                """,
+                (
+                    int(peer_id),
+                    username or cur.get("username") or "",
+                    source or cur.get("source") or "unread",
+                    int(unread_at_scan if unread_at_scan is not None else cur.get("unread_at_scan") or 0),
+                    int(last_msg_id if last_msg_id is not None else cur.get("last_msg_id") or 0),
+                    now,
+                ),
+            )
+
+    def known_mark_invited(self, peer_id: int, last_msg_id: int = 0) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE support_known
+                SET invited = 1, invited_at = ?, last_msg_id = CASE
+                    WHEN ? > last_msg_id THEN ? ELSE last_msg_id END
+                WHERE peer_id = ?
+                """,
+                (now, int(last_msg_id), int(last_msg_id), int(peer_id)),
+            )
+
+    def known_mark_blocked(self, peer_id: int) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO support_known(
+                    peer_id, username, source, unread_at_scan, invited,
+                    invited_at, blocked, blocked_at, last_msg_id, first_seen
+                ) VALUES(?, '', 'block', 0, 0, '', 1, ?, 0, ?)
+                ON CONFLICT(peer_id) DO UPDATE SET
+                    blocked = 1, blocked_at = excluded.blocked_at
+                """,
+                (int(peer_id), now, now),
+            )
+
+    def known_unblock(self, peer_id: int) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE support_known SET blocked = 0, blocked_at = '' WHERE peer_id = ?",
+                (int(peer_id),),
+            )
+
+    def lobby_claim_user_ids(self) -> list[int]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT user_id FROM lobby_claims"
+            ).fetchall()
+        return [int(r["user_id"]) for r in rows]
+
+    def seed_done(self) -> bool:
+        return self.get_bool("support_seed_done", False)
+
+    def mark_seed_done(self) -> None:
+        self.set("support_seed_done", "1")
+
+    def comp_list_channels(self, *, enabled_only: bool = False) -> list[dict[str, Any]]:
+        q = "SELECT * FROM comp_channels"
+        if enabled_only:
+            q += " WHERE enabled = 1"
+        q += " ORDER BY id"
+        with self._connect() as conn:
+            rows = conn.execute(q).fetchall()
+        return [dict(r) for r in rows]
+
+    def comp_add_channel(
+        self, chat_id: int, title: str = "", username: str = ""
+    ) -> int:
+        now = datetime.now(timezone.utc).isoformat()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO comp_channels(chat_id, title, username, enabled, created_at)
+                VALUES(?, ?, ?, 1, ?)
+                ON CONFLICT(chat_id) DO UPDATE SET
+                    title = excluded.title,
+                    username = excluded.username,
+                    enabled = 1
+                """,
+                (int(chat_id), title or "", (username or "").lstrip("@"), now),
+            )
+            row = conn.execute(
+                "SELECT id FROM comp_channels WHERE chat_id = ?",
+                (int(chat_id),),
+            ).fetchone()
+        return int(row["id"]) if row else 0
+
+    def comp_delete_channel(self, channel_id: int) -> None:
+        with self._connect() as conn:
+            conn.execute("DELETE FROM comp_channels WHERE id = ?", (int(channel_id),))
+
+    def comp_toggle_channel(self, channel_id: int) -> bool:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT enabled FROM comp_channels WHERE id = ?",
+                (int(channel_id),),
+            ).fetchone()
+            if not row:
+                return False
+            new = 0 if int(row["enabled"]) else 1
+            conn.execute(
+                "UPDATE comp_channels SET enabled = ? WHERE id = ?",
+                (new, int(channel_id)),
+            )
+        return bool(new)
+
+    def comp_save_invite(
+        self,
+        *,
+        claim_id: int,
+        user_id: int,
+        channel_id: int,
+        invite_link: str,
+        expire_at: float = 0,
+    ) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO comp_invites(
+                    claim_id, user_id, channel_id, invite_link, expire_at, created_at
+                ) VALUES(?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    int(claim_id),
+                    int(user_id),
+                    int(channel_id),
+                    invite_link,
+                    float(expire_at or 0),
                     now,
                 ),
             )

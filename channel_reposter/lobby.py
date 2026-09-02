@@ -2,9 +2,8 @@
 lobby.py — лобби компенсации.
 
 Вход для админа: меню команд бота (/lobby, /lobby_mail, /lobby_sync).
-Основной диалог с покупателями ведёт юзербот в личке поддержки:
-тарифы берём из @sweetshopxxx_bot, человек выбирает кнопкой,
-чек проверяется на Photoshop, возмещаем максимум один тариф.
+Покупатели оформляют компенсацию в этом боте. Юзербот только зовёт
+своих людей из непрочитанных чатов и блокирует левых. Чек проверяет Gemini.
 """
 
 from __future__ import annotations
@@ -13,6 +12,7 @@ import asyncio
 import logging
 import re
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 from aiogram import Bot, F, Router
@@ -390,14 +390,14 @@ def collect_private_user_ids(
 
 
 def mailing_invite_text(bot_username: str) -> str:
+    handle = (bot_username or "").lstrip("@") or "ZzzLV_bot"
     return (
         "Здравствуйте. Это поддержка.\n\n"
-        "Приватные каналы были заблокированы. Можем возместить "
-        "максимум один купленный тариф — после проверки чека "
-        "(в том числе на Photoshop).\n\n"
-        "Ответьте на это сообщение, и пришлю кнопки с актуальными "
-        "тарифами и ценами из @sweetshopxxx_bot. Либо откройте меню бота "
-        f"@{(bot_username or '').lstrip('@')} → «Лобби компенсации»."
+        "Приватные каналы были заблокированы. Компенсацию оформляем "
+        f"только в боте @{handle}: команда /lobby, тариф кнопкой, "
+        "затем чек. Нейросеть проверит, что это квитанция, а не "
+        "случайное фото и не Photoshop.\n\n"
+        "Сюда писать не нужно — сообщения от новых людей не принимаются."
     )
 
 
@@ -430,7 +430,8 @@ def welcome_text(*, already_granted: bool = False, is_admin: bool = False) -> st
         "<b>Лобби компенсации</b>\n\n"
         "Приватные каналы с товаром были заблокированы. "
         "Возмещаем <b>максимум один тариф</b> из актуального списка "
-        "@sweetshopxxx_bot — после проверки чека (в т.ч. Photoshop).\n\n"
+        "@sweetshopxxx_bot. Чек смотрит нейросеть: это должна быть "
+        "квитанция оплаты (сумма как в магазине), не скрин чата и не Photoshop.\n\n"
         "Выберите тариф, затем срок: <b>цены подтягиваются из магазина</b>."
         + extra
     )
@@ -444,6 +445,9 @@ LOBBY_MAIL_COMMAND = BotCommand(
 )
 LOBBY_SYNC_COMMAND = BotCommand(
     command="lobby_sync", description="Обновить тарифы из магазина"
+)
+LOBBY_ALLOW_COMMAND = BotCommand(
+    command="lobby_allow", description="Разрешить пользователя лобби"
 )
 
 _ADMIN_EXTRA = [
@@ -467,7 +471,13 @@ async def setup_bot_menu(bot: Bot) -> None:
     for aid in config.ADMIN_IDS:
         try:
             await bot.set_my_commands(
-                [LOBBY_COMMAND, LOBBY_MAIL_COMMAND, LOBBY_SYNC_COMMAND, *_ADMIN_EXTRA],
+                [
+                    LOBBY_COMMAND,
+                    LOBBY_MAIL_COMMAND,
+                    LOBBY_SYNC_COMMAND,
+                    LOBBY_ALLOW_COMMAND,
+                    *_ADMIN_EXTRA,
+                ],
                 scope=BotCommandScopeChat(chat_id=aid),
             )
         except Exception:
@@ -522,6 +532,21 @@ async def start_lobby(message: Message, state: FSMContext) -> None:
     await state.clear()
     db = _require_db()
     uid = message.from_user.id if message.from_user else 0
+    username = ""
+    if message.from_user:
+        username = message.from_user.username or ""
+    from access import is_privileged, may_use_lobby
+
+    if uid and is_privileged(uid, username):
+        db.known_upsert(uid, username=username, source="test")
+    if not may_use_lobby(db, uid, username):
+        await message.answer(
+            "Этот бот только для тех, кому написала поддержка.\n"
+            "Если вы покупатель — дождитесь сообщения на аккаунт поддержки "
+            "и откройте /lobby по приглашению.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return
     granted = db.lobby_has_granted(uid) if uid else False
     is_admin = admin_bot.is_admin(uid or None)
     catalog = _catalog()
@@ -590,6 +615,43 @@ async def cmd_lobby_sync(message: Message) -> None:
             await message.answer(f"Не удалось обновить каталог: {e}")
 
     asyncio.create_task(_job())
+
+
+@router.message(Command("lobby_allow"))
+async def cmd_lobby_allow(message: Message) -> None:
+    uid = message.from_user.id if message.from_user else None
+    if not admin_bot.is_admin(uid):
+        await message.answer("Только администратор.")
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer("Формат: /lobby_allow 123456 или /lobby_allow @username")
+        return
+    raw = parts[1].strip()
+    db = _require_db()
+    peer = 0
+    uname = ""
+    if raw.lstrip("-").isdigit():
+        peer = int(raw)
+    else:
+        uname = raw.lstrip("@")
+        if _bridge is not None and getattr(_bridge, "auth", None) and getattr(_bridge.auth, "client", None):
+            try:
+                chat = await _bridge.call(_bridge.auth.client.get_chat(uname), timeout=20)
+                peer = int(getattr(chat, "id", 0) or 0)
+                uname = getattr(chat, "username", None) or uname
+            except Exception as e:
+                await message.answer(f"Не нашёл @{uname}: {e}")
+                return
+        else:
+            await message.answer("Юзербот не готов — укажите числовой id.")
+            return
+    if peer <= 0:
+        await message.answer("Не понял пользователя.")
+        return
+    db.known_upsert(peer, username=uname, source="admin")
+    db.known_unblock(peer)
+    await message.answer(f"Разрешил {peer}" + (f" (@{uname})" if uname else "") + ". Может открыть /lobby.")
 
 
 @router.message(Command("lobby_mail"))
@@ -779,42 +841,79 @@ async def on_receipt(message: Message, state: FSMContext) -> None:
         )
         return
 
-    forensic_notes = ""
-    if _bot is not None and item.file_id:
-        try:
-            from receipt_forensics import inspect_receipt_bytes
+    if _bot is None or not item.file_id:
+        await message.answer("Не удалось скачать файл. Пришлите чек ещё раз.")
+        return
 
-            buf = await _bot.download(item.file_id)
-            raw = buf.read() if hasattr(buf, "read") else bytes(buf)
-            forensic = inspect_receipt_bytes(
-                raw,
-                filename=item.file_name,
-                mime=item.mime,
-                declared_price=price,
-                caption=item.caption,
+    await message.answer("Проверяю чек нейросетью — это займёт несколько секунд…")
+    forensic_notes = ""
+    try:
+        from gemini_receipt import inspect_receipt_gemini
+        from receipt_forensics import inspect_receipt_bytes
+
+        buf = await _bot.download(item.file_id)
+        raw = buf.read() if hasattr(buf, "read") else bytes(buf)
+        forensic = inspect_receipt_bytes(
+            raw,
+            filename=item.file_name,
+            mime=item.mime,
+            declared_price=price,
+            caption=item.caption,
+        )
+        forensic_notes = "; ".join(forensic.flags)
+        if not forensic.ok:
+            db.lobby_save_claim(
+                user_id=uid,
+                username=username,
+                tariff=tariff,
+                duration_days=days,
+                price=price,
+                receipt_file_id=item.file_id,
+                receipt_type=_receipt_kind(item),
+                status="rejected",
+                reject_reason=forensic.reason,
+                shop_id=shop_id,
+                forensic_notes=forensic_notes,
             )
-            forensic_notes = "; ".join(forensic.flags)
-            if not forensic.ok:
-                db.lobby_save_claim(
-                    user_id=uid,
-                    username=username,
-                    tariff=tariff,
-                    duration_days=days,
-                    price=price,
-                    receipt_file_id=item.file_id,
-                    receipt_type=_receipt_kind(item),
-                    status="rejected",
-                    reject_reason=forensic.reason,
-                    shop_id=shop_id,
-                    forensic_notes=forensic_notes,
-                )
-                await message.answer(
-                    f"Чек отклонён: {forensic.reason}.\n"
-                    "Пришлите исходный файл без Photoshop / обработки."
-                )
-                return
-        except Exception:
-            logger.exception("forensics via admin-bot")
+            await message.answer(
+                f"Чек отклонён: {forensic.reason}.\n"
+                "Пришлите исходный файл без Photoshop / обработки."
+            )
+            return
+        gemini = await inspect_receipt_gemini(
+            raw,
+            mime=item.mime,
+            filename=item.file_name,
+            declared_price=price,
+        )
+        forensic_notes = "; ".join(
+            [x for x in (forensic_notes, "; ".join(gemini.flags), gemini.reason) if x]
+        )
+        if not gemini.ok:
+            db.lobby_save_claim(
+                user_id=uid,
+                username=username,
+                tariff=tariff,
+                duration_days=days,
+                price=price,
+                receipt_file_id=item.file_id,
+                receipt_type=_receipt_kind(item),
+                status="rejected",
+                reject_reason=gemini.reason,
+                shop_id=shop_id,
+                forensic_notes=forensic_notes,
+            )
+            await message.answer(
+                f"Чек отклонён: {gemini.reason}.\n"
+                "Нужна квитанция банка/СБП с суммой тарифа, не скрин чата и не обработанное фото."
+            )
+            return
+    except Exception:
+        logger.exception("gemini/forensics via admin-bot")
+        await message.answer(
+            "Не удалось проверить чек. Пришлите файл ещё раз через минуту."
+        )
+        return
 
     granted = granted_days_for(days)
     claim_id = db.lobby_save_claim(
@@ -831,12 +930,22 @@ async def on_receipt(message: Message, state: FSMContext) -> None:
         forensic_notes=forensic_notes,
     )
     await state.clear()
+    invites = await issue_comp_invites(
+        db, _bot, _bridge, uid, days, claim_id
+    )
+    extra_access = ""
+    if invites:
+        extra_access = "\n\nСсылки в каналы (личный вход, на выбранный срок):\n" + "\n".join(
+            f"• {_esc(title)}: {url}" for title, url in invites
+        )
+    else:
+        extra_access = "\n\nАдминистратор откроет доступ."
     await message.answer(
-        "✅ Чек принят, следов Photoshop не видно.\n\n"
+        "✅ Чек принят: нейросеть подтвердила квитанцию, монтажа не видно.\n\n"
         f"Возмещаем <b>один</b> тариф: <b>{_esc(tariff)}</b> "
         f"на <b>{_fmt_days(days)}</b> (цена {price:g} ₽).\n"
-        "Больше одного тарифа выдать нельзя.\n\n"
-        "Администратор откроет доступ.",
+        "Больше одного тарифа выдать нельзя."
+        + extra_access,
         parse_mode="HTML",
         reply_markup=ReplyKeyboardRemove(),
     )
@@ -851,6 +960,8 @@ async def on_receipt(message: Message, state: FSMContext) -> None:
         item=item,
         from_chat=message.chat.id,
         message_id=message.message_id,
+        notes=forensic_notes,
+        invites=invites,
     )
 
 
@@ -874,6 +985,69 @@ def _esc(text: str) -> str:
     )
 
 
+async def issue_comp_invites(
+    db,
+    bot: Bot | None,
+    bridge,
+    user_id: int,
+    days: int,
+    claim_id: int,
+) -> list[tuple[str, str]]:
+    """Ссылки-приглашения в каналы доступа на срок тарифа, 1 человек."""
+    channels = db.comp_list_channels(enabled_only=True)
+    if not channels:
+        return []
+    now = datetime.now(timezone.utc)
+    expire_dt = None
+    if days < 3000:
+        expire_dt = now + timedelta(days=min(max(int(days), 1), 365))
+    expire_ts = float(expire_dt.timestamp()) if expire_dt else 0.0
+    out: list[tuple[str, str]] = []
+    for ch in channels:
+        chat_id = int(ch["chat_id"])
+        title = str(ch.get("title") or ch.get("username") or chat_id)
+        url = ""
+        if bot is not None:
+            try:
+                kw: dict[str, Any] = {
+                    "chat_id": chat_id,
+                    "member_limit": 1,
+                    "name": f"c{claim_id}"[:16],
+                }
+                if expire_dt is not None:
+                    kw["expire_date"] = expire_dt
+                link = await bot.create_chat_invite_link(**kw)
+                url = getattr(link, "invite_link", "") or ""
+            except Exception:
+                logger.debug("bot invite %s failed", chat_id, exc_info=True)
+        if not url and bridge is not None and getattr(bridge, "auth", None) is not None:
+            client = getattr(bridge.auth, "client", None)
+            if client is not None:
+                try:
+                    async def _ub(_chat=chat_id, _exp=expire_dt):
+                        kw2: dict[str, Any] = {"chat_id": _chat, "member_limit": 1}
+                        if _exp is not None:
+                            kw2["expire_date"] = _exp
+                        link = await client.create_chat_invite_link(**kw2)
+                        return getattr(link, "invite_link", None) or ""
+
+                    url = await bridge.call(_ub(), timeout=30)
+                except Exception:
+                    logger.exception("userbot invite %s", chat_id)
+        if url:
+            db.comp_save_invite(
+                claim_id=claim_id,
+                user_id=user_id,
+                channel_id=chat_id,
+                invite_link=url,
+                expire_at=expire_ts,
+            )
+            out.append((title, url))
+        else:
+            logger.warning("не удалось создать инвайт в %s (%s)", title, chat_id)
+    return out
+
+
 async def _notify_admins_grant(
     *,
     claim_id: int,
@@ -886,17 +1060,24 @@ async def _notify_admins_grant(
     item: ReceiptInput,
     from_chat: int,
     message_id: int,
+    notes: str = "",
+    invites: list[tuple[str, str]] | None = None,
 ) -> None:
     bot = _bot
     if bot is None:
         return
     who = f"@{username}" if username else str(user_id)
+    extra = ""
+    if invites:
+        extra = "\nСсылки:\n" + "\n".join(f"• {t}: {u}" for t, u in invites)
     text = (
         f"✅ Лобби: заявка #{claim_id} принята.\n"
         f"Пользователь: {who} (<code>{user_id}</code>)\n"
         f"Тариф: {_esc(tariff)}\n"
         f"Брали: {_fmt_days(days)} за {price:g} ₽\n"
-        f"Выдать: <b>один тариф</b> {_esc(tariff)} на {_fmt_days(granted)}"
+        f"Выдать: <b>один тариф</b> {_esc(tariff)} на {_fmt_days(granted)}\n"
+        f"Gemini: {_esc(notes)[:400]}"
+        f"{extra}"
     )
     targets = list(config.ADMIN_IDS)
     if not targets:

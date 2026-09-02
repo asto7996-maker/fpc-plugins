@@ -35,6 +35,8 @@ from shop_catalog import (  # noqa: E402
     tariffs_to_db_rows,
 )
 from support_inbox import should_handle_top  # noqa: E402
+from access import decide_inbox_action, is_privileged  # noqa: E402
+from gemini_receipt import parse_verdict_json  # noqa: E402
 
 
 class ShopTitleTests(unittest.TestCase):
@@ -209,6 +211,88 @@ class ForensicsTests(unittest.TestCase):
         img.save(buf, "JPEG", quality=85, exif=exif)
         r = inspect_receipt_bytes(buf.getvalue())
         self.assertFalse(r.ok)
+
+
+class AccessPolicyTests(unittest.TestCase):
+    def test_seed_unread_before_lock(self) -> None:
+        self.assertEqual(
+            decide_inbox_action(
+                privileged=False,
+                known=False,
+                blocked=False,
+                incoming=True,
+                seed_done=False,
+                unread=True,
+            ),
+            "seed",
+        )
+
+    def test_block_strangers_after_seed(self) -> None:
+        self.assertEqual(
+            decide_inbox_action(
+                privileged=False,
+                known=False,
+                blocked=False,
+                incoming=True,
+                seed_done=True,
+                unread=True,
+            ),
+            "block",
+        )
+
+    def test_known_is_reminded(self) -> None:
+        self.assertEqual(
+            decide_inbox_action(
+                privileged=False,
+                known=True,
+                blocked=False,
+                incoming=True,
+                seed_done=True,
+                unread=False,
+            ),
+            "remind",
+        )
+
+    def test_test_account_privileged(self) -> None:
+        self.assertTrue(is_privileged(1, "Hgfthjj"))
+        self.assertFalse(is_privileged(1, "random_user"))
+
+
+class GeminiVerdictTests(unittest.TestCase):
+    def test_rejects_chat_screenshot(self) -> None:
+        v = parse_verdict_json(
+            '{"is_receipt": false, "edited": false, "amount": null, '
+            '"amount_matches": false, "verdict": "reject", '
+            '"reason": "это скриншот чата"}',
+            179,
+        )
+        self.assertFalse(v.ok)
+        self.assertIn("чат", v.reason.lower())
+
+    def test_ok_matching_amount(self) -> None:
+        v = parse_verdict_json(
+            '{"is_receipt": true, "edited": false, "amount": 179, '
+            '"amount_matches": true, "verdict": "ok", "reason": "квитанция СБП"}',
+            179,
+        )
+        self.assertTrue(v.ok)
+
+    def test_rejects_photoshop(self) -> None:
+        v = parse_verdict_json(
+            '{"is_receipt": true, "edited": true, "amount": 179, '
+            '"amount_matches": true, "verdict": "ok", "reason": "слои"}',
+            179,
+        )
+        self.assertFalse(v.ok)
+
+    def test_rejects_wrong_amount(self) -> None:
+        v = parse_verdict_json(
+            '{"is_receipt": true, "edited": false, "amount": 50, '
+            '"amount_matches": true, "verdict": "ok", "reason": "чек"}',
+            179,
+        )
+        self.assertFalse(v.ok)
+        self.assertFalse(v.amount_matches)
 
 
 class _Btn:
