@@ -71,6 +71,7 @@ POST_DELAY_MAX: float = max(POST_DELAY_MIN, _float("POST_DELAY_MAX", 4.0))
 # Оконный залив: один юзербот, несколько пар. Чтобы одно окно не забивало остальные.
 WINDOW_CYCLE_TIMEOUT: float = max(15.0, _float("WINDOW_CYCLE_TIMEOUT", 90.0))
 PASS_TIMEOUT: float = max(WINDOW_CYCLE_TIMEOUT, _float("PASS_TIMEOUT", 180.0))
+PASS_PUBLISH_LIMIT: int = max(1, int(_optional("PASS_PUBLISH_LIMIT", "16") or "16"))
 SHOP_BOT_USERNAME: str = _optional("SHOP_BOT_USERNAME", "sweetshopxxx_bot") or "sweetshopxxx_bot"
 # Юзербот опрашивает лички поддержки и сам ведёт компенсацию
 SUPPORT_INBOX_SECONDS: float = max(8.0, _float("SUPPORT_INBOX_SECONDS", 12.0))
