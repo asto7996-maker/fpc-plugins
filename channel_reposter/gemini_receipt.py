@@ -280,9 +280,16 @@ def inspect_receipt_gemini_sync(
             return verdict
         if auth_fail >= 3:
             break
+    if "HTTP 401" in last_err or "HTTP 403" in last_err:
+        reason = (
+            "Google не принял ключ Gemini (401). "
+            "Админу нужно выпустить новый ключ AQ в AI Studio и прописать GEMINI_API_KEY."
+        )
+    else:
+        reason = f"нейросеть не ответила ({last_err or 'нет модели'})"
     return GeminiVerdict(
         ok=False,
-        reason=f"нейросеть не ответила ({last_err or 'нет модели'})",
+        reason=reason,
         flags=["gemini-error"],
     )
 
