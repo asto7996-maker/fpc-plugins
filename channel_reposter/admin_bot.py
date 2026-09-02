@@ -141,7 +141,11 @@ async def _deny(uid: Optional[int], reply: Callable) -> bool:
     if is_admin(uid):
         return False
     try:
-        await reply("⛔ Только для администраторов.")
+        await reply(
+            "Панель репостера только для администраторов.\n"
+            "Лобби компенсации: меню бота (кнопка рядом со строкой ввода) "
+            "→ «Лобби компенсации», либо /lobby"
+        )
     except Exception:
         logger.debug("deny reply failed", exc_info=True)
     return True
@@ -516,9 +520,13 @@ def status_text(db: Database) -> str:
 
 @router.message(Command("start", "menu", "help"))
 async def cmd_start(message: Message, state: FSMContext) -> None:
-    if await _deny(message.from_user.id if message.from_user else None, message.answer):
+    uid = message.from_user.id if message.from_user else None
+    if not is_admin(uid):
+        import lobby as _lobby
+
+        await _lobby.start_lobby(message, state)
         return
-    _remember_admin(message.from_user.id if message.from_user else None)
+    _remember_admin(uid)
     await state.clear()
     db = _require_db()
     await message.answer(
@@ -530,7 +538,9 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
         "3️⃣ В каждом окне: источник + назначение + «С начала»\n"
         "4️⃣ Описание → ⏱ Интервал → ▶️ Старт\n\n"
         "Управление — кнопками ниже.\n"
-        "Команды на всякий случай: /status /run_now /stop /test /ping /unstick\n\n"
+        "Лобби компенсации — отдельная команда в <b>меню бота</b> "
+        "(рядом со строкой ввода): /lobby. Не путать с кнопками этого сообщения.\n"
+        "Команды панели: /status /run_now /stop /test /ping /unstick\n\n"
         + status_text(db),
         reply_markup=main_kb(db),
         parse_mode="HTML",

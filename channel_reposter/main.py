@@ -23,6 +23,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 
 import admin_bot
 import config
+import lobby
 import single_instance
 from bridge import BRIDGE
 from database import Database
@@ -603,9 +604,18 @@ async def main() -> None:
         bridge=BRIDGE,
         bot=bot,
     )
+    lobby.set_dependencies(
+        db=db,
+        bot=bot,
+        bridge=BRIDGE,
+        bot_username=me.username or "",
+    )
 
     dp = Dispatcher(storage=MemoryStorage())
+    # Лобби раньше панели: иначе catch-all /start и on_unknown съедят диалог
+    dp.include_router(lobby.router)
     admin_bot.setup_dispatcher(dp)
+    await lobby.setup_bot_menu(bot)
 
     # Планировщик работает всегда: вход юзербота можно сделать позже
     # через панель, и автопостинг подхватится без перезапуска бота.

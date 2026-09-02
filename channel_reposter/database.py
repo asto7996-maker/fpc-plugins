@@ -216,6 +216,31 @@ class Database:
                     last_error_at REAL NOT NULL DEFAULT 0,
                     latest_source_id INTEGER NOT NULL DEFAULT 0
                 );
+
+                CREATE TABLE IF NOT EXISTS lobby_mailings (
+                    peer_id INTEGER PRIMARY KEY,
+                    sent_at TEXT NOT NULL,
+                    error TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS lobby_claims (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    username TEXT NOT NULL DEFAULT '',
+                    tariff TEXT NOT NULL,
+                    duration_days INTEGER NOT NULL,
+                    price REAL NOT NULL,
+                    receipt_file_id TEXT NOT NULL DEFAULT '',
+                    receipt_type TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL,
+                    reject_reason TEXT NOT NULL DEFAULT '',
+                    granted_days INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_lobby_claims_user
+                    ON lobby_claims(user_id);
+                CREATE INDEX IF NOT EXISTS idx_lobby_claims_status
+                    ON lobby_claims(status);
                 """
             )
             cols = [r[1] for r in conn.execute("PRAGMA table_info(history)")]
@@ -967,3 +992,107 @@ class Database:
         with self._connect() as conn:
             rows = conn.execute(sql, (job_id,)).fetchall()
         return [int(r["mid"]) for r in rows if r["mid"] is not None]
+
+    # ------------------------------------------------------------------
+    # Лобби компенсации: рассылка и заявки
+    # ------------------------------------------------------------------
+
+    def lobby_was_mailed(self, peer_id: int) -> bool:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT peer_id FROM lobby_mailings WHERE peer_id = ?",
+                (int(peer_id),),
+            ).fetchone()
+        return row is not None
+
+    def lobby_mailed_ids(self) -> set[int]:
+        with self._connect() as conn:
+            rows = conn.execute("SELECT peer_id FROM lobby_mailings").fetchall()
+        return {int(r["peer_id"]) for r in rows}
+
+    def lobby_mark_mailed(self, peer_id: int, error: str = "") -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO lobby_mailings(peer_id, sent_at, error)
+                VALUES(?, ?, ?)
+                ON CONFLICT(peer_id) DO UPDATE SET
+                    sent_at = excluded.sent_at,
+                    error = excluded.error
+                """,
+                (int(peer_id), now, error or ""),
+            )
+
+    def lobby_mailing_count(self) -> int:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS c FROM lobby_mailings WHERE error = ''"
+            ).fetchone()
+        return int(row["c"]) if row else 0
+
+    def lobby_save_claim(
+        self,
+        *,
+        user_id: int,
+        username: str,
+        tariff: str,
+        duration_days: int,
+        price: float,
+        receipt_file_id: str,
+        receipt_type: str,
+        status: str,
+        reject_reason: str = "",
+        granted_days: int = 0,
+    ) -> int:
+        now = datetime.now(timezone.utc).isoformat()
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO lobby_claims(
+                    user_id, username, tariff, duration_days, price,
+                    receipt_file_id, receipt_type, status, reject_reason,
+                    granted_days, created_at
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    int(user_id),
+                    username or "",
+                    tariff,
+                    int(duration_days),
+                    float(price),
+                    receipt_file_id or "",
+                    receipt_type or "",
+                    status,
+                    reject_reason or "",
+                    int(granted_days),
+                    now,
+                ),
+            )
+            return int(cur.lastrowid)
+
+    def lobby_latest_claim(self, user_id: int) -> Optional[dict[str, Any]]:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM lobby_claims
+                WHERE user_id = ?
+                ORDER BY id DESC LIMIT 1
+                """,
+                (int(user_id),),
+            ).fetchone()
+            if row is None:
+                return None
+            return dict(row)
+
+    def lobby_has_granted(self, user_id: int) -> bool:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT id FROM lobby_claims
+                WHERE user_id = ? AND status = 'granted'
+                LIMIT 1
+                """,
+                (int(user_id),),
+            ).fetchone()
+        return row is not None
