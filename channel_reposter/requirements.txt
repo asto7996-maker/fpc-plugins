@@ -4,6 +4,8 @@ Pillow>=10.0.0
 # @sweetshopxxx_bot (MessageMediaUnsupported, без подписи и цен).
 # Импорт тот же: `from pyrogram import Client`.
 pyrofork==2.3.69
+pytesseract>=0.3.10
+pypdf>=4.0.0
 
 # Необязательно, но ускоряет шифрование Pyrogram в разы.
 # Требует компилятор и python3-dev, поэтому не включён в обязательные:

@@ -24,6 +24,7 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 
 import config
+from receipt_amount import prices_equal
 
 logger = logging.getLogger(__name__)
 
@@ -55,7 +56,7 @@ PROMPT = """Ты проверяешь файл на компенсацию по�
 - обрезок без суммы;
 - отредактированное изображение (Photoshop, Photopea, нарисованный текст, слои, штамп).
 
-Ожидаемая сумма оплаты: {price:.2f} RUB (допуск 5% или 1 рубль).
+Ожидаемая сумма оплаты: {price:.2f} RUB. Совпадение СТРОГО копейка в копейку, без допуска.
 
 Ответь ТОЛЬКО JSON без markdown:
 {{
@@ -66,7 +67,8 @@ PROMPT = """Ты проверяешь файл на компенсацию по�
   "verdict": "ok" или "reject",
   "reason": "кратко по-русски, одна фраза"
 }}
-verdict=ok только если is_receipt=true, edited=false и (amount_matches=true ИЛИ сумма на чеке совпадает с ожидаемой).
+verdict=ok только если is_receipt=true, edited=false и amount_matches=true.
+amount_matches=true только если сумма на чеке равна {price:.2f} RUB копейка в копейку.
 В поле reason не упоминай нейросеть, Gemini, Google и AI Studio.
 """
 
@@ -183,12 +185,9 @@ def parse_verdict_json(text: str, declared_price: float) -> GeminiVerdict:
         amount_f = float(amount) if amount is not None and amount != "" else None
     except (TypeError, ValueError):
         amount_f = None
-    amount_matches = bool(data.get("amount_matches"))
+    amount_matches = False
     if amount_f is not None and declared_price > 0:
-        if abs(amount_f - declared_price) <= max(1.0, declared_price * 0.05):
-            amount_matches = True
-        else:
-            amount_matches = False
+        amount_matches = prices_equal(amount_f, declared_price)
     verdict = str(data.get("verdict") or "").strip().lower()
     reason = str(data.get("reason") or "").strip() or "отклонено"
 
@@ -205,7 +204,7 @@ def parse_verdict_json(text: str, declared_price: float) -> GeminiVerdict:
         reason = reason or "есть следы Photoshop / монтажа"
         ok = False
     elif not amount_matches:
-        reason = reason or "сумма на чеке не совпадает с тарифом"
+        reason = reason or "сумма на чеке не совпадает с тарифом копейка в копейку"
         ok = False
     return GeminiVerdict(
         ok=ok,

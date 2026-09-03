@@ -103,29 +103,6 @@ class ReceiptValidationTests(unittest.TestCase):
         )
         self.assertFalse(ok)
 
-    def test_rejects_wrong_amount_in_caption(self) -> None:
-        ok, reason = validate_receipt(
-            ReceiptInput(
-                has_photo=True,
-                file_size=20_000,
-                caption="оплачено 200 ₽",
-            ),
-            1500,
-        )
-        self.assertFalse(ok)
-        self.assertIn("сумма", reason)
-
-    def test_caption_amount_matches(self) -> None:
-        ok, reason = validate_receipt(
-            ReceiptInput(
-                has_photo=True,
-                file_size=20_000,
-                caption="заказ на 1 500 руб",
-            ),
-            1500,
-        )
-        self.assertTrue(ok, reason)
-
     def test_rejects_video(self) -> None:
         ok, _ = validate_receipt(ReceiptInput(has_video=True, file_size=90_000), 100)
         self.assertFalse(ok)
@@ -166,6 +143,80 @@ class MailingPeerTests(unittest.TestCase):
         self.assertNotIn("FunPay", text)
         self.assertNotIn("фанпей", text.lower())
         self.assertIn("Банк", text)
+        self.assertIn("ровно", text.lower())
+
+
+class ReceiptAmountTests(unittest.TestCase):
+    def test_exact_kopeck_match(self) -> None:
+        from receipt_amount import (
+            amount_is_confirmed,
+            AmountCheck,
+            check_receipt_amount,
+            price_in_text,
+            prices_equal,
+        )
+
+        self.assertTrue(prices_equal(1490, 1490.00))
+        self.assertTrue(prices_equal(99.5, 99.50))
+        self.assertFalse(prices_equal(1500, 1499))
+        self.assertFalse(prices_equal(1500, 1425))
+        self.assertTrue(price_in_text("Перевод СБП 1 490 ₽", 1490))
+        self.assertTrue(price_in_text("Итого: 1490,00 руб", 1490))
+        self.assertTrue(price_in_text("сумма 99,50 RUB", 99.5))
+        self.assertFalse(price_in_text("перевод 14 900 ₽", 1490))
+        self.assertFalse(price_in_text("оплачено 200 ₽", 1500))
+        pdf_ok = b"%PDF-1.4\nBT (Summa 1 490 rub) Tj ET\n"
+        hit = check_receipt_amount(
+            pdf_ok, mime="application/pdf", filename="c.pdf", declared_price=1490
+        )
+        self.assertTrue(hit.ok, hit.reason)
+        pdf_bad = b"%PDF-1.4\nBT (Summa 200 rub) Tj ET\n"
+        miss = check_receipt_amount(
+            pdf_bad, mime="application/pdf", filename="c.pdf", declared_price=1490
+        )
+        self.assertFalse(miss.ok)
+        self.assertIn("ровно", miss.reason)
+        self.assertFalse(
+            amount_is_confirmed(
+                AmountCheck(ok=False, reason="x"),
+                vision_amount=None,
+                declared_price=1490,
+            )
+        )
+        self.assertTrue(
+            amount_is_confirmed(
+                AmountCheck(ok=False, reason="x"),
+                vision_amount=1490.0,
+                declared_price=1490,
+            )
+        )
+
+    def test_ocr_image_if_tesseract(self) -> None:
+        import shutil
+
+        from receipt_amount import check_receipt_amount
+
+        if shutil.which("tesseract") is None:
+            self.skipTest("tesseract")
+        try:
+            from PIL import Image, ImageDraw, ImageFont
+        except ImportError:
+            self.skipTest("pillow")
+        img = Image.new("RGB", (900, 500), (255, 255, 255))
+        draw = ImageDraw.Draw(img)
+        try:
+            font = ImageFont.truetype("DejaVuSans.ttf", 48)
+        except OSError:
+            font = ImageFont.load_default()
+        draw.text((40, 180), "CБП  1 490 RUB", fill=(0, 0, 0), font=font)
+        buf = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
+        img.save(buf.name, "JPEG", quality=95)
+        data = Path(buf.name).read_bytes()
+        Path(buf.name).unlink(missing_ok=True)
+        hit = check_receipt_amount(
+            data, mime="image/jpeg", filename="bank.jpg", declared_price=1490
+        )
+        self.assertTrue(hit.ok, f"{hit.reason} sample={hit.text_sample!r}")
 
 
 class LobbyDbTests(unittest.TestCase):

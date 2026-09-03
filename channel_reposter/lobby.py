@@ -272,14 +272,11 @@ def _extract_amounts(text: str) -> list[float]:
 
 
 def amount_matches_price(amounts: list[float], price: float) -> bool:
-    if not amounts:
-        return True
-    for amt in amounts:
-        if price <= 0:
-            continue
-        if abs(amt - price) <= max(1.0, price * 0.05):
-            return True
-    return False
+    if not amounts or price <= 0:
+        return False
+    from receipt_amount import prices_equal
+
+    return any(prices_equal(amt, price) for amt in amounts)
 
 
 def validate_receipt(item: ReceiptInput, declared_price: float) -> tuple[bool, str]:
@@ -303,13 +300,6 @@ def validate_receipt(item: ReceiptInput, declared_price: float) -> tuple[bool, s
 
     if item.file_size and item.file_size < MIN_RECEIPT_BYTES:
         return False, "файл слишком маленький — пришлите полный скриншот чека"
-
-    amounts = _extract_amounts(item.caption)
-    if amounts and not amount_matches_price(amounts, declared_price):
-        return (
-            False,
-            f"сумма на чеке не совпадает с указанной ценой {declared_price:g} ₽",
-        )
     return True, ""
 
 
@@ -407,7 +397,8 @@ def receipt_guide_text() -> str:
         "<b>Как получить чек</b>\n"
         "1. Банк / СБП: приложение банка → операция → «Квитанция» "
         "или «Чек» → скачать / скриншот.\n"
-        "2. На чеке должны быть видны сумма, дата и получатель.\n\n"
+        "2. На чеке должны быть видны сумма, дата и получатель. "
+        "Сумма — ровно как цена тарифа в магазине, без округлений.\n\n"
         "Не подходит: стикеры, видео, голосовые, обрезанный кусок без суммы."
     )
 
@@ -849,6 +840,7 @@ async def on_receipt(message: Message, state: FSMContext) -> None:
     forensic_notes = ""
     try:
         from gemini_receipt import inspect_receipt_gemini, vision_should_reject
+        from receipt_amount import amount_is_confirmed, check_receipt_amount
         from receipt_forensics import inspect_receipt_bytes
 
         buf = await _bot.download(item.file_id)
@@ -880,6 +872,15 @@ async def on_receipt(message: Message, state: FSMContext) -> None:
                 "Пришлите исходный файл без Photoshop / обработки."
             )
             return
+        amount_hit = check_receipt_amount(
+            raw,
+            mime=item.mime,
+            filename=item.file_name,
+            declared_price=price,
+        )
+        forensic_notes = "; ".join(
+            x for x in (forensic_notes, "; ".join(amount_hit.flags)) if x
+        )
         gemini = await inspect_receipt_gemini(
             raw,
             mime=item.mime,
@@ -890,9 +891,10 @@ async def on_receipt(message: Message, state: FSMContext) -> None:
         if gemini.unavailable:
             extra_flags.append("check-skipped")
             logger.warning(
-                "vision unavailable, accept after local check uid=%s flags=%s",
+                "vision unavailable, local amount uid=%s ok=%s flags=%s",
                 uid,
-                gemini.flags,
+                amount_hit.ok,
+                amount_hit.flags,
             )
         forensic_notes = "; ".join(
             [x for x in (forensic_notes, "; ".join(extra_flags), gemini.reason) if x]
@@ -914,6 +916,30 @@ async def on_receipt(message: Message, state: FSMContext) -> None:
             await message.answer(
                 f"Чек отклонён: {gemini.reason}.\n"
                 "Нужна квитанция банка/СБП с суммой тарифа, не скрин чата и не обработанное фото."
+            )
+            return
+        if not amount_is_confirmed(
+            amount_hit, vision_amount=gemini.amount, declared_price=price
+        ):
+            reason = amount_hit.reason or (
+                f"на чеке должна быть сумма ровно {price:g} ₽ — как цена тарифа в магазине"
+            )
+            db.lobby_save_claim(
+                user_id=uid,
+                username=username,
+                tariff=tariff,
+                duration_days=days,
+                price=price,
+                receipt_file_id=item.file_id,
+                receipt_type=_receipt_kind(item),
+                status="rejected",
+                reject_reason=reason,
+                shop_id=shop_id,
+                forensic_notes=forensic_notes,
+            )
+            await message.answer(
+                f"Чек отклонён: {reason}.\n"
+                "Пришлите полный чек, где сумма совпадает с тарифом без округлений."
             )
             return
     except Exception:

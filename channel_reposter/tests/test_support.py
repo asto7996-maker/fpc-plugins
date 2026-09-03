@@ -303,6 +303,22 @@ class GeminiVerdictTests(unittest.TestCase):
         self.assertFalse(v.ok)
         self.assertFalse(v.amount_matches)
 
+    def test_rejects_near_amount_no_tolerance(self) -> None:
+        v = parse_verdict_json(
+            '{"is_receipt": true, "edited": false, "amount": 1499, '
+            '"amount_matches": true, "verdict": "ok", "reason": "почти"}',
+            1500,
+        )
+        self.assertFalse(v.ok)
+        self.assertFalse(v.amount_matches)
+        v_ok = parse_verdict_json(
+            '{"is_receipt": true, "edited": false, "amount": 1500.00, '
+            '"amount_matches": false, "verdict": "ok", "reason": "чек"}',
+            1500,
+        )
+        self.assertTrue(v_ok.ok)
+        self.assertTrue(v_ok.amount_matches)
+
     def test_parse_errors_do_not_mention_ai(self) -> None:
         v = parse_verdict_json("not-json", 179)
         self.assertEqual(v.reason, USER_BAD_ANSWER)
