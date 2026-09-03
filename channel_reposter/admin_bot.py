@@ -53,6 +53,7 @@ class S(StatesGroup):
     phone = State()
     code = State()
     password = State()
+    comp_channel = State()
 
 
 _db: Optional[Database] = None
@@ -141,7 +142,11 @@ async def _deny(uid: Optional[int], reply: Callable) -> bool:
     if is_admin(uid):
         return False
     try:
-        await reply("⛔ Только для администраторов.")
+        await reply(
+            "Панель репостера только для администраторов.\n"
+            "Лобби компенсации: меню бота (кнопка рядом со строкой ввода) "
+            "→ «Лобби компенсации», либо /lobby"
+        )
     except Exception:
         logger.debug("deny reply failed", exc_info=True)
     return True
@@ -291,6 +296,7 @@ def menu_kb(
                     callback_data="a:clean",
                 ),
             ],
+            [InlineKeyboardButton(text="🎁 Каналы доступа", callback_data="a:comp")],
             [
                 InlineKeyboardButton(text="📝 Rewrite подписей", callback_data="a:rewrite"),
                 InlineKeyboardButton(text="🧹 Разблокировать", callback_data="a:unstick"),
@@ -516,9 +522,13 @@ def status_text(db: Database) -> str:
 
 @router.message(Command("start", "menu", "help"))
 async def cmd_start(message: Message, state: FSMContext) -> None:
-    if await _deny(message.from_user.id if message.from_user else None, message.answer):
+    uid = message.from_user.id if message.from_user else None
+    if not is_admin(uid):
+        import lobby as _lobby
+
+        await _lobby.start_lobby(message, state)
         return
-    _remember_admin(message.from_user.id if message.from_user else None)
+    _remember_admin(uid)
     await state.clear()
     db = _require_db()
     await message.answer(
@@ -530,7 +540,9 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
         "3️⃣ В каждом окне: источник + назначение + «С начала»\n"
         "4️⃣ Описание → ⏱ Интервал → ▶️ Старт\n\n"
         "Управление — кнопками ниже.\n"
-        "Команды на всякий случай: /status /run_now /stop /test /ping /unstick\n\n"
+        "Лобби компенсации — отдельная команда в <b>меню бота</b> "
+        "(рядом со строкой ввода): /lobby. Не путать с кнопками этого сообщения.\n"
+        "Команды панели: /status /run_now /stop /test /ping /unstick\n\n"
         + status_text(db),
         reply_markup=main_kb(db),
         parse_mode="HTML",
@@ -902,6 +914,130 @@ async def cb_clean_transfer(c: CallbackQuery) -> None:
             "Копирую посты как есть, с описанием, файлами, гифками и текстом."
         )
     await _replace(c, text + "\n\n" + status_text(db), main_kb(db))
+
+
+def _comp_screen(db: Database) -> tuple[str, InlineKeyboardMarkup]:
+    channels = db.comp_list_channels()
+    lines = [
+        "<b>🎁 Каналы доступа</b>",
+        "После принятого чека бот выдаст одноразовую ссылку-приглашение "
+        "на срок тарифа. Юзербот или этот бот должны быть админом канала "
+        "с правом приглашать.",
+        "",
+    ]
+    if not channels:
+        lines.append("<i>Пока пусто — добавьте канал.</i>")
+    else:
+        for ch in channels:
+            flag = "🟢" if ch["enabled"] else "⏸"
+            name = ch["title"] or ch["username"] or str(ch["chat_id"])
+            uname = f" @{ch['username']}" if ch.get("username") else ""
+            lines.append(f"{flag} {name}{uname} <code>{ch['chat_id']}</code>")
+    rows: list[list[InlineKeyboardButton]] = []
+    for ch in channels:
+        on = "вкл" if ch["enabled"] else "выкл"
+        name = (ch["title"] or ch["username"] or str(ch["chat_id"]))[:28]
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=f"{name} ({on})",
+                    callback_data=f"a:comptog:{ch['id']}",
+                ),
+                InlineKeyboardButton(text="🗑", callback_data=f"a:compdel:{ch['id']}"),
+            ]
+        )
+    rows.append([InlineKeyboardButton(text="➕ Добавить канал", callback_data="a:compadd")])
+    rows.append([InlineKeyboardButton(text="◀️ К панели", callback_data="a:status")])
+    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@router.callback_query(F.data == "a:comp")
+async def cb_comp(c: CallbackQuery) -> None:
+    if await _deny_cb(c):
+        return
+    await _ack(c)
+    text, kb = _comp_screen(_require_db())
+    await _replace(c, text, kb)
+
+
+@router.callback_query(F.data == "a:compadd")
+async def cb_comp_add(c: CallbackQuery, state: FSMContext) -> None:
+    if await _deny_cb(c):
+        return
+    await _ack(c)
+    await state.set_state(S.comp_channel)
+    await c.message.answer(  # type: ignore
+        "Пришлите канал: <code>@name</code>, ссылку <code>t.me/c/…</code> "
+        "или числовой id. Бот или юзербот должен быть админом.",
+        parse_mode="HTML",
+        reply_markup=cancel_kb(),
+    )
+
+
+@router.callback_query(F.data.startswith("a:comptog:"))
+async def cb_comp_tog(c: CallbackQuery) -> None:
+    if await _deny_cb(c):
+        return
+    cid = int((c.data or "").split(":")[-1])
+    _require_db().comp_toggle_channel(cid)
+    await _ack(c)
+    text, kb = _comp_screen(_require_db())
+    await _replace(c, text, kb)
+
+
+@router.callback_query(F.data.startswith("a:compdel:"))
+async def cb_comp_del(c: CallbackQuery) -> None:
+    if await _deny_cb(c):
+        return
+    cid = int((c.data or "").split(":")[-1])
+    _require_db().comp_delete_channel(cid)
+    await _ack(c, "удалён")
+    text, kb = _comp_screen(_require_db())
+    await _replace(c, text, kb)
+
+
+@router.message(S.comp_channel)
+async def on_comp_channel(message: Message, state: FSMContext) -> None:
+    if await _deny(message.from_user.id if message.from_user else None, message.answer):
+        return
+    from links import normalize_channel
+
+    raw = (message.text or "").strip()
+    if not raw:
+        await message.answer("Пришлите @канал или id.")
+        return
+    try:
+        ref = normalize_channel(raw)
+    except ValueError as e:
+        await message.answer(f"❌ {e}")
+        return
+    chat = None
+    err = ""
+    if _bot is not None:
+        try:
+            chat = await _bot.get_chat(ref)
+        except Exception as e:
+            err = str(e)
+    if chat is None and _bridge is not None and getattr(_bridge, "auth", None) is not None:
+        client = getattr(_bridge.auth, "client", None)
+        if client is not None:
+            try:
+                chat = await _bridge.call(client.get_chat(ref), timeout=20)
+            except Exception as e:
+                err = str(e)
+    if chat is None:
+        await message.answer(f"Не открыл канал: {err or 'нет доступа'}")
+        return
+    chat_id = int(chat.id)
+    title = getattr(chat, "title", None) or getattr(chat, "first_name", None) or ""
+    uname = getattr(chat, "username", None) or ""
+    _require_db().comp_add_channel(chat_id, title=str(title), username=str(uname))
+    await state.clear()
+    await message.answer(
+        f"✅ Канал доступа: <b>{title or chat_id}</b>\n<code>{chat_id}</code>",
+        parse_mode="HTML",
+        reply_markup=main_kb(),
+    )
 
 
 @router.message(Command("filter", "clean"))

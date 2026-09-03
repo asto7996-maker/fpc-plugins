@@ -1,6 +1,11 @@
 aiogram==3.15.0
-python-dotenv==1.0.1
-pyrogram==2.0.106
+Pillow>=10.0.0
+# Drop-in вместо pyrogram 2.0.106: официальный слой не читает карточки
+# @sweetshopxxx_bot (MessageMediaUnsupported, без подписи и цен).
+# Импорт тот же: `from pyrogram import Client`.
+pyrofork==2.3.69
+pytesseract>=0.3.10
+pypdf>=4.0.0
 
 # Необязательно, но ускоряет шифрование Pyrogram в разы.
 # Требует компилятор и python3-dev, поэтому не включён в обязательные:
