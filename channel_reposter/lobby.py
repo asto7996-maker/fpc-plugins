@@ -848,7 +848,7 @@ async def on_receipt(message: Message, state: FSMContext) -> None:
     await message.answer("Проверяю чек — это займёт несколько секунд…")
     forensic_notes = ""
     try:
-        from gemini_receipt import inspect_receipt_gemini
+        from gemini_receipt import inspect_receipt_gemini, vision_should_reject
         from receipt_forensics import inspect_receipt_bytes
 
         buf = await _bot.download(item.file_id)
@@ -886,10 +886,18 @@ async def on_receipt(message: Message, state: FSMContext) -> None:
             filename=item.file_name,
             declared_price=price,
         )
+        extra_flags = list(gemini.flags)
+        if gemini.unavailable:
+            extra_flags.append("check-skipped")
+            logger.warning(
+                "vision unavailable, accept after local check uid=%s flags=%s",
+                uid,
+                gemini.flags,
+            )
         forensic_notes = "; ".join(
-            [x for x in (forensic_notes, "; ".join(gemini.flags), gemini.reason) if x]
+            [x for x in (forensic_notes, "; ".join(extra_flags), gemini.reason) if x]
         )
-        if not gemini.ok:
+        if vision_should_reject(gemini):
             db.lobby_save_claim(
                 user_id=uid,
                 username=username,

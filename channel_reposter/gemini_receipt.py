@@ -39,6 +39,7 @@ DEFAULT_MODELS = (
 USER_CHECK_FAIL = "не удалось проверить чек"
 USER_BAD_FILE = "не удалось подготовить файл чека"
 USER_BAD_ANSWER = "не удалось разобрать ответ проверки"
+UNAVAILABLE_FLAGS = frozenset({"check-error", "no-key"})
 
 _JSON_RE = re.compile(r"\{.*\}", re.S)
 
@@ -82,10 +83,25 @@ class GeminiVerdict:
     model: str = ""
     flags: list[str] = field(default_factory=list)
 
+    @property
+    def unavailable(self) -> bool:
+        """Google не ответил / ключ не принят — это не вердикт по картинке."""
+        return any(flag in UNAVAILABLE_FLAGS for flag in self.flags)
+
     def reject(self, reason: str) -> "GeminiVerdict":
         self.ok = False
         self.reason = reason
         return self
+
+
+def vision_should_reject(verdict: GeminiVerdict) -> bool:
+    """Отклонять чек только если проверка реально сказала «нет».
+
+    Сбой API (401, нет ключа, сеть) не должен браковать нормальную квитанцию.
+    """
+    if verdict.unavailable:
+        return False
+    return not verdict.ok
 
 
 def normalize_api_key(raw: str) -> str:

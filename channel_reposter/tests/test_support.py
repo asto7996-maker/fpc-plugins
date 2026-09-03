@@ -39,10 +39,12 @@ from access import decide_inbox_action, is_privileged  # noqa: E402
 from gemini_receipt import (  # noqa: E402
     USER_BAD_ANSWER,
     USER_CHECK_FAIL,
+    GeminiVerdict,
     extract_model_text,
     inspect_receipt_gemini_sync,
     normalize_api_key,
     parse_verdict_json,
+    vision_should_reject,
 )
 
 
@@ -381,10 +383,31 @@ class GeminiVerdictTests(unittest.TestCase):
                 api_key="AQ.Ab8FakeTestKeyForHeaderCheck0123456789",
             )
         self.assertFalse(v.ok)
+        self.assertTrue(v.unavailable)
+        self.assertFalse(vision_should_reject(v))
         self.assertEqual(v.reason, USER_CHECK_FAIL)
         self.assertNotIn("нейросет", v.reason.lower())
         self.assertNotIn("gemini", v.reason.lower())
         self.assertNotIn("ai studio", v.reason.lower())
+
+    def test_api_outage_does_not_reject_receipt(self) -> None:
+        down = GeminiVerdict(ok=False, reason=USER_CHECK_FAIL, flags=["check-error"])
+        no_key = GeminiVerdict(ok=False, reason=USER_CHECK_FAIL, flags=["no-key"])
+        fake = parse_verdict_json(
+            '{"is_receipt": false, "edited": false, "amount": null, '
+            '"amount_matches": false, "verdict": "reject", '
+            '"reason": "это скриншот чата"}',
+            179,
+        )
+        ok = parse_verdict_json(
+            '{"is_receipt": true, "edited": false, "amount": 179, '
+            '"amount_matches": true, "verdict": "ok", "reason": "квитанция СБП"}',
+            179,
+        )
+        self.assertFalse(vision_should_reject(down))
+        self.assertFalse(vision_should_reject(no_key))
+        self.assertTrue(vision_should_reject(fake))
+        self.assertFalse(vision_should_reject(ok))
 
 
 class _Btn:
