@@ -3,7 +3,7 @@ lobby.py — лобби компенсации.
 
 Вход для админа: меню команд бота (/lobby, /lobby_mail, /lobby_sync).
 Покупатели оформляют компенсацию в этом боте. Юзербот только зовёт
-своих людей из непрочитанных чатов и блокирует левых. Чек проверяет Gemini.
+своих людей из непрочитанных чатов и блокирует левых. Чек проверяется отдельно.
 """
 
 from __future__ import annotations
@@ -395,8 +395,8 @@ def mailing_invite_text(bot_username: str) -> str:
         "Здравствуйте. Это поддержка.\n\n"
         "Приватные каналы были заблокированы. Компенсацию оформляем "
         f"только в боте @{handle}: команда /lobby, тариф кнопкой, "
-        "затем чек. Нейросеть проверит, что это квитанция, а не "
-        "случайное фото и не Photoshop.\n\n"
+        "затем чек. Нужна квитанция оплаты, не случайное фото "
+        "и не Photoshop.\n\n"
         "Сюда писать не нужно — сообщения от новых людей не принимаются."
     )
 
@@ -430,8 +430,8 @@ def welcome_text(*, already_granted: bool = False, is_admin: bool = False) -> st
         "<b>Лобби компенсации</b>\n\n"
         "Приватные каналы с товаром были заблокированы. "
         "Возмещаем <b>максимум один тариф</b> из актуального списка "
-        "@sweetshopxxx_bot. Чек смотрит нейросеть: это должна быть "
-        "квитанция оплаты (сумма как в магазине), не скрин чата и не Photoshop.\n\n"
+        "@sweetshopxxx_bot. Нужна квитанция оплаты (сумма как в магазине), "
+        "не скрин чата и не Photoshop.\n\n"
         "Выберите тариф, затем срок: <b>цены подтягиваются из магазина</b>."
         + extra
     )
@@ -845,7 +845,7 @@ async def on_receipt(message: Message, state: FSMContext) -> None:
         await message.answer("Не удалось скачать файл. Пришлите чек ещё раз.")
         return
 
-    await message.answer("Проверяю чек нейросетью — это займёт несколько секунд…")
+    await message.answer("Проверяю чек — это займёт несколько секунд…")
     forensic_notes = ""
     try:
         from gemini_receipt import inspect_receipt_gemini
@@ -941,7 +941,7 @@ async def on_receipt(message: Message, state: FSMContext) -> None:
     else:
         extra_access = "\n\nАдминистратор откроет доступ."
     await message.answer(
-        "✅ Чек принят: нейросеть подтвердила квитанцию, монтажа не видно.\n\n"
+        "✅ Чек принят: квитанция подтверждена, монтажа не видно.\n\n"
         f"Возмещаем <b>один</b> тариф: <b>{_esc(tariff)}</b> "
         f"на <b>{_fmt_days(days)}</b> (цена {price:g} ₽).\n"
         "Больше одного тарифа выдать нельзя."
@@ -1076,7 +1076,7 @@ async def _notify_admins_grant(
         f"Тариф: {_esc(tariff)}\n"
         f"Брали: {_fmt_days(days)} за {price:g} ₽\n"
         f"Выдать: <b>один тариф</b> {_esc(tariff)} на {_fmt_days(granted)}\n"
-        f"Gemini: {_esc(notes)[:400]}"
+        f"Проверка: {_esc(notes)[:400]}"
         f"{extra}"
     )
     targets = list(config.ADMIN_IDS)

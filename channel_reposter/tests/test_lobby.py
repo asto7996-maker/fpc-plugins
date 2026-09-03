@@ -25,7 +25,9 @@ from lobby import (  # noqa: E402
     parse_tariff_duration,
     receipt_guide_text,
     validate_receipt,
+    welcome_text,
 )
+from support_inbox import invite_to_bot_text  # noqa: E402
 
 
 class ParseTariffDurationTests(unittest.TestCase):
@@ -152,7 +154,12 @@ class MailingPeerTests(unittest.TestCase):
         text = mailing_invite_text("ZzzLV_bot")
         self.assertIn("@ZzzLV_bot", text)
         self.assertIn("/lobby", text)
-        self.assertIn("нейросеть", text.lower())
+        self.assertIn("квитанц", text.lower())
+        for blob in (text, welcome_text(), invite_to_bot_text("ZzzLV_bot")):
+            low = blob.lower()
+            self.assertNotIn("нейросет", low)
+            self.assertNotIn("gemini", low)
+            self.assertNotIn("ai studio", low)
 
     def test_receipt_guide_has_no_funpay(self) -> None:
         text = receipt_guide_text()

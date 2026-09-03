@@ -1,8 +1,12 @@
 """
-gemini_receipt.py — проверка чека нейросетью Gemini (vision).
+gemini_receipt.py — проверка чека через Gemini vision.
 
 Локальный EXIF/ELA не отличает квитанцию от скрина чата.
 Сюда уходит картинка: это чек? сумма сходится? есть монтаж/Photoshop?
+
+Ключи AQ. (новый формат AI Studio) и старые AIza идут одним путём:
+заголовок x-goog-api-key, сначала Interactions API, потом generateContent.
+В ответах пользователю не пишем, чем именно проверяли.
 """
 
 from __future__ import annotations
@@ -23,12 +27,18 @@ import config
 
 logger = logging.getLogger(__name__)
 
-GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
+INTERACTIONS_URL = "https://generativelanguage.googleapis.com/v1beta/interactions"
+GENERATE_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
+API_REVISION = "2026-05-20"
 DEFAULT_MODELS = (
+    "gemini-3.6-flash",
+    "gemini-3.7-flash",
+    "gemini-3.5-flash",
     "gemini-2.5-flash",
-    "gemini-2.5-flash-lite",
-    "gemini-2.0-flash",
 )
+USER_CHECK_FAIL = "не удалось проверить чек"
+USER_BAD_FILE = "не удалось подготовить файл чека"
+USER_BAD_ANSWER = "не удалось разобрать ответ проверки"
 
 _JSON_RE = re.compile(r"\{.*\}", re.S)
 
@@ -56,6 +66,7 @@ PROMPT = """Ты проверяешь файл на компенсацию по�
   "reason": "кратко по-русски, одна фраза"
 }}
 verdict=ok только если is_receipt=true, edited=false и (amount_matches=true ИЛИ сумма на чеке совпадает с ожидаемой).
+В поле reason не упоминай нейросеть, Gemini, Google и AI Studio.
 """
 
 
@@ -77,12 +88,62 @@ class GeminiVerdict:
         return self
 
 
-def _headers(api_key: str) -> dict[str, str]:
-    return {"Content-Type": "application/json", "x-goog-api-key": api_key.strip()}
+def normalize_api_key(raw: str) -> str:
+    """AQ. и AIza ключи — обычные строки. Срезаем кавычки, BOM и пробелы."""
+    key = (raw or "").replace("\ufeff", "").strip()
+    if len(key) >= 2 and key[0] == key[-1] and key[0] in {'"', "'"}:
+        key = key[1:-1].strip()
+    return key.replace("\r", "").replace("\n", "").replace(" ", "")
 
 
-def _gemini_url(model: str) -> str:
-    return f"{GEMINI_BASE}/{model}:generateContent"
+def key_meta(raw: str) -> str:
+    key = normalize_api_key(raw)
+    if not key:
+        return "empty"
+    prefix = key[:4] if key.startswith("AQ.") else key[:4]
+    return f"prefix={prefix} len={len(key)}"
+
+
+def _headers(api_key: str, *, interactions: bool = False) -> dict[str, str]:
+    headers = {
+        "Content-Type": "application/json",
+        "x-goog-api-key": normalize_api_key(api_key),
+    }
+    if interactions:
+        headers["Api-Revision"] = API_REVISION
+    return headers
+
+
+def extract_model_text(parsed: Any) -> str:
+    """Достать текст и из Interactions, и из generateContent."""
+    if isinstance(parsed, str):
+        return parsed.strip()
+    if not isinstance(parsed, dict):
+        return ""
+    direct = parsed.get("output_text")
+    if isinstance(direct, str) and direct.strip():
+        return direct.strip()
+    chunks: list[str] = []
+    for item in parsed.get("outputs") or parsed.get("output") or []:
+        if not isinstance(item, dict):
+            continue
+        text = item.get("text")
+        if isinstance(text, str) and text.strip():
+            chunks.append(text)
+        for part in item.get("content") or []:
+            if isinstance(part, dict):
+                ptext = part.get("text")
+                if isinstance(ptext, str) and ptext.strip():
+                    chunks.append(ptext)
+    if chunks:
+        return "\n".join(chunks).strip()
+    parts = (
+        ((parsed.get("candidates") or [{}])[0].get("content") or {}).get("parts")
+        or []
+    )
+    return "\n".join(
+        p.get("text", "") for p in parts if isinstance(p, dict) and p.get("text")
+    ).strip()
 
 
 def parse_verdict_json(text: str, declared_price: float) -> GeminiVerdict:
@@ -93,11 +154,11 @@ def parse_verdict_json(text: str, declared_price: float) -> GeminiVerdict:
         raw = raw.rstrip("`").strip()
     match = _JSON_RE.search(raw)
     if not match:
-        return GeminiVerdict(ok=False, reason="нейросеть вернула непонятный ответ", raw=text)
+        return GeminiVerdict(ok=False, reason=USER_BAD_ANSWER, raw=text)
     try:
         data: dict[str, Any] = json.loads(match.group(0))
     except json.JSONDecodeError:
-        return GeminiVerdict(ok=False, reason="нейросеть вернула битый JSON", raw=text)
+        return GeminiVerdict(ok=False, reason=USER_BAD_ANSWER, raw=text)
 
     is_receipt = bool(data.get("is_receipt"))
     edited = bool(data.get("edited"))
@@ -189,40 +250,19 @@ def _post(url: str, headers: dict[str, str], payload: dict[str, Any], timeout: f
         return int(e.code), err
 
 
-def _auth_attempts(api_key: str, model: str) -> list[tuple[str, dict[str, str]]]:
-    """AQ-ключи часто принимают и заголовок, и ?key= — пробуем оба."""
-    url = _gemini_url(model)
-    key = api_key.strip()
-    header = _headers(key)
-    return [
-        (url, header),
-        (f"{url}?key={urllib.parse.quote(key)}", {"Content-Type": "application/json"}),
-        (f"{url}?key={urllib.parse.quote(key)}", header),
-    ]
+def _interactions_payload(model: str, prompt: str, mime_out: str, b64: str) -> dict[str, Any]:
+    media_type = "document" if mime_out == "application/pdf" else "image"
+    return {
+        "model": model,
+        "input": [
+            {"type": "text", "text": prompt},
+            {"type": media_type, "data": b64, "mime_type": mime_out},
+        ],
+    }
 
 
-def inspect_receipt_gemini_sync(
-    data: bytes,
-    *,
-    mime: str = "",
-    filename: str = "",
-    declared_price: float = 0.0,
-    api_key: str = "",
-    model: str = "",
-) -> GeminiVerdict:
-    key = (api_key or getattr(config, "GEMINI_API_KEY", "") or "").strip()
-    if not key:
-        return GeminiVerdict(ok=False, reason="не настроен ключ Gemini — чек не проверен")
-    try:
-        mime_out, b64 = _prepare_inline(data, mime, filename)
-    except ValueError as e:
-        return GeminiVerdict(ok=False, reason=str(e))
-    except Exception:
-        logger.exception("prepare receipt for gemini")
-        return GeminiVerdict(ok=False, reason="не удалось подготовить файл чека")
-
-    prompt = PROMPT.format(price=float(declared_price or 0))
-    payload = {
+def _generate_payload(prompt: str, mime_out: str, b64: str) -> dict[str, Any]:
+    return {
         "contents": [
             {
                 "role": "user",
@@ -238,60 +278,108 @@ def inspect_receipt_gemini_sync(
             "responseMimeType": "application/json",
         },
     }
+
+
+def _request_attempts(
+    api_key: str, model: str, prompt: str, mime_out: str, b64: str
+) -> list[tuple[str, str, dict[str, str], dict[str, Any]]]:
+    """Сначала Interactions (актуальный путь для AQ.), потом generateContent."""
+    key = normalize_api_key(api_key)
+    ix_headers = _headers(key, interactions=True)
+    gc_headers = _headers(key, interactions=False)
+    gc_url = f"{GENERATE_BASE}/{model}:generateContent"
+    ix_body = _interactions_payload(model, prompt, mime_out, b64)
+    gc_body = _generate_payload(prompt, mime_out, b64)
+    return [
+        ("interactions", INTERACTIONS_URL, ix_headers, ix_body),
+        ("generate", gc_url, gc_headers, gc_body),
+        (
+            "generate-query",
+            f"{gc_url}?key={urllib.parse.quote(key)}",
+            {"Content-Type": "application/json"},
+            gc_body,
+        ),
+    ]
+
+
+def _verdict_from_body(
+    body: str, declared_price: float, model: str, surface: str
+) -> Optional[GeminiVerdict]:
+    try:
+        parsed = json.loads(body)
+    except json.JSONDecodeError:
+        return None
+    if isinstance(parsed, list):
+        parsed = parsed[0] if parsed and isinstance(parsed[0], dict) else {}
+    if isinstance(parsed, dict) and parsed.get("error"):
+        return None
+    text = extract_model_text(parsed)
+    if not text:
+        return None
+    verdict = parse_verdict_json(text, declared_price)
+    verdict.model = model
+    verdict.flags.append(f"check:{surface}:{model}")
+    if verdict.is_receipt:
+        verdict.flags.append("receipt")
+    if verdict.edited:
+        verdict.flags.append("edited")
+    return verdict
+
+
+def inspect_receipt_gemini_sync(
+    data: bytes,
+    *,
+    mime: str = "",
+    filename: str = "",
+    declared_price: float = 0.0,
+    api_key: str = "",
+    model: str = "",
+) -> GeminiVerdict:
+    key = normalize_api_key(api_key or getattr(config, "GEMINI_API_KEY", "") or "")
+    if not key:
+        return GeminiVerdict(ok=False, reason=USER_CHECK_FAIL, flags=["no-key"])
+    try:
+        mime_out, b64 = _prepare_inline(data, mime, filename)
+    except ValueError as e:
+        return GeminiVerdict(ok=False, reason=str(e))
+    except Exception:
+        logger.exception("prepare receipt for check")
+        return GeminiVerdict(ok=False, reason=USER_BAD_FILE)
+
+    prompt = PROMPT.format(price=float(declared_price or 0))
     preferred = (model or getattr(config, "GEMINI_MODEL", "") or DEFAULT_MODELS[0]).strip()
     models = [preferred] + [m for m in DEFAULT_MODELS if m != preferred]
     last_err = ""
+    logger.info("receipt check key %s models=%s", key_meta(key), ",".join(models[:3]))
     for try_model in models:
         auth_fail = 0
-        for url, headers in _auth_attempts(key, try_model):
+        for surface, url, headers, payload in _request_attempts(
+            key, try_model, prompt, mime_out, b64
+        ):
             status, body = _post(url, headers, payload, timeout=55)
             if status in (401, 403):
-                last_err = f"{try_model} HTTP {status}: {body[:180]}"
-                logger.warning("Gemini %s", last_err)
+                last_err = f"{surface} {try_model} HTTP {status}: {body[:160]}"
+                logger.warning("receipt check auth %s %s", key_meta(key), last_err)
                 auth_fail += 1
                 continue
             if status in (404, 429):
-                last_err = f"{try_model} HTTP {status}"
+                last_err = f"{surface} {try_model} HTTP {status}"
+                logger.warning("receipt check %s", last_err)
                 break
             if status != 200:
-                last_err = f"{try_model} HTTP {status}: {body[:180]}"
-                logger.warning("Gemini %s", last_err)
+                last_err = f"{surface} {try_model} HTTP {status}: {body[:160]}"
+                logger.warning("receipt check %s", last_err)
                 continue
-            try:
-                parsed = json.loads(body)
-            except json.JSONDecodeError:
-                last_err = "не JSON от API"
+            verdict = _verdict_from_body(body, declared_price, try_model, surface)
+            if verdict is None:
+                last_err = f"{surface} {try_model} empty/bad body"
                 continue
-            parts = (
-                ((parsed.get("candidates") or [{}])[0].get("content") or {}).get("parts")
-                or []
-            )
-            text = "\n".join(p.get("text", "") for p in parts if p.get("text")).strip()
-            if not text:
-                last_err = "пустой ответ Gemini"
-                continue
-            verdict = parse_verdict_json(text, declared_price)
-            verdict.model = try_model
-            verdict.flags.append(f"gemini:{try_model}")
-            if verdict.is_receipt:
-                verdict.flags.append("receipt")
-            if verdict.edited:
-                verdict.flags.append("edited")
             return verdict
         if auth_fail >= 3:
+            # Этот ключ Google не принимает ни на одном транспорте — дальше те же 401.
             break
-    if "HTTP 401" in last_err or "HTTP 403" in last_err:
-        reason = (
-            "Google не принял ключ Gemini (401). "
-            "Админу нужно выпустить новый ключ AQ в AI Studio и прописать GEMINI_API_KEY."
-        )
-    else:
-        reason = f"нейросеть не ответила ({last_err or 'нет модели'})"
-    return GeminiVerdict(
-        ok=False,
-        reason=reason,
-        flags=["gemini-error"],
-    )
+    logger.error("receipt check failed %s last=%s", key_meta(key), last_err[:180])
+    return GeminiVerdict(ok=False, reason=USER_CHECK_FAIL, flags=["check-error"])
 
 
 async def inspect_receipt_gemini(

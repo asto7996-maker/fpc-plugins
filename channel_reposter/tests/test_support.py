@@ -36,7 +36,14 @@ from shop_catalog import (  # noqa: E402
 )
 from support_inbox import should_handle_top  # noqa: E402
 from access import decide_inbox_action, is_privileged  # noqa: E402
-from gemini_receipt import parse_verdict_json  # noqa: E402
+from gemini_receipt import (  # noqa: E402
+    USER_BAD_ANSWER,
+    USER_CHECK_FAIL,
+    extract_model_text,
+    inspect_receipt_gemini_sync,
+    normalize_api_key,
+    parse_verdict_json,
+)
 
 
 class ShopTitleTests(unittest.TestCase):
@@ -293,6 +300,91 @@ class GeminiVerdictTests(unittest.TestCase):
         )
         self.assertFalse(v.ok)
         self.assertFalse(v.amount_matches)
+
+    def test_parse_errors_do_not_mention_ai(self) -> None:
+        v = parse_verdict_json("not-json", 179)
+        self.assertEqual(v.reason, USER_BAD_ANSWER)
+        self.assertNotIn("нейросет", v.reason.lower())
+        self.assertNotIn("gemini", v.reason.lower())
+
+    def test_aq_key_normalized(self) -> None:
+        raw = '  "AQ.Ab8ExampleKeyValue0123456789"  \n'
+        self.assertTrue(normalize_api_key(raw).startswith("AQ."))
+        self.assertNotIn('"', normalize_api_key(raw))
+        self.assertNotIn(" ", normalize_api_key(raw))
+
+    def test_extract_interactions_and_generate_text(self) -> None:
+        ix = {
+            "output_text": '{"is_receipt": true, "edited": false, "amount": 179, '
+            '"amount_matches": true, "verdict": "ok", "reason": "квитанция"}'
+        }
+        self.assertIn("квитанция", extract_model_text(ix))
+        gc = {
+            "candidates": [
+                {"content": {"parts": [{"text": '{"verdict":"ok"}'}]}}
+            ]
+        }
+        self.assertIn("verdict", extract_model_text(gc))
+
+    def _jpeg(self) -> bytes:
+        try:
+            from PIL import Image
+        except ImportError:
+            self.skipTest("pillow")
+        img = Image.new("RGB", (640, 480), (240, 240, 240))
+        buf = io.BytesIO()
+        img.save(buf, "JPEG", quality=80)
+        return buf.getvalue()
+
+    def test_aq_key_uses_header_and_interactions(self) -> None:
+        calls: list[tuple[str, dict[str, str]]] = []
+
+        def fake_post(url, headers, payload, timeout):
+            calls.append((url, dict(headers)))
+            if "interactions" in url:
+                body = (
+                    '{"output_text": "{\\"is_receipt\\": true, \\"edited\\": false, '
+                    '\\"amount\\": 179, \\"amount_matches\\": true, '
+                    '\\"verdict\\": \\"ok\\", \\"reason\\": \\"квитанция СБП\\"}"}'
+                )
+                return 200, body
+            return 500, "{}"
+
+        with patch("gemini_receipt._post", side_effect=fake_post):
+            v = inspect_receipt_gemini_sync(
+                self._jpeg(),
+                mime="image/jpeg",
+                filename="check.jpg",
+                declared_price=179,
+                api_key="AQ.Ab8FakeTestKeyForHeaderCheck0123456789",
+                model="gemini-3.6-flash",
+            )
+        self.assertTrue(v.ok, v.reason)
+        self.assertTrue(any("interactions" in url for url, _ in calls))
+        self.assertTrue(
+            any(
+                h.get("x-goog-api-key", "").startswith("AQ.")
+                for _, h in calls
+            )
+        )
+
+    def test_http_401_is_generic_for_user(self) -> None:
+        def fake_post(url, headers, payload, timeout):
+            return 401, '{"error":{"status":"UNAUTHENTICATED"}}'
+
+        with patch("gemini_receipt._post", side_effect=fake_post):
+            v = inspect_receipt_gemini_sync(
+                self._jpeg(),
+                mime="image/jpeg",
+                filename="check.jpg",
+                declared_price=179,
+                api_key="AQ.Ab8FakeTestKeyForHeaderCheck0123456789",
+            )
+        self.assertFalse(v.ok)
+        self.assertEqual(v.reason, USER_CHECK_FAIL)
+        self.assertNotIn("нейросет", v.reason.lower())
+        self.assertNotIn("gemini", v.reason.lower())
+        self.assertNotIn("ai studio", v.reason.lower())
 
 
 class _Btn:

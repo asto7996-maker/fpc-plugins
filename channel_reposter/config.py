@@ -78,8 +78,17 @@ SHOP_SYNC_TIMEOUT: float = max(120.0, _float("SHOP_SYNC_TIMEOUT", 240.0))
 # Юзербот опрашивает лички поддержки (непрочитанные → приглашение в бота)
 SUPPORT_INBOX_SECONDS: float = max(8.0, _float("SUPPORT_INBOX_SECONDS", 12.0))
 SUPPORT_CATCHUP_HOURS: float = max(1.0, _float("SUPPORT_CATCHUP_HOURS", 36.0))
-GEMINI_API_KEY: str = _optional("GEMINI_API_KEY")
-GEMINI_MODEL: str = _optional("GEMINI_MODEL", "gemini-2.5-flash") or "gemini-2.5-flash"
+
+
+def _api_key(name: str) -> str:
+    raw = _optional(name)
+    if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in {'"', "'"}:
+        raw = raw[1:-1].strip()
+    return raw.replace("\r", "").replace("\n", "").replace(" ", "")
+
+
+GEMINI_API_KEY: str = _api_key("GEMINI_API_KEY")
+GEMINI_MODEL: str = _optional("GEMINI_MODEL", "gemini-3.6-flash") or "gemini-3.6-flash"
 TEST_USERNAMES: list[str] = [
     p.strip().lstrip("@")
     for p in _optional("TEST_USERNAMES", "Hgfthjj").split(",")
